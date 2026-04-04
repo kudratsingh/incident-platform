@@ -1,5 +1,6 @@
-from contextlib import asynccontextmanager
+import asyncio
 from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -8,6 +9,7 @@ from app.config import get_settings
 from app.core.exceptions import AppError
 from app.core.logging import get_logger, request_id_var, setup_logging
 from app.core.middleware import RequestContextMiddleware
+from app.core.redis import close_redis_pool, get_redis_client
 
 logger = get_logger(__name__)
 
@@ -17,7 +19,24 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     settings = get_settings()
     setup_logging(level=settings.log_level)
     logger.info("startup", extra={"environment": settings.environment})
+
+    # Import here to avoid circular imports at module load time
+    from app.dependencies import get_session_factory
+    from app.workers.dispatcher import worker_loop
+
+    redis = get_redis_client()
+    session_factory = get_session_factory()
+    worker_task = asyncio.create_task(worker_loop(session_factory, redis))
+
     yield
+
+    worker_task.cancel()
+    try:
+        await worker_task
+    except asyncio.CancelledError:
+        pass
+
+    await close_redis_pool()
     logger.info("shutdown")
 
 
@@ -33,7 +52,6 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
-    # Middleware — outermost runs first
     app.add_middleware(RequestContextMiddleware)
 
     # ---------------------------------------------------------------------------
@@ -56,13 +74,14 @@ def create_app() -> FastAPI:
     # Routers
     # ---------------------------------------------------------------------------
 
-    from app.api import admin, audit, auth, jobs
+    from app.api import admin, audit, auth, jobs, streaming
 
     prefix = settings.api_v1_prefix
     app.include_router(auth.router, prefix=prefix)
     app.include_router(jobs.router, prefix=prefix)
     app.include_router(admin.router, prefix=prefix)
     app.include_router(audit.router, prefix=prefix)
+    app.include_router(streaming.router, prefix=prefix)
 
     @app.get("/healthz", include_in_schema=False)
     async def healthz() -> dict[str, str]:

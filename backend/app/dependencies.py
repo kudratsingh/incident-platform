@@ -1,18 +1,19 @@
+import uuid
 from collections.abc import AsyncGenerator
 
 from fastapi import Depends
 from fastapi.security import OAuth2PasswordBearer
+from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.config import get_settings
 from app.core.exceptions import AuthenticationError, AuthorizationError
 from app.core.logging import user_id_var
+from app.core.redis import get_redis as _get_redis
 from app.core.security import decode_token
 from app.models.enums import UserRole
 from app.models.user import User
 from app.repositories.user import UserRepository
-
-import uuid
 
 # ---------------------------------------------------------------------------
 # Database
@@ -59,6 +60,15 @@ async def get_current_user(
 
     user_id_var.set(str(user.id))
     return user
+
+
+# Re-export so callers import from one place
+get_redis = _get_redis
+
+
+def get_session_factory() -> async_sessionmaker[AsyncSession]:
+    """Return the shared session factory — used by the worker (no HTTP context)."""
+    return _async_session
 
 
 def require_role(*roles: UserRole) -> "type[User]":  # type: ignore[return]
