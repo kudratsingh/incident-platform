@@ -95,8 +95,6 @@ FastAPI Gateway
 | `threading` | Blocking SDKs, file upload helpers, log shipping, wrapping legacy blocking functions |
 | `multiprocessing` | CPU-heavy CSV parsing, document transformation, PDF/text extraction, data aggregation |
 
-The key learning is deciding **which work belongs where**.
-
 ---
 
 ## Code Style & Conventions
@@ -128,12 +126,6 @@ The key learning is deciding **which work belongs where**.
 **Descriptors** (one meaningful use) — e.g., validated config field or tracked model attribute that validates/normalizes on assignment
 
 **`**kwargs`** — in configurable base service classes, adapters, logging helpers
-
-### What to Avoid
-- Do NOT stuff every advanced Python concept into every file
-- Do NOT spam inheritance everywhere
-- Mostly clean, boring, readable code with a few well-chosen advanced techniques where they truly help
-- That restraint is part of seniority
 
 ---
 
@@ -250,7 +242,7 @@ Use Python's logging with structured formatters (JSON). Logs must be queryable b
 
 ---
 
-## Repo Structure (Suggested)
+## Repo Structure 
 
 ```
 ├── CLAUDE.md
