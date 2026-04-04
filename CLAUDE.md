@@ -298,14 +298,3 @@ Use Python's logging with structured formatters (JSON). Logs must be queryable b
 └── scripts/                     # Dev helpers, seed data, migrations
 ```
 
----
-
-## Key Interview Talking Points This Project Enables
-
-- Why async for request handling, threads for one subsystem, processes for another
-- How to trace a failed job from browser request → backend logs → worker state
-- Idempotency and retry design decisions
-- Code structure for readability and maintainability
-- Layered test strategy
-- Bottleneck identification and what changes at 10x scale
-- Observability and incident response workflow
