@@ -78,4 +78,4 @@ async def subscribe(
                 break
     finally:
         await pubsub.unsubscribe(_channel(job_id))
-        await pubsub.aclose()
+        await pubsub.aclose()  # type: ignore[no-untyped-call]

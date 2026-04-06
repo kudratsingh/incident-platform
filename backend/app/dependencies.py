@@ -69,7 +69,7 @@ def get_session_factory() -> async_sessionmaker[AsyncSession]:
     return _async_session
 
 
-def require_role(*roles: UserRole) -> "type[User]":  # type: ignore[return]
+def require_role(*roles: UserRole) -> "type[User]":
     """Factory that returns a FastAPI dependency enforcing one of the given roles."""
 
     async def _dependency(

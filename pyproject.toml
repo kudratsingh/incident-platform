@@ -48,6 +48,7 @@ strict = true
 python_version = "3.12"
 plugins = ["sqlalchemy.ext.mypy.plugin"]
 exclude = ["alembic/"]
+mypy_path = "backend"
 
 [tool.ruff]
 line-length = 100

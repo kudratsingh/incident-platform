@@ -90,7 +90,7 @@ async def _run_job(
     # ------------------------------------------------------------------ #
     # 2. Execute processor                                                  #
     # ------------------------------------------------------------------ #
-    processor = _PROCESSORS.get(job_type)  # type: ignore[arg-type]
+    processor = _PROCESSORS.get(JobType(job_type))
     if processor is None:
         async with session_factory() as session:
             async with session.begin():
