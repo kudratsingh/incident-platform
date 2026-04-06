@@ -29,10 +29,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     from app.models.base import Base
     from app.workers.dispatcher import worker_loop
 
-    # Create all tables if they don't exist (dev convenience — use Alembic in prod)
-    async with _engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    logger.info("database tables ready")
+    # In production, run `alembic upgrade head` before starting the app.
+    # This create_all is kept only as a dev convenience for fresh environments.
+    if settings.environment != "production":
+        async with _engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        logger.info("database tables ready (dev: create_all)")
 
     redis = get_redis_client()
     session_factory = get_session_factory()
