@@ -53,6 +53,7 @@ mypy_path = "backend"
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+exclude = ["backend/alembic/versions/"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W", "UP"]
