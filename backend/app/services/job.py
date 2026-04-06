@@ -1,22 +1,26 @@
 import uuid
 from typing import Any
 
+from redis.asyncio import Redis
+
 from app.core.exceptions import AuthorizationError, JobError, NotFoundError
 from app.core.logging import get_logger, request_id_var, trace_id_var
 from app.models.job import Job
 from app.models.enums import JobStatus, UserRole
 from app.repositories.audit import AuditRepository
 from app.repositories.job import JobRepository
+from app.workers import queue
 
 logger = get_logger(__name__)
 
 
 class JobService:
     def __init__(
-        self, job_repo: JobRepository, audit_repo: AuditRepository
+        self, job_repo: JobRepository, audit_repo: AuditRepository, redis: Redis
     ) -> None:
         self.job_repo = job_repo
         self.audit_repo = audit_repo
+        self.redis = redis
 
     async def create_job(
         self,
@@ -56,6 +60,7 @@ class JobService:
             request_id=request_id_var.get("") or None,
             extra_data={"type": job_type, "priority": priority},
         )
+        await queue.push(self.redis, str(job.id), priority=priority)
         logger.info("job created", extra={"job_id": str(job.id), "type": job_type})
         return job
 
@@ -118,6 +123,7 @@ class JobService:
             resource_id=str(job_id),
             request_id=request_id_var.get("") or None,
         )
+        await queue.push(self.redis, str(job_id), priority=0)
         logger.info("job replayed", extra={"job_id": str(job_id)})
         assert updated is not None
         return updated

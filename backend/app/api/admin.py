@@ -1,9 +1,10 @@
 import uuid
 
 from fastapi import APIRouter, Depends
+from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.dependencies import get_db, require_role
+from app.dependencies import get_db, get_redis, require_role
 from app.models.enums import UserRole
 from app.models.user import User
 from app.repositories.audit import AuditRepository
@@ -20,8 +21,8 @@ _require_support_or_admin = require_role(UserRole.SUPPORT, UserRole.ADMIN)
 _require_admin = require_role(UserRole.ADMIN)
 
 
-def _job_service(db: AsyncSession) -> JobService:
-    return JobService(JobRepository(db), AuditRepository(db))
+def _job_service(db: AsyncSession, redis: Redis) -> JobService:
+    return JobService(JobRepository(db), AuditRepository(db), redis)
 
 
 @router.get("/jobs", response_model=PaginatedResponse[JobResponse])
@@ -29,8 +30,9 @@ async def admin_list_jobs(
     params: AdminJobListParams = Depends(),
     current_user: User = Depends(_require_support_or_admin),
     db: AsyncSession = Depends(get_db),
+    redis: Redis = Depends(get_redis),
 ) -> PaginatedResponse[JobResponse]:
-    svc = _job_service(db)
+    svc = _job_service(db, redis)
     jobs, total = await svc.list_jobs(
         requesting_user_id=current_user.id,
         user_role=current_user.role,
@@ -54,8 +56,9 @@ async def admin_get_job(
     job_id: uuid.UUID,
     current_user: User = Depends(_require_support_or_admin),
     db: AsyncSession = Depends(get_db),
+    redis: Redis = Depends(get_redis),
 ) -> JobResponse:
-    svc = _job_service(db)
+    svc = _job_service(db, redis)
     job = await svc.get_job(
         job_id=job_id,
         requesting_user_id=current_user.id,
@@ -69,8 +72,9 @@ async def replay_job(
     job_id: uuid.UUID,
     current_user: User = Depends(_require_support_or_admin),
     db: AsyncSession = Depends(get_db),
+    redis: Redis = Depends(get_redis),
 ) -> JobResponse:
-    svc = _job_service(db)
+    svc = _job_service(db, redis)
     job = await svc.replay_job(job_id=job_id, requesting_user_id=current_user.id)
     return JobResponse.model_validate(job)
 
@@ -80,8 +84,9 @@ async def resolve_incident(
     job_id: uuid.UUID,
     current_user: User = Depends(_require_support_or_admin),
     db: AsyncSession = Depends(get_db),
+    redis: Redis = Depends(get_redis),
 ) -> JobResponse:
-    svc = _job_service(db)
+    svc = _job_service(db, redis)
     job = await svc.resolve_incident(job_id=job_id, requesting_user_id=current_user.id)
     return JobResponse.model_validate(job)
 

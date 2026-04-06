@@ -1,9 +1,10 @@
 import uuid
 
 from fastapi import APIRouter, Depends
+from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.dependencies import get_current_user, get_db
+from app.dependencies import get_current_user, get_db, get_redis
 from app.models.user import User
 from app.repositories.audit import AuditRepository
 from app.repositories.job import JobRepository
@@ -14,8 +15,8 @@ from app.services.job import JobService
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 
 
-def _job_service(db: AsyncSession) -> JobService:
-    return JobService(JobRepository(db), AuditRepository(db))
+def _job_service(db: AsyncSession, redis: Redis) -> JobService:
+    return JobService(JobRepository(db), AuditRepository(db), redis)
 
 
 @router.post("", response_model=JobResponse, status_code=201)
@@ -23,8 +24,9 @@ async def create_job(
     body: JobCreate,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    redis: Redis = Depends(get_redis),
 ) -> JobResponse:
-    svc = _job_service(db)
+    svc = _job_service(db, redis)
     job = await svc.create_job(
         user_id=current_user.id,
         job_type=body.type,
@@ -40,8 +42,9 @@ async def list_jobs(
     params: JobListParams = Depends(),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    redis: Redis = Depends(get_redis),
 ) -> PaginatedResponse[JobResponse]:
-    svc = _job_service(db)
+    svc = _job_service(db, redis)
     jobs, total = await svc.list_jobs(
         requesting_user_id=current_user.id,
         user_role=current_user.role,
@@ -64,8 +67,9 @@ async def get_job(
     job_id: uuid.UUID,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    redis: Redis = Depends(get_redis),
 ) -> JobResponse:
-    svc = _job_service(db)
+    svc = _job_service(db, redis)
     job = await svc.get_job(
         job_id=job_id,
         requesting_user_id=current_user.id,

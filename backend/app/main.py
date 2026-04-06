@@ -3,6 +3,7 @@ from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.config import get_settings
@@ -21,8 +22,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info("startup", extra={"environment": settings.environment})
 
     # Import here to avoid circular imports at module load time
-    from app.dependencies import get_session_factory
+    from app.dependencies import get_session_factory, _engine
+    from app.models.base import Base
     from app.workers.dispatcher import worker_loop
+
+    # Create all tables if they don't exist (dev convenience — use Alembic in prod)
+    async with _engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    logger.info("database tables ready")
 
     redis = get_redis_client()
     session_factory = get_session_factory()
@@ -53,6 +60,14 @@ def create_app() -> FastAPI:
     )
 
     app.add_middleware(RequestContextMiddleware)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+        expose_headers=["X-Request-ID", "X-Trace-ID"],
+    )
 
     # ---------------------------------------------------------------------------
     # Exception handlers
