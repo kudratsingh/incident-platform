@@ -82,6 +82,9 @@ async def client(db_session: AsyncSession) -> AsyncGenerator[AsyncClient, None]:
         mock.zrem = AsyncMock(return_value=0)
         mock.incr = AsyncMock(return_value=1)
         mock.expire = AsyncMock(return_value=True)
+        mock.get = AsyncMock(return_value=None)  # cache always misses in tests
+        mock.set = AsyncMock(return_value=True)
+        mock.delete = AsyncMock(return_value=1)
         yield mock
 
     app.dependency_overrides[get_db] = _override_db
