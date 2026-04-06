@@ -4,7 +4,6 @@ import uuid
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-
 from app.core.exceptions import AuthorizationError, JobError, NotFoundError
 from app.models.enums import JobStatus, JobType, UserRole
 from app.models.job import Job
@@ -36,7 +35,8 @@ def _make_job(**kwargs: object) -> Job:
 def _make_service() -> tuple[JobService, AsyncMock, AsyncMock]:
     job_repo = AsyncMock()
     audit_repo = AsyncMock()
-    svc = JobService(job_repo, audit_repo)
+    redis = AsyncMock()
+    svc = JobService(job_repo, audit_repo, redis)
     return svc, job_repo, audit_repo
 
 

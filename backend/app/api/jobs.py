@@ -1,9 +1,5 @@
 import uuid
 
-from fastapi import APIRouter, Depends
-from redis.asyncio import Redis
-from sqlalchemy.ext.asyncio import AsyncSession
-
 from app.dependencies import get_current_user, get_db, get_redis
 from app.models.user import User
 from app.repositories.audit import AuditRepository
@@ -11,6 +7,9 @@ from app.repositories.job import JobRepository
 from app.schemas.common import PaginatedResponse
 from app.schemas.job import JobCreate, JobListParams, JobResponse
 from app.services.job import JobService
+from fastapi import APIRouter, Depends
+from redis.asyncio import Redis
+from sqlalchemy.ext.asyncio import AsyncSession
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 

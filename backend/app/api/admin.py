@@ -1,9 +1,5 @@
 import uuid
 
-from fastapi import APIRouter, Depends
-from redis.asyncio import Redis
-from sqlalchemy.ext.asyncio import AsyncSession
-
 from app.dependencies import get_db, get_redis, require_role
 from app.models.enums import UserRole
 from app.models.user import User
@@ -14,6 +10,9 @@ from app.schemas.common import PaginatedResponse
 from app.schemas.job import AdminJobListParams, JobResponse
 from app.schemas.user import UserResponse
 from app.services.job import JobService
+from fastapi import APIRouter, Depends
+from redis.asyncio import Redis
+from sqlalchemy.ext.asyncio import AsyncSession
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 

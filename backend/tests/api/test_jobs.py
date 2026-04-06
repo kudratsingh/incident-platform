@@ -1,6 +1,5 @@
 """API contract tests for /api/v1/jobs endpoints."""
 
-import pytest
 from httpx import AsyncClient
 
 

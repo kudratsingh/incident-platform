@@ -1,12 +1,11 @@
-from fastapi import APIRouter, Depends
-from sqlalchemy.ext.asyncio import AsyncSession
-
 from app.dependencies import get_db, require_role
 from app.models.enums import UserRole
 from app.models.user import User
 from app.repositories.audit import AuditRepository
 from app.schemas.audit import AuditListParams, AuditLogResponse
 from app.schemas.common import PaginatedResponse
+from fastapi import APIRouter, Depends
+from sqlalchemy.ext.asyncio import AsyncSession
 
 router = APIRouter(prefix="/audit", tags=["audit"])
 

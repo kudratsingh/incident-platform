@@ -1,12 +1,11 @@
 import uuid
 from typing import TYPE_CHECKING
 
+from app.models.base import Base, TimestampMixin
+from app.models.enums import UserRole
 from sqlalchemy import Boolean, String
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
-
-from app.models.base import Base, TimestampMixin
-from app.models.enums import UserRole
 
 if TYPE_CHECKING:
     from app.models.audit import AuditLog

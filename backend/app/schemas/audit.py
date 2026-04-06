@@ -2,9 +2,8 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict
-
 from app.schemas.common import PaginationParams
+from pydantic import BaseModel, ConfigDict
 
 
 class AuditLogResponse(BaseModel):

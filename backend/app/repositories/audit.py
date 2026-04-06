@@ -1,10 +1,9 @@
 import uuid
 from typing import Any
 
-from sqlalchemy import and_, select
-
 from app.models.audit import AuditLog
 from app.repositories.base import BaseRepository
+from sqlalchemy import and_, select
 
 
 class AuditRepository(BaseRepository[AuditLog]):

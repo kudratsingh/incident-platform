@@ -2,15 +2,14 @@ import asyncio
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-
 from app.config import get_settings
 from app.core.exceptions import AppError
 from app.core.logging import get_logger, request_id_var, setup_logging
 from app.core.middleware import RequestContextMiddleware
 from app.core.redis import close_redis_pool, get_redis_client
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 logger = get_logger(__name__)
 
@@ -22,7 +21,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info("startup", extra={"environment": settings.environment})
 
     # Import here to avoid circular imports at module load time
-    from app.dependencies import get_session_factory, _engine
+    from app.dependencies import _engine, get_session_factory
     from app.models.base import Base
     from app.workers.dispatcher import worker_loop
 

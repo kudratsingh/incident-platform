@@ -2,11 +2,10 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable
 
+from app.core.logging import get_logger, request_id_var, trace_id_var
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
-
-from app.core.logging import get_logger, request_id_var, trace_id_var
 
 logger = get_logger(__name__)
 

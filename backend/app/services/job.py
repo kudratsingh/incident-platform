@@ -1,15 +1,14 @@
 import uuid
 from typing import Any
 
-from redis.asyncio import Redis
-
 from app.core.exceptions import AuthorizationError, JobError, NotFoundError
 from app.core.logging import get_logger, request_id_var, trace_id_var
-from app.models.job import Job
 from app.models.enums import JobStatus, UserRole
+from app.models.job import Job
 from app.repositories.audit import AuditRepository
 from app.repositories.job import JobRepository
 from app.workers import queue
+from redis.asyncio import Redis
 
 logger = get_logger(__name__)
 
@@ -70,7 +69,8 @@ class JobService:
         job = await self.job_repo.get_by_id(job_id)
         if not job:
             raise NotFoundError(f"Job {job_id} not found")
-        if user_role not in (UserRole.ADMIN, UserRole.SUPPORT) and job.user_id != requesting_user_id:
+        privileged = user_role in (UserRole.ADMIN, UserRole.SUPPORT)
+        if not privileged and job.user_id != requesting_user_id:
             raise AuthorizationError("Not allowed to view this job")
         return job
 

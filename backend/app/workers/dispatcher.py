@@ -24,15 +24,13 @@ import asyncio
 import uuid
 from typing import Any
 
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-
 from app.config import get_settings
 from app.core.logging import get_logger, job_id_var, trace_id_var
 from app.models.enums import JobStatus, JobType
 from app.repositories.audit import AuditRepository
 from app.repositories.job import JobRepository
 from app.workers import async_tasks, cpu_processors, progress, queue, thread_adapters
-from app.workers.progress import ProgressPublisher
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 logger = get_logger(__name__)
 
@@ -71,7 +69,10 @@ async def _run_job(
                 return
             if job.status not in (JobStatus.PENDING,):
                 # Could have been replayed or cancelled between pop and now
-                logger.info("job no longer pending, skipping", extra={"job_id": job_id_str, "status": job.status})
+                logger.info(
+                    "job no longer pending, skipping",
+                    extra={"job_id": job_id_str, "status": job.status},
+                )
                 job_id_var.reset(token)
                 return
 
