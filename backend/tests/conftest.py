@@ -80,6 +80,8 @@ async def client(db_session: AsyncSession) -> AsyncGenerator[AsyncClient, None]:
         mock.zpopmax = AsyncMock(return_value=[])
         mock.zrangebyscore = AsyncMock(return_value=[])
         mock.zrem = AsyncMock(return_value=0)
+        mock.incr = AsyncMock(return_value=1)
+        mock.expire = AsyncMock(return_value=True)
         yield mock
 
     app.dependency_overrides[get_db] = _override_db

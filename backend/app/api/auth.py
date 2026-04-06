@@ -5,6 +5,7 @@ from app.repositories.user import UserRepository
 from app.schemas.auth import LoginRequest, RefreshRequest, TokenResponse
 from app.schemas.user import UserCreate, UserResponse
 from app.services.auth import AuthService
+from app.utils.rate_limit import rate_limiter
 from fastapi import APIRouter, Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -20,6 +21,7 @@ async def register(
     body: UserCreate,
     request: Request,
     db: AsyncSession = Depends(get_db),
+    _rl: None = Depends(rate_limiter(limit=10, window=60, key_prefix="register")),
 ) -> UserResponse:
     svc = _auth_service(db)
     user = await svc.register(
@@ -36,6 +38,7 @@ async def login(
     body: LoginRequest,
     request: Request,
     db: AsyncSession = Depends(get_db),
+    _rl: None = Depends(rate_limiter(limit=10, window=60, key_prefix="login")),
 ) -> TokenResponse:
     svc = _auth_service(db)
     access_token, refresh_token = await svc.login(

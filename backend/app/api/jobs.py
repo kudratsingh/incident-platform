@@ -7,7 +7,8 @@ from app.repositories.job import JobRepository
 from app.schemas.common import PaginatedResponse
 from app.schemas.job import JobCreate, JobListParams, JobResponse
 from app.services.job import JobService
-from fastapi import APIRouter, Depends
+from app.utils.rate_limit import rate_limiter
+from fastapi import APIRouter, Depends, Request
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -21,9 +22,11 @@ def _job_service(db: AsyncSession, redis: Redis) -> JobService:
 @router.post("", response_model=JobResponse, status_code=201)
 async def create_job(
     body: JobCreate,
+    request: Request,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
     redis: Redis = Depends(get_redis),
+    _rl: None = Depends(rate_limiter(limit=30, window=60, key_prefix="jobs:create")),
 ) -> JobResponse:
     svc = _job_service(db, redis)
     job = await svc.create_job(
