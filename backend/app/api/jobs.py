@@ -1,12 +1,14 @@
 import uuid
 
 from app.dependencies import get_current_user, get_db, get_redis
+from app.models.enums import UserRole
 from app.models.user import User
 from app.repositories.audit import AuditRepository
 from app.repositories.job import JobRepository
 from app.schemas.common import PaginatedResponse
 from app.schemas.job import JobCreate, JobListParams, JobResponse
 from app.services.job import JobService
+from app.utils.cache import JobCache
 from app.utils.rate_limit import rate_limiter
 from fastapi import APIRouter, Depends, Request
 from redis.asyncio import Redis
@@ -71,10 +73,21 @@ async def get_job(
     db: AsyncSession = Depends(get_db),
     redis: Redis = Depends(get_redis),
 ) -> JobResponse:
+    # Cache hit — skip DB entirely for repeat reads
+    cached = await JobCache.get(redis, job_id)
+    if cached is not None:
+        job_resp = JobResponse.model_validate(cached)
+        privileged = current_user.role in (UserRole.ADMIN, UserRole.SUPPORT)
+        if privileged or str(job_resp.user_id) == str(current_user.id):
+            return job_resp
+
+    # Cache miss — fetch from DB, authorise, then cache result
     svc = _job_service(db, redis)
     job = await svc.get_job(
         job_id=job_id,
         requesting_user_id=current_user.id,
         user_role=current_user.role,
     )
-    return JobResponse.model_validate(job)
+    response = JobResponse.model_validate(job)
+    await JobCache.set(redis, job_id, response.model_dump(mode="json"))
+    return response

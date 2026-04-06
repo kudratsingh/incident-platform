@@ -10,6 +10,7 @@ from app.schemas.common import PaginatedResponse
 from app.schemas.job import AdminJobListParams, JobResponse
 from app.schemas.user import UserResponse
 from app.services.job import JobService
+from app.utils.cache import JobCache
 from fastapi import APIRouter, Depends
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -75,6 +76,7 @@ async def replay_job(
 ) -> JobResponse:
     svc = _job_service(db, redis)
     job = await svc.replay_job(job_id=job_id, requesting_user_id=current_user.id)
+    await JobCache.delete(redis, job_id)
     return JobResponse.model_validate(job)
 
 
@@ -87,6 +89,7 @@ async def resolve_incident(
 ) -> JobResponse:
     svc = _job_service(db, redis)
     job = await svc.resolve_incident(job_id=job_id, requesting_user_id=current_user.id)
+    await JobCache.delete(redis, job_id)
     return JobResponse.model_validate(job)
 
 
