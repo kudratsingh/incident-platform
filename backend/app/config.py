@@ -1,7 +1,9 @@
 from functools import lru_cache
 
-from pydantic import RedisDsn
+from pydantic import RedisDsn, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_INSECURE_DEFAULT_KEY = "change-me-in-production-please-use-a-long-random-string"
 
 
 class Settings(BaseSettings):
@@ -26,7 +28,19 @@ class Settings(BaseSettings):
     redis_url: RedisDsn = "redis://localhost:6379/0"  # type: ignore[assignment]
 
     # JWT
-    secret_key: str = "change-me-in-production-please-use-a-long-random-string"
+    secret_key: str = _INSECURE_DEFAULT_KEY
+
+    @field_validator("secret_key")
+    @classmethod
+    def secret_key_must_be_set(cls, v: str, info: object) -> str:
+        # Delay the import to avoid circular dependency at module load time
+        import os
+        if os.getenv("ENVIRONMENT", "development") == "production" and v == _INSECURE_DEFAULT_KEY:
+            raise ValueError(
+                "SECRET_KEY must be set to a strong random value in production. "
+                "Generate one with: python -c \"import secrets; print(secrets.token_hex(32))\""
+            )
+        return v
     algorithm: str = "HS256"
     access_token_expire_minutes: int = 30
     refresh_token_expire_days: int = 7
