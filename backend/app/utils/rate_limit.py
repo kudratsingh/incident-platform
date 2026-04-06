@@ -23,9 +23,12 @@ from collections.abc import Callable, Coroutine
 from typing import Any
 
 from app.core.exceptions import RateLimitError
+from app.core.logging import get_logger
 from app.core.redis import get_redis
 from fastapi import Depends, Request
 from redis.asyncio import Redis
+
+logger = get_logger(__name__)
 
 
 def _client_key(request: Request) -> str:
@@ -77,6 +80,12 @@ def rate_limiter(
     ) -> None:
         client = _client_key(request)
         key = f"{key_prefix}:{client}" if key_prefix else client
-        await _check(redis, key, limit, window)
+        try:
+            await _check(redis, key, limit, window)
+        except RateLimitError:
+            raise
+        except Exception:
+            # Redis unavailable — fail open so legitimate traffic is not blocked
+            logger.warning("rate_limit_check_failed", extra={"key": key})
 
     return dependency
