@@ -60,7 +60,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
 
       {/* Footer */}
       <footer className="border-t border-gray-800 py-3 text-center text-xs text-gray-600 font-mono">
-        incident-platform · phase 3
+        incident-platform · internal ops
       </footer>
     </div>
   )

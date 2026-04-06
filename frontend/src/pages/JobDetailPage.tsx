@@ -118,7 +118,7 @@ export default function JobDetailPage() {
           {events.length > 0 && (
             <div className="bg-gray-900 border border-gray-800 rounded-lg p-5">
               <h2 className="text-sm font-medium text-gray-300 mb-3">Event log</h2>
-              <div className="space-y-1.5 max-h-60 overflow-y-auto">
+              <div className="space-y-1.5 max-h-60 overflow-y-auto scrollbar-thin">
                 {events.map((ev, i) => (
                   <div key={i} className="flex items-start gap-3 text-xs font-mono">
                     <span className="text-gray-600 shrink-0">
