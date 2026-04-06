@@ -33,6 +33,7 @@ dev = [
 
     "types-python-jose>=3.3.4",
     "aiosqlite>=0.20.0",
+    "locust>=2.29.0",
 ]
 
 [tool.hatch.build.targets.wheel]
