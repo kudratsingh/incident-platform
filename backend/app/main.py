@@ -11,13 +11,17 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+# Configure JSON logging immediately at import time so every log line —
+# including uvicorn startup messages — goes through JSONFormatter.
+_settings = get_settings()
+setup_logging(level=_settings.log_level)
+
 logger = get_logger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     settings = get_settings()
-    setup_logging(level=settings.log_level)
     logger.info("startup", extra={"environment": settings.environment})
 
     # Import here to avoid circular imports at module load time

@@ -61,8 +61,31 @@ def setup_logging(level: str = "INFO") -> None:
     handler.setFormatter(JSONFormatter())
     logging.root.setLevel(level)
     logging.root.handlers = [handler]
-    # Quiet noisy third-party loggers
+    # Route uvicorn loggers through our root handler so they emit JSON too
+    for name in ("uvicorn", "uvicorn.error"):
+        lg = logging.getLogger(name)
+        lg.handlers = []
+        lg.propagate = True
+    # Suppress uvicorn access logs — our RequestContextMiddleware handles request logging
     logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+
+
+def get_uvicorn_log_config(level: str = "INFO") -> dict[str, Any]:
+    """Return a uvicorn log_config dict that disables uvicorn's default handlers.
+
+    Pass this to uvicorn.run() or the --log-config flag so uvicorn does not
+    install its own ColorFormatter, letting our root JSONFormatter take over.
+    """
+    return {
+        "version": 1,
+        "disable_existing_loggers": False,
+        "handlers": {},
+        "loggers": {
+            "uvicorn": {"handlers": [], "propagate": True, "level": level},
+            "uvicorn.error": {"handlers": [], "propagate": True, "level": level},
+            "uvicorn.access": {"handlers": [], "propagate": False, "level": "WARNING"},
+        },
+    }
 
 
 def get_logger(name: str) -> logging.Logger:
