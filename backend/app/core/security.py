@@ -1,13 +1,11 @@
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import bcrypt
-from jose import JWTError, jwt
-
 from app.config import get_settings
 from app.core.exceptions import AuthenticationError
-
+from jose import JWTError, jwt
 
 # ---------------------------------------------------------------------------
 # Password helpers
@@ -31,8 +29,8 @@ def _make_token(data: dict[str, Any], expires_delta: timedelta, token_type: str)
     settings = get_settings()
     payload = {
         **data,
-        "exp": datetime.now(timezone.utc) + expires_delta,
-        "iat": datetime.now(timezone.utc),
+        "exp": datetime.now(UTC) + expires_delta,
+        "iat": datetime.now(UTC),
         "type": token_type,
         "jti": str(uuid.uuid4()),
     }

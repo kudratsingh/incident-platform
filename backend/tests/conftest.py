@@ -14,21 +14,19 @@ from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
+from app.core.security import create_access_token, hash_password
+from app.dependencies import get_db, get_redis
+from app.main import create_app
+from app.models.base import Base
+from app.models.enums import UserRole
+from app.models.user import User
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import event
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
     create_async_engine,
 )
 from sqlalchemy.pool import StaticPool
-
-from app.core.security import create_access_token, hash_password
-from app.dependencies import get_db
-from app.main import create_app
-from app.models.base import Base
-from app.models.enums import UserRole
-from app.models.user import User
 
 # ---------------------------------------------------------------------------
 # SQLite in-memory engine (for API + shape tests)
@@ -45,9 +43,6 @@ async def sqlite_engine():  # type: ignore[return]
         poolclass=StaticPool,
     )
     # SQLite doesn't know UUID / JSONB — render them as strings/text
-    from sqlalchemy.dialects import sqlite
-    from sqlalchemy import TypeDecorator, String, Text
-    import uuid, json
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -79,7 +74,16 @@ async def client(db_session: AsyncSession) -> AsyncGenerator[AsyncClient, None]:
     async def _override_db() -> AsyncGenerator[AsyncSession, None]:
         yield db_session
 
+    async def _override_redis() -> AsyncGenerator[AsyncMock, None]:
+        mock = AsyncMock()
+        mock.zadd = AsyncMock(return_value=1)
+        mock.zpopmax = AsyncMock(return_value=[])
+        mock.zrangebyscore = AsyncMock(return_value=[])
+        mock.zrem = AsyncMock(return_value=0)
+        yield mock
+
     app.dependency_overrides[get_db] = _override_db
+    app.dependency_overrides[get_redis] = _override_redis
 
     async with AsyncClient(
         transport=ASGITransport(app=app), base_url="http://test"

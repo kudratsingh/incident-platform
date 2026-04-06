@@ -11,9 +11,8 @@ one pool for the whole process.
 
 from collections.abc import AsyncGenerator
 
-from redis.asyncio import ConnectionPool, Redis
-
 from app.config import get_settings
+from redis.asyncio import ConnectionPool, Redis
 
 _pool: ConnectionPool | None = None
 

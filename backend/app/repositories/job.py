@@ -2,10 +2,9 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import and_, select, update
-
 from app.models.job import Job
 from app.repositories.base import BaseRepository
+from sqlalchemy import and_, select, update
 
 
 class JobRepository(BaseRepository[Job]):

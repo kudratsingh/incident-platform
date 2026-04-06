@@ -2,11 +2,10 @@ import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
+from app.models.base import Base, PortableJSON
 from sqlalchemy import DateTime, ForeignKey, String, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
-
-from app.models.base import Base, PortableJSON
 
 if TYPE_CHECKING:
     from app.models.job import Job

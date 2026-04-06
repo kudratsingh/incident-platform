@@ -4,7 +4,6 @@ import uuid
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-
 from app.core.exceptions import AuthenticationError, ConflictError
 from app.core.security import hash_password
 from app.models.enums import UserRole

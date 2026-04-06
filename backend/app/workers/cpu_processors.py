@@ -104,7 +104,10 @@ async def process_doc_analysis(
     result: dict[str, Any] = await loop.run_in_executor(
         _process_pool, _analyze_document, payload
     )
-    await publish(100, f"Analysis complete — {result['word_count']} words across {result['pages_analyzed']} pages")
+    await publish(
+        100,
+        f"Analysis complete — {result['word_count']} words across {result['pages_analyzed']} pages",
+    )
     return result
 
 
@@ -120,5 +123,8 @@ async def process_report_gen(
     result: dict[str, Any] = await loop.run_in_executor(
         _process_pool, _generate_report, payload
     )
-    await publish(100, f"Report generated — {result['groups']} groups, format={result['output_format']}")
+    await publish(
+        100,
+        f"Report generated — {result['groups']} groups, format={result['output_format']}",
+    )
     return result

@@ -1,15 +1,16 @@
 """Unit tests for all three job processor families."""
 
 import asyncio
-from typing import Any
 from unittest.mock import AsyncMock, patch
 
-import pytest
-
 from app.workers.async_tasks import process_bulk_api_sync
-from app.workers.cpu_processors import _analyze_document, _generate_report, process_doc_analysis, process_report_gen
+from app.workers.cpu_processors import (
+    _analyze_document,
+    _generate_report,
+    process_doc_analysis,
+    process_report_gen,
+)
 from app.workers.thread_adapters import process_csv_upload
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -96,7 +97,6 @@ async def test_doc_analysis_async_wrapper() -> None:
     loop = asyncio.get_running_loop()
 
     async def _sync_executor(executor: object, fn: object, *args: object) -> object:
-        import inspect
         if callable(fn):
             return fn(*args)
         return {}

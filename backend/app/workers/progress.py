@@ -8,10 +8,9 @@ Channel naming: job:progress:{job_id}
 """
 
 import json
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
-from typing import Callable, Awaitable
+from datetime import UTC, datetime
 
 from redis.asyncio import Redis
 
@@ -29,7 +28,7 @@ class ProgressEvent:
 
     def __post_init__(self) -> None:
         if not self.timestamp:
-            self.timestamp = datetime.now(timezone.utc).isoformat()
+            self.timestamp = datetime.now(UTC).isoformat()
 
     def to_json(self) -> str:
         return json.dumps(asdict(self))
@@ -79,4 +78,4 @@ async def subscribe(
                 break
     finally:
         await pubsub.unsubscribe(_channel(job_id))
-        await pubsub.aclose()
+        await pubsub.aclose()  # type: ignore[no-untyped-call]

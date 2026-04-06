@@ -13,19 +13,16 @@ Why SSE over WebSockets here:
   - No need for a full duplex channel.
 """
 
-import json
 import uuid
 from collections.abc import AsyncGenerator
 
+from app.core.redis import get_redis
+from app.dependencies import get_current_user
+from app.models.user import User
+from app.workers.progress import subscribe
 from fastapi import APIRouter, Depends
 from redis.asyncio import Redis
 from sse_starlette.sse import EventSourceResponse
-
-from app.core.redis import get_redis
-from app.dependencies import get_current_user
-from app.models.enums import UserRole
-from app.models.user import User
-from app.workers.progress import subscribe
 
 router = APIRouter(tags=["streaming"])
 

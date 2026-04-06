@@ -1,11 +1,6 @@
 import uuid
 from collections.abc import AsyncGenerator
 
-from fastapi import Depends
-from fastapi.security import OAuth2PasswordBearer
-from redis.asyncio import Redis
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-
 from app.config import get_settings
 from app.core.exceptions import AuthenticationError, AuthorizationError
 from app.core.logging import user_id_var
@@ -14,6 +9,9 @@ from app.core.security import decode_token
 from app.models.enums import UserRole
 from app.models.user import User
 from app.repositories.user import UserRepository
+from fastapi import Depends
+from fastapi.security import OAuth2PasswordBearer
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 # ---------------------------------------------------------------------------
 # Database
@@ -71,7 +69,7 @@ def get_session_factory() -> async_sessionmaker[AsyncSession]:
     return _async_session
 
 
-def require_role(*roles: UserRole) -> "type[User]":  # type: ignore[return]
+def require_role(*roles: UserRole) -> "type[User]":
     """Factory that returns a FastAPI dependency enforcing one of the given roles."""
 
     async def _dependency(

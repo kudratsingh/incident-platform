@@ -1,9 +1,7 @@
 """Unit tests for the Redis job queue — Redis is fully mocked."""
 
-from unittest.mock import AsyncMock, MagicMock, patch
 import time
-
-import pytest
+from unittest.mock import AsyncMock, MagicMock
 
 from app.workers import queue
 

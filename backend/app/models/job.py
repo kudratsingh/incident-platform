@@ -2,12 +2,11 @@ import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
+from app.models.base import Base, PortableJSON, TimestampMixin
+from app.models.enums import JobStatus
 from sqlalchemy import DateTime, ForeignKey, Integer, String, Text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
-
-from app.models.base import Base, PortableJSON, TimestampMixin
-from app.models.enums import JobStatus, JobType
 
 if TYPE_CHECKING:
     from app.models.audit import AuditLog
