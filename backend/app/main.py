@@ -14,7 +14,7 @@ from fastapi.responses import JSONResponse
 # Configure JSON logging immediately at import time so every log line —
 # including uvicorn startup messages — goes through JSONFormatter.
 _settings = get_settings()
-setup_logging(level=_settings.log_level)
+setup_logging(level=_settings.log_level, log_file=_settings.log_file)
 
 logger = get_logger(__name__)
 
@@ -70,7 +70,7 @@ def create_app() -> FastAPI:
         allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
         allow_credentials=True,
         allow_methods=["*"],
-        allow_headers=["*"],
+        allow_headers=["*", "X-Request-ID", "X-Trace-ID"],
         expose_headers=["X-Request-ID", "X-Trace-ID"],
     )
 
