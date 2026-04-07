@@ -6,12 +6,19 @@
  *  - Automatic access-token refresh on 401
  *  - Consistent error parsing (ApiError shape from backend)
  *  - X-Request-ID / X-Trace-ID echoed in every response → shown in UI
+ *  - X-Trace-ID sent on every request so the backend logger ties browser
+ *    sessions to server-side traces end-to-end.  The session trace ID is
+ *    generated once per page load; individual request IDs are per-call.
  */
 
 import type { ApiError, TokenResponse } from '../types'
 import { getAccessToken, getRefreshToken, setTokens, clearTokens } from '../utils/tokens'
 
 const BASE_URL = import.meta.env.VITE_API_URL ?? '/api/v1'
+
+/** One UUID generated when the JS bundle loads — ties all requests in this
+ *  browser tab to a single session trace that the backend echoes back. */
+export const SESSION_TRACE_ID = crypto.randomUUID()
 
 export class AppError extends Error {
   constructor(
@@ -71,6 +78,7 @@ async function request<T>(
   const token = getAccessToken()
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
+    'X-Trace-ID': SESSION_TRACE_ID,
     ...(options.headers as Record<string, string>),
     ...(token ? { Authorization: `Bearer ${token}` } : {}),
   }

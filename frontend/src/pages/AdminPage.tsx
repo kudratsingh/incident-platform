@@ -4,17 +4,24 @@ import Layout from '../components/Layout'
 import StatusBadge from '../components/StatusBadge'
 import { TableRowSkeleton } from '../components/Skeleton'
 import { useToast } from '../components/Toast'
-import type { AuditLog, Job } from '../types'
+import type { AuditLog, Job, User } from '../types'
 import { adminApi } from '../api/admin'
 import { AppError } from '../api/client'
 import { formatDate, JOB_TYPE_LABELS } from '../utils/format'
 
-type Tab = 'jobs' | 'audit'
+type Tab = 'jobs' | 'users' | 'audit'
+
+const ROLE_COLORS: Record<string, string> = {
+  admin: 'bg-purple-500/20 text-purple-300 border-purple-500/30',
+  support: 'bg-blue-500/20 text-blue-300 border-blue-500/30',
+  user: 'bg-gray-500/20 text-gray-300 border-gray-500/30',
+}
 
 export default function AdminPage() {
   const toast = useToast()
   const [tab, setTab] = useState<Tab>('jobs')
   const [jobs, setJobs] = useState<Job[]>([])
+  const [users, setUsers] = useState<User[]>([])
   const [logs, setLogs] = useState<AuditLog[]>([])
   const [total, setTotal] = useState(0)
   const [page, setPage] = useState(1)
@@ -38,6 +45,17 @@ export default function AdminPage() {
     }
   }, [page, statusFilter, traceFilter])
 
+  const loadUsers = useCallback(async () => {
+    setLoading(true)
+    try {
+      const res = await adminApi.listUsers(page)
+      setUsers(res.items)
+      setTotal(res.total)
+    } finally {
+      setLoading(false)
+    }
+  }, [page])
+
   const loadLogs = useCallback(async () => {
     setLoading(true)
     try {
@@ -51,8 +69,9 @@ export default function AdminPage() {
 
   useEffect(() => {
     if (tab === 'jobs') void loadJobs()
+    else if (tab === 'users') void loadUsers()
     else void loadLogs()
-  }, [tab, loadJobs, loadLogs])
+  }, [tab, loadJobs, loadUsers, loadLogs])
 
   async function replay(jobId: string) {
     try {
@@ -82,7 +101,7 @@ export default function AdminPage() {
           <p className="text-sm text-gray-500">{total} records</p>
         </div>
         <div className="flex gap-1 bg-gray-800/60 rounded-lg p-1">
-          {(['jobs', 'audit'] as Tab[]).map((t) => (
+          {(['jobs', 'users', 'audit'] as Tab[]).map((t) => (
             <button
               key={t}
               onClick={() => { setTab(t); setPage(1) }}
@@ -182,6 +201,53 @@ export default function AdminPage() {
             )}
           </div>
         </>
+      )}
+
+      {tab === 'users' && (
+        <div className="bg-gray-900 border border-gray-800 rounded-lg overflow-hidden">
+          {loading ? (
+            <table className="w-full text-sm">
+              <tbody className="divide-y divide-gray-800/60">
+                {Array.from({ length: 8 }).map((_, i) => <TableRowSkeleton key={i} />)}
+              </tbody>
+            </table>
+          ) : (
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b border-gray-800 text-xs text-gray-500">
+                  <th className="text-left px-4 py-3 font-medium">Email</th>
+                  <th className="text-left px-4 py-3 font-medium">Role</th>
+                  <th className="text-left px-4 py-3 font-medium hidden md:table-cell">Status</th>
+                  <th className="text-left px-4 py-3 font-medium hidden lg:table-cell">Joined</th>
+                  <th className="text-left px-4 py-3 font-medium font-mono hidden lg:table-cell">ID</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-800/60">
+                {users.map((u) => (
+                  <tr key={u.id} className="hover:bg-gray-800/30 transition-colors">
+                    <td className="px-4 py-3 text-gray-200">{u.email}</td>
+                    <td className="px-4 py-3">
+                      <span className={`inline-flex px-2 py-0.5 rounded-full text-xs font-medium border ${ROLE_COLORS[u.role] ?? ROLE_COLORS.user}`}>
+                        {u.role}
+                      </span>
+                    </td>
+                    <td className="px-4 py-3 hidden md:table-cell">
+                      <span className={`text-xs font-medium ${u.is_active ? 'text-green-400' : 'text-red-400'}`}>
+                        {u.is_active ? 'active' : 'inactive'}
+                      </span>
+                    </td>
+                    <td className="px-4 py-3 hidden lg:table-cell text-xs text-gray-500">
+                      {formatDate(u.created_at)}
+                    </td>
+                    <td className="px-4 py-3 hidden lg:table-cell">
+                      <code className="text-xs font-mono text-gray-600">{u.id.slice(0, 8)}…</code>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
       )}
 
       {tab === 'audit' && (
