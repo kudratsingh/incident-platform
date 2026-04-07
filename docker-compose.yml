@@ -58,6 +58,15 @@ services:
       - ./backend:/app/backend
     command: uvicorn backend.app.main:app --host 0.0.0.0 --port 8000 --reload
 
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:80"
+    depends_on:
+      - app
+
 volumes:
   postgres_data:
   redis_data:
