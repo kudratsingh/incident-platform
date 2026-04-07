@@ -49,6 +49,8 @@ resource "aws_ecs_task_definition" "backend" {
         { name = "REDIS_URL", value = local.redis_url },
         { name = "STORAGE_BUCKET", value = aws_s3_bucket.storage.bucket },
         { name = "AWS_DEFAULT_REGION", value = var.aws_region },
+        # ALB DNS name so the backend allows cross-origin requests from the frontend.
+        { name = "CORS_ORIGINS", value = "[\"http://${aws_lb.main.dns_name}\"]" },
       ]
 
       secrets = [

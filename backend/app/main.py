@@ -67,7 +67,7 @@ def create_app() -> FastAPI:
     app.add_middleware(RequestContextMiddleware)
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+        allow_origins=settings.cors_origins,
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*", "X-Request-ID", "X-Trace-ID"],
@@ -106,6 +106,39 @@ def create_app() -> FastAPI:
     @app.get("/healthz", include_in_schema=False)
     async def healthz() -> dict[str, str]:
         return {"status": "ok"}
+
+    @app.get(f"{settings.api_v1_prefix}/health", include_in_schema=False)
+    async def health() -> JSONResponse:
+        """Deep health check used by ECS and load balancers.
+
+        Verifies DB and Redis connectivity. Returns 200 if all healthy,
+        503 if any dependency is down.
+        """
+        from app.core.redis import get_redis_client
+        from app.dependencies import _engine
+        from sqlalchemy import text
+
+        checks: dict[str, str] = {}
+
+        try:
+            async with _engine.connect() as conn:
+                await conn.execute(text("SELECT 1"))
+            checks["db"] = "ok"
+        except Exception:
+            checks["db"] = "error"
+
+        try:
+            redis = get_redis_client()
+            await redis.ping()  # type: ignore[misc]
+            checks["redis"] = "ok"
+        except Exception:
+            checks["redis"] = "error"
+
+        healthy = all(v == "ok" for v in checks.values())
+        return JSONResponse(
+            status_code=200 if healthy else 503,
+            content={"status": "ok" if healthy else "degraded", **checks},
+        )
 
     return app
 
