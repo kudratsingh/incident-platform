@@ -17,9 +17,10 @@ FROM python:3.12-slim AS runtime
 
 WORKDIR /app
 
-# Runtime system deps only (libpq for asyncpg)
+# Runtime system deps only (libpq for asyncpg, curl for ECS health checks)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq5 \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy installed packages from builder
