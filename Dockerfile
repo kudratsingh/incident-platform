@@ -27,11 +27,15 @@ COPY --from=builder /install /usr/local
 
 # Copy application source
 COPY backend/ ./backend/
+COPY alembic.ini ./
+COPY backend/alembic/ ./backend/alembic/
+COPY scripts/entrypoint.sh ./entrypoint.sh
 
 # Non-root user for security
-RUN addgroup --system appgroup && adduser --system --ingroup appgroup appuser
+RUN addgroup --system appgroup && adduser --system --ingroup appgroup appuser \
+    && chmod +x /app/entrypoint.sh
 USER appuser
 
 EXPOSE 8000
 
-CMD ["uvicorn", "backend.app.main:app", "--host", "0.0.0.0", "--port", "8000", "--no-access-log", "--log-level", "warning"]
+CMD ["/app/entrypoint.sh"]
