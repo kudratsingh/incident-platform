@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom'
 import Layout from '../components/Layout'
 import JobForm from '../components/JobForm'
 import StatusBadge from '../components/StatusBadge'
+import { TableRowSkeleton } from '../components/Skeleton'
 import type { Job } from '../types'
 import { jobsApi } from '../api/jobs'
 import { formatDate, JOB_TYPE_LABELS } from '../utils/format'
@@ -98,7 +99,11 @@ export default function DashboardPage() {
       {/* Table */}
       <div className="bg-gray-900 border border-gray-800 rounded-lg overflow-hidden">
         {loading && jobs.length === 0 ? (
-          <div className="py-12 text-center text-gray-600 text-sm">Loading…</div>
+          <table className="w-full text-sm">
+            <tbody className="divide-y divide-gray-800/60">
+              {Array.from({ length: 8 }).map((_, i) => <TableRowSkeleton key={i} />)}
+            </tbody>
+          </table>
         ) : jobs.length === 0 ? (
           <div className="py-12 text-center text-gray-600 text-sm">No jobs found</div>
         ) : (

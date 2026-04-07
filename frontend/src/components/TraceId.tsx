@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useToast } from './Toast'
 
 interface Props {
   label: string
@@ -11,14 +11,13 @@ interface Props {
  * search logs is the core of the "debugging realism" goal in Phase 3.
  */
 export default function TraceId({ label, value }: Props) {
-  const [copied, setCopied] = useState(false)
+  const toast = useToast()
 
   if (!value) return null
 
   function copy() {
     navigator.clipboard.writeText(value!)
-    setCopied(true)
-    setTimeout(() => setCopied(false), 1500)
+    toast.info(`Copied ${label}`)
   }
 
   return (
@@ -31,7 +30,7 @@ export default function TraceId({ label, value }: Props) {
         onClick={copy}
         className="text-xs text-gray-500 hover:text-gray-300 transition-colors shrink-0"
       >
-        {copied ? '✓' : 'copy'}
+        copy
       </button>
     </div>
   )

@@ -2,6 +2,8 @@ import { useCallback, useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 import Layout from '../components/Layout'
 import StatusBadge from '../components/StatusBadge'
+import { TableRowSkeleton } from '../components/Skeleton'
+import { useToast } from '../components/Toast'
 import type { AuditLog, Job } from '../types'
 import { adminApi } from '../api/admin'
 import { AppError } from '../api/client'
@@ -10,6 +12,7 @@ import { formatDate, JOB_TYPE_LABELS } from '../utils/format'
 type Tab = 'jobs' | 'audit'
 
 export default function AdminPage() {
+  const toast = useToast()
   const [tab, setTab] = useState<Tab>('jobs')
   const [jobs, setJobs] = useState<Job[]>([])
   const [logs, setLogs] = useState<AuditLog[]>([])
@@ -18,7 +21,6 @@ export default function AdminPage() {
   const [statusFilter, setStatusFilter] = useState('')
   const [traceFilter, setTraceFilter] = useState('')
   const [loading, setLoading] = useState(true)
-  const [actionMsg, setActionMsg] = useState<string | null>(null)
 
   const loadJobs = useCallback(async () => {
     setLoading(true)
@@ -55,23 +57,21 @@ export default function AdminPage() {
   async function replay(jobId: string) {
     try {
       await adminApi.replayJob(jobId)
-      setActionMsg(`Job ${jobId.slice(0, 8)}… queued for replay`)
+      toast.success(`Job ${jobId.slice(0, 8)}… queued for replay`)
       void loadJobs()
     } catch (err) {
-      setActionMsg(err instanceof AppError ? err.message : 'Replay failed')
+      toast.error(err instanceof AppError ? err.message : 'Replay failed')
     }
-    setTimeout(() => setActionMsg(null), 3000)
   }
 
   async function resolve(jobId: string) {
     try {
       await adminApi.resolveIncident(jobId)
-      setActionMsg(`Incident ${jobId.slice(0, 8)}… marked resolved`)
+      toast.success(`Incident ${jobId.slice(0, 8)}… marked resolved`)
       void loadJobs()
     } catch (err) {
-      setActionMsg(err instanceof AppError ? err.message : 'Resolve failed')
+      toast.error(err instanceof AppError ? err.message : 'Resolve failed')
     }
-    setTimeout(() => setActionMsg(null), 3000)
   }
 
   return (
@@ -95,12 +95,6 @@ export default function AdminPage() {
           ))}
         </div>
       </div>
-
-      {actionMsg && (
-        <div className="mb-4 px-4 py-2.5 rounded bg-blue-900/20 border border-blue-800/30 text-sm text-blue-300">
-          {actionMsg}
-        </div>
-      )}
 
       {tab === 'jobs' && (
         <>
@@ -127,7 +121,11 @@ export default function AdminPage() {
 
           <div className="bg-gray-900 border border-gray-800 rounded-lg overflow-hidden">
             {loading ? (
-              <div className="py-12 text-center text-gray-600 text-sm">Loading…</div>
+              <table className="w-full text-sm">
+                <tbody className="divide-y divide-gray-800/60">
+                  {Array.from({ length: 8 }).map((_, i) => <TableRowSkeleton key={i} />)}
+                </tbody>
+              </table>
             ) : (
               <table className="w-full text-sm">
                 <thead>
@@ -189,7 +187,11 @@ export default function AdminPage() {
       {tab === 'audit' && (
         <div className="bg-gray-900 border border-gray-800 rounded-lg overflow-hidden">
           {loading ? (
-            <div className="py-12 text-center text-gray-600 text-sm">Loading…</div>
+            <table className="w-full text-sm">
+              <tbody className="divide-y divide-gray-800/60">
+                {Array.from({ length: 8 }).map((_, i) => <TableRowSkeleton key={i} />)}
+              </tbody>
+            </table>
           ) : (
             <table className="w-full text-sm">
               <thead>

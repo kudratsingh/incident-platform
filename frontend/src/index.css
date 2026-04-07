@@ -8,4 +8,29 @@
 
 body {
   font-family: 'Inter', system-ui, sans-serif;
+  background-color: #030712; /* gray-950 */
+  color: #f9fafb;            /* gray-50 */
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Prevent flash of white on initial load */
+html {
+  background-color: #030712;
+}
+
+/* Thin scrollbar for log panels */
+.scrollbar-thin {
+  scrollbar-width: thin;
+  scrollbar-color: #374151 transparent;
+}
+.scrollbar-thin::-webkit-scrollbar {
+  width: 4px;
+}
+.scrollbar-thin::-webkit-scrollbar-track {
+  background: transparent;
+}
+.scrollbar-thin::-webkit-scrollbar-thumb {
+  background-color: #374151;
+  border-radius: 2px;
 }
