@@ -57,6 +57,7 @@ class Settings(BaseSettings):
 
     # Logging
     log_level: str = "INFO"
+    log_file: str | None = None  # e.g. "logs/app.log" — if set, JSON logs are also written here
 
 
 @lru_cache

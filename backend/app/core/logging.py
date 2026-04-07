@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import time
 from contextvars import ContextVar
 from typing import Any
@@ -36,6 +37,7 @@ class JSONFormatter(logging.Formatter):
             + f".{int(record.msecs):03d}Z",
             "level": record.levelname,
             "logger": record.name,
+            "caller": f"{record.filename}:{record.lineno}",
             "message": record.message,
             # Structured context from the current async task / request
             "request_id": request_id_var.get("") or None,
@@ -56,11 +58,24 @@ class JSONFormatter(logging.Formatter):
         return json.dumps({k: v for k, v in log_entry.items() if v is not None})
 
 
-def setup_logging(level: str = "INFO") -> None:
-    handler = logging.StreamHandler()
-    handler.setFormatter(JSONFormatter())
+def setup_logging(level: str = "INFO", log_file: str | None = None) -> None:
+    formatter = JSONFormatter()
+
+    # Always log to stdout
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+    handlers: list[logging.Handler] = [stream_handler]
+
+    # Optionally also write to a file (creates parent dirs automatically)
+    if log_file:
+        os.makedirs(os.path.dirname(log_file), exist_ok=True) if os.path.dirname(log_file) else None
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setFormatter(formatter)
+        handlers.append(file_handler)
+
     logging.root.setLevel(level)
-    logging.root.handlers = [handler]
+    logging.root.handlers = handlers
+
     # Route uvicorn loggers through our root handler so they emit JSON too
     for name in ("uvicorn", "uvicorn.error"):
         lg = logging.getLogger(name)

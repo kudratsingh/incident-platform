@@ -60,7 +60,16 @@ class JobService:
             extra_data={"type": job_type, "priority": priority},
         )
         await queue.push(self.redis, str(job.id), priority=priority)
-        logger.info("job created", extra={"job_id": str(job.id), "type": job_type})
+        logger.info(
+            "job.created",
+            extra={
+                "job_id": str(job.id),
+                "type": job_type,
+                "priority": priority,
+                "trace_id": str(job.trace_id),
+                "user_id": str(user_id),
+            },
+        )
         return job
 
     async def get_job(
@@ -124,7 +133,15 @@ class JobService:
             request_id=request_id_var.get("") or None,
         )
         await queue.push(self.redis, str(job_id), priority=0)
-        logger.info("job replayed", extra={"job_id": str(job_id)})
+        logger.info(
+            "job.replayed",
+            extra={
+                "job_id": str(job_id),
+                "previous_status": job.status,
+                "retry_count": job.retry_count,
+                "replayed_by": str(requesting_user_id),
+            },
+        )
         assert updated is not None
         return updated
 
