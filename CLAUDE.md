@@ -13,7 +13,8 @@ This is NOT a generic CRUD app. It intentionally forces: concurrency model decis
 ### Backend
 - **Python 3.12+ / FastAPI** — async API gateway
 - **PostgreSQL** — system of record
-- **Redis** — cache, locks, queues, rate limits
+- **Redis** — cache, locks, rate limits, pub/sub progress events
+- **Kafka** (Confluent / MSK / local Redpanda) — durable event log; decouples job submission from execution, powers event sourcing and fan-out
 - **Object storage** (S3 or MinIO locally) — uploaded files and artifacts
 - **Worker layer** — asyncio tasks, threading adapters, multiprocessing for CPU-heavy work
 
@@ -22,9 +23,9 @@ This is NOT a generic CRUD app. It intentionally forces: concurrency model decis
 - Auth flow, dashboards, upload page, live job progress, admin console
 
 ### Infrastructure
-- **Docker** / Docker Compose for local dev
+- **Docker** / Docker Compose for local dev (includes Redpanda as Kafka-compatible broker)
 - **CI/CD** pipeline with linting, mypy, pytest
-- Cloud target: AWS ECS/Fargate or GCP Cloud Run
+- Cloud target: AWS ECS/Fargate; **Amazon MSK** (managed Kafka) for production Kafka
 
 ### Testing
 - `pytest` with fixtures, parametrization, factories
@@ -42,10 +43,14 @@ Frontend (React/Next)
    v
 FastAPI Gateway
    |── Auth / Users / Jobs / Admin / Audit APIs
-   |── SSE or WebSocket progress stream
+   |── SSE progress stream (Redis pub/sub → client)
    |
-   ├── PostgreSQL (system of record)
-   ├── Redis (cache, locks, queues, rate limits)
+   ├── PostgreSQL (system of record + outbox table)
+   ├── Redis (cache, locks, rate limits, pub/sub)
+   ├── Kafka (durable event log — job lifecycle events)
+   │     ├── Topics: job.submitted, job.progress, job.completed, job.failed
+   │     ├── Producer: API publishes on job create/update
+   │     └── Consumers: worker dispatcher, audit writer, SSE broadcaster
    ├── Object storage (uploaded files, artifacts)
    ├── Worker layer
    │     ├── asyncio tasks — I/O-heavy workflows
@@ -236,19 +241,22 @@ Topics this project should demonstrate end-to-end:
 
 | Concept | Where It Appears |
 |---|---|
-| At-least-once delivery | Outbox pattern + Redis pub/sub |
+| At-least-once delivery | Outbox pattern + Kafka; offset commit after processing |
 | Exactly-once semantics | Idempotency keys + DB unique constraint |
-| Backpressure | Queue depth → reject/slow job submission |
+| Backpressure | Kafka consumer lag metric → reject/slow job submission |
 | Circuit breaker | External API calls in async_tasks.py |
 | Read/write split | CQRS read models for admin queries |
 | Consistency vs availability | Redis cache TTL vs DB source of truth |
 | Distributed locking | Redis SETNX for job deduplication |
-| Saga / compensating txns | Multi-step job workflows |
-| Event sourcing | Job state transition log |
-| Fan-out / fan-in | asyncio.TaskGroup in bulk_api_sync |
+| Saga / compensating txns | Kafka-choreographed multi-step job workflows |
+| Event sourcing | Kafka topic as immutable job state log (replay from offset 0) |
+| Fan-out / fan-in | Multiple Kafka consumer groups on same topic |
+| Consumer group isolation | Audit writer, SSE broadcaster, worker each have own group |
+| Schema evolution | Avro + Schema Registry; backward/forward compatibility |
+| Dead-letter queue | `job.dlq` Kafka topic; admin replay from DLQ |
 | Connection pool sizing | PgBouncer + SQLAlchemy pool tuning |
 | Time-series partitioning | audit_logs partitioned by month |
-| DAG scheduling | Job dependency resolution |
+| DAG scheduling | Job dependency resolution via `job.completed` event subscriptions |
 
 ---
 
@@ -297,14 +305,23 @@ Topics this project should demonstrate end-to-end:
 - **Structured runbooks** — machine-readable runbooks attached to alerts; document diagnosis steps for every alarm
 - **Focus:** production observability, on-call readiness, failure isolation
 
-### Phase 7: Advanced Architecture Patterns
-- **Outbox pattern** — write events to a DB outbox table in the same transaction as job state changes; a separate relay publishes them to Redis/SQS, guaranteeing at-least-once delivery even if the process crashes
-- **CQRS** — separate read models (denormalized, Redis-backed) from write models (normalized Postgres); heavy admin queries hit read side without slowing writes
-- **Event sourcing** — store job state transitions as an immutable event log rather than mutable rows; replay events to rebuild state; enables full audit trail and time-travel debugging
-- **Saga pattern** — multi-step distributed workflows (e.g. upload → validate → transform → notify) with compensating transactions on failure; implemented as choreography (events) or orchestration (central coordinator)
-- **Job dependency DAG** — jobs can declare dependencies on other jobs; scheduler resolves the DAG and only runs a job when all dependencies are complete; detect cycles at submission time
-- **Backpressure** — workers signal capacity back to the API; reject or slow-down job submission when queue depth exceeds threshold; expose queue depth as a metric
-- **Focus:** distributed systems correctness, consistency guarantees, failure recovery
+### Phase 7: Kafka + Advanced Architecture Patterns
+- **Kafka integration (end-to-end)** — replace the Redis job queue with Kafka as the durable backbone:
+  - **Producer**: FastAPI publishes `job.submitted` events to Kafka on every job creation; all state transitions (`job.started`, `job.progress`, `job.completed`, `job.failed`) also published
+  - **Consumer groups**: worker dispatcher consumes `job.submitted` with a dedicated consumer group; audit log writer and SSE broadcaster each have their own groups — all three process the same events independently
+  - **Partitioning strategy**: partition by `user_id` so all events for one user land on the same partition and are processed in order
+  - **Offset management**: commit offsets only after successful job dispatch — if the worker crashes before committing, Kafka re-delivers; combined with idempotency keys to avoid double-execution
+  - **Dead-letter topic**: after N failed processing attempts, route message to `job.dlq`; admin UI can inspect and replay from DLQ
+  - **Schema Registry** (Confluent or Apicurio) — enforce Avro or JSON Schema on every topic; producer and consumer validate at runtime; schema evolution with backward/forward compatibility rules
+  - **Local dev**: Redpanda (drop-in Kafka-compatible broker, single binary) in docker-compose; MSK (managed Kafka) on AWS in production
+  - **Testing**: `pytest` integration tests spin up Redpanda via Testcontainers; assert exact event sequence and consumer group lag
+- **Outbox pattern** — write events to a DB outbox table in the same transaction as job state changes; a separate relay publishes them to Kafka, guaranteeing at-least-once delivery even if the process crashes between DB write and Kafka publish
+- **CQRS** — separate read models (denormalized, Redis-backed) from write models (normalized Postgres); Kafka events drive the read-model projections; heavy admin queries hit read side without slowing writes
+- **Event sourcing** — store job state transitions as an immutable event log in Kafka (infinite retention topic) rather than mutable rows; replay the topic from offset 0 to reconstruct any job's full history; enables time-travel debugging
+- **Saga pattern** — multi-step distributed workflows (upload → validate → transform → notify) coordinated via Kafka topics; each step publishes a completion event that triggers the next; compensating events on failure roll back completed steps
+- **Job dependency DAG** — jobs can declare dependencies on other jobs; scheduler resolves the DAG, subscribes to `job.completed` events, and only dispatches a job when all its dependencies have published completion events; detect cycles at submission time
+- **Backpressure** — consumer lag (Kafka `__consumer_offsets`) exposed as a CloudWatch metric; API checks lag depth and rejects job submissions with `503 Service Unavailable` when the worker is overwhelmed
+- **Focus:** Kafka end-to-end (produce → consume → DLQ → replay), distributed systems correctness, event-driven architecture
 
 ### Phase 8: Platform Engineering & Scale
 - **HTTPS + ACM** — add TLS to the ALB with an AWS Certificate Manager cert; redirect HTTP → HTTPS; enforce HSTS
@@ -363,9 +380,13 @@ Topics this project should demonstrate end-to-end:
 │   │   │   ├── async_tasks.py   # asyncio — bulk API sync
 │   │   │   ├── thread_adapters.py  # threading — CSV upload
 │   │   │   ├── cpu_processors.py   # multiprocessing — doc analysis, report gen
-│   │   │   ├── dispatcher.py    # main worker loop
-│   │   │   ├── queue.py         # Redis priority queue
-│   │   │   └── progress.py      # Redis pub/sub progress events
+│   │   │   ├── dispatcher.py    # Kafka consumer — job.submitted → worker
+│   │   │   ├── kafka_producer.py   # publish job lifecycle events to Kafka
+│   │   │   ├── kafka_consumer.py   # base consumer class with offset management
+│   │   │   ├── audit_consumer.py   # consumer group: write audit log from events
+│   │   │   ├── sse_consumer.py     # consumer group: fan events to SSE clients
+│   │   │   ├── queue.py         # Redis priority queue (pre-Kafka; kept for rate limiting)
+│   │   │   └── progress.py      # Redis pub/sub progress events (SSE bridge)
 │   │   ├── core/                # exceptions, logging, middleware, redis, security
 │   │   └── utils/               # rate_limit, cache, decorators, mixins
 │   └── tests/
@@ -395,6 +416,7 @@ Topics this project should demonstrate end-to-end:
 │   ├── s3.tf                    # Object storage bucket
 │   ├── rds.tf                   # RDS Postgres
 │   ├── elasticache.tf           # ElastiCache Redis
+│   ├── msk.tf                   # Amazon MSK (managed Kafka) cluster + topics
 │   ├── alb.tf                   # ALB, target groups, listener rules
 │   └── ecs.tf                   # Cluster, task definitions, Fargate services
 └── scripts/                     # seed data, migrations, ops helpers
