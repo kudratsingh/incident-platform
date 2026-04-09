@@ -11,6 +11,58 @@ import { formatDate, JOB_TYPE_LABELS } from '../utils/format'
 
 type Tab = 'jobs' | 'users' | 'audit'
 
+function AuditLogModal({ log, onClose }: { log: AuditLog; onClose: () => void }) {
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
+      onClick={onClose}
+    >
+      <div
+        className="bg-gray-900 border border-gray-700 rounded-xl shadow-2xl w-full max-w-lg mx-4 overflow-hidden"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between px-5 py-4 border-b border-gray-800">
+          <div>
+            <code className="text-blue-300 font-mono text-sm">{log.action}</code>
+            <p className="text-xs text-gray-500 mt-0.5">{new Date(log.created_at).toLocaleString()}</p>
+          </div>
+          <button onClick={onClose} className="text-gray-500 hover:text-white text-lg leading-none">✕</button>
+        </div>
+
+        <div className="px-5 py-4 space-y-3 text-sm">
+          <Row label="Log ID" value={log.id} mono />
+          <Row label="Action" value={log.action} mono />
+          {log.resource_type && (
+            <Row label="Resource" value={`${log.resource_type} / ${log.resource_id ?? '—'}`} mono />
+          )}
+          {log.job_id && <Row label="Job ID" value={log.job_id} mono />}
+          {log.user_id && <Row label="User ID" value={log.user_id} mono />}
+          {log.request_id && <Row label="Request ID" value={log.request_id} mono />}
+          {log.ip_address && <Row label="IP Address" value={log.ip_address} mono />}
+
+          {log.extra_data && Object.keys(log.extra_data).length > 0 && (
+            <div>
+              <p className="text-xs text-gray-500 mb-1.5 font-medium uppercase tracking-wide">Metadata</p>
+              <pre className="bg-gray-800/70 rounded-lg p-3 text-xs font-mono text-gray-300 overflow-auto max-h-48 whitespace-pre-wrap break-all">
+                {JSON.stringify(log.extra_data, null, 2)}
+              </pre>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function Row({ label, value, mono }: { label: string; value: string; mono?: boolean }) {
+  return (
+    <div className="flex gap-3">
+      <span className="text-gray-500 w-28 shrink-0 text-xs font-medium uppercase tracking-wide pt-0.5">{label}</span>
+      <span className={`text-gray-200 break-all text-xs ${mono ? 'font-mono' : ''}`}>{value}</span>
+    </div>
+  )
+}
+
 const ROLE_COLORS: Record<string, string> = {
   admin: 'bg-purple-500/20 text-purple-300 border-purple-500/30',
   support: 'bg-blue-500/20 text-blue-300 border-blue-500/30',
@@ -28,6 +80,7 @@ export default function AdminPage() {
   const [statusFilter, setStatusFilter] = useState('')
   const [traceFilter, setTraceFilter] = useState('')
   const [loading, setLoading] = useState(true)
+  const [selectedLog, setSelectedLog] = useState<AuditLog | null>(null)
 
   const loadJobs = useCallback(async () => {
     setLoading(true)
@@ -270,7 +323,11 @@ export default function AdminPage() {
               </thead>
               <tbody className="divide-y divide-gray-800/60">
                 {logs.map((log) => (
-                  <tr key={log.id} className="hover:bg-gray-800/30">
+                  <tr
+                    key={log.id}
+                    className="hover:bg-gray-800/30 cursor-pointer transition-colors"
+                    onClick={() => setSelectedLog(log)}
+                  >
                     <td className="px-4 py-3">
                       <code className="text-xs font-mono text-blue-300">{log.action}</code>
                     </td>
@@ -307,6 +364,7 @@ export default function AdminPage() {
           </button>
         </div>
       )}
+      {selectedLog && <AuditLogModal log={selectedLog} onClose={() => setSelectedLog(null)} />}
     </Layout>
   )
 }
