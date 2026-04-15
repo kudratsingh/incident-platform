@@ -40,3 +40,9 @@ variable "frontend_image_tag" {
   type        = string
   default     = "latest"
 }
+
+variable "alarm_email" {
+  description = "Email address for CloudWatch alarm notifications (leave empty to skip subscription)"
+  type        = string
+  default     = ""
+}

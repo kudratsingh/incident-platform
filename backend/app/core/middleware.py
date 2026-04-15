@@ -1,7 +1,9 @@
+import asyncio
 import time
 import uuid
 from collections.abc import Awaitable, Callable
 
+from app.core import metrics
 from app.core.logging import get_logger, request_id_var, trace_id_var
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
@@ -45,6 +47,19 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
                     "status_code": status_code,
                     "latency_ms": latency_ms,
                 },
+            )
+
+            # Fire-and-forget: emit latency metric without blocking the response
+            asyncio.create_task(
+                metrics.emit_gauge(
+                    "RequestLatency",
+                    latency_ms,
+                    unit="Milliseconds",
+                    dimensions={
+                        "Path": request.url.path,
+                        "StatusCode": str(status_code),
+                    },
+                )
             )
 
             if response is not None:

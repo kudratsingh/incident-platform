@@ -25,6 +25,7 @@ import uuid
 from typing import Any
 
 from app.config import get_settings
+from app.core import metrics
 from app.core.logging import get_logger, job_id_var, trace_id_var
 from app.models.enums import JobStatus, JobType
 from app.repositories.audit import AuditRepository
@@ -131,6 +132,7 @@ async def _run_job(
                 retry_count=new_retry_count,
             )
             logger.info("job scheduled for retry", extra={"delay_seconds": delay})
+            await metrics.emit_count("JobFailed", dimensions={"JobType": str(job_type)})
         else:
             async with session_factory() as session:
                 async with session.begin():
@@ -151,6 +153,7 @@ async def _run_job(
                 retry_count=new_retry_count,
             )
             logger.error("job dead-lettered", extra={"error": str(exc)})
+            await metrics.emit_count("JobDeadLettered", dimensions={"JobType": str(job_type)})
 
         job_id_var.reset(token)
         return
@@ -174,6 +177,7 @@ async def _run_job(
 
     await progress.publish(redis, job_id_str, "completed", 100, "Job completed successfully")
     logger.info("job completed", extra={"type": job_type})
+    await metrics.emit_count("JobCompleted", dimensions={"JobType": str(job_type)})
     job_id_var.reset(token)
 
 
@@ -194,6 +198,8 @@ async def worker_loop(
     """
     logger.info("worker loop started")
     in_flight: set[asyncio.Task[None]] = set()
+    _metric_tick = 0
+    _metric_interval = 120  # emit queue metrics every 120 ticks (~60 s at 0.5 s/tick)
 
     while True:
         try:
@@ -207,6 +213,13 @@ async def worker_loop(
                     )
                     in_flight.add(task)
                     task.add_done_callback(in_flight.discard)
+
+            _metric_tick += 1
+            if _metric_tick >= _metric_interval:
+                _metric_tick = 0
+                depth = await queue.queue_length(redis)
+                await metrics.emit_gauge("QueueDepth", float(depth))
+                await metrics.emit_gauge("InFlightJobs", float(len(in_flight)))
 
         except asyncio.CancelledError:
             logger.info("worker loop cancelled, waiting for in-flight jobs")

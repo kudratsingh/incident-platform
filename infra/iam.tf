@@ -51,6 +51,28 @@ resource "aws_iam_role" "ecs_task" {
   assume_role_policy = data.aws_iam_policy_document.ecs_assume_role.json
 }
 
+# Allow backend tasks to publish custom metrics to CloudWatch
+resource "aws_iam_role_policy" "ecs_task_cloudwatch" {
+  name = "${var.app_name}-ecs-task-cloudwatch"
+  role = aws_iam_role.ecs_task.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["cloudwatch:PutMetricData"]
+        Resource = "*"
+        Condition = {
+          StringEquals = {
+            "cloudwatch:namespace" = "IncidentPlatform"
+          }
+        }
+      }
+    ]
+  })
+}
+
 # Allow backend tasks to access the S3 storage bucket
 resource "aws_iam_role_policy" "ecs_task_s3" {
   name = "${var.app_name}-ecs-task-s3"
