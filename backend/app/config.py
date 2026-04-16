@@ -59,6 +59,9 @@ class Settings(BaseSettings):
     max_job_retries: int = 3
     job_retry_backoff_base: float = 2.0
 
+    # Tracing — set to http://localhost:4318 locally (Jaeger), or X-Ray OTLP endpoint in prod
+    otlp_endpoint: str | None = None
+
     # Logging
     log_level: str = "INFO"
     log_file: str | None = None  # e.g. "logs/app.log" — if set, JSON logs are also written here
