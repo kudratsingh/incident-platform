@@ -20,6 +20,12 @@ dependencies = [
     "python-multipart>=0.0.9",
     "sse-starlette>=2.1.0",
     "boto3>=1.34.0",
+    "opentelemetry-api>=1.24.0",
+    "opentelemetry-sdk>=1.24.0",
+    "opentelemetry-exporter-otlp-proto-http>=1.24.0",
+    "opentelemetry-instrumentation-fastapi>=0.45b0",
+    "opentelemetry-instrumentation-sqlalchemy>=0.45b0",
+    "opentelemetry-instrumentation-redis>=0.45b0",
 ]
 
 [project.optional-dependencies]

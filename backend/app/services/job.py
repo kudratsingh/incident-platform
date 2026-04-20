@@ -3,6 +3,7 @@ from typing import Any
 
 from app.core.exceptions import AuthorizationError, JobError, NotFoundError
 from app.core.logging import get_logger, request_id_var, trace_id_var
+from app.core.tracing import inject_context
 from app.models.enums import JobStatus, UserRole
 from app.models.job import Job
 from app.repositories.audit import AuditRepository
@@ -40,12 +41,19 @@ class JobService:
                 )
                 return existing
 
+        # Carry the current OTel span context through the queue boundary so the
+        # worker can create a proper child span linked to this request's trace.
+        otel_ctx = inject_context()
+        enriched_payload: dict[str, Any] = {**(payload or {})}
+        if otel_ctx:
+            enriched_payload["__traceparent"] = otel_ctx
+
         job = await self.job_repo.create(
             user_id=user_id,
             type=job_type,
             status=JobStatus.PENDING,
             idempotency_key=idempotency_key,
-            payload=payload,
+            payload=enriched_payload,
             priority=priority,
             max_retries=max_retries,
             trace_id=trace_id_var.get("") or None,

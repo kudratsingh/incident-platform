@@ -11,11 +11,8 @@ from app.models.user import User
 from app.repositories.user import UserRepository
 from fastapi import Depends
 from fastapi.security import OAuth2PasswordBearer
+from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-
-# ---------------------------------------------------------------------------
-# Database
-# ---------------------------------------------------------------------------
 
 _settings = get_settings()
 _engine = create_async_engine(
@@ -23,6 +20,7 @@ _engine = create_async_engine(
     echo=_settings.debug,
     pool_pre_ping=True,
 )
+SQLAlchemyInstrumentor().instrument(engine=_engine.sync_engine)
 _async_session = async_sessionmaker(_engine, expire_on_commit=False)
 
 

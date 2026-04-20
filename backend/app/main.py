@@ -7,14 +7,17 @@ from app.core.exceptions import AppError
 from app.core.logging import get_logger, request_id_var, setup_logging
 from app.core.middleware import RequestContextMiddleware
 from app.core.redis import close_redis_pool, get_redis_client
+from app.core.tracing import setup_tracing
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from opentelemetry.instrumentation.redis import RedisInstrumentor
 
-# Configure JSON logging immediately at import time so every log line —
-# including uvicorn startup messages — goes through JSONFormatter.
 _settings = get_settings()
 setup_logging(level=_settings.log_level, log_file=_settings.log_file)
+setup_tracing(service_name="incident-platform", otlp_endpoint=_settings.otlp_endpoint)
+RedisInstrumentor().instrument()
 
 logger = get_logger(__name__)
 
@@ -140,6 +143,7 @@ def create_app() -> FastAPI:
             content={"status": "ok" if healthy else "degraded", **checks},
         )
 
+    FastAPIInstrumentor.instrument_app(app)
     return app
 
 

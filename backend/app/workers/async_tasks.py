@@ -13,30 +13,31 @@ import asyncio
 import random
 from typing import Any
 
+from app.core.tracing import get_tracer
 from app.workers.progress import ProgressPublisher
+from opentelemetry.trace import SpanKind
+
+tracer = get_tracer(__name__)
 
 
 async def process_bulk_api_sync(
     payload: dict[str, Any],
     publish: ProgressPublisher,
 ) -> dict[str, Any]:
-    """
-    Concurrently "calls" N external API endpoints and aggregates results.
-
-    Why asyncio here: each call is I/O-bound and we want all of them in-flight
-    simultaneously.  A thread per call would waste OS resources at scale.
-    asyncio.gather gives us fan-out with a single thread.
-    """
     endpoint_count: int = int(payload.get("endpoint_count", 5))
     await publish(0, f"Starting sync of {endpoint_count} endpoints")
 
     async def _call_one(index: int) -> dict[str, Any]:
-        # Simulate variable network latency
-        await asyncio.sleep(random.uniform(0.05, 0.3))
-        # Simulate occasional transient errors (10% chance)
-        if random.random() < 0.10:
-            return {"endpoint": index, "status": "error", "code": 503}
-        return {"endpoint": index, "status": "ok", "records_synced": random.randint(10, 500)}
+        with tracer.start_as_current_span(
+            f"external.api_call/{index}", kind=SpanKind.CLIENT
+        ) as span:
+            span.set_attribute("endpoint.index", index)
+            await asyncio.sleep(random.uniform(0.05, 0.3))
+            if random.random() < 0.10:
+                span.set_attribute("endpoint.status", "error")
+                return {"endpoint": index, "status": "error", "code": 503}
+            span.set_attribute("endpoint.status", "ok")
+            return {"endpoint": index, "status": "ok", "records_synced": random.randint(10, 500)}
 
     tasks = [asyncio.create_task(_call_one(i)) for i in range(endpoint_count)]
     results: list[dict[str, Any]] = []

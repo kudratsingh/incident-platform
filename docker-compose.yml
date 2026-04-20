@@ -39,6 +39,14 @@ services:
     volumes:
       - minio_data:/data
 
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    ports:
+      - "16686:16686"  # UI
+      - "4318:4318"    # OTLP HTTP
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+
   app:
     build: .
     ports:
@@ -49,6 +57,7 @@ services:
       STORAGE_ENDPOINT: http://minio:9000
       ENVIRONMENT: development
       DEBUG: "true"
+      OTLP_ENDPOINT: http://jaeger:4318
     depends_on:
       postgres:
         condition: service_healthy
