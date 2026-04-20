@@ -17,8 +17,20 @@ import { getAccessToken, getRefreshToken, setTokens, clearTokens } from '../util
 const BASE_URL = import.meta.env.VITE_API_URL ?? '/api/v1'
 
 /** One UUID generated when the JS bundle loads — ties all requests in this
- *  browser tab to a single session trace that the backend echoes back. */
-export const SESSION_TRACE_ID = crypto.randomUUID()
+ *  browser tab to a single session trace that the backend echoes back.
+ *  Falls back to a Math.random-based ID when crypto.randomUUID is unavailable
+ *  (e.g. HTTP non-secure contexts). */
+function generateId(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID()
+  }
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0
+    return (c === 'x' ? r : (r & 0x3) | 0x8).toString(16)
+  })
+}
+
+export const SESSION_TRACE_ID = generateId()
 
 export class AppError extends Error {
   constructor(
