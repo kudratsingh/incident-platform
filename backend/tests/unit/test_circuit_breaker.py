@@ -1,6 +1,9 @@
 import pytest
-
-from app.core.circuit_breaker import CircuitBreaker, CircuitOpenError, CircuitState
+from app.core.circuit_breaker import (
+    CircuitBreaker,
+    CircuitOpenError,
+    CircuitState,
+)
 
 
 async def _ok() -> str:
