@@ -59,6 +59,19 @@ class Settings(BaseSettings):
     max_job_retries: int = 3
     job_retry_backoff_base: float = 2.0
 
+    # Kafka / Redpanda
+    kafka_bootstrap_servers: str = "localhost:9092"
+    kafka_topic_job_submitted: str = "job.submitted"
+    kafka_topic_job_progress: str = "job.progress"
+    kafka_topic_job_completed: str = "job.completed"
+    kafka_topic_job_failed: str = "job.failed"
+    kafka_topic_job_dlq: str = "job.dlq"
+    kafka_consumer_group_worker: str = "worker-dispatcher"
+    kafka_consumer_group_audit: str = "audit-writer"
+    kafka_consumer_group_sse: str = "sse-broadcaster"
+    kafka_max_poll_interval_ms: int = 300_000
+    kafka_session_timeout_ms: int = 30_000
+
     # Tracing — set to http://localhost:4318 locally (Jaeger), or X-Ray OTLP endpoint in prod
     otlp_endpoint: str | None = None
 
