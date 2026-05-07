@@ -14,7 +14,7 @@ import json
 from abc import ABC, abstractmethod
 from typing import Any
 
-from aiokafka import AIOKafkaConsumer, ConsumerRecord
+from aiokafka import AIOKafkaConsumer, ConsumerRecord  # type: ignore[import-untyped]
 from app.config import get_settings
 from app.core.logging import get_logger
 
@@ -89,7 +89,7 @@ class BaseKafkaConsumer(ABC):
                     for message in messages:
                         await self._process_one(message)
 
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 # No messages — just loop again
                 continue
             except asyncio.CancelledError:
@@ -102,11 +102,11 @@ class BaseKafkaConsumer(ABC):
                 )
                 await asyncio.sleep(1.0)
 
-    async def _process_one(self, message: ConsumerRecord) -> None:  # type: ignore[type-arg]
+    async def _process_one(self, message: ConsumerRecord) -> None:
         """Process a single message, committing offset on success."""
         try:
-            value: dict[str, Any] = message.value  # type: ignore[assignment]
-            key: str | None = message.key  # type: ignore[assignment]
+            value: dict[str, Any] = message.value
+            key: str | None = message.key
             await self.handle_message(message.topic, key, value)
             # Commit after successful processing — at-least-once delivery
             await self._consumer.commit()  # type: ignore[union-attr]

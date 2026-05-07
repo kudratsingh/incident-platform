@@ -14,7 +14,7 @@ import json
 import uuid
 from typing import Any
 
-from aiokafka import AIOKafkaProducer
+from aiokafka import AIOKafkaProducer  # type: ignore[import-untyped]
 from app.config import get_settings
 from app.core.logging import get_logger
 
