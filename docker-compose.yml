@@ -27,6 +27,38 @@ services:
       timeout: 5s
       retries: 5
 
+  redpanda:
+    image: redpandadata/redpanda:latest
+    command:
+      - redpanda
+      - start
+      - --smp=1
+      - --memory=512M
+      - --overprovisioned
+      - --kafka-addr=PLAINTEXT://0.0.0.0:9092
+      - --advertise-kafka-addr=PLAINTEXT://redpanda:9092
+    ports:
+      - "9092:9092"
+    healthcheck:
+      test: ["CMD", "rpk", "cluster", "info", "--brokers=localhost:9092"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redpanda-init:
+    image: redpandadata/redpanda:latest
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    entrypoint: >
+      /bin/bash -c "
+        rpk topic create job.submitted --brokers=redpanda:9092 --partitions=6 --replicas=1 &&
+        rpk topic create job.progress  --brokers=redpanda:9092 --partitions=6 --replicas=1 &&
+        rpk topic create job.completed --brokers=redpanda:9092 --partitions=6 --replicas=1 &&
+        rpk topic create job.failed    --brokers=redpanda:9092 --partitions=6 --replicas=1 &&
+        rpk topic create job.dlq       --brokers=redpanda:9092 --partitions=6 --replicas=1
+      "
+
   minio:
     image: minio/minio:latest
     command: server /data --console-address ":9001"
@@ -58,10 +90,13 @@ services:
       ENVIRONMENT: development
       DEBUG: "true"
       OTLP_ENDPOINT: http://jaeger:4318
+      KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
     depends_on:
       postgres:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      redpanda:
         condition: service_healthy
     volumes:
       - ./backend:/app/backend

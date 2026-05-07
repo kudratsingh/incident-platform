@@ -26,6 +26,7 @@ dependencies = [
     "opentelemetry-instrumentation-fastapi>=0.45b0",
     "opentelemetry-instrumentation-sqlalchemy>=0.45b0",
     "opentelemetry-instrumentation-redis>=0.45b0",
+    "aiokafka>=0.11.0",
 ]
 
 [project.optional-dependencies]
