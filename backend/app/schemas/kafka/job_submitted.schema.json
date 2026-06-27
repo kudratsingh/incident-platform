@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "job.submitted/v1",
+  "title": "JobSubmitted",
+  "type": "object",
+  "required": ["event", "job_id", "user_id", "job_type"],
+  "properties": {
+    "event": { "const": "job.submitted" },
+    "job_id": { "type": "string", "format": "uuid" },
+    "user_id": { "type": "string", "format": "uuid" },
+    "job_type": { "type": "string", "minLength": 1 },
+    "payload": { "type": ["object", "null"] },
+    "priority": { "type": "integer", "minimum": 0 },
+    "trace_id": { "type": ["string", "null"] }
+  },
+  "additionalProperties": true
+}

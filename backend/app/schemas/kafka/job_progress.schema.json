@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "job.progress/v1",
+  "title": "JobProgress",
+  "type": "object",
+  "required": ["event", "job_id", "user_id", "status", "percent"],
+  "properties": {
+    "event": { "const": "job.progress" },
+    "job_id": { "type": "string", "format": "uuid" },
+    "user_id": { "type": "string", "format": "uuid" },
+    "status": { "type": "string", "minLength": 1 },
+    "percent": { "type": "integer", "minimum": 0, "maximum": 100 },
+    "message": { "type": "string" },
+    "retry_count": { "type": "integer", "minimum": 0 }
+  },
+  "additionalProperties": true
+}

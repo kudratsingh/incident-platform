@@ -9,6 +9,7 @@ from app.repositories.outbox import OutboxRepository
 from app.schemas.common import PaginatedResponse
 from app.schemas.job import JobCreate, JobListParams, JobResponse
 from app.services.job import JobService
+from app.utils.backpressure import check_backpressure
 from app.utils.cache import JobCache
 from app.utils.rate_limit import rate_limiter
 from fastapi import APIRouter, Depends, Request
@@ -33,6 +34,7 @@ async def create_job(
     redis: Redis = Depends(get_redis),
     _rl: None = Depends(rate_limiter(limit=30, window=60, key_prefix="jobs:create")),
 ) -> JobResponse:
+    await check_backpressure(redis)
     svc = _job_service(db, redis)
     job = await svc.create_job(
         user_id=current_user.id,

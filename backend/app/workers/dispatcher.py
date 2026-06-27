@@ -334,6 +334,34 @@ class JobDispatcherConsumer(BaseKafkaConsumer):
         finally:
             self.semaphore.release()
 
+    async def consumer_lag(self) -> int:
+        """Sum of (log_end_offset - committed_offset) across all assigned partitions.
+
+        Returns 0 if the consumer hasn't joined the group yet or has no
+        assignments — caller treats "unknown" as "not backed up."
+        """
+        consumer = self._consumer
+        if consumer is None:
+            return 0
+        try:
+            assignment = consumer.assignment()
+            if not assignment:
+                return 0
+            end_offsets = await consumer.end_offsets(list(assignment))
+            lag = 0
+            for tp in assignment:
+                committed = await consumer.committed(tp)
+                end = end_offsets.get(tp, 0)
+                if committed is None:
+                    # Never committed — everything in the log is pending.
+                    lag += int(end)
+                else:
+                    lag += max(0, int(end) - int(committed))
+            return lag
+        except Exception as exc:
+            logger.warning("consumer_lag query failed", extra={"error": str(exc)})
+            return 0
+
 
 async def _promote_delayed_loop(
     session_factory: async_sessionmaker[AsyncSession],
@@ -452,14 +480,25 @@ async def _outbox_relay_loop(
         await asyncio.sleep(OUTBOX_RELAY_INTERVAL)
 
 
+BACKPRESSURE_LAG_KEY = "kafka:consumer_lag:worker-dispatcher"
+BACKPRESSURE_LAG_TTL = 90  # seconds — must exceed metrics loop interval (60s)
+
+
 async def _metrics_loop(redis: Any, consumer: JobDispatcherConsumer) -> None:
-    """Emit queue/in-flight gauges every ~60s."""
+    """Emit queue/in-flight/consumer-lag gauges every ~60s.
+
+    Lag is also cached in Redis so the API can read it cheaply for the
+    backpressure check (no per-request Kafka query).
+    """
     while True:
         try:
             await asyncio.sleep(60.0)
             delayed = await queue.delayed_length(redis)
+            lag = await consumer.consumer_lag()
             await metrics.emit_gauge("QueueDepth", float(delayed))
             await metrics.emit_gauge("InFlightJobs", float(len(consumer.in_flight)))
+            await metrics.emit_gauge("ConsumerLag", float(lag))
+            await redis.set(BACKPRESSURE_LAG_KEY, lag, ex=BACKPRESSURE_LAG_TTL)
         except asyncio.CancelledError:
             break
         except Exception as exc:

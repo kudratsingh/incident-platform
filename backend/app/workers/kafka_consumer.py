@@ -17,6 +17,8 @@ from typing import Any
 from aiokafka import AIOKafkaConsumer, ConsumerRecord  # type: ignore[import-untyped]
 from app.config import get_settings
 from app.core.logging import get_logger
+from app.workers.schema_registry import SchemaValidationError
+from app.workers.schema_registry import validate as validate_schema
 
 logger = get_logger(__name__)
 
@@ -104,9 +106,29 @@ class BaseKafkaConsumer(ABC):
 
     async def _process_one(self, message: ConsumerRecord) -> None:
         """Process a single message, committing offset on success."""
+        value: dict[str, Any] = message.value
+        key: str | None = message.key
+
+        # Schema validation — bad messages are a poison pill: re-delivering them
+        # would block the partition forever. Commit and move on; the producer
+        # side never should have sent this.
         try:
-            value: dict[str, Any] = message.value
-            key: str | None = message.key
+            validate_schema(message.topic, value)
+        except SchemaValidationError as exc:
+            logger.error(
+                "kafka message dropped — schema invalid",
+                extra={
+                    "group_id": self.group_id,
+                    "topic": message.topic,
+                    "partition": message.partition,
+                    "offset": message.offset,
+                    "error": str(exc),
+                },
+            )
+            await self._consumer.commit()  # type: ignore[union-attr]
+            return
+
+        try:
             await self.handle_message(message.topic, key, value)
             # Commit after successful processing — at-least-once delivery
             await self._consumer.commit()  # type: ignore[union-attr]
