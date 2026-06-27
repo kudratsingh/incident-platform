@@ -12,6 +12,10 @@ class JobCreate(BaseModel):
     payload: dict[str, Any] | None = None
     idempotency_key: str | None = Field(default=None, max_length=255)
     priority: int = Field(default=0, ge=0, le=100)
+    dependencies: list[uuid.UUID] = Field(
+        default_factory=list,
+        description="Parent job IDs that must reach COMPLETED before this one runs.",
+    )
 
 
 class JobResponse(BaseModel):
@@ -29,6 +33,7 @@ class JobResponse(BaseModel):
     max_retries: int
     priority: int
     trace_id: str | None
+    saga_id: uuid.UUID | None = None
     created_at: datetime
     started_at: datetime | None
     completed_at: datetime | None

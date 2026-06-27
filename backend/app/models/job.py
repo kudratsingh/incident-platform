@@ -10,6 +10,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 if TYPE_CHECKING:
     from app.models.audit import AuditLog
+    from app.models.saga import Saga
     from app.models.user import User
 
 
@@ -48,8 +49,17 @@ class Job(TimestampMixin, Base):
     completed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    saga_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("sagas.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
 
     user: Mapped["User"] = relationship("User", back_populates="jobs", lazy="noload")
+    saga: Mapped["Saga | None"] = relationship(
+        "Saga", back_populates="jobs", lazy="noload"
+    )
     audit_logs: Mapped[list["AuditLog"]] = relationship(
         "AuditLog", back_populates="job", lazy="noload"
     )

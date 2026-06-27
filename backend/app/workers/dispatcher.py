@@ -40,9 +40,11 @@ from app.workers import (
     thread_adapters,
 )
 from app.workers.audit_consumer import AuditConsumer
+from app.workers.dependency_resolver import DependencyResolver
 from app.workers.event_log_consumer import EventLogConsumer
 from app.workers.kafka_consumer import BaseKafkaConsumer
 from app.workers.read_model import ReadModelProjector
+from app.workers.saga_coordinator import SagaCoordinator
 from app.workers.sse_consumer import SseConsumer
 from opentelemetry import trace
 from opentelemetry.trace import SpanKind
@@ -534,7 +536,17 @@ async def worker_loop(
     sse = SseConsumer(redis)
     event_log = EventLogConsumer(session_factory)
     read_model = ReadModelProjector(redis)
-    consumers: list[BaseKafkaConsumer] = [dispatcher, audit, sse, event_log, read_model]
+    dep_resolver = DependencyResolver(session_factory)
+    saga = SagaCoordinator(session_factory)
+    consumers: list[BaseKafkaConsumer] = [
+        dispatcher,
+        audit,
+        sse,
+        event_log,
+        read_model,
+        dep_resolver,
+        saga,
+    ]
 
     started: list[BaseKafkaConsumer] = []
     for c in consumers:
