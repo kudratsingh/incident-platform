@@ -60,8 +60,11 @@ async def test_run_job_success_marks_completed() -> None:
     processor = AsyncMock(return_value={"ok": True})
     with patch("app.workers.dispatcher.JobRepository", return_value=job_repo), \
          patch("app.workers.dispatcher.AuditRepository", return_value=audit_repo), \
-         patch.dict(dispatcher._PROCESSORS, {JobType.BULK_API_SYNC: processor}), \
-         patch("app.workers.dispatcher.progress.publish", new=AsyncMock()):
+         patch(
+             "app.workers.dispatcher.OutboxRepository",
+             new=MagicMock(return_value=AsyncMock()),
+         ), \
+         patch.dict(dispatcher._PROCESSORS, {JobType.BULK_API_SYNC: processor}):
         await dispatcher._run_job(str(job.id), factory, redis)
 
     calls = [c.args[1] for c in job_repo.update_status.call_args_list]
@@ -77,8 +80,11 @@ async def test_run_job_retries_on_failure() -> None:
     processor = AsyncMock(side_effect=RuntimeError("boom"))
     with patch("app.workers.dispatcher.JobRepository", return_value=job_repo), \
          patch("app.workers.dispatcher.AuditRepository", return_value=audit_repo), \
+         patch(
+             "app.workers.dispatcher.OutboxRepository",
+             new=MagicMock(return_value=AsyncMock()),
+         ), \
          patch.dict(dispatcher._PROCESSORS, {JobType.BULK_API_SYNC: processor}), \
-         patch("app.workers.dispatcher.progress.publish", new=AsyncMock()), \
          patch("app.workers.dispatcher.queue.push_delayed", new=AsyncMock()) as mock_delay:
         await dispatcher._run_job(str(job.id), factory, redis)
 
@@ -95,8 +101,11 @@ async def test_run_job_dead_letters_after_exhaustion() -> None:
     processor = AsyncMock(side_effect=RuntimeError("boom"))
     with patch("app.workers.dispatcher.JobRepository", return_value=job_repo), \
          patch("app.workers.dispatcher.AuditRepository", return_value=audit_repo), \
+         patch(
+             "app.workers.dispatcher.OutboxRepository",
+             new=MagicMock(return_value=AsyncMock()),
+         ), \
          patch.dict(dispatcher._PROCESSORS, {JobType.BULK_API_SYNC: processor}), \
-         patch("app.workers.dispatcher.progress.publish", new=AsyncMock()), \
          patch("app.workers.dispatcher.queue.push_delayed", new=AsyncMock()) as mock_delay:
         await dispatcher._run_job(str(job.id), factory, redis)
 
