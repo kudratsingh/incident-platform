@@ -9,7 +9,7 @@ import { adminApi } from '../api/admin'
 import { AppError } from '../api/client'
 import { formatDate, JOB_TYPE_LABELS } from '../utils/format'
 
-type Tab = 'jobs' | 'users' | 'audit'
+type Tab = 'jobs' | 'dlq' | 'users' | 'audit'
 
 function AuditLogModal({ log, onClose }: { log: AuditLog; onClose: () => void }) {
   return (
@@ -81,6 +81,8 @@ export default function AdminPage() {
   const [traceFilter, setTraceFilter] = useState('')
   const [loading, setLoading] = useState(true)
   const [selectedLog, setSelectedLog] = useState<AuditLog | null>(null)
+  const [dlqStats, setDlqStats] = useState<{ total: number; by_type: Record<string, number> } | null>(null)
+  const [dlqJobs, setDlqJobs] = useState<Job[]>([])
 
   const loadJobs = useCallback(async () => {
     setLoading(true)
@@ -120,17 +122,39 @@ export default function AdminPage() {
     }
   }, [page])
 
+  const loadDlq = useCallback(async () => {
+    setLoading(true)
+    try {
+      const [stats, jobsRes] = await Promise.all([
+        adminApi.dlqStats(),
+        adminApi.listJobs({ page, page_size: 20, status: 'dead_letter' }),
+      ])
+      setDlqStats(stats)
+      setDlqJobs(jobsRes.items)
+      setTotal(jobsRes.total)
+    } finally {
+      setLoading(false)
+    }
+  }, [page])
+
+  // Keep the badge fresh on every tab switch so admins see the current count.
+  useEffect(() => {
+    void adminApi.dlqStats().then(setDlqStats).catch(() => {})
+  }, [tab])
+
   useEffect(() => {
     if (tab === 'jobs') void loadJobs()
+    else if (tab === 'dlq') void loadDlq()
     else if (tab === 'users') void loadUsers()
     else void loadLogs()
-  }, [tab, loadJobs, loadUsers, loadLogs])
+  }, [tab, loadJobs, loadDlq, loadUsers, loadLogs])
 
   async function replay(jobId: string) {
     try {
       await adminApi.replayJob(jobId)
       toast.success(`Job ${jobId.slice(0, 8)}… queued for replay`)
-      void loadJobs()
+      if (tab === 'dlq') void loadDlq()
+      else void loadJobs()
     } catch (err) {
       toast.error(err instanceof AppError ? err.message : 'Replay failed')
     }
@@ -154,15 +178,20 @@ export default function AdminPage() {
           <p className="text-sm text-gray-500">{total} records</p>
         </div>
         <div className="flex gap-1 bg-gray-800/60 rounded-lg p-1">
-          {(['jobs', 'users', 'audit'] as Tab[]).map((t) => (
+          {(['jobs', 'dlq', 'users', 'audit'] as Tab[]).map((t) => (
             <button
               key={t}
               onClick={() => { setTab(t); setPage(1) }}
-              className={`px-4 py-1.5 rounded text-sm font-medium transition-colors capitalize ${
+              className={`px-4 py-1.5 rounded text-sm font-medium transition-colors capitalize inline-flex items-center gap-2 ${
                 tab === t ? 'bg-gray-700 text-white' : 'text-gray-400 hover:text-white'
               }`}
             >
-              {t}
+              {t === 'dlq' ? 'DLQ' : t}
+              {t === 'dlq' && dlqStats && dlqStats.total > 0 && (
+                <span className="bg-red-500/20 text-red-300 border border-red-500/40 rounded-full px-2 py-0.5 text-[10px] font-mono leading-none">
+                  {dlqStats.total}
+                </span>
+              )}
             </button>
           ))}
         </div>
@@ -246,6 +275,90 @@ export default function AdminPage() {
                             Resolve
                           </button>
                         )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </div>
+        </>
+      )}
+
+      {tab === 'dlq' && (
+        <>
+          {dlqStats && dlqStats.total > 0 && (
+            <div className="mb-4 flex flex-wrap gap-2">
+              {Object.entries(dlqStats.by_type).map(([type, n]) => (
+                <span
+                  key={type}
+                  className="bg-red-500/10 border border-red-500/20 text-red-200 rounded-full px-3 py-1 text-xs font-mono"
+                >
+                  {JOB_TYPE_LABELS[type] ?? type}: {n}
+                </span>
+              ))}
+            </div>
+          )}
+
+          <div className="bg-gray-900 border border-gray-800 rounded-lg overflow-hidden">
+            {loading ? (
+              <table className="w-full text-sm">
+                <tbody className="divide-y divide-gray-800/60">
+                  {Array.from({ length: 8 }).map((_, i) => <TableRowSkeleton key={i} />)}
+                </tbody>
+              </table>
+            ) : dlqJobs.length === 0 ? (
+              <div className="px-6 py-12 text-center text-sm text-gray-500">
+                Dead letter queue is empty.
+              </div>
+            ) : (
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b border-gray-800 text-xs text-gray-500">
+                    <th className="text-left px-4 py-3 font-medium">Job</th>
+                    <th className="text-left px-4 py-3 font-medium">Error</th>
+                    <th className="text-left px-4 py-3 font-medium hidden md:table-cell">Attempts</th>
+                    <th className="text-left px-4 py-3 font-medium hidden lg:table-cell">Failed</th>
+                    <th className="text-right px-4 py-3 font-medium">Actions</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-gray-800/60">
+                  {dlqJobs.map((job) => (
+                    <tr key={job.id} className="hover:bg-gray-800/30 transition-colors">
+                      <td className="px-4 py-3 align-top">
+                        <Link to={`/jobs/${job.id}`} className="text-gray-200 hover:text-white">
+                          {JOB_TYPE_LABELS[job.type] ?? job.type}
+                        </Link>
+                        <code className="text-xs text-gray-600 block font-mono">
+                          {job.id.slice(0, 8)}…
+                        </code>
+                      </td>
+                      <td className="px-4 py-3 align-top max-w-md">
+                        <p className="text-xs text-red-300 font-mono whitespace-pre-wrap break-all">
+                          {job.error_message ?? '—'}
+                        </p>
+                      </td>
+                      <td className="px-4 py-3 hidden md:table-cell align-top">
+                        <span className="text-xs font-mono text-gray-400">
+                          {job.retry_count}/{job.max_retries}
+                        </span>
+                      </td>
+                      <td className="px-4 py-3 hidden lg:table-cell text-gray-500 text-xs align-top">
+                        {job.completed_at ? formatDate(job.completed_at) : '—'}
+                      </td>
+                      <td className="px-4 py-3 text-right space-x-2 align-top">
+                        <button
+                          onClick={() => void replay(job.id)}
+                          className="text-xs text-blue-400 hover:text-blue-300 transition-colors"
+                        >
+                          Replay
+                        </button>
+                        <button
+                          onClick={() => void resolve(job.id)}
+                          className="text-xs text-green-400 hover:text-green-300 transition-colors"
+                        >
+                          Resolve
+                        </button>
                       </td>
                     </tr>
                   ))}

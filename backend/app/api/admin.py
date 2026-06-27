@@ -1,4 +1,5 @@
 import uuid
+from typing import Any
 
 from app.dependencies import get_db, get_redis, require_role
 from app.models.enums import UserRole
@@ -81,6 +82,16 @@ async def replay_job(
     job = await svc.replay_job(job_id=job_id, requesting_user_id=current_user.id)
     await JobCache.delete(redis, job_id)
     return JobResponse.model_validate(job)
+
+
+@router.get("/dlq/stats")
+async def dlq_stats(
+    current_user: User = Depends(_require_support_or_admin),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Counts of dead-lettered jobs for the admin DLQ badge / dashboard."""
+    total, by_type = await JobRepository(db).dlq_stats()
+    return {"total": total, "by_type": by_type}
 
 
 @router.post("/incidents/{job_id}/resolve", response_model=JobResponse)

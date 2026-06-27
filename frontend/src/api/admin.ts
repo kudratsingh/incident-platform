@@ -25,6 +25,9 @@ export const adminApi = {
 
   resolveIncident: (id: string) => api.post<Job>(`/admin/incidents/${id}/resolve`),
 
+  dlqStats: () =>
+    api.get<{ total: number; by_type: Record<string, number> }>(`/admin/dlq/stats`),
+
   listUsers: (page = 1) =>
     api.get<PaginatedResponse<User>>(`/admin/users?page=${page}&page_size=50`),
 

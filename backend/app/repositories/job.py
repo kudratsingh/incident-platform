@@ -2,9 +2,10 @@ import uuid
 from datetime import datetime
 from typing import Any
 
+from app.models.enums import JobStatus
 from app.models.job import Job
 from app.repositories.base import BaseRepository
-from sqlalchemy import and_, select, update
+from sqlalchemy import and_, func, select, update
 
 
 class JobRepository(BaseRepository[Job]):
@@ -64,3 +65,14 @@ class JobRepository(BaseRepository[Job]):
         )
         await self.session.flush()
         return await self.get_by_id(job_id)
+
+    async def dlq_stats(self) -> tuple[int, dict[str, int]]:
+        """Total DLQ count plus per-job-type breakdown."""
+        stmt = (
+            select(Job.type, func.count().label("n"))
+            .where(Job.status == JobStatus.DEAD_LETTER)
+            .group_by(Job.type)
+        )
+        result = await self.session.execute(stmt)
+        by_type = {row.type: int(row.n) for row in result.all()}
+        return sum(by_type.values()), by_type

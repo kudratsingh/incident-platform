@@ -115,3 +115,79 @@ async def test_admin_can_list_all_jobs(
     resp = await client.get("/api/v1/admin/jobs", headers=admin_headers)
     assert resp.status_code == 200
     assert isinstance(resp.json()["items"], list)
+
+
+async def test_admin_dlq_stats_empty(
+    client: AsyncClient, admin_headers: dict[str, str]
+) -> None:
+    resp = await client.get("/api/v1/admin/dlq/stats", headers=admin_headers)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body == {"total": 0, "by_type": {}}
+
+
+async def test_admin_dlq_stats_counts_by_type(
+    client: AsyncClient,
+    db_session,  # type: ignore[no-untyped-def]
+    admin_user,  # type: ignore[no-untyped-def]
+    admin_headers: dict[str, str],
+) -> None:
+    """Insert two dead-lettered jobs of different types and assert the breakdown."""
+    from app.models.enums import JobStatus, JobType
+    from app.models.job import Job
+
+    for jt in (JobType.CSV_UPLOAD, JobType.CSV_UPLOAD, JobType.BULK_API_SYNC):
+        db_session.add(
+            Job(
+                user_id=admin_user.id,
+                type=jt,
+                status=JobStatus.DEAD_LETTER,
+                retry_count=3,
+                max_retries=3,
+                priority=0,
+                error_message="boom",
+            )
+        )
+    await db_session.flush()
+
+    resp = await client.get("/api/v1/admin/dlq/stats", headers=admin_headers)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["total"] == 3
+    assert body["by_type"] == {
+        JobType.CSV_UPLOAD: 2,
+        JobType.BULK_API_SYNC: 1,
+    }
+
+
+async def test_admin_replay_resets_retry_count(
+    client: AsyncClient,
+    db_session,  # type: ignore[no-untyped-def]
+    admin_user,  # type: ignore[no-untyped-def]
+    admin_headers: dict[str, str],
+) -> None:
+    """A DLQ'd job at max retries replays with retry_count=0 and a clean error."""
+    from app.models.enums import JobStatus, JobType
+    from app.models.job import Job
+
+    job = Job(
+        user_id=admin_user.id,
+        type=JobType.CSV_UPLOAD,
+        status=JobStatus.DEAD_LETTER,
+        retry_count=3,
+        max_retries=3,
+        priority=0,
+        error_message="last attempt boom",
+    )
+    db_session.add(job)
+    await db_session.flush()
+    await db_session.refresh(job)
+
+    resp = await client.post(
+        f"/api/v1/admin/jobs/{job.id}/replay", headers=admin_headers
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "pending"
+    assert body["retry_count"] == 0
+    assert body["error_message"] is None
