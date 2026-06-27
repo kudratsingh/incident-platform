@@ -43,7 +43,11 @@ class SseConsumer(BaseKafkaConsumer):
         self.redis = redis
 
     async def handle_message(
-        self, topic: str, key: str | None, value: dict[str, Any]
+        self,
+        topic: str,
+        key: str | None,
+        value: dict[str, Any],
+        **_kafka_meta: Any,
     ) -> None:
         if not isinstance(value, dict):
             logger.warning("skipping non-dict SSE event", extra={"topic": topic})

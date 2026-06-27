@@ -43,7 +43,11 @@ class AuditConsumer(BaseKafkaConsumer):
         self.session_factory = session_factory
 
     async def handle_message(
-        self, topic: str, key: str | None, value: dict[str, Any]
+        self,
+        topic: str,
+        key: str | None,
+        value: dict[str, Any],
+        **_kafka_meta: Any,
     ) -> None:
         event_name = value.get("event") if isinstance(value, dict) else None
         if not event_name:

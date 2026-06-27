@@ -69,6 +69,8 @@ class Settings(BaseSettings):
     kafka_consumer_group_worker: str = "worker-dispatcher"
     kafka_consumer_group_audit: str = "audit-writer"
     kafka_consumer_group_sse: str = "sse-broadcaster"
+    kafka_consumer_group_event_log: str = "event-log"
+    kafka_consumer_group_read_model: str = "read-model"
     kafka_max_poll_interval_ms: int = 300_000
     kafka_session_timeout_ms: int = 30_000
 
