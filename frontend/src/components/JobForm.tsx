@@ -21,6 +21,8 @@ export default function JobForm({ onCreated }: Props) {
   const [type, setType] = useState<JobType>('csv_upload')
   const [priority, setPriority] = useState(0)
   const [idempotencyKey, setIdempotencyKey] = useState('')
+  const [dependenciesText, setDependenciesText] = useState('')
+  const [showAdvanced, setShowAdvanced] = useState(false)
   const [payloadText, setPayloadText] = useState(
     JSON.stringify(DEFAULT_PAYLOADS.csv_upload, null, 2),
   )
@@ -44,6 +46,15 @@ export default function JobForm({ onCreated }: Props) {
       return
     }
 
+    const dependencies = dependenciesText
+      .split(/[\s,]+/)
+      .map((s) => s.trim())
+      .filter(Boolean)
+    if (dependencies.some((d) => !/^[0-9a-f-]{36}$/i.test(d))) {
+      setError('Dependencies must be UUIDs (one per line or comma-separated).')
+      return
+    }
+
     setSubmitting(true)
     try {
       const job = await jobsApi.create({
@@ -51,11 +62,19 @@ export default function JobForm({ onCreated }: Props) {
         payload,
         priority,
         idempotency_key: idempotencyKey || undefined,
+        dependencies: dependencies.length > 0 ? dependencies : undefined,
       })
       onCreated(job)
       setIdempotencyKey('')
+      setDependenciesText('')
     } catch (err) {
-      setError(err instanceof AppError ? err.message : 'Failed to create job')
+      if (err instanceof AppError && err.errorCode === 'backpressure') {
+        setError(
+          'Workers are backed up — please wait a moment before submitting again.',
+        )
+      } else {
+        setError(err instanceof AppError ? err.message : 'Failed to create job')
+      }
     } finally {
       setSubmitting(false)
     }
@@ -118,6 +137,35 @@ export default function JobForm({ onCreated }: Props) {
             className="w-full bg-gray-800/60 border border-gray-700/50 rounded px-3 py-2 text-sm font-mono text-gray-200 placeholder-gray-600 focus:outline-none focus:border-blue-500/50"
           />
         </div>
+      </div>
+
+      {/* Advanced (dependencies) */}
+      <div>
+        <button
+          type="button"
+          onClick={() => setShowAdvanced((s) => !s)}
+          className="text-xs text-gray-500 hover:text-gray-300"
+        >
+          {showAdvanced ? '− Hide' : '+ Show'} advanced (dependencies)
+        </button>
+        {showAdvanced && (
+          <div className="mt-2">
+            <label className="block text-xs text-gray-400 mb-1.5">
+              Parent job IDs
+            </label>
+            <textarea
+              value={dependenciesText}
+              onChange={(e) => setDependenciesText(e.target.value)}
+              rows={3}
+              placeholder="One UUID per line or comma-separated"
+              className="w-full bg-gray-800/60 border border-gray-700/50 rounded px-3 py-2 text-xs font-mono text-gray-200 placeholder-gray-600 focus:outline-none focus:border-blue-500/50"
+            />
+            <p className="text-[11px] text-gray-600 mt-1">
+              The new job starts <code>waiting</code> until every listed parent
+              reaches <code>completed</code>.
+            </p>
+          </div>
+        )}
       </div>
 
       {error && <p className="text-sm text-red-400">{error}</p>}

@@ -52,6 +52,55 @@ def _saga_service(db: AsyncSession, redis: Redis) -> SagaService:
     return SagaService(SagaRepository(db), job_service, AuditRepository(db))
 
 
+class SagaListItem(BaseModel):
+    id: uuid.UUID
+    name: str
+    status: str
+    created_at: str
+    completed_at: str | None
+    step_count: int
+
+
+class SagaListResponse(BaseModel):
+    items: list[SagaListItem]
+    total: int
+    page: int
+    page_size: int
+
+
+@router.get("", response_model=SagaListResponse)
+async def list_sagas(
+    page: int = 1,
+    page_size: int = 20,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> SagaListResponse:
+    from app.models.enums import UserRole
+
+    repo = SagaRepository(db)
+    # Admins/support see all sagas, regular users see only their own.
+    privileged = current_user.role in (UserRole.ADMIN, UserRole.SUPPORT)
+    sagas, total = await repo.list_for_user(
+        user_id=None if privileged else current_user.id,
+        offset=(page - 1) * page_size,
+        limit=page_size,
+    )
+    items: list[SagaListItem] = []
+    for s in sagas:
+        steps = await repo.jobs(s.id)
+        items.append(
+            SagaListItem(
+                id=s.id,
+                name=s.name,
+                status=s.status,
+                created_at=s.created_at.isoformat(),
+                completed_at=s.completed_at.isoformat() if s.completed_at else None,
+                step_count=len(steps),
+            )
+        )
+    return SagaListResponse(items=items, total=total, page=page, page_size=page_size)
+
+
 @router.post("", response_model=SagaResponse, status_code=201)
 async def create_saga(
     body: SagaCreateRequest,

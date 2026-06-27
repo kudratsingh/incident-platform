@@ -4,12 +4,12 @@ import Layout from '../components/Layout'
 import StatusBadge from '../components/StatusBadge'
 import { TableRowSkeleton } from '../components/Skeleton'
 import { useToast } from '../components/Toast'
-import type { AuditLog, Job, User } from '../types'
+import type { AuditLog, Job, SystemStats, User } from '../types'
 import { adminApi } from '../api/admin'
 import { AppError } from '../api/client'
 import { formatDate, JOB_TYPE_LABELS } from '../utils/format'
 
-type Tab = 'jobs' | 'dlq' | 'users' | 'audit'
+type Tab = 'overview' | 'jobs' | 'dlq' | 'users' | 'audit'
 
 function AuditLogModal({ log, onClose }: { log: AuditLog; onClose: () => void }) {
   return (
@@ -71,7 +71,8 @@ const ROLE_COLORS: Record<string, string> = {
 
 export default function AdminPage() {
   const toast = useToast()
-  const [tab, setTab] = useState<Tab>('jobs')
+  const [tab, setTab] = useState<Tab>('overview')
+  const [stats, setStats] = useState<SystemStats | null>(null)
   const [jobs, setJobs] = useState<Job[]>([])
   const [users, setUsers] = useState<User[]>([])
   const [logs, setLogs] = useState<AuditLog[]>([])
@@ -142,7 +143,26 @@ export default function AdminPage() {
     void adminApi.dlqStats().then(setDlqStats).catch(() => {})
   }, [tab])
 
+  const loadOverview = useCallback(async () => {
+    setLoading(true)
+    try {
+      const s = await adminApi.systemStats()
+      setStats(s)
+    } finally {
+      setLoading(false)
+    }
+  }, [])
+
+  // Auto-refresh the overview every 5s so the CQRS read-model lag is visible.
   useEffect(() => {
+    if (tab !== 'overview') return
+    void loadOverview()
+    const t = setInterval(() => void loadOverview(), 5000)
+    return () => clearInterval(t)
+  }, [tab, loadOverview])
+
+  useEffect(() => {
+    if (tab === 'overview') return  // handled by its own polling effect above
     if (tab === 'jobs') void loadJobs()
     else if (tab === 'dlq') void loadDlq()
     else if (tab === 'users') void loadUsers()
@@ -178,7 +198,7 @@ export default function AdminPage() {
           <p className="text-sm text-gray-500">{total} records</p>
         </div>
         <div className="flex gap-1 bg-gray-800/60 rounded-lg p-1">
-          {(['jobs', 'dlq', 'users', 'audit'] as Tab[]).map((t) => (
+          {(['overview', 'jobs', 'dlq', 'users', 'audit'] as Tab[]).map((t) => (
             <button
               key={t}
               onClick={() => { setTab(t); setPage(1) }}
@@ -196,6 +216,51 @@ export default function AdminPage() {
           ))}
         </div>
       </div>
+
+      {tab === 'overview' && (
+        <>
+          <div className="mb-4 flex items-center gap-2">
+            <span className="text-xs text-gray-500">
+              CQRS read model — denormalized Redis sets, refreshed every 5s.
+            </span>
+            <span className="ml-auto text-xs text-gray-600 flex items-center gap-1.5">
+              <span className="w-1.5 h-1.5 rounded-full bg-blue-400 animate-pulse" />
+              live
+            </span>
+          </div>
+
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-6">
+            {(['running', 'completed', 'failed', 'dead_letter'] as const).map(
+              (st) => (
+                <StatCard
+                  key={st}
+                  label={st.replace('_', ' ')}
+                  value={stats?.by_status?.[st] ?? 0}
+                  loading={loading && stats === null}
+                  color={
+                    st === 'completed'
+                      ? 'green'
+                      : st === 'running'
+                        ? 'blue'
+                        : st === 'failed'
+                          ? 'red'
+                          : 'red-dark'
+                  }
+                />
+              ),
+            )}
+          </div>
+
+          <div className="bg-gray-900 border border-gray-800 rounded-lg p-5">
+            <p className="text-xs text-gray-500">
+              These counts come from <code className="text-blue-300">/admin/stats</code>{' '}
+              which reads denormalized job-status sets in Redis. No SQL aggregate
+              on the jobs table — eventually consistent with the write side, with
+              latency dominated by Kafka consumer-group lag.
+            </p>
+          </div>
+        </>
+      )}
 
       {tab === 'jobs' && (
         <>
@@ -479,5 +544,35 @@ export default function AdminPage() {
       )}
       {selectedLog && <AuditLogModal log={selectedLog} onClose={() => setSelectedLog(null)} />}
     </Layout>
+  )
+}
+
+const CARD_COLORS: Record<string, string> = {
+  blue: 'border-blue-700/40 from-blue-900/30 text-blue-300',
+  green: 'border-green-700/40 from-green-900/30 text-green-300',
+  red: 'border-red-700/40 from-red-900/30 text-red-300',
+  'red-dark': 'border-red-800/40 from-red-950/50 text-red-400',
+}
+
+function StatCard({
+  label,
+  value,
+  loading,
+  color,
+}: {
+  label: string
+  value: number
+  loading: boolean
+  color: 'blue' | 'green' | 'red' | 'red-dark'
+}) {
+  return (
+    <div
+      className={`bg-gradient-to-br to-transparent border rounded-lg p-4 ${CARD_COLORS[color]}`}
+    >
+      <p className="text-[10px] uppercase tracking-wider opacity-70">{label}</p>
+      <p className="text-2xl font-semibold font-mono mt-1">
+        {loading ? '—' : value.toLocaleString()}
+      </p>
+    </div>
   )
 }
