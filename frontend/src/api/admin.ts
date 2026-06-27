@@ -1,5 +1,12 @@
 import { api } from './client'
-import type { AuditLog, Job, PaginatedResponse, User } from '../types'
+import type {
+  AuditLog,
+  Job,
+  JobTimeline,
+  PaginatedResponse,
+  SystemStats,
+  User,
+} from '../types'
 import type { JobListParams } from './jobs'
 
 export interface AdminJobListParams extends JobListParams {
@@ -27,6 +34,14 @@ export const adminApi = {
 
   dlqStats: () =>
     api.get<{ total: number; by_type: Record<string, number> }>(`/admin/dlq/stats`),
+
+  systemStats: () => api.get<SystemStats>(`/admin/stats`),
+
+  userStats: (userId: string) =>
+    api.get<SystemStats>(`/admin/users/${userId}/stats`),
+
+  jobTimeline: (jobId: string) =>
+    api.get<JobTimeline>(`/admin/jobs/${jobId}/timeline`),
 
   listUsers: (page = 1) =>
     api.get<PaginatedResponse<User>>(`/admin/users?page=${page}&page_size=50`),

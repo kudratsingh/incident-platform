@@ -6,6 +6,9 @@ import RegisterPage from './pages/RegisterPage'
 import DashboardPage from './pages/DashboardPage'
 import JobDetailPage from './pages/JobDetailPage'
 import AdminPage from './pages/AdminPage'
+import SagasPage from './pages/SagasPage'
+import SagaNewPage from './pages/SagaNewPage'
+import SagaDetailPage from './pages/SagaDetailPage'
 
 export default function App() {
   return (
@@ -28,6 +31,30 @@ export default function App() {
             element={
               <ProtectedRoute>
                 <JobDetailPage />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="/sagas"
+            element={
+              <ProtectedRoute>
+                <SagasPage />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="/sagas/new"
+            element={
+              <ProtectedRoute>
+                <SagaNewPage />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="/sagas/:id"
+            element={
+              <ProtectedRoute>
+                <SagaDetailPage />
               </ProtectedRoute>
             }
           />

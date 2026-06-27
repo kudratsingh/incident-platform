@@ -7,11 +7,20 @@ export type UserRole = 'user' | 'support' | 'admin'
 export type JobType = 'csv_upload' | 'report_gen' | 'bulk_api_sync' | 'doc_analysis'
 
 export type JobStatus =
+  | 'waiting'
   | 'pending'
   | 'running'
   | 'completed'
   | 'failed'
   | 'dead_letter'
+  | 'cancelled'
+
+export type SagaStatus =
+  | 'running'
+  | 'completed'
+  | 'failed'
+  | 'compensating'
+  | 'compensated'
 
 export interface User {
   id: string
@@ -34,9 +43,39 @@ export interface Job {
   max_retries: number
   priority: number
   trace_id: string | null
+  saga_id?: string | null
   created_at: string
   started_at: string | null
   completed_at: string | null
+}
+
+export interface Saga {
+  id: string
+  name: string
+  status: SagaStatus
+  created_at: string
+  completed_at: string | null
+  steps: Job[]
+}
+
+export interface JobEvent {
+  id: string
+  event_name: string
+  recorded_at: string
+  kafka_topic: string
+  kafka_partition: number
+  kafka_offset: number
+  payload: Record<string, unknown>
+}
+
+export interface JobTimeline {
+  job_id: string
+  count: number
+  events: JobEvent[]
+}
+
+export interface SystemStats {
+  by_status: Record<string, number>
 }
 
 export interface AuditLog {
@@ -87,4 +126,16 @@ export interface JobCreateRequest {
   payload?: Record<string, unknown>
   idempotency_key?: string
   priority?: number
+  dependencies?: string[]
+}
+
+export interface SagaStepRequest {
+  type: JobType
+  payload?: Record<string, unknown>
+  priority?: number
+}
+
+export interface SagaCreateRequest {
+  name: string
+  steps: SagaStepRequest[]
 }

@@ -1,13 +1,15 @@
 import { useEffect, useState } from 'react'
-import { useParams, useNavigate } from 'react-router-dom'
+import { useParams, useNavigate, Link } from 'react-router-dom'
 import Layout from '../components/Layout'
 import StatusBadge from '../components/StatusBadge'
 import ProgressBar from '../components/ProgressBar'
 import TraceId from '../components/TraceId'
 import { jobsApi } from '../api/jobs'
+import { adminApi } from '../api/admin'
 import { lastMeta } from '../api/client'
+import { useAuth } from '../hooks/useAuth'
 import { useJobStream } from '../hooks/useJobStream'
-import type { Job } from '../types'
+import type { Job, JobEvent } from '../types'
 import { formatDate, formatDuration, JOB_TYPE_LABELS } from '../utils/format'
 
 function JsonBlock({ label, data }: { label: string; data: unknown }) {
@@ -25,10 +27,14 @@ function JsonBlock({ label, data }: { label: string; data: unknown }) {
 export default function JobDetailPage() {
   const { id } = useParams<{ id: string }>()
   const navigate = useNavigate()
+  const { user } = useAuth()
   const [job, setJob] = useState<Job | null>(null)
   const [requestId, setRequestId] = useState<string | undefined>()
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  const [timeline, setTimeline] = useState<JobEvent[] | null>(null)
+  const [timelineOpen, setTimelineOpen] = useState(false)
+  const isPrivileged = user?.role === 'admin' || user?.role === 'support'
 
   const { latest, events, connected } = useJobStream(
     job?.status === 'running' || job?.status === 'pending' ? id ?? null : null,
@@ -54,6 +60,15 @@ export default function JobDetailPage() {
       jobsApi.get(id).then(setJob).catch(() => {})
     }
   }, [latest, id])
+
+  // Lazy-load the Kafka event timeline the first time the user opens it.
+  useEffect(() => {
+    if (!timelineOpen || !id || !isPrivileged || timeline !== null) return
+    adminApi
+      .jobTimeline(id)
+      .then((t) => setTimeline(t.events))
+      .catch(() => setTimeline([]))
+  }, [timelineOpen, id, isPrivileged, timeline])
 
   if (loading) {
     return (
@@ -146,6 +161,66 @@ export default function JobDetailPage() {
               </div>
             )}
           </div>
+
+          {/* Kafka event timeline (event sourcing) — admin/support only */}
+          {isPrivileged && (
+            <div className="bg-gray-900 border border-gray-800 rounded-lg p-5">
+              <button
+                onClick={() => setTimelineOpen((o) => !o)}
+                className="w-full flex items-center justify-between text-left"
+              >
+                <div>
+                  <h2 className="text-sm font-medium text-gray-300">
+                    Kafka event timeline
+                  </h2>
+                  <p className="text-xs text-gray-600">
+                    Event-sourced log — replays the durable Kafka events for this job.
+                  </p>
+                </div>
+                <span className="text-xs text-gray-500 font-mono">
+                  {timelineOpen ? '−' : '+'}
+                </span>
+              </button>
+
+              {timelineOpen && (
+                <div className="mt-4">
+                  {timeline === null ? (
+                    <p className="text-xs text-gray-500">Loading…</p>
+                  ) : timeline.length === 0 ? (
+                    <p className="text-xs text-gray-500">
+                      No Kafka events recorded — the event-log consumer hasn't
+                      seen this job yet (or none of its events have flowed
+                      through Kafka).
+                    </p>
+                  ) : (
+                    <ol className="space-y-2">
+                      {timeline.map((ev) => (
+                        <li key={ev.id} className="flex items-start gap-3">
+                          <span className="w-2 h-2 rounded-full bg-blue-500 mt-1.5 shrink-0" />
+                          <div className="flex-1 min-w-0">
+                            <div className="flex items-baseline gap-2 flex-wrap">
+                              <code className="text-xs font-mono text-blue-300">
+                                {ev.event_name}
+                              </code>
+                              <span className="text-[10px] text-gray-500 font-mono">
+                                {ev.kafka_topic} / p{ev.kafka_partition} / o{ev.kafka_offset}
+                              </span>
+                              <span className="text-[10px] text-gray-500 ml-auto">
+                                {formatDate(ev.recorded_at)}
+                              </span>
+                            </div>
+                            <pre className="mt-1 bg-gray-800/40 border border-gray-700/40 rounded px-2 py-1 text-[11px] font-mono text-gray-400 overflow-x-auto whitespace-pre-wrap break-all max-h-32">
+                              {JSON.stringify(ev.payload, null, 2)}
+                            </pre>
+                          </div>
+                        </li>
+                      ))}
+                    </ol>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
         </div>
 
         {/* Right: metadata */}
@@ -167,6 +242,19 @@ export default function JobDetailPage() {
                   <dd className="text-gray-300 text-right">{value}</dd>
                 </div>
               ))}
+              {job.saga_id && (
+                <div className="flex justify-between gap-2">
+                  <dt className="text-gray-500 shrink-0">Saga</dt>
+                  <dd className="text-right">
+                    <Link
+                      to={`/sagas/${job.saga_id}`}
+                      className="text-blue-400 hover:text-blue-300 font-mono text-xs"
+                    >
+                      {job.saga_id.slice(0, 8)}…
+                    </Link>
+                  </dd>
+                </div>
+              )}
             </dl>
           </div>
 

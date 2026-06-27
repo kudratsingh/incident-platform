@@ -96,3 +96,31 @@ async def test_job_with_missing_dependency_returns_404(
         headers=auth_headers,
     )
     assert resp.status_code == 404
+
+
+async def test_list_sagas_returns_user_sagas(
+    client: AsyncClient, auth_headers: dict[str, str]
+) -> None:
+    await client.post(
+        "/api/v1/sagas",
+        json={"name": "alpha", "steps": [{"type": "csv_upload"}]},
+        headers=auth_headers,
+    )
+    await client.post(
+        "/api/v1/sagas",
+        json={
+            "name": "beta",
+            "steps": [{"type": "csv_upload"}, {"type": "report_gen"}],
+        },
+        headers=auth_headers,
+    )
+
+    resp = await client.get("/api/v1/sagas", headers=auth_headers)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["total"] >= 2
+    # Most recent first.
+    names = [i["name"] for i in body["items"][:2]]
+    assert "beta" in names and "alpha" in names
+    beta = next(i for i in body["items"] if i["name"] == "beta")
+    assert beta["step_count"] == 2
