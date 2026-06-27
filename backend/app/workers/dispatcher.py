@@ -36,11 +36,12 @@ from app.workers import (
     async_tasks,
     cpu_processors,
     kafka_producer,
-    progress,
     queue,
     thread_adapters,
 )
+from app.workers.audit_consumer import AuditConsumer
 from app.workers.kafka_consumer import BaseKafkaConsumer
+from app.workers.sse_consumer import SseConsumer
 from opentelemetry import trace
 from opentelemetry.trace import SpanKind
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -99,7 +100,6 @@ async def _run_job(
 
             await repo.update_status(job_id, JobStatus.RUNNING)
 
-    await progress.publish(redis, job_id_str, "running", 0, "Job started")
     await kafka_producer.publish_job_progress(
         job_id=job_id,
         user_id=user_id,
@@ -126,12 +126,24 @@ async def _run_job(
                     job_id, JobStatus.FAILED,
                     extra={"error_message": f"No processor for type: {job_type}"},
                 )
-        await progress.publish(redis, job_id_str, "failed", 0, f"Unknown job type: {job_type}")
+                await OutboxRepository(session).add(
+                    topic=settings.kafka_topic_job_failed,
+                    key=str(user_id),
+                    payload={
+                        "event": "job.failed",
+                        "job_id": job_id_str,
+                        "user_id": str(user_id),
+                        "job_type": job_type,
+                        "error": f"Unknown job type: {job_type}",
+                        "message": f"Unknown job type: {job_type}",
+                        "retry_count": retry_count,
+                        "dead_lettered": False,
+                    },
+                )
         job_id_var.reset(token)
         return
 
     async def _publish(pct: int, message: str) -> None:
-        await progress.publish(redis, job_id_str, "running", pct, message, retry_count)
         await kafka_producer.publish_job_progress(
             job_id=job_id,
             user_id=user_id,
@@ -183,16 +195,15 @@ async def _run_job(
                                 "user_id": str(user_id),
                                 "job_type": job_type,
                                 "error": str(exc),
+                                "message": (
+                                    f"Retrying in {delay:.0f}s "
+                                    f"(attempt {new_retry_count}/{max_retries})"
+                                ),
                                 "retry_count": new_retry_count,
                                 "dead_lettered": False,
                             },
                         )
                 await queue.push_delayed(redis, job_id_str, delay)
-                await progress.publish(
-                    redis, job_id_str, "retrying",
-                    0, f"Retrying in {delay:.0f}s (attempt {new_retry_count}/{max_retries})",
-                    retry_count=new_retry_count,
-                )
                 logger.info("job scheduled for retry", extra={"delay_seconds": delay})
                 await metrics.emit_count("JobFailed", dimensions={"JobType": str(job_type)})
             else:
@@ -218,15 +229,13 @@ async def _run_job(
                                 "user_id": str(user_id),
                                 "job_type": job_type,
                                 "error": str(exc),
+                                "message": (
+                                    f"Job exhausted after {new_retry_count} attempts: {exc}"
+                                ),
                                 "retry_count": new_retry_count,
                                 "dead_lettered": True,
                             },
                         )
-                await progress.publish(
-                    redis, job_id_str, "dead_letter",
-                    0, f"Job exhausted after {new_retry_count} attempts: {exc}",
-                    retry_count=new_retry_count,
-                )
                 logger.error("job dead-lettered", extra={"error": str(exc)})
                 await metrics.emit_count("JobDeadLettered", dimensions={"JobType": str(job_type)})
 
@@ -264,7 +273,6 @@ async def _run_job(
 
         span.set_status(trace.StatusCode.OK)
 
-    await progress.publish(redis, job_id_str, "completed", 100, "Job completed successfully")
     logger.info("job completed", extra={"type": job_type})
     await metrics.emit_count("JobCompleted", dimensions={"JobType": str(job_type)})
     job_id_var.reset(token)
@@ -463,32 +471,52 @@ async def worker_loop(
     redis: Any,
 ) -> None:
     """
-    Start the Kafka dispatcher consumer and the supporting background loops.
+    Start the Kafka consumers and the supporting background loops.
 
-    Three concurrent tasks make up the worker:
-      1. consumer.run()           — consumes `job.submitted`, spawns _run_job.
-      2. _promote_delayed_loop    — re-publishes delayed retries back to Kafka.
-      3. _metrics_loop            — emits queue/in-flight gauges to CloudWatch.
+    Concurrent tasks that make up the worker:
+      1. dispatcher.run()       — consumes `job.submitted`, spawns _run_job.
+      2. audit.run()            — consumes lifecycle events, writes audit rows.
+      3. sse.run()              — consumes lifecycle events, bridges to Redis pub/sub.
+      4. _promote_delayed_loop  — re-publishes delayed retries via the outbox.
+      5. _outbox_relay_loop     — publishes outbox rows to Kafka.
+      6. _metrics_loop          — emits queue/in-flight gauges to CloudWatch.
 
-    Cancel signal: cancel all three, wait for in-flight jobs to finish, stop consumer.
+    Cancel signal: cancel all, wait for in-flight jobs, stop all consumers.
+    Independent consumer groups — failure in one doesn't affect the others.
     """
-    consumer = JobDispatcherConsumer(session_factory, redis)
-    try:
-        await consumer.start()
-    except Exception as exc:
-        logger.error(
-            "dispatcher consumer failed to start — worker disabled",
-            extra={"error": str(exc)},
-        )
+    dispatcher = JobDispatcherConsumer(session_factory, redis)
+    audit = AuditConsumer(session_factory)
+    sse = SseConsumer(redis)
+    consumers: list[BaseKafkaConsumer] = [dispatcher, audit, sse]
+
+    started: list[BaseKafkaConsumer] = []
+    for c in consumers:
+        try:
+            await c.start()
+            started.append(c)
+        except Exception as exc:
+            logger.error(
+                "kafka consumer failed to start",
+                extra={"group_id": c.group_id, "error": str(exc)},
+            )
+
+    if dispatcher not in started:
+        logger.error("dispatcher consumer not running — worker disabled")
+        for c in started:
+            await c.stop()
         return
 
-    logger.info("worker loop started (kafka dispatcher)")
-    tasks = [
-        asyncio.create_task(consumer.run()),
-        asyncio.create_task(_promote_delayed_loop(session_factory, redis)),
-        asyncio.create_task(_outbox_relay_loop(session_factory)),
-        asyncio.create_task(_metrics_loop(redis, consumer)),
-    ]
+    logger.info(
+        "worker loop started", extra={"consumers": [c.group_id for c in started]}
+    )
+    tasks = [asyncio.create_task(c.run()) for c in started]
+    tasks.extend(
+        [
+            asyncio.create_task(_promote_delayed_loop(session_factory, redis)),
+            asyncio.create_task(_outbox_relay_loop(session_factory)),
+            asyncio.create_task(_metrics_loop(redis, dispatcher)),
+        ]
+    )
 
     try:
         await asyncio.gather(*tasks)
@@ -497,8 +525,9 @@ async def worker_loop(
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-        if consumer.in_flight:
-            await asyncio.gather(*consumer.in_flight, return_exceptions=True)
+        if dispatcher.in_flight:
+            await asyncio.gather(*dispatcher.in_flight, return_exceptions=True)
         raise
     finally:
-        await consumer.stop()
+        for c in started:
+            await c.stop()
