@@ -27,6 +27,7 @@ dependencies = [
     "opentelemetry-instrumentation-sqlalchemy>=0.45b0",
     "opentelemetry-instrumentation-redis>=0.45b0",
     "aiokafka>=0.11.0",
+    "jsonschema>=4.21.0",
 ]
 
 [project.optional-dependencies]
@@ -40,8 +41,10 @@ dev = [
     "sqlalchemy[mypy]>=2.0.0",
 
     "types-python-jose>=3.3.4",
+    "types-jsonschema>=4.21.0",
     "aiosqlite>=0.20.0",
     "locust>=2.29.0",
+    "testcontainers[postgres]>=4.7.0",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -49,8 +52,11 @@ packages = ["backend/app"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-testpaths = ["backend/tests"]
+testpaths = ["backend/tests/unit", "backend/tests/api"]
 addopts = "--cov=backend/app --cov-report=term-missing --cov-fail-under=70"
+# Integration tests live in backend/tests/integration/. They require Docker and
+# are opt-in: `pytest backend/tests/integration/` to run them locally or in a
+# dedicated CI job.
 
 [tool.mypy]
 strict = true

@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "job.completed/v1",
+  "title": "JobCompleted",
+  "type": "object",
+  "required": ["event", "job_id", "user_id", "job_type"],
+  "properties": {
+    "event": { "const": "job.completed" },
+    "job_id": { "type": "string", "format": "uuid" },
+    "user_id": { "type": "string", "format": "uuid" },
+    "job_type": { "type": "string", "minLength": 1 },
+    "result": { "type": ["object", "null"] },
+    "retry_count": { "type": "integer", "minimum": 0 }
+  },
+  "additionalProperties": true
+}

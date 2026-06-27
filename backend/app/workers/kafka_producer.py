@@ -17,6 +17,8 @@ from typing import Any
 from aiokafka import AIOKafkaProducer  # type: ignore[import-untyped]
 from app.config import get_settings
 from app.core.logging import get_logger
+from app.workers.schema_registry import SchemaValidationError
+from app.workers.schema_registry import validate as validate_schema
 
 logger = get_logger(__name__)
 
@@ -58,7 +60,15 @@ def _get_producer() -> AIOKafkaProducer:
 async def _publish(topic: str, key: str, payload: dict[str, Any]) -> None:
     """Send a single message; log and swallow errors so Kafka issues don't crash the API."""
     try:
+        validate_schema(topic, payload)
         await _get_producer().send_and_wait(topic, value=payload, key=key)
+    except SchemaValidationError as exc:
+        # Schema violations are *our* bug, not the broker's — log loudly and drop.
+        # Never send malformed events to consumers.
+        logger.error(
+            "kafka publish skipped — schema invalid",
+            extra={"topic": topic, "key": key, "error": str(exc)},
+        )
     except Exception as exc:
         logger.error(
             "kafka publish failed",
@@ -68,7 +78,10 @@ async def _publish(topic: str, key: str, payload: dict[str, Any]) -> None:
 
 async def publish_raw(topic: str, key: str, payload: dict[str, Any]) -> None:
     """Send a message and propagate errors. Used by the outbox relay so it can
-    leave the row unpublished on failure and retry on the next tick."""
+    leave the row unpublished on failure and retry on the next tick. Schema
+    violations raise SchemaValidationError so the relay marks the row failed
+    rather than republishing forever."""
+    validate_schema(topic, payload)
     await _get_producer().send_and_wait(topic, value=payload, key=key)
 
 

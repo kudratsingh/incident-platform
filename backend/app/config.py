@@ -72,6 +72,10 @@ class Settings(BaseSettings):
     kafka_max_poll_interval_ms: int = 300_000
     kafka_session_timeout_ms: int = 30_000
 
+    # Backpressure — reject new job submissions when the dispatcher's Kafka
+    # consumer group is more than this many messages behind. 0 disables.
+    backpressure_lag_threshold: int = 1000
+
     # Tracing — set to http://localhost:4318 locally (Jaeger), or X-Ray OTLP endpoint in prod
     otlp_endpoint: str | None = None
 

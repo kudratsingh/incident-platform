@@ -51,3 +51,8 @@ class JobError(AppError):
 class StorageError(AppError):
     status_code = 500
     error_code = "storage_error"
+
+
+class BackpressureError(AppError):
+    status_code = 503
+    error_code = "backpressure"
