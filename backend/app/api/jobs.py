@@ -5,6 +5,7 @@ from app.models.enums import UserRole
 from app.models.user import User
 from app.repositories.audit import AuditRepository
 from app.repositories.job import JobRepository
+from app.repositories.outbox import OutboxRepository
 from app.schemas.common import PaginatedResponse
 from app.schemas.job import JobCreate, JobListParams, JobResponse
 from app.services.job import JobService
@@ -18,7 +19,9 @@ router = APIRouter(prefix="/jobs", tags=["jobs"])
 
 
 def _job_service(db: AsyncSession, redis: Redis) -> JobService:
-    return JobService(JobRepository(db), AuditRepository(db), redis)
+    return JobService(
+        JobRepository(db), AuditRepository(db), OutboxRepository(db), redis
+    )
 
 
 @router.post("", response_model=JobResponse, status_code=201)

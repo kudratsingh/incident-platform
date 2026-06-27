@@ -5,6 +5,7 @@ from app.models.enums import UserRole
 from app.models.user import User
 from app.repositories.audit import AuditRepository
 from app.repositories.job import JobRepository
+from app.repositories.outbox import OutboxRepository
 from app.repositories.user import UserRepository
 from app.schemas.common import PaginatedResponse
 from app.schemas.job import AdminJobListParams, JobResponse
@@ -22,7 +23,9 @@ _require_admin = require_role(UserRole.ADMIN)
 
 
 def _job_service(db: AsyncSession, redis: Redis) -> JobService:
-    return JobService(JobRepository(db), AuditRepository(db), redis)
+    return JobService(
+        JobRepository(db), AuditRepository(db), OutboxRepository(db), redis
+    )
 
 
 @router.get("/jobs", response_model=PaginatedResponse[JobResponse])

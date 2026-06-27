@@ -60,6 +60,27 @@ async def promote_delayed(redis: Redis) -> int:
     return len(ready)
 
 
+async def pop_ready_delayed(redis: Redis) -> list[str]:
+    """Atomically remove and return all delayed jobs whose run_at has passed.
+
+    Unlike `promote_delayed`, this does NOT re-enqueue them — the caller decides
+    where they go next. Used by the Kafka dispatcher to re-publish ready retries
+    to the `job.submitted` topic instead of the Redis active queue.
+    """
+    now = time.time()
+    ready: list[tuple[str, float]] = await redis.zrangebyscore(
+        DELAYED_KEY, "-inf", now, withscores=True
+    )
+    if not ready:
+        return []
+
+    pipe = redis.pipeline()
+    for job_id, _score in ready:
+        pipe.zrem(DELAYED_KEY, job_id)
+    await pipe.execute()
+    return [job_id for job_id, _score in ready]
+
+
 async def queue_length(redis: Redis) -> int:
     return int(await redis.zcard(QUEUE_KEY))
 

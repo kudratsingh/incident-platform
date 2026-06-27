@@ -66,6 +66,12 @@ async def _publish(topic: str, key: str, payload: dict[str, Any]) -> None:
         )
 
 
+async def publish_raw(topic: str, key: str, payload: dict[str, Any]) -> None:
+    """Send a message and propagate errors. Used by the outbox relay so it can
+    leave the row unpublished on failure and retry on the next tick."""
+    await _get_producer().send_and_wait(topic, value=payload, key=key)
+
+
 async def publish_job_submitted(
     job_id: uuid.UUID,
     user_id: uuid.UUID,

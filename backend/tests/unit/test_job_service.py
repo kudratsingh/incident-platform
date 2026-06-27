@@ -32,12 +32,13 @@ def _make_job(**kwargs: object) -> Job:
     return job  # type: ignore[return-value]
 
 
-def _make_service() -> tuple[JobService, AsyncMock, AsyncMock]:
+def _make_service() -> tuple[JobService, AsyncMock, AsyncMock, AsyncMock]:
     job_repo = AsyncMock()
     audit_repo = AsyncMock()
+    outbox_repo = AsyncMock()
     redis = AsyncMock()
-    svc = JobService(job_repo, audit_repo, redis)
-    return svc, job_repo, audit_repo
+    svc = JobService(job_repo, audit_repo, outbox_repo, redis)
+    return svc, job_repo, audit_repo, outbox_repo
 
 
 # ---------------------------------------------------------------------------
@@ -46,7 +47,7 @@ def _make_service() -> tuple[JobService, AsyncMock, AsyncMock]:
 
 
 async def test_create_job_success() -> None:
-    svc, job_repo, audit_repo = _make_service()
+    svc, job_repo, audit_repo, _ = _make_service()
     job_repo.get_by_idempotency_key.return_value = None
     new_job = _make_job()
     job_repo.create.return_value = new_job
@@ -61,7 +62,7 @@ async def test_create_job_success() -> None:
 
 
 async def test_create_job_idempotency_returns_existing() -> None:
-    svc, job_repo, _ = _make_service()
+    svc, job_repo, _, _ = _make_service()
     existing = _make_job(idempotency_key="key-123")
     job_repo.get_by_idempotency_key.return_value = existing
 
@@ -81,7 +82,7 @@ async def test_create_job_idempotency_returns_existing() -> None:
 
 
 async def test_get_job_owner_can_access() -> None:
-    svc, job_repo, _ = _make_service()
+    svc, job_repo, _, _ = _make_service()
     owner_id = uuid.uuid4()
     job = _make_job(user_id=owner_id)
     job_repo.get_by_id.return_value = job
@@ -91,7 +92,7 @@ async def test_get_job_owner_can_access() -> None:
 
 
 async def test_get_job_non_owner_raises() -> None:
-    svc, job_repo, _ = _make_service()
+    svc, job_repo, _, _ = _make_service()
     job = _make_job(user_id=uuid.uuid4())
     job_repo.get_by_id.return_value = job
 
@@ -100,7 +101,7 @@ async def test_get_job_non_owner_raises() -> None:
 
 
 async def test_get_job_admin_can_access_any() -> None:
-    svc, job_repo, _ = _make_service()
+    svc, job_repo, _, _ = _make_service()
     job = _make_job(user_id=uuid.uuid4())
     job_repo.get_by_id.return_value = job
 
@@ -109,7 +110,7 @@ async def test_get_job_admin_can_access_any() -> None:
 
 
 async def test_get_job_not_found_raises() -> None:
-    svc, job_repo, _ = _make_service()
+    svc, job_repo, _, _ = _make_service()
     job_repo.get_by_id.return_value = None
 
     with pytest.raises(NotFoundError):
@@ -122,7 +123,7 @@ async def test_get_job_not_found_raises() -> None:
 
 
 async def test_replay_failed_job() -> None:
-    svc, job_repo, audit_repo = _make_service()
+    svc, job_repo, audit_repo, _ = _make_service()
     failed_job = _make_job(status=JobStatus.FAILED)
     replayed_job = _make_job(status=JobStatus.PENDING, id=failed_job.id)
     job_repo.get_by_id.return_value = failed_job
@@ -136,7 +137,7 @@ async def test_replay_failed_job() -> None:
 
 
 async def test_replay_non_failed_job_raises() -> None:
-    svc, job_repo, _ = _make_service()
+    svc, job_repo, _, _ = _make_service()
     running_job = _make_job(status=JobStatus.RUNNING)
     job_repo.get_by_id.return_value = running_job
 
