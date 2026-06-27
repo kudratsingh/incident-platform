@@ -146,7 +146,7 @@ def create_app() -> FastAPI:
 
         try:
             redis = get_redis_client()
-            await redis.ping()  # type: ignore[misc]
+            await redis.ping()  # type: ignore[misc,unused-ignore]
             checks["redis"] = "ok"
         except Exception:
             checks["redis"] = "error"
