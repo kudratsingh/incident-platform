@@ -10,6 +10,7 @@ the main queue, then calls `pop()` to get the next job to process.
 """
 
 import time
+from typing import cast
 
 from redis.asyncio import Redis
 
@@ -34,7 +35,7 @@ async def pop(redis: Redis) -> str | None:
     if not result:
         return None
     # zpopmax returns list of (member, score) tuples
-    job_id: str = result[0][0]
+    job_id = cast(str, result[0][0])
     return job_id
 
 
@@ -45,9 +46,8 @@ async def promote_delayed(redis: Redis) -> int:
     """
     now = time.time()
     # Fetch all jobs with score <= now (i.e. ready to run)
-    ready: list[tuple[str, float]] = await redis.zrangebyscore(
-        DELAYED_KEY, "-inf", now, withscores=True
-    )
+    raw = await redis.zrangebyscore(DELAYED_KEY, "-inf", now, withscores=True)
+    ready = cast(list[tuple[str, float]], raw)
     if not ready:
         return 0
 
@@ -58,6 +58,26 @@ async def promote_delayed(redis: Redis) -> int:
         pipe.zadd(QUEUE_KEY, {job_id: 0})
     await pipe.execute()
     return len(ready)
+
+
+async def pop_ready_delayed(redis: Redis) -> list[str]:
+    """Atomically remove and return all delayed jobs whose run_at has passed.
+
+    Unlike `promote_delayed`, this does NOT re-enqueue them — the caller decides
+    where they go next. Used by the Kafka dispatcher to re-publish ready retries
+    to the `job.submitted` topic instead of the Redis active queue.
+    """
+    now = time.time()
+    raw = await redis.zrangebyscore(DELAYED_KEY, "-inf", now, withscores=True)
+    ready = cast(list[tuple[str, float]], raw)
+    if not ready:
+        return []
+
+    pipe = redis.pipeline()
+    for job_id, _score in ready:
+        pipe.zrem(DELAYED_KEY, job_id)
+    await pipe.execute()
+    return [job_id for job_id, _score in ready]
 
 
 async def queue_length(redis: Redis) -> int:

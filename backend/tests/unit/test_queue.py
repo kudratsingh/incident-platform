@@ -63,3 +63,22 @@ async def test_promote_delayed_does_nothing_when_empty() -> None:
     redis.zrangebyscore.return_value = []
     promoted = await queue.promote_delayed(redis)
     assert promoted == 0
+
+
+async def test_pop_ready_delayed_returns_and_removes_ready_ids() -> None:
+    redis = _mock_redis()
+    redis.zrangebyscore.return_value = [("job-x", 100.0), ("job-y", 200.0)]
+    pipe = redis.pipeline.return_value
+
+    ready = await queue.pop_ready_delayed(redis)
+
+    assert ready == ["job-x", "job-y"]
+    # One zrem per ready id; pipeline.execute awaited once.
+    assert pipe.zrem.call_count == 2
+    pipe.execute.assert_awaited_once()
+
+
+async def test_pop_ready_delayed_returns_empty_when_none_ready() -> None:
+    redis = _mock_redis()
+    redis.zrangebyscore.return_value = []
+    assert await queue.pop_ready_delayed(redis) == []

@@ -1,6 +1,7 @@
 import uuid
 from typing import Any
 
+from app.config import get_settings
 from app.core.exceptions import AuthorizationError, JobError, NotFoundError
 from app.core.logging import get_logger, request_id_var, trace_id_var
 from app.core.tracing import inject_context
@@ -8,6 +9,7 @@ from app.models.enums import JobStatus, UserRole
 from app.models.job import Job
 from app.repositories.audit import AuditRepository
 from app.repositories.job import JobRepository
+from app.repositories.outbox import OutboxRepository
 from app.workers import queue
 from redis.asyncio import Redis
 
@@ -16,10 +18,15 @@ logger = get_logger(__name__)
 
 class JobService:
     def __init__(
-        self, job_repo: JobRepository, audit_repo: AuditRepository, redis: Redis
+        self,
+        job_repo: JobRepository,
+        audit_repo: AuditRepository,
+        outbox_repo: OutboxRepository,
+        redis: Redis,
     ) -> None:
         self.job_repo = job_repo
         self.audit_repo = audit_repo
+        self.outbox_repo = outbox_repo
         self.redis = redis
 
     async def create_job(
@@ -66,6 +73,23 @@ class JobService:
             resource_id=str(job.id),
             request_id=request_id_var.get("") or None,
             extra_data={"type": job_type, "priority": priority},
+        )
+        # Transactional outbox: write the Kafka event to a DB table in the same
+        # transaction as the job row. A background relay publishes it later.
+        # Guarantees at-least-once delivery even if the API crashes here.
+        settings = get_settings()
+        await self.outbox_repo.add(
+            topic=settings.kafka_topic_job_submitted,
+            key=str(user_id),
+            payload={
+                "event": "job.submitted",
+                "job_id": str(job.id),
+                "user_id": str(user_id),
+                "job_type": job_type,
+                "payload": enriched_payload,
+                "priority": priority,
+                "trace_id": job.trace_id,
+            },
         )
         await queue.push(self.redis, str(job.id), priority=priority)
         logger.info(
@@ -139,6 +163,20 @@ class JobService:
             resource_type="job",
             resource_id=str(job_id),
             request_id=request_id_var.get("") or None,
+        )
+        settings = get_settings()
+        await self.outbox_repo.add(
+            topic=settings.kafka_topic_job_submitted,
+            key=str(job.user_id),
+            payload={
+                "event": "job.submitted",
+                "job_id": str(job_id),
+                "user_id": str(job.user_id),
+                "job_type": job.type,
+                "payload": dict(job.payload or {}),
+                "priority": job.priority,
+                "trace_id": job.trace_id,
+            },
         )
         await queue.push(self.redis, str(job_id), priority=0)
         logger.info(

@@ -1,5 +1,6 @@
 """Unit tests for the worker dispatcher — DB and Redis fully mocked."""
 
+import asyncio
 import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -126,3 +127,60 @@ async def test_run_job_skips_unknown_job() -> None:
         await dispatcher._run_job(str(uuid.uuid4()), factory, redis)
 
     job_repo.update_status.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# JobDispatcherConsumer
+# ---------------------------------------------------------------------------
+
+
+async def test_dispatcher_consumer_spawns_run_job_for_valid_message() -> None:
+    factory = MagicMock()
+    redis = AsyncMock()
+    consumer = dispatcher.JobDispatcherConsumer(factory, redis)
+    job_id_str = str(uuid.uuid4())
+
+    with patch("app.workers.dispatcher._run_job", new=AsyncMock()) as mock_run:
+        await consumer.handle_message(
+            topic="job.submitted",
+            key="user-1",
+            value={"job_id": job_id_str, "user_id": "user-1", "job_type": "csv_upload"},
+        )
+        # Let the spawned background task run to completion
+        await asyncio.gather(*consumer.in_flight, return_exceptions=True)
+
+    mock_run.assert_awaited_once_with(job_id_str, factory, redis)
+
+
+async def test_dispatcher_consumer_skips_malformed_message() -> None:
+    factory = MagicMock()
+    redis = AsyncMock()
+    consumer = dispatcher.JobDispatcherConsumer(factory, redis)
+
+    with patch("app.workers.dispatcher._run_job", new=AsyncMock()) as mock_run:
+        # Missing job_id — must return without raising and without dispatching.
+        await consumer.handle_message(
+            topic="job.submitted", key=None, value={"user_id": "x"}
+        )
+
+    mock_run.assert_not_awaited()
+    assert not consumer.in_flight
+
+
+async def test_dispatcher_consumer_semaphore_releases_on_run_failure() -> None:
+    """If _run_job raises, the semaphore must still release so we don't deadlock."""
+    factory = MagicMock()
+    redis = AsyncMock()
+    consumer = dispatcher.JobDispatcherConsumer(factory, redis, max_concurrent=1)
+
+    with patch(
+        "app.workers.dispatcher._run_job",
+        new=AsyncMock(side_effect=RuntimeError("boom")),
+    ):
+        await consumer.handle_message(
+            topic="job.submitted", key="u", value={"job_id": str(uuid.uuid4())}
+        )
+        await asyncio.gather(*consumer.in_flight, return_exceptions=True)
+
+    # Semaphore should be back at 1 — i.e. a fresh acquire returns immediately.
+    assert consumer.semaphore.locked() is False

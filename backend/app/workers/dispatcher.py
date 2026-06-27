@@ -31,7 +31,16 @@ from app.core.tracing import extract_context, get_tracer
 from app.models.enums import JobStatus, JobType
 from app.repositories.audit import AuditRepository
 from app.repositories.job import JobRepository
-from app.workers import async_tasks, cpu_processors, progress, queue, thread_adapters
+from app.repositories.outbox import OutboxRepository
+from app.workers import (
+    async_tasks,
+    cpu_processors,
+    kafka_producer,
+    progress,
+    queue,
+    thread_adapters,
+)
+from app.workers.kafka_consumer import BaseKafkaConsumer
 from opentelemetry import trace
 from opentelemetry.trace import SpanKind
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -84,12 +93,21 @@ async def _run_job(
             trace_id_var.set(job.trace_id or job_id_str)
             payload = dict(job.payload or {})
             job_type = job.type
+            user_id = job.user_id
             retry_count = job.retry_count
             max_retries = job.max_retries
 
             await repo.update_status(job_id, JobStatus.RUNNING)
 
     await progress.publish(redis, job_id_str, "running", 0, "Job started")
+    await kafka_producer.publish_job_progress(
+        job_id=job_id,
+        user_id=user_id,
+        status="running",
+        percent=0,
+        message="Job started",
+        retry_count=retry_count,
+    )
     logger.info("job started", extra={"type": job_type, "retry_count": retry_count})
 
     # Restore the OTel trace context that was injected at job creation time so
@@ -114,6 +132,14 @@ async def _run_job(
 
     async def _publish(pct: int, message: str) -> None:
         await progress.publish(redis, job_id_str, "running", pct, message, retry_count)
+        await kafka_producer.publish_job_progress(
+            job_id=job_id,
+            user_id=user_id,
+            status="running",
+            percent=pct,
+            message=message,
+            retry_count=retry_count,
+        )
 
     with tracer.start_as_current_span(
         f"job.execute/{job_type}",
@@ -148,6 +174,19 @@ async def _run_job(
                             job_id, JobStatus.PENDING,
                             extra={"retry_count": new_retry_count, "error_message": str(exc)},
                         )
+                        await OutboxRepository(session).add(
+                            topic=settings.kafka_topic_job_failed,
+                            key=str(user_id),
+                            payload={
+                                "event": "job.failed",
+                                "job_id": job_id_str,
+                                "user_id": str(user_id),
+                                "job_type": job_type,
+                                "error": str(exc),
+                                "retry_count": new_retry_count,
+                                "dead_lettered": False,
+                            },
+                        )
                 await queue.push_delayed(redis, job_id_str, delay)
                 await progress.publish(
                     redis, job_id_str, "retrying",
@@ -169,6 +208,19 @@ async def _run_job(
                             "job.dead_letter",
                             job_id=job_id,
                             extra_data={"error": str(exc), "retry_count": new_retry_count},
+                        )
+                        await OutboxRepository(session).add(
+                            topic=settings.kafka_topic_job_dlq,
+                            key=str(user_id),
+                            payload={
+                                "event": "job.failed",
+                                "job_id": job_id_str,
+                                "user_id": str(user_id),
+                                "job_type": job_type,
+                                "error": str(exc),
+                                "retry_count": new_retry_count,
+                                "dead_lettered": True,
+                            },
                         )
                 await progress.publish(
                     redis, job_id_str, "dead_letter",
@@ -197,6 +249,18 @@ async def _run_job(
                     job_id=job_id,
                     extra_data={"type": job_type, "retry_count": retry_count},
                 )
+                await OutboxRepository(session).add(
+                    topic=settings.kafka_topic_job_completed,
+                    key=str(user_id),
+                    payload={
+                        "event": "job.completed",
+                        "job_id": job_id_str,
+                        "user_id": str(user_id),
+                        "job_type": job_type,
+                        "result": result,
+                        "retry_count": retry_count,
+                    },
+                )
 
         span.set_status(trace.StatusCode.OK)
 
@@ -206,52 +270,235 @@ async def _run_job(
     job_id_var.reset(token)
 
 
+class JobDispatcherConsumer(BaseKafkaConsumer):
+    """
+    Consumes `job.submitted` and dispatches each job to `_run_job`.
+
+    Concurrency: an asyncio.Semaphore bounds in-flight jobs to MAX_CONCURRENT_JOBS.
+    When the worker is saturated, `handle_message` blocks on acquire, naturally
+    creating backpressure against the partition (the consumer stops polling until
+    a slot opens — within max_poll_interval_ms, otherwise it's kicked from the group).
+
+    Offset semantics: the base class commits offsets after `handle_message` returns.
+    We spawn `_run_job` as a background task and return immediately, so the offset
+    advances at dispatch time rather than at job completion. The trade-off:
+      * Pro: high throughput, the consumer is never blocked by a long job.
+      * Con: a worker crash between commit-and-completion leaves the job in DB
+        as RUNNING. Recovery is left to the outbox pattern in a follow-up.
+    """
+
+    def __init__(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        redis: Any,
+        max_concurrent: int = MAX_CONCURRENT_JOBS,
+    ) -> None:
+        settings = get_settings()
+        super().__init__(
+            topics=[settings.kafka_topic_job_submitted],
+            group_id=settings.kafka_consumer_group_worker,
+        )
+        self.session_factory = session_factory
+        self.redis = redis
+        self.semaphore = asyncio.Semaphore(max_concurrent)
+        self.in_flight: set[asyncio.Task[None]] = set()
+
+    async def handle_message(
+        self, topic: str, key: str | None, value: dict[str, Any]
+    ) -> None:
+        job_id_str = value.get("job_id") if isinstance(value, dict) else None
+        if not job_id_str:
+            logger.warning(
+                "skipping malformed job.submitted message",
+                extra={"topic": topic, "key": key, "value": value},
+            )
+            return
+
+        # Acquire a slot — blocks (and stops polling) when at capacity.
+        await self.semaphore.acquire()
+        task = asyncio.create_task(self._run_and_release(job_id_str))
+        self.in_flight.add(task)
+        task.add_done_callback(self.in_flight.discard)
+
+    async def _run_and_release(self, job_id_str: str) -> None:
+        try:
+            await _run_job(job_id_str, self.session_factory, self.redis)
+        finally:
+            self.semaphore.release()
+
+
+async def _promote_delayed_loop(
+    session_factory: async_sessionmaker[AsyncSession],
+    redis: Any,
+) -> None:
+    """
+    Periodically re-queue delayed retry jobs once their backoff has elapsed.
+
+    The re-publish goes through the outbox (not direct Kafka) so the retry
+    survives a worker crash between Redis pop and Kafka publish.
+    """
+    settings = get_settings()
+    while True:
+        try:
+            ready_ids = await queue.pop_ready_delayed(redis)
+            for job_id_str in ready_ids:
+                try:
+                    job_id = uuid.UUID(job_id_str)
+                except ValueError:
+                    logger.warning("invalid delayed job id", extra={"id": job_id_str})
+                    continue
+
+                async with session_factory() as session:
+                    async with session.begin():
+                        job = await JobRepository(session).get_by_id(job_id)
+                        if job is None:
+                            logger.warning(
+                                "delayed job not found, dropping",
+                                extra={"job_id": job_id_str},
+                            )
+                            continue
+                        await OutboxRepository(session).add(
+                            topic=settings.kafka_topic_job_submitted,
+                            key=str(job.user_id),
+                            payload={
+                                "event": "job.submitted",
+                                "job_id": str(job.id),
+                                "user_id": str(job.user_id),
+                                "job_type": job.type,
+                                "payload": dict(job.payload or {}),
+                                "priority": job.priority,
+                                "trace_id": job.trace_id,
+                            },
+                        )
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            logger.error("promote loop error", extra={"error": str(exc)})
+
+        await asyncio.sleep(POLL_INTERVAL)
+
+
+OUTBOX_RELAY_INTERVAL = 1.0  # seconds between outbox polls
+OUTBOX_RELAY_BATCH = 100
+
+
+async def _outbox_relay_loop(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """
+    Transactional outbox relay.
+
+    Each tick:
+      1. Read up to OUTBOX_RELAY_BATCH unpublished rows in one transaction.
+      2. For each row, attempt to publish to Kafka.
+      3. Mark successfully-published rows in a second transaction.
+      4. Rows whose publish failed remain unpublished and are retried next tick.
+    """
+    while True:
+        try:
+            async with session_factory() as session:
+                async with session.begin():
+                    repo = OutboxRepository(session)
+                    events = await repo.fetch_unpublished(limit=OUTBOX_RELAY_BATCH)
+
+            if not events:
+                await asyncio.sleep(OUTBOX_RELAY_INTERVAL)
+                continue
+
+            published_ids: list[uuid.UUID] = []
+            failed_ids: list[uuid.UUID] = []
+            for event in events:
+                try:
+                    await kafka_producer.publish_raw(
+                        topic=event.topic, key=event.key, payload=event.payload
+                    )
+                    published_ids.append(event.id)
+                except Exception as exc:
+                    failed_ids.append(event.id)
+                    logger.warning(
+                        "outbox publish failed, will retry",
+                        extra={
+                            "outbox_id": str(event.id),
+                            "topic": event.topic,
+                            "error": str(exc),
+                        },
+                    )
+
+            async with session_factory() as session:
+                async with session.begin():
+                    repo = OutboxRepository(session)
+                    await repo.mark_published(published_ids)
+                    await repo.increment_attempts(failed_ids)
+
+            if published_ids:
+                logger.info(
+                    "outbox batch published",
+                    extra={"published": len(published_ids), "failed": len(failed_ids)},
+                )
+
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            logger.error("outbox relay error", extra={"error": str(exc)})
+
+        await asyncio.sleep(OUTBOX_RELAY_INTERVAL)
+
+
+async def _metrics_loop(redis: Any, consumer: JobDispatcherConsumer) -> None:
+    """Emit queue/in-flight gauges every ~60s."""
+    while True:
+        try:
+            await asyncio.sleep(60.0)
+            delayed = await queue.delayed_length(redis)
+            await metrics.emit_gauge("QueueDepth", float(delayed))
+            await metrics.emit_gauge("InFlightJobs", float(len(consumer.in_flight)))
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            logger.error("metrics loop error", extra={"error": str(exc)})
+
+
 async def worker_loop(
     session_factory: async_sessionmaker[AsyncSession],
     redis: Any,
 ) -> None:
     """
-    Main worker loop — runs forever as a background asyncio task.
+    Start the Kafka dispatcher consumer and the supporting background loops.
 
-    Each iteration:
-      1. Promote delayed jobs that are ready.
-      2. Pop one job from the queue.
-      3. Spawn an asyncio task to process it (non-blocking).
-      4. Sleep briefly before next poll.
+    Three concurrent tasks make up the worker:
+      1. consumer.run()           — consumes `job.submitted`, spawns _run_job.
+      2. _promote_delayed_loop    — re-publishes delayed retries back to Kafka.
+      3. _metrics_loop            — emits queue/in-flight gauges to CloudWatch.
 
-    We track in-flight tasks to respect MAX_CONCURRENT_JOBS.
+    Cancel signal: cancel all three, wait for in-flight jobs to finish, stop consumer.
     """
-    logger.info("worker loop started")
-    in_flight: set[asyncio.Task[None]] = set()
-    _metric_tick = 0
-    _metric_interval = 120  # emit queue metrics every 120 ticks (~60 s at 0.5 s/tick)
+    consumer = JobDispatcherConsumer(session_factory, redis)
+    try:
+        await consumer.start()
+    except Exception as exc:
+        logger.error(
+            "dispatcher consumer failed to start — worker disabled",
+            extra={"error": str(exc)},
+        )
+        return
 
-    while True:
-        try:
-            await queue.promote_delayed(redis)
+    logger.info("worker loop started (kafka dispatcher)")
+    tasks = [
+        asyncio.create_task(consumer.run()),
+        asyncio.create_task(_promote_delayed_loop(session_factory, redis)),
+        asyncio.create_task(_outbox_relay_loop(session_factory)),
+        asyncio.create_task(_metrics_loop(redis, consumer)),
+    ]
 
-            if len(in_flight) < MAX_CONCURRENT_JOBS:
-                job_id_str = await queue.pop(redis)
-                if job_id_str:
-                    task = asyncio.create_task(
-                        _run_job(job_id_str, session_factory, redis)
-                    )
-                    in_flight.add(task)
-                    task.add_done_callback(in_flight.discard)
-
-            _metric_tick += 1
-            if _metric_tick >= _metric_interval:
-                _metric_tick = 0
-                depth = await queue.queue_length(redis)
-                await metrics.emit_gauge("QueueDepth", float(depth))
-                await metrics.emit_gauge("InFlightJobs", float(len(in_flight)))
-
-        except asyncio.CancelledError:
-            logger.info("worker loop cancelled, waiting for in-flight jobs")
-            if in_flight:
-                await asyncio.gather(*in_flight, return_exceptions=True)
-            break
-        except Exception as exc:
-            logger.error("worker loop error", extra={"error": str(exc)})
-
-        await asyncio.sleep(POLL_INTERVAL)
+    try:
+        await asyncio.gather(*tasks)
+    except asyncio.CancelledError:
+        logger.info("worker loop cancelled, waiting for in-flight jobs")
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        if consumer.in_flight:
+            await asyncio.gather(*consumer.in_flight, return_exceptions=True)
+        raise
+    finally:
+        await consumer.stop()

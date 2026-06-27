@@ -31,6 +31,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     from app.dependencies import _engine, get_session_factory
     from app.models.base import Base
     from app.workers.dispatcher import worker_loop
+    from app.workers.kafka_producer import start_producer, stop_producer
 
     # In production, run `alembic upgrade head` before starting the app.
     # This create_all is kept only as a dev convenience for fresh environments.
@@ -38,6 +39,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         async with _engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
         logger.info("database tables ready (dev: create_all)")
+
+    # Kafka producer — if broker is unreachable we log and continue so the API
+    # still boots; publish_* calls will then no-op via the producer's internal
+    # error handling.
+    try:
+        await start_producer()
+    except Exception as exc:
+        logger.error("kafka producer failed to start", extra={"error": str(exc)})
 
     redis = get_redis_client()
     session_factory = get_session_factory()
@@ -50,6 +59,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await worker_task
     except asyncio.CancelledError:
         pass
+
+    try:
+        await stop_producer()
+    except Exception as exc:
+        logger.error("kafka producer failed to stop", extra={"error": str(exc)})
 
     await close_redis_pool()
     logger.info("shutdown")
@@ -132,7 +146,7 @@ def create_app() -> FastAPI:
 
         try:
             redis = get_redis_client()
-            await redis.ping()  # type: ignore[misc]
+            await redis.ping()  # type: ignore[misc,unused-ignore]
             checks["redis"] = "ok"
         except Exception:
             checks["redis"] = "error"
