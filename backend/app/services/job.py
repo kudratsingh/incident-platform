@@ -151,10 +151,14 @@ class JobService:
         if job.status not in (JobStatus.FAILED, JobStatus.DEAD_LETTER):
             raise JobError(f"Only failed/dead_letter jobs can be replayed, got: {job.status}")
 
+        # Reset retry_count so a DLQ replay actually gets fresh retries.
+        # Without this, a job at retry_count==max_retries would dead-letter
+        # again on the first failure of its replayed run.
+        previous_retry_count = job.retry_count
         updated = await self.job_repo.update_status(
             job_id,
             JobStatus.PENDING,
-            extra={"retry_count": job.retry_count, "error_message": None, "result": None},
+            extra={"retry_count": 0, "error_message": None, "result": None},
         )
         await self.audit_repo.log(
             "job.replayed",
@@ -163,6 +167,10 @@ class JobService:
             resource_type="job",
             resource_id=str(job_id),
             request_id=request_id_var.get("") or None,
+            extra_data={
+                "previous_status": job.status,
+                "previous_retry_count": previous_retry_count,
+            },
         )
         settings = get_settings()
         await self.outbox_repo.add(

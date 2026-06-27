@@ -136,6 +136,31 @@ async def test_replay_failed_job() -> None:
     assert result is replayed_job
 
 
+async def test_replay_resets_retry_count_and_error() -> None:
+    """A DLQ'd job at max retries must get a clean retry budget on replay,
+    or the next failure dead-letters it again immediately."""
+    svc, job_repo, audit_repo, _ = _make_service()
+    dead_job = _make_job(
+        status=JobStatus.DEAD_LETTER,
+        retry_count=3,
+        max_retries=3,
+        error_message="last attempt boom",
+    )
+    job_repo.get_by_id.return_value = dead_job
+    job_repo.update_status.return_value = dead_job
+
+    await svc.replay_job(dead_job.id, uuid.uuid4())
+
+    extra = job_repo.update_status.await_args.kwargs["extra"]
+    assert extra["retry_count"] == 0
+    assert extra["error_message"] is None
+    assert extra["result"] is None
+
+    audit_extra = audit_repo.log.await_args.kwargs["extra_data"]
+    assert audit_extra["previous_retry_count"] == 3
+    assert audit_extra["previous_status"] == JobStatus.DEAD_LETTER
+
+
 async def test_replay_non_failed_job_raises() -> None:
     svc, job_repo, _, _ = _make_service()
     running_job = _make_job(status=JobStatus.RUNNING)
