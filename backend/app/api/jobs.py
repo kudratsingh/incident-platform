@@ -5,6 +5,7 @@ from app.models.enums import UserRole
 from app.models.user import User
 from app.repositories.audit import AuditRepository
 from app.repositories.job import JobRepository
+from app.repositories.job_dependency import JobDependencyRepository
 from app.repositories.outbox import OutboxRepository
 from app.schemas.common import PaginatedResponse
 from app.schemas.job import JobCreate, JobListParams, JobResponse
@@ -21,7 +22,11 @@ router = APIRouter(prefix="/jobs", tags=["jobs"])
 
 def _job_service(db: AsyncSession, redis: Redis) -> JobService:
     return JobService(
-        JobRepository(db), AuditRepository(db), OutboxRepository(db), redis
+        JobRepository(db),
+        AuditRepository(db),
+        OutboxRepository(db),
+        redis,
+        dep_repo=JobDependencyRepository(db),
     )
 
 
@@ -42,6 +47,7 @@ async def create_job(
         payload=body.payload,
         idempotency_key=body.idempotency_key,
         priority=body.priority,
+        dependencies=body.dependencies or None,
     )
     return JobResponse.model_validate(job)
 
