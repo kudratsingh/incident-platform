@@ -4,12 +4,12 @@ import Layout from '../components/Layout'
 import StatusBadge from '../components/StatusBadge'
 import { TableRowSkeleton } from '../components/Skeleton'
 import { useToast } from '../components/Toast'
-import type { AuditLog, Job, SystemStats, User } from '../types'
+import type { AuditLog, Job, Runbook, SLOState, SystemStats, User } from '../types'
 import { adminApi } from '../api/admin'
 import { AppError } from '../api/client'
 import { formatDate, JOB_TYPE_LABELS } from '../utils/format'
 
-type Tab = 'overview' | 'jobs' | 'dlq' | 'users' | 'audit'
+type Tab = 'overview' | 'jobs' | 'dlq' | 'runbooks' | 'users' | 'audit'
 
 function AuditLogModal({ log, onClose }: { log: AuditLog; onClose: () => void }) {
   return (
@@ -73,6 +73,9 @@ export default function AdminPage() {
   const toast = useToast()
   const [tab, setTab] = useState<Tab>('overview')
   const [stats, setStats] = useState<SystemStats | null>(null)
+  const [slos, setSlos] = useState<SLOState[] | null>(null)
+  const [runbooks, setRunbooks] = useState<Runbook[]>([])
+  const [selectedRunbook, setSelectedRunbook] = useState<Runbook | null>(null)
   const [jobs, setJobs] = useState<Job[]>([])
   const [users, setUsers] = useState<User[]>([])
   const [logs, setLogs] = useState<AuditLog[]>([])
@@ -146,8 +149,22 @@ export default function AdminPage() {
   const loadOverview = useCallback(async () => {
     setLoading(true)
     try {
-      const s = await adminApi.systemStats()
+      const [s, sloResp] = await Promise.all([
+        adminApi.systemStats(),
+        adminApi.slos().catch(() => ({ slos: [] })),
+      ])
       setStats(s)
+      setSlos(sloResp.slos)
+    } finally {
+      setLoading(false)
+    }
+  }, [])
+
+  const loadRunbooks = useCallback(async () => {
+    setLoading(true)
+    try {
+      const r = await adminApi.runbooks()
+      setRunbooks(r.items)
     } finally {
       setLoading(false)
     }
@@ -165,9 +182,10 @@ export default function AdminPage() {
     if (tab === 'overview') return  // handled by its own polling effect above
     if (tab === 'jobs') void loadJobs()
     else if (tab === 'dlq') void loadDlq()
+    else if (tab === 'runbooks') void loadRunbooks()
     else if (tab === 'users') void loadUsers()
     else void loadLogs()
-  }, [tab, loadJobs, loadDlq, loadUsers, loadLogs])
+  }, [tab, loadJobs, loadDlq, loadRunbooks, loadUsers, loadLogs])
 
   async function replay(jobId: string) {
     try {
@@ -198,7 +216,7 @@ export default function AdminPage() {
           <p className="text-sm text-gray-500">{total} records</p>
         </div>
         <div className="flex gap-1 bg-gray-800/60 rounded-lg p-1">
-          {(['overview', 'jobs', 'dlq', 'users', 'audit'] as Tab[]).map((t) => (
+          {(['overview', 'jobs', 'dlq', 'runbooks', 'users', 'audit'] as Tab[]).map((t) => (
             <button
               key={t}
               onClick={() => { setTab(t); setPage(1) }}
@@ -259,7 +277,79 @@ export default function AdminPage() {
               latency dominated by Kafka consumer-group lag.
             </p>
           </div>
+
+          {/* SLOs */}
+          {slos && slos.length > 0 && (
+            <div className="mt-6">
+              <h2 className="text-sm font-medium text-gray-300 mb-3">
+                Service Level Objectives
+              </h2>
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
+                {slos.map((s) => (
+                  <SLOCard
+                    key={s.id}
+                    slo={s}
+                    onOpenRunbook={async () => {
+                      try {
+                        const rb = await adminApi.runbook(s.runbook_id)
+                        setSelectedRunbook(rb)
+                      } catch {
+                        /* runbook missing — silently ignore */
+                      }
+                    }}
+                  />
+                ))}
+              </div>
+            </div>
+          )}
         </>
+      )}
+
+      {tab === 'runbooks' && (
+        <div className="bg-gray-900 border border-gray-800 rounded-lg overflow-hidden">
+          {loading ? (
+            <div className="px-6 py-12 text-center text-sm text-gray-500">Loading…</div>
+          ) : runbooks.length === 0 ? (
+            <div className="px-6 py-12 text-center text-sm text-gray-500">
+              No runbooks found.
+            </div>
+          ) : (
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b border-gray-800 text-xs text-gray-500">
+                  <th className="text-left px-4 py-3 font-medium">ID</th>
+                  <th className="text-left px-4 py-3 font-medium">Title</th>
+                  <th className="text-left px-4 py-3 font-medium hidden md:table-cell">
+                    Severity
+                  </th>
+                  <th className="text-left px-4 py-3 font-medium hidden lg:table-cell">
+                    Alarm
+                  </th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-800/60">
+                {runbooks.map((rb) => (
+                  <tr
+                    key={rb.id}
+                    onClick={() => setSelectedRunbook(rb)}
+                    className="hover:bg-gray-800/30 cursor-pointer transition-colors"
+                  >
+                    <td className="px-4 py-3">
+                      <code className="text-xs font-mono text-blue-300">{rb.id}</code>
+                    </td>
+                    <td className="px-4 py-3 text-gray-200">{rb.title}</td>
+                    <td className="px-4 py-3 hidden md:table-cell">
+                      <SeverityPill severity={rb.severity} />
+                    </td>
+                    <td className="px-4 py-3 hidden lg:table-cell text-xs text-gray-500 font-mono">
+                      {rb.alarm ?? '—'}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
       )}
 
       {tab === 'jobs' && (
@@ -543,7 +633,220 @@ export default function AdminPage() {
         </div>
       )}
       {selectedLog && <AuditLogModal log={selectedLog} onClose={() => setSelectedLog(null)} />}
+      {selectedRunbook && (
+        <RunbookModal runbook={selectedRunbook} onClose={() => setSelectedRunbook(null)} />
+      )}
     </Layout>
+  )
+}
+
+function SeverityPill({ severity }: { severity?: string }) {
+  const sev = (severity ?? 'unknown').toLowerCase()
+  const colors: Record<string, string> = {
+    critical: 'bg-red-900/40 text-red-300 border-red-800/40',
+    high: 'bg-orange-500/20 text-orange-300 border-orange-500/30',
+    medium: 'bg-yellow-500/20 text-yellow-300 border-yellow-500/30',
+    low: 'bg-gray-500/20 text-gray-300 border-gray-500/30',
+    unknown: 'bg-gray-500/20 text-gray-300 border-gray-500/30',
+  }
+  return (
+    <span
+      className={`inline-flex px-2 py-0.5 rounded-full text-[10px] uppercase tracking-wide font-medium border ${
+        colors[sev] ?? colors.unknown
+      }`}
+    >
+      {sev}
+    </span>
+  )
+}
+
+function SLOCard({ slo, onOpenRunbook }: { slo: SLOState; onOpenRunbook: () => void }) {
+  const pct = (slo.current * 100).toFixed(slo.current >= 0.999 ? 3 : 2)
+  const targetPct = (slo.target * 100).toFixed(1)
+  const burn = slo.burn_rate
+  const burnLabel =
+    burn === null
+      ? '∞'
+      : burn < 0.01
+        ? '0.0×'
+        : `${burn.toFixed(burn < 10 ? 2 : 1)}×`
+  const budgetPctLabel = `${slo.budget_remaining_pct.toFixed(0)}%`
+  const isHealthy = slo.healthy
+  const isHot = !isHealthy || (burn !== null && burn >= 14.4)
+
+  return (
+    <div
+      className={`bg-gray-900 border rounded-lg p-4 ${
+        isHot ? 'border-red-700/40' : isHealthy ? 'border-green-700/30' : 'border-gray-800'
+      }`}
+    >
+      <div className="flex items-baseline justify-between mb-1">
+        <h3 className="text-sm font-medium text-gray-200">{slo.name}</h3>
+        <span
+          className={`text-xs font-mono ${isHealthy ? 'text-green-400' : 'text-red-400'}`}
+        >
+          {isHealthy ? 'meeting SLO' : 'breaching'}
+        </span>
+      </div>
+      <p className="text-xs text-gray-500 mb-3">{slo.description}</p>
+      <div className="grid grid-cols-3 gap-3 mb-3">
+        <div>
+          <p className="text-[10px] uppercase tracking-wide text-gray-500">Current</p>
+          <p className="text-lg font-mono text-gray-200">{pct}%</p>
+        </div>
+        <div>
+          <p className="text-[10px] uppercase tracking-wide text-gray-500">Target</p>
+          <p className="text-lg font-mono text-gray-400">{targetPct}%</p>
+        </div>
+        <div>
+          <p className="text-[10px] uppercase tracking-wide text-gray-500">Burn rate</p>
+          <p
+            className={`text-lg font-mono ${burn === null || burn >= 14.4 ? 'text-red-400' : burn >= 1 ? 'text-yellow-300' : 'text-gray-300'}`}
+          >
+            {burnLabel}
+          </p>
+        </div>
+      </div>
+      <div className="flex items-center gap-2 mb-2">
+        <p className="text-[10px] text-gray-500 w-20 shrink-0">Budget remaining</p>
+        <div className="flex-1 h-1.5 bg-gray-800 rounded overflow-hidden">
+          <div
+            className={`h-full ${
+              slo.budget_remaining_pct > 50
+                ? 'bg-green-500'
+                : slo.budget_remaining_pct > 0
+                  ? 'bg-yellow-400'
+                  : 'bg-red-500'
+            }`}
+            style={{ width: `${Math.max(0, Math.min(100, slo.budget_remaining_pct))}%` }}
+          />
+        </div>
+        <span className="text-xs font-mono text-gray-400 w-12 text-right">
+          {budgetPctLabel}
+        </span>
+      </div>
+      <div className="flex items-center justify-between mt-3">
+        <p className="text-[11px] text-gray-600 font-mono">
+          {slo.total.toLocaleString()} jobs · {slo.failed.toLocaleString()} failed ·{' '}
+          {slo.window_hours}h
+        </p>
+        <button
+          onClick={onOpenRunbook}
+          className="text-xs text-blue-400 hover:text-blue-300"
+        >
+          Open runbook →
+        </button>
+      </div>
+    </div>
+  )
+}
+
+function RunbookModal({ runbook, onClose }: { runbook: Runbook; onClose: () => void }) {
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm overflow-y-auto p-4"
+      onClick={onClose}
+    >
+      <div
+        className="bg-gray-900 border border-gray-700 rounded-xl shadow-2xl w-full max-w-2xl my-8 overflow-hidden"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between px-5 py-4 border-b border-gray-800">
+          <div className="min-w-0">
+            <div className="flex items-center gap-2 flex-wrap">
+              <code className="text-xs text-blue-300 font-mono">{runbook.id}</code>
+              <SeverityPill severity={runbook.severity} />
+            </div>
+            <p className="text-sm text-gray-200 mt-0.5 truncate">{runbook.title}</p>
+            {runbook.alarm && (
+              <p className="text-xs text-gray-500 font-mono mt-0.5">
+                Alarm: {runbook.alarm}
+              </p>
+            )}
+          </div>
+          <button
+            onClick={onClose}
+            className="text-gray-500 hover:text-white text-lg leading-none ml-3 shrink-0"
+          >
+            ✕
+          </button>
+        </div>
+
+        <div className="px-5 py-4 space-y-4 text-sm max-h-[70vh] overflow-y-auto">
+          {runbook.summary && (
+            <Section title="Summary">
+              <p className="text-gray-300 whitespace-pre-wrap">{runbook.summary}</p>
+            </Section>
+          )}
+          {runbook.symptoms && runbook.symptoms.length > 0 && (
+            <Section title="Symptoms">
+              <ul className="list-disc list-inside text-gray-300 space-y-1">
+                {runbook.symptoms.map((s, i) => (
+                  <li key={i}>{s}</li>
+                ))}
+              </ul>
+            </Section>
+          )}
+          {runbook.diagnosis_steps && runbook.diagnosis_steps.length > 0 && (
+            <Section title="Diagnosis">
+              <ol className="space-y-3">
+                {runbook.diagnosis_steps.map((step, i) => (
+                  <li key={i} className="bg-gray-800/40 border border-gray-700/40 rounded p-3">
+                    <p className="text-xs text-gray-300">
+                      <span className="font-mono text-gray-500">{i + 1}.</span>{' '}
+                      {step.description}
+                    </p>
+                    {step.command && (
+                      <pre className="mt-2 text-[11px] font-mono text-blue-300 whitespace-pre-wrap break-all">
+                        $ {step.command}
+                      </pre>
+                    )}
+                  </li>
+                ))}
+              </ol>
+            </Section>
+          )}
+          {runbook.mitigation && runbook.mitigation.length > 0 && (
+            <Section title="Mitigation">
+              <ul className="list-disc list-inside text-gray-300 space-y-1">
+                {runbook.mitigation.map((m, i) => (
+                  <li key={i}>{m}</li>
+                ))}
+              </ul>
+            </Section>
+          )}
+          {runbook.escalation && runbook.escalation.length > 0 && (
+            <Section title="Escalation">
+              <ul className="list-disc list-inside text-gray-300 space-y-1">
+                {runbook.escalation.map((e, i) => (
+                  <li key={i}>{e}</li>
+                ))}
+              </ul>
+            </Section>
+          )}
+          {runbook.related_dashboards && runbook.related_dashboards.length > 0 && (
+            <Section title="Related dashboards">
+              <ul className="text-gray-400 text-xs space-y-1 font-mono">
+                {runbook.related_dashboards.map((d, i) => (
+                  <li key={i}>{d}</li>
+                ))}
+              </ul>
+            </Section>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function Section({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <div>
+      <p className="text-[10px] uppercase tracking-wider text-gray-500 mb-1.5 font-medium">
+        {title}
+      </p>
+      {children}
+    </div>
   )
 }
 

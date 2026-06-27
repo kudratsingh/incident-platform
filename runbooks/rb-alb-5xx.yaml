@@ -1,0 +1,40 @@
+id: rb-alb-5xx
+title: ALB 5xx error rate elevated
+severity: high
+alarm: incident-platform-alb-5xx-high
+
+summary: |
+  The ALB is returning more than 10 5xx responses per minute from the backend
+  target group. Users are seeing failed requests right now.
+
+symptoms:
+  - "5xx error rate spike in the ALB target group metrics"
+  - "Customer reports of failed API calls or hung uploads"
+  - "Possible correlated alarm: ECS task count low (backend crash-looping)"
+
+diagnosis_steps:
+  - id: check-ecs-tasks
+    description: "Are backend ECS tasks actually running?"
+    command: "aws ecs describe-services --cluster incident-platform --services backend"
+  - id: tail-app-logs
+    description: "Recent error logs from the backend container"
+    command: "aws logs tail /ecs/incident-platform-backend --since 10m --filter-pattern ERROR"
+  - id: check-db-pool
+    description: "Is the connection pool exhausted? Look for 'pool timeout' in logs."
+    command: "aws logs tail /ecs/incident-platform-backend --since 10m --filter-pattern 'pool'"
+  - id: check-deploy
+    description: "Did a deploy just go out?"
+    command: "git log --oneline --since='30 minutes ago'"
+
+mitigation:
+  - "If a bad deploy: roll back via ECS service force-new-deployment to previous image tag."
+  - "If DB pool exhausted: scale the backend horizontally (raise desired count) to free pool slots."
+  - "If RDS is the bottleneck: check rb-rds-cpu-high in parallel."
+
+escalation:
+  - "If 5xx > 50/minute or persists > 15 minutes, page the on-call platform engineer."
+  - "If credentials/secrets are suspected, also page security on-call."
+
+related_dashboards:
+  - "CloudWatch ALB target group → HTTPCode_Target_5XX_Count"
+  - "CloudWatch IncidentPlatform → JobFailed by JobType"

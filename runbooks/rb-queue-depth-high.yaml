@@ -1,0 +1,39 @@
+id: rb-queue-depth-high
+title: Job queue depth above 50
+severity: medium
+alarm: incident-platform-queue-depth-high
+
+summary: |
+  Pending+delayed jobs in the queue have climbed above 50 for 3 minutes.
+  Either worker throughput is too low or a downstream dependency is
+  blocking processors. New job submissions will start returning 503
+  (backpressure) once the consumer lag crosses its threshold.
+
+symptoms:
+  - "QueueDepth metric trending up steadily"
+  - "Job dispatch latency SLO (rb-slo-dispatch-latency) burning fast"
+  - "POST /api/v1/jobs returning 503 backpressure responses"
+
+diagnosis_steps:
+  - id: check-consumer-lag
+    description: "How far behind is the dispatcher consumer?"
+    command: "CloudWatch metric IncidentPlatform/ConsumerLag"
+  - id: check-in-flight
+    description: "Are workers actually doing work, or stuck?"
+    command: "CloudWatch metric IncidentPlatform/InFlightJobs"
+  - id: check-processor-errors
+    description: "Are any specific job types failing repeatedly?"
+    command: "CloudWatch metric IncidentPlatform/JobFailed dimensioned by JobType"
+  - id: external-deps
+    description: "Are external APIs the bulk_api_sync calls saturated or rate-limited?"
+
+mitigation:
+  - "Scale the worker tasks horizontally (raise desired count of the worker ECS service)."
+  - "If one job type is stuck: pause new submissions of that type via a feature flag while you investigate."
+  - "If external API is the bottleneck: confirm circuit breaker opened; let it shed load."
+
+escalation:
+  - "If QueueDepth keeps climbing for > 30 minutes despite scale-out, page on-call."
+
+related_dashboards:
+  - "IncidentPlatform → QueueDepth, InFlightJobs, ConsumerLag"

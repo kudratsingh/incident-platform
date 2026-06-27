@@ -228,6 +228,87 @@ async def test_admin_user_stats_uses_user_specific_keys(
     assert "by_status" in resp.json()
 
 
+async def test_admin_slos_returns_two_objectives(
+    client: AsyncClient, admin_headers: dict[str, str]
+) -> None:
+    """The two declared SLOs are returned; with no traffic, both are healthy."""
+    resp = await client.get("/api/v1/admin/slos", headers=admin_headers)
+    assert resp.status_code == 200
+    body = resp.json()
+    ids = {s["id"] for s in body["slos"]}
+    assert ids == {"job_completion_rate", "job_dispatch_latency"}
+    for s in body["slos"]:
+        assert s["healthy"] is True
+        assert s["runbook_id"].startswith("rb-")
+
+
+async def test_admin_slos_reflects_dead_letter_failures(
+    client: AsyncClient,
+    db_session,  # type: ignore[no-untyped-def]
+    admin_user,  # type: ignore[no-untyped-def]
+    admin_headers: dict[str, str],
+) -> None:
+    """Insert 8 completed + 2 dead-lettered → 80% success → completion SLO breached."""
+    from app.models.enums import JobStatus, JobType
+    from app.models.job import Job
+
+    for _ in range(8):
+        db_session.add(
+            Job(
+                user_id=admin_user.id,
+                type=JobType.CSV_UPLOAD,
+                status=JobStatus.COMPLETED,
+                retry_count=0,
+                max_retries=3,
+                priority=0,
+            )
+        )
+    for _ in range(2):
+        db_session.add(
+            Job(
+                user_id=admin_user.id,
+                type=JobType.CSV_UPLOAD,
+                status=JobStatus.DEAD_LETTER,
+                retry_count=3,
+                max_retries=3,
+                priority=0,
+                error_message="boom",
+            )
+        )
+    await db_session.flush()
+
+    resp = await client.get("/api/v1/admin/slos", headers=admin_headers)
+    assert resp.status_code == 200
+    completion = next(
+        s for s in resp.json()["slos"] if s["id"] == "job_completion_rate"
+    )
+    assert completion["total"] == 10
+    assert completion["failed"] == 2
+    assert abs(completion["current"] - 0.8) < 1e-9
+    assert completion["healthy"] is False
+    # Failure rate 20% vs allowed 1% → burn rate 20×.
+    assert completion["burn_rate"] is not None
+    assert abs(completion["burn_rate"] - 20.0) < 1e-6
+
+
+async def test_admin_runbooks_list_and_get(
+    client: AsyncClient, admin_headers: dict[str, str]
+) -> None:
+    resp = await client.get("/api/v1/admin/runbooks", headers=admin_headers)
+    assert resp.status_code == 200
+    items = resp.json()["items"]
+    assert any(rb["id"] == "rb-slo-job-completion" for rb in items)
+
+    detail = await client.get(
+        "/api/v1/admin/runbooks/rb-slo-job-completion", headers=admin_headers
+    )
+    assert detail.status_code == 200
+    assert detail.json()["id"] == "rb-slo-job-completion"
+
+    missing = await client.get("/api/v1/admin/runbooks/nope", headers=admin_headers)
+    assert missing.status_code == 404
+
+
 async def test_admin_replay_resets_retry_count(
     client: AsyncClient,
     db_session,  # type: ignore[no-untyped-def]

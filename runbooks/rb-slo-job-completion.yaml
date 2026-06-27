@@ -1,0 +1,39 @@
+id: rb-slo-job-completion
+title: Job completion SLO breached
+severity: high
+alarm: incident-platform-slo-job-completion-fast-burn
+
+summary: |
+  The job-completion SLO (≥99% over 24h) is burning at 14× normal or faster.
+  Too many jobs are dead-lettering relative to the error budget. If sustained
+  this will exhaust the full 30-day budget in under 2 hours.
+
+symptoms:
+  - "JobDeadLettered count climbing on the IncidentPlatform CloudWatch namespace"
+  - "DLQ tab on the admin console showing recent additions"
+  - "Specific job type may be over-represented in dead-lettered rows"
+
+diagnosis_steps:
+  - id: check-dlq
+    description: "What's in the DLQ? Group by type and by error pattern."
+    command: "Open Admin → DLQ in the UI; or hit /api/v1/admin/dlq/stats"
+  - id: sample-failures
+    description: "Look at the actual error messages on the most recent failures."
+    command: "psql -c \"SELECT type, error_message, COUNT(*) FROM jobs WHERE status = 'dead_letter' AND created_at > now() - interval '1 hour' GROUP BY type, error_message ORDER BY 3 DESC LIMIT 20\""
+  - id: external-deps
+    description: "If bulk_api_sync dominates, is the upstream API down?"
+  - id: check-circuit-breaker
+    description: "Is the circuit breaker open? That should be shedding load cleanly."
+
+mitigation:
+  - "If a single root cause: deploy the fix, then bulk-replay the affected DLQ jobs from the admin UI."
+  - "If a flaky external dependency: increase max_retries on that job type temporarily."
+  - "If a code regression: roll back the most recent backend deploy."
+
+escalation:
+  - "Page the team that owns the failing job-type processor."
+  - "If burn continues despite mitigation, lower the alert burn-rate threshold and notify customers."
+
+related_dashboards:
+  - "IncidentPlatform → JobDeadLettered, JobCompleted (per JobType)"
+  - "Admin console → DLQ tab"
