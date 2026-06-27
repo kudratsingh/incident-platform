@@ -5,6 +5,7 @@ from app.dependencies import get_db, get_redis, require_role
 from app.models.enums import UserRole
 from app.models.user import User
 from app.repositories.audit import AuditRepository
+from app.repositories.event_log import EventLogRepository
 from app.repositories.job import JobRepository
 from app.repositories.outbox import OutboxRepository
 from app.repositories.user import UserRepository
@@ -13,6 +14,7 @@ from app.schemas.job import AdminJobListParams, JobResponse
 from app.schemas.user import UserResponse
 from app.services.job import JobService
 from app.utils.cache import JobCache
+from app.workers.read_model import read_global_stats, read_user_stats
 from fastapi import APIRouter, Depends
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -84,6 +86,30 @@ async def replay_job(
     return JobResponse.model_validate(job)
 
 
+@router.get("/stats")
+async def system_stats(
+    current_user: User = Depends(_require_support_or_admin),
+    redis: Redis = Depends(get_redis),
+) -> dict[str, dict[str, int]]:
+    """System-wide job counts by status, served from the CQRS read model.
+
+    Reads denormalized Redis sets maintained by ReadModelProjector — no
+    aggregate SQL on the jobs table. Numbers are eventually consistent
+    with the write side (latency dominated by Kafka lag).
+    """
+    return {"by_status": await read_global_stats(redis)}
+
+
+@router.get("/users/{user_id}/stats")
+async def user_stats(
+    user_id: uuid.UUID,
+    current_user: User = Depends(_require_support_or_admin),
+    redis: Redis = Depends(get_redis),
+) -> dict[str, dict[str, int]]:
+    """Per-user job counts by status, served from the CQRS read model."""
+    return {"by_status": await read_user_stats(redis, str(user_id))}
+
+
 @router.get("/dlq/stats")
 async def dlq_stats(
     current_user: User = Depends(_require_support_or_admin),
@@ -92,6 +118,38 @@ async def dlq_stats(
     """Counts of dead-lettered jobs for the admin DLQ badge / dashboard."""
     total, by_type = await JobRepository(db).dlq_stats()
     return {"total": total, "by_type": by_type}
+
+
+@router.get("/jobs/{job_id}/timeline")
+async def job_timeline(
+    job_id: uuid.UUID,
+    current_user: User = Depends(_require_support_or_admin),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Event-sourced timeline for a job — all Kafka lifecycle events in order.
+
+    Replays the immutable job_events log, which the EventLogConsumer fills
+    from every job.submitted / progress / completed / failed / dlq message.
+    Useful for forensic / time-travel debugging of a single job's full
+    history without trusting the mutable jobs row.
+    """
+    events = await EventLogRepository(db).timeline(job_id)
+    return {
+        "job_id": str(job_id),
+        "count": len(events),
+        "events": [
+            {
+                "id": str(e.id),
+                "event_name": e.event_name,
+                "recorded_at": e.recorded_at.isoformat(),
+                "kafka_topic": e.kafka_topic,
+                "kafka_partition": e.kafka_partition,
+                "kafka_offset": e.kafka_offset,
+                "payload": e.payload,
+            }
+            for e in events
+        ],
+    }
 
 
 @router.post("/incidents/{job_id}/resolve", response_model=JobResponse)

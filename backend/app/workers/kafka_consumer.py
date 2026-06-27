@@ -129,7 +129,13 @@ class BaseKafkaConsumer(ABC):
             return
 
         try:
-            await self.handle_message(message.topic, key, value)
+            await self.handle_message(
+                message.topic,
+                key,
+                value,
+                partition=message.partition,
+                offset=message.offset,
+            )
             # Commit after successful processing — at-least-once delivery
             await self._consumer.commit()  # type: ignore[union-attr]
         except Exception as exc:
@@ -147,7 +153,17 @@ class BaseKafkaConsumer(ABC):
 
     @abstractmethod
     async def handle_message(
-        self, topic: str, key: str | None, value: dict[str, Any]
+        self,
+        topic: str,
+        key: str | None,
+        value: dict[str, Any],
+        *,
+        partition: int = 0,
+        offset: int = 0,
     ) -> None:
-        """Implement this in each subclass to handle a single message."""
+        """Implement this in each subclass to handle a single message.
+
+        partition and offset are passed as keyword-only args so consumers that
+        don't need Kafka coordinates can ignore them with `**_`. Required by
+        EventLogConsumer for at-least-once dedup."""
         ...

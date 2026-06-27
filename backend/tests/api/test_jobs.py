@@ -160,6 +160,74 @@ async def test_admin_dlq_stats_counts_by_type(
     }
 
 
+async def test_admin_job_timeline_returns_events_in_order(
+    client: AsyncClient,
+    db_session,  # type: ignore[no-untyped-def]
+    admin_user,  # type: ignore[no-untyped-def]
+    admin_headers: dict[str, str],
+) -> None:
+    """Event-sourcing timeline endpoint replays job_events ordered by recorded_at."""
+    import uuid as _uuid
+
+    from app.models.event_log import JobEvent
+
+    job_id = _uuid.uuid4()
+    for i, name in enumerate(["job.submitted", "job.progress", "job.completed"]):
+        db_session.add(
+            JobEvent(
+                job_id=job_id,
+                event_name=name,
+                payload={"event": name, "job_id": str(job_id)},
+                kafka_topic=name,
+                kafka_partition=0,
+                kafka_offset=i,
+            )
+        )
+    await db_session.flush()
+
+    resp = await client.get(
+        f"/api/v1/admin/jobs/{job_id}/timeline", headers=admin_headers
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["count"] == 3
+    assert [e["event_name"] for e in body["events"]] == [
+        "job.submitted",
+        "job.progress",
+        "job.completed",
+    ]
+    assert [e["kafka_offset"] for e in body["events"]] == [0, 1, 2]
+
+
+async def test_admin_stats_reads_from_read_model(
+    client: AsyncClient, admin_headers: dict[str, str]
+) -> None:
+    """/admin/stats reads denormalized Redis sets, not the jobs table."""
+    resp = await client.get("/api/v1/admin/stats", headers=admin_headers)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "by_status" in body
+    # Mocked Redis in tests returns 0 cardinality.
+    assert set(body["by_status"].keys()) == {
+        "running",
+        "completed",
+        "failed",
+        "dead_letter",
+    }
+
+
+async def test_admin_user_stats_uses_user_specific_keys(
+    client: AsyncClient,
+    admin_user,  # type: ignore[no-untyped-def]
+    admin_headers: dict[str, str],
+) -> None:
+    resp = await client.get(
+        f"/api/v1/admin/users/{admin_user.id}/stats", headers=admin_headers
+    )
+    assert resp.status_code == 200
+    assert "by_status" in resp.json()
+
+
 async def test_admin_replay_resets_retry_count(
     client: AsyncClient,
     db_session,  # type: ignore[no-untyped-def]

@@ -40,7 +40,9 @@ from app.workers import (
     thread_adapters,
 )
 from app.workers.audit_consumer import AuditConsumer
+from app.workers.event_log_consumer import EventLogConsumer
 from app.workers.kafka_consumer import BaseKafkaConsumer
+from app.workers.read_model import ReadModelProjector
 from app.workers.sse_consumer import SseConsumer
 from opentelemetry import trace
 from opentelemetry.trace import SpanKind
@@ -312,7 +314,11 @@ class JobDispatcherConsumer(BaseKafkaConsumer):
         self.in_flight: set[asyncio.Task[None]] = set()
 
     async def handle_message(
-        self, topic: str, key: str | None, value: dict[str, Any]
+        self,
+        topic: str,
+        key: str | None,
+        value: dict[str, Any],
+        **_kafka_meta: Any,
     ) -> None:
         job_id_str = value.get("job_id") if isinstance(value, dict) else None
         if not job_id_str:
@@ -526,7 +532,9 @@ async def worker_loop(
     dispatcher = JobDispatcherConsumer(session_factory, redis)
     audit = AuditConsumer(session_factory)
     sse = SseConsumer(redis)
-    consumers: list[BaseKafkaConsumer] = [dispatcher, audit, sse]
+    event_log = EventLogConsumer(session_factory)
+    read_model = ReadModelProjector(redis)
+    consumers: list[BaseKafkaConsumer] = [dispatcher, audit, sse, event_log, read_model]
 
     started: list[BaseKafkaConsumer] = []
     for c in consumers:
