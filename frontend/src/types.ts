@@ -78,6 +78,34 @@ export interface SystemStats {
   by_status: Record<string, number>
 }
 
+export interface SLOState {
+  id: string
+  name: string
+  description: string
+  target: number
+  window_hours: number
+  runbook_id: string
+  total: number
+  failed: number
+  current: number
+  budget_remaining_pct: number
+  burn_rate: number | null
+  healthy: boolean
+}
+
+export interface Runbook {
+  id: string
+  title: string
+  severity?: string
+  alarm?: string
+  summary?: string
+  symptoms?: string[]
+  diagnosis_steps?: Array<{ id?: string; description?: string; command?: string }>
+  mitigation?: string[]
+  escalation?: string[]
+  related_dashboards?: string[]
+}
+
 export interface AuditLog {
   id: string
   user_id: string | null

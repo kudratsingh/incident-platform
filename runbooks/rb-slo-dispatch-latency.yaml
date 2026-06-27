@@ -1,0 +1,37 @@
+id: rb-slo-dispatch-latency
+title: Job dispatch-latency SLO breached
+severity: medium
+alarm: incident-platform-slo-dispatch-latency-fast-burn
+
+summary: |
+  The dispatch-latency SLO (≥95% of jobs leave PENDING within 30 s) is burning
+  at >14× normal. Jobs are sitting in the queue longer than promised. Users
+  will perceive this as "I submitted a job and nothing's happening."
+
+symptoms:
+  - "QueueDepth metric trending up"
+  - "ConsumerLag metric > 0 and growing"
+  - "API may start returning 503 backpressure"
+
+diagnosis_steps:
+  - id: queue-depth
+    description: "Is this throughput (depth growing) or a single stuck partition?"
+    command: "CloudWatch IncidentPlatform/QueueDepth + ConsumerLag"
+  - id: in-flight
+    description: "Are workers saturated (in_flight == MAX_CONCURRENT_JOBS)?"
+    command: "CloudWatch IncidentPlatform/InFlightJobs"
+  - id: check-stuck-jobs
+    description: "Any RUNNING jobs older than 10 minutes (could be a process crash mid-run)?"
+    command: "psql -c \"SELECT id, type, started_at FROM jobs WHERE status = 'running' AND started_at < now() - interval '10 minutes'\""
+
+mitigation:
+  - "Scale the worker ECS service horizontally."
+  - "If RUNNING jobs are stuck from a crashed worker: mark them FAILED and replay from admin UI."
+  - "Reduce inbound rate by lowering the rate-limit on POST /jobs temporarily."
+
+escalation:
+  - "If queue depth doubles after scale-out, page on-call — likely a downstream block (DB pool, external API)."
+  - "See rb-queue-depth-high for further triage."
+
+related_dashboards:
+  - "IncidentPlatform → QueueDepth, InFlightJobs, ConsumerLag"

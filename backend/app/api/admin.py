@@ -14,6 +14,9 @@ from app.schemas.common import PaginatedResponse
 from app.schemas.job import AdminJobListParams, JobResponse
 from app.schemas.user import UserResponse
 from app.services.job import JobService
+from app.services.runbooks import get as get_runbook
+from app.services.runbooks import list_all as list_runbooks
+from app.services.slo import compute_all as compute_slos
 from app.utils.cache import JobCache
 from app.workers.read_model import read_global_stats, read_user_stats
 from fastapi import APIRouter, Depends
@@ -113,6 +116,56 @@ async def user_stats(
 ) -> dict[str, dict[str, int]]:
     """Per-user job counts by status, served from the CQRS read model."""
     return {"by_status": await read_user_stats(redis, str(user_id))}
+
+
+@router.get("/slos")
+async def list_slos(
+    current_user: User = Depends(_require_support_or_admin),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Current SLO state with error-budget and burn-rate per objective."""
+    states = await compute_slos(db)
+    return {
+        "slos": [
+            {
+                "id": s.definition.id,
+                "name": s.definition.name,
+                "description": s.definition.description,
+                "target": s.definition.target,
+                "window_hours": s.definition.window_hours,
+                "runbook_id": s.definition.runbook_id,
+                "total": s.total,
+                "failed": s.failed,
+                "current": s.current,
+                "budget_remaining_pct": s.budget_remaining_pct,
+                "burn_rate": s.burn_rate if s.burn_rate != float("inf") else None,
+                "healthy": s.healthy,
+            }
+            for s in states
+        ]
+    }
+
+
+@router.get("/runbooks")
+async def admin_list_runbooks(
+    current_user: User = Depends(_require_support_or_admin),
+) -> dict[str, Any]:
+    """All runbooks, ordered by id. Each one documents an alarm or SLO breach."""
+    items = list_runbooks()
+    return {"items": items, "count": len(items)}
+
+
+@router.get("/runbooks/{runbook_id}")
+async def admin_get_runbook(
+    runbook_id: str,
+    current_user: User = Depends(_require_support_or_admin),
+) -> dict[str, Any]:
+    from app.core.exceptions import NotFoundError
+
+    rb = get_runbook(runbook_id)
+    if rb is None:
+        raise NotFoundError(f"Runbook {runbook_id} not found")
+    return rb
 
 
 @router.get("/dlq/stats")

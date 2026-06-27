@@ -1,0 +1,36 @@
+id: rb-ecs-tasks-low
+title: Backend ECS task count below 1
+severity: critical
+alarm: incident-platform-backend-tasks-low
+
+summary: |
+  No backend ECS tasks are running. The service is fully down and the ALB has
+  no healthy targets. Most user-facing requests are returning 5xx right now.
+
+symptoms:
+  - "ALB target group shows zero healthy targets"
+  - "Customer-wide outage of the API"
+
+diagnosis_steps:
+  - id: check-stop-reason
+    description: "Why did the most recent tasks stop?"
+    command: "aws ecs describe-tasks --cluster incident-platform --tasks $(aws ecs list-tasks --cluster incident-platform --service-name backend --desired-status STOPPED --query 'taskArns[0]' --output text)"
+  - id: check-image
+    description: "Does the configured image tag exist in ECR?"
+    command: "aws ecr describe-images --repository-name incident-platform-backend"
+  - id: tail-startup-logs
+    description: "Look at the failed container's startup logs."
+    command: "aws logs tail /ecs/incident-platform-backend --since 30m"
+
+mitigation:
+  - "If image missing: redeploy a known-good image tag via Terraform or ECS console."
+  - "If migrations crashed at boot: run `alembic upgrade head` manually against RDS, then force-new-deployment."
+  - "If task definition is broken: roll back to the previous revision."
+
+escalation:
+  - "This is always paged — the service is offline."
+  - "Engage AWS support if the cause is ECS control-plane related."
+
+related_dashboards:
+  - "ECS Container Insights → RunningTaskCount"
+  - "ALB target group → HealthyHostCount"

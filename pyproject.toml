@@ -28,6 +28,7 @@ dependencies = [
     "opentelemetry-instrumentation-redis>=0.45b0",
     "aiokafka>=0.11.0",
     "jsonschema>=4.21.0",
+    "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]
@@ -42,6 +43,7 @@ dev = [
 
     "types-python-jose>=3.3.4",
     "types-jsonschema>=4.21.0",
+    "types-pyyaml>=6.0",
     "aiosqlite>=0.20.0",
     "locust>=2.29.0",
     "testcontainers[postgres]>=4.7.0",

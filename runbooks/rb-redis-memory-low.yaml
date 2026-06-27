@@ -1,0 +1,37 @@
+id: rb-redis-memory-low
+title: Redis freeable memory below 50 MB
+severity: medium
+alarm: incident-platform-redis-memory-low
+
+summary: |
+  ElastiCache Redis is running low on memory. Once it hits the eviction
+  threshold, keys without TTLs will start being evicted, which can break
+  rate-limit counters, cached job responses, and (most damagingly) the
+  CQRS read-model job-status sets.
+
+symptoms:
+  - "Rate limiter behaving inconsistently (some requests allowed past the cap)"
+  - "Cached /jobs/{id} responses stale or missing"
+  - "Admin Overview counts going backwards"
+
+diagnosis_steps:
+  - id: redis-info
+    description: "What's the largest type / key prefix using memory?"
+    command: "redis-cli --memkeys"
+  - id: check-eviction
+    description: "Has Redis already evicted any keys?"
+    command: "redis-cli info stats | grep evicted_keys"
+  - id: check-read-model
+    description: "Has the CQRS projector been creating an outsized number of sets?"
+    command: "redis-cli --scan --pattern 'jobs:user:*:status:*' | wc -l"
+
+mitigation:
+  - "Scale ElastiCache up one node size (cache.t3.small → cache.t3.medium)."
+  - "If the read model is the culprit: shorten TTL on per-user sets or move historical jobs out of the projection."
+  - "Short-term relief: FLUSHDB the rate-limit keys (`jobs:create:*`) — they regenerate in seconds."
+
+escalation:
+  - "If evicted_keys > 0 and CQRS counts are visibly wrong, alert the on-call platform engineer."
+
+related_dashboards:
+  - "ElastiCache → FreeableMemory, EngineCPUUtilization, Evictions"

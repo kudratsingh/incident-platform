@@ -4,6 +4,8 @@ import type {
   Job,
   JobTimeline,
   PaginatedResponse,
+  Runbook,
+  SLOState,
   SystemStats,
   User,
 } from '../types'
@@ -42,6 +44,12 @@ export const adminApi = {
 
   jobTimeline: (jobId: string) =>
     api.get<JobTimeline>(`/admin/jobs/${jobId}/timeline`),
+
+  slos: () => api.get<{ slos: SLOState[] }>(`/admin/slos`),
+
+  runbooks: () => api.get<{ items: Runbook[]; count: number }>(`/admin/runbooks`),
+
+  runbook: (id: string) => api.get<Runbook>(`/admin/runbooks/${id}`),
 
   listUsers: (page = 1) =>
     api.get<PaginatedResponse<User>>(`/admin/users?page=${page}&page_size=50`),
