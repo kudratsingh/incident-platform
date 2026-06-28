@@ -291,6 +291,88 @@ async def test_admin_slos_reflects_dead_letter_failures(
     assert abs(completion["burn_rate"] - 20.0) < 1e-6
 
 
+async def test_admin_triage_returns_404_when_missing(
+    client: AsyncClient,
+    admin_user,  # type: ignore[no-untyped-def]
+    admin_headers: dict[str, str],
+) -> None:
+    """No triage row → 404, not an empty success."""
+    import uuid as _uuid
+
+    from app.models.enums import JobStatus, JobType
+    from app.models.job import Job
+
+    job = Job(
+        user_id=admin_user.id,
+        type=JobType.CSV_UPLOAD,
+        status=JobStatus.DEAD_LETTER,
+        retry_count=3,
+        max_retries=3,
+        priority=0,
+        error_message="boom",
+    )
+
+    # Need a real db_session to insert — get one via the override.
+    from app.dependencies import get_db
+
+    async for db in client._transport.app.dependency_overrides[get_db]():  # type: ignore[attr-defined]
+        db.add(job)
+        await db.flush()
+        await db.refresh(job)
+        break
+    _ = _uuid  # silence unused import for the case where no insert succeeded
+    resp = await client.get(
+        f"/api/v1/admin/jobs/{job.id}/triage", headers=admin_headers
+    )
+    assert resp.status_code == 404
+
+
+async def test_admin_triage_returns_row_when_present(
+    client: AsyncClient,
+    db_session,  # type: ignore[no-untyped-def]
+    admin_user,  # type: ignore[no-untyped-def]
+    admin_headers: dict[str, str],
+) -> None:
+    from app.models.enums import JobStatus, JobType
+    from app.models.job import Job
+    from app.models.triage import JobTriage
+
+    job = Job(
+        user_id=admin_user.id,
+        type=JobType.CSV_UPLOAD,
+        status=JobStatus.DEAD_LETTER,
+        retry_count=3,
+        max_retries=3,
+        priority=0,
+        error_message="boom",
+    )
+    db_session.add(job)
+    await db_session.flush()
+
+    triage = JobTriage(
+        job_id=job.id,
+        root_cause_category="external_api_failure",
+        summary="Upstream HTTP 504 from analytics.example.com.",
+        suggested_fix="Verify analytics.example.com health; raise worker HTTP timeout.",
+        is_retryable=True,
+        confidence=0.82,
+        model_used="claude-opus-4-7",
+        usage={"input_tokens": 100, "cache_read_input_tokens": 1500},
+    )
+    db_session.add(triage)
+    await db_session.flush()
+
+    resp = await client.get(
+        f"/api/v1/admin/jobs/{job.id}/triage", headers=admin_headers
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["root_cause_category"] == "external_api_failure"
+    assert body["is_retryable"] is True
+    assert body["model_used"] == "claude-opus-4-7"
+    assert body["usage"]["cache_read_input_tokens"] == 1500
+
+
 async def test_admin_runbooks_list_and_get(
     client: AsyncClient, admin_headers: dict[str, str]
 ) -> None:

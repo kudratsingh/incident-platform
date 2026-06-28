@@ -9,6 +9,7 @@ from app.repositories.event_log import EventLogRepository
 from app.repositories.job import JobRepository
 from app.repositories.job_dependency import JobDependencyRepository
 from app.repositories.outbox import OutboxRepository
+from app.repositories.triage import TriageRepository
 from app.repositories.user import UserRepository
 from app.schemas.common import PaginatedResponse
 from app.schemas.job import AdminJobListParams, JobResponse
@@ -176,6 +177,37 @@ async def dlq_stats(
     """Counts of dead-lettered jobs for the admin DLQ badge / dashboard."""
     total, by_type = await JobRepository(db).dlq_stats()
     return {"total": total, "by_type": by_type}
+
+
+@router.get("/jobs/{job_id}/triage")
+async def job_triage(
+    job_id: uuid.UUID,
+    current_user: User = Depends(_require_support_or_admin),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """LLM-generated triage analysis for a dead-lettered job.
+
+    Returns 404 if no triage row exists (the job hasn't dead-lettered yet,
+    triage is disabled, or the consumer hasn't caught up).
+    """
+    from app.core.exceptions import NotFoundError
+
+    triage = await TriageRepository(db).get_by_job_id(job_id)
+    if triage is None:
+        raise NotFoundError(f"No triage analysis for job {job_id}")
+    return {
+        "id": str(triage.id),
+        "job_id": str(triage.job_id),
+        "root_cause_category": triage.root_cause_category,
+        "summary": triage.summary,
+        "suggested_fix": triage.suggested_fix,
+        "is_retryable": triage.is_retryable,
+        "confidence": triage.confidence,
+        "model_used": triage.model_used,
+        "usage": triage.usage,
+        "created_at": triage.created_at.isoformat(),
+        "updated_at": triage.updated_at.isoformat(),
+    }
 
 
 @router.get("/jobs/{job_id}/timeline")

@@ -46,6 +46,7 @@ from app.workers.kafka_consumer import BaseKafkaConsumer
 from app.workers.read_model import ReadModelProjector
 from app.workers.saga_coordinator import SagaCoordinator
 from app.workers.sse_consumer import SseConsumer
+from app.workers.triage_consumer import LlmTriageConsumer
 from opentelemetry import trace
 from opentelemetry.trace import SpanKind
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -538,6 +539,7 @@ async def worker_loop(
     read_model = ReadModelProjector(redis)
     dep_resolver = DependencyResolver(session_factory)
     saga = SagaCoordinator(session_factory)
+    triage = LlmTriageConsumer(session_factory)
     consumers: list[BaseKafkaConsumer] = [
         dispatcher,
         audit,
@@ -546,6 +548,7 @@ async def worker_loop(
         read_model,
         dep_resolver,
         saga,
+        triage,
     ]
 
     started: list[BaseKafkaConsumer] = []
