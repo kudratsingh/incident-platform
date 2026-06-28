@@ -9,7 +9,7 @@ import { adminApi } from '../api/admin'
 import { lastMeta } from '../api/client'
 import { useAuth } from '../hooks/useAuth'
 import { useJobStream } from '../hooks/useJobStream'
-import type { Job, JobEvent } from '../types'
+import type { Job, JobEvent, JobTriage } from '../types'
 import { formatDate, formatDuration, JOB_TYPE_LABELS } from '../utils/format'
 
 function JsonBlock({ label, data }: { label: string; data: unknown }) {
@@ -34,6 +34,7 @@ export default function JobDetailPage() {
   const [error, setError] = useState<string | null>(null)
   const [timeline, setTimeline] = useState<JobEvent[] | null>(null)
   const [timelineOpen, setTimelineOpen] = useState(false)
+  const [triage, setTriage] = useState<JobTriage | null>(null)
   const isPrivileged = user?.role === 'admin' || user?.role === 'support'
 
   const { latest, events, connected } = useJobStream(
@@ -69,6 +70,17 @@ export default function JobDetailPage() {
       .then((t) => setTimeline(t.events))
       .catch(() => setTimeline([]))
   }, [timelineOpen, id, isPrivileged, timeline])
+
+  // Fetch triage as soon as we know we're an admin viewing a dead-lettered
+  // job. 404 just means "no analysis yet" — silent.
+  useEffect(() => {
+    if (!id || !isPrivileged || !job) return
+    if (job.status !== 'dead_letter') return
+    adminApi
+      .jobTriage(id)
+      .then(setTriage)
+      .catch(() => setTriage(null))
+  }, [id, isPrivileged, job])
 
   if (loading) {
     return (
@@ -161,6 +173,9 @@ export default function JobDetailPage() {
               </div>
             )}
           </div>
+
+          {/* LLM triage analysis — admin/support only, dead_letter jobs */}
+          {isPrivileged && triage && <TriageCard triage={triage} />}
 
           {/* Kafka event timeline (event sourcing) — admin/support only */}
           {isPrivileged && (
@@ -271,5 +286,93 @@ export default function JobDetailPage() {
         </div>
       </div>
     </Layout>
+  )
+}
+
+const CATEGORY_LABELS: Record<string, string> = {
+  external_api_failure: 'External API',
+  validation_error: 'Validation',
+  infrastructure: 'Infrastructure',
+  data_corruption: 'Data Corruption',
+  configuration: 'Configuration',
+  transient: 'Transient',
+  unknown: 'Unknown',
+}
+
+const CATEGORY_COLORS: Record<string, string> = {
+  external_api_failure: 'bg-orange-500/20 text-orange-300 border-orange-500/30',
+  validation_error: 'bg-yellow-500/20 text-yellow-300 border-yellow-500/30',
+  infrastructure: 'bg-red-500/20 text-red-300 border-red-500/30',
+  data_corruption: 'bg-purple-500/20 text-purple-300 border-purple-500/30',
+  configuration: 'bg-blue-500/20 text-blue-300 border-blue-500/30',
+  transient: 'bg-gray-500/20 text-gray-300 border-gray-500/30',
+  unknown: 'bg-gray-500/20 text-gray-300 border-gray-500/30',
+}
+
+function TriageCard({ triage }: { triage: JobTriage }) {
+  const confidencePct = Math.round(triage.confidence * 100)
+  const cat = triage.root_cause_category
+  return (
+    <div className="bg-gradient-to-br from-purple-900/15 to-transparent border border-purple-700/30 rounded-lg p-5">
+      <div className="flex items-start justify-between mb-3 gap-3">
+        <div>
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className="text-[10px] uppercase tracking-wider text-purple-300 font-medium">
+              AI Triage
+            </span>
+            <span
+              className={`inline-flex px-2 py-0.5 rounded-full text-[10px] uppercase tracking-wide font-medium border ${CATEGORY_COLORS[cat] ?? CATEGORY_COLORS.unknown}`}
+            >
+              {CATEGORY_LABELS[cat] ?? cat}
+            </span>
+            <span
+              className={`inline-flex px-2 py-0.5 rounded-full text-[10px] uppercase tracking-wide font-medium border ${
+                triage.is_retryable
+                  ? 'bg-green-500/20 text-green-300 border-green-500/30'
+                  : 'bg-red-500/20 text-red-300 border-red-500/30'
+              }`}
+            >
+              {triage.is_retryable ? 'Retryable' : 'Not retryable'}
+            </span>
+          </div>
+          <p className="text-sm text-gray-200 mt-2 leading-relaxed">{triage.summary}</p>
+        </div>
+        <div className="text-right shrink-0">
+          <p className="text-[10px] text-gray-500 uppercase tracking-wide">
+            Confidence
+          </p>
+          <p
+            className={`text-lg font-mono ${
+              confidencePct >= 80
+                ? 'text-green-400'
+                : confidencePct >= 50
+                  ? 'text-yellow-300'
+                  : 'text-red-400'
+            }`}
+          >
+            {confidencePct}%
+          </p>
+        </div>
+      </div>
+
+      <div className="bg-gray-800/40 border border-gray-700/40 rounded p-3 mt-3">
+        <p className="text-[10px] uppercase tracking-wider text-gray-500 mb-1.5">
+          Suggested fix
+        </p>
+        <p className="text-sm text-gray-200 leading-relaxed">{triage.suggested_fix}</p>
+      </div>
+
+      <div className="flex items-center justify-between mt-3 text-[11px] text-gray-600 font-mono flex-wrap gap-2">
+        <span>{triage.model_used}</span>
+        {triage.usage && (
+          <span>
+            in: {triage.usage.input_tokens ?? 0} · out: {triage.usage.output_tokens ?? 0}
+            {(triage.usage.cache_read_input_tokens ?? 0) > 0 && (
+              <> · cached: {triage.usage.cache_read_input_tokens}</>
+            )}
+          </span>
+        )}
+      </div>
+    </div>
   )
 }

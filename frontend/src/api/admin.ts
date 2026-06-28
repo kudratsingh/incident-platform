@@ -3,6 +3,7 @@ import type {
   AuditLog,
   Job,
   JobTimeline,
+  JobTriage,
   PaginatedResponse,
   Runbook,
   SLOState,
@@ -44,6 +45,9 @@ export const adminApi = {
 
   jobTimeline: (jobId: string) =>
     api.get<JobTimeline>(`/admin/jobs/${jobId}/timeline`),
+
+  jobTriage: (jobId: string) =>
+    api.get<JobTriage>(`/admin/jobs/${jobId}/triage`),
 
   slos: () => api.get<{ slos: SLOState[] }>(`/admin/slos`),
 

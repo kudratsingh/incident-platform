@@ -73,12 +73,18 @@ class Settings(BaseSettings):
     kafka_consumer_group_read_model: str = "read-model"
     kafka_consumer_group_dependency: str = "dependency-resolver"
     kafka_consumer_group_saga: str = "saga-coordinator"
+    kafka_consumer_group_triage: str = "llm-triage"
     kafka_max_poll_interval_ms: int = 300_000
     kafka_session_timeout_ms: int = 30_000
 
     # Backpressure — reject new job submissions when the dispatcher's Kafka
     # consumer group is more than this many messages behind. 0 disables.
     backpressure_lag_threshold: int = 1000
+
+    # LLM-driven DLQ triage. Disabled by default; enabling requires an
+    # Anthropic API key (read from ANTHROPIC_API_KEY env var by the SDK).
+    llm_triage_enabled: bool = False
+    llm_triage_model: str = "claude-opus-4-7"
 
     # Tracing — set to http://localhost:4318 locally (Jaeger), or X-Ray OTLP endpoint in prod
     otlp_endpoint: str | None = None

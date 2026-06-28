@@ -4,6 +4,7 @@ from app.models.job import Job
 from app.models.job_dependency import JobDependency
 from app.models.outbox import OutboxEvent
 from app.models.saga import Saga
+from app.models.triage import JobTriage
 from app.models.user import User
 
 __all__ = [
@@ -11,6 +12,7 @@ __all__ = [
     "Job",
     "JobDependency",
     "JobEvent",
+    "JobTriage",
     "OutboxEvent",
     "Saga",
     "User",

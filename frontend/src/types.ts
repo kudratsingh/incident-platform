@@ -93,6 +93,29 @@ export interface SLOState {
   healthy: boolean
 }
 
+export type TriageCategory =
+  | 'external_api_failure'
+  | 'validation_error'
+  | 'infrastructure'
+  | 'data_corruption'
+  | 'configuration'
+  | 'transient'
+  | 'unknown'
+
+export interface JobTriage {
+  id: string
+  job_id: string
+  root_cause_category: TriageCategory
+  summary: string
+  suggested_fix: string
+  is_retryable: boolean
+  confidence: number
+  model_used: string
+  usage: Record<string, number> | null
+  created_at: string
+  updated_at: string
+}
+
 export interface Runbook {
   id: string
   title: string
