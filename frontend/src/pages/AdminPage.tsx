@@ -7,6 +7,7 @@ import { useToast } from '../components/Toast'
 import type { AuditLog, Job, Runbook, SLOState, SystemStats, Tenant, User } from '../types'
 import { adminApi } from '../api/admin'
 import { AppError } from '../api/client'
+import { useAuth } from '../hooks/useAuth'
 import { formatDate, JOB_TYPE_LABELS } from '../utils/format'
 
 type Tab = 'overview' | 'jobs' | 'dlq' | 'runbooks' | 'users' | 'tenants' | 'audit'
@@ -54,6 +55,99 @@ function AuditLogModal({ log, onClose }: { log: AuditLog; onClose: () => void })
   )
 }
 
+function CreateTenantModal({
+  onClose,
+  onCreated,
+}: {
+  onClose: () => void
+  onCreated: (tenant: Tenant) => void
+}) {
+  const [slug, setSlug] = useState('')
+  const [name, setName] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState<string | null>(null)
+
+  async function handleCreate(e: React.FormEvent) {
+    e.preventDefault()
+    setBusy(true)
+    setErr(null)
+    try {
+      const created = await adminApi.createTenant(slug.trim(), name.trim())
+      onCreated(created)
+    } catch (e2) {
+      setErr(e2 instanceof AppError ? e2.message : 'Failed to create tenant')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
+      onClick={onClose}
+    >
+      <form
+        onClick={(e) => e.stopPropagation()}
+        onSubmit={handleCreate}
+        className="bg-gray-900 border border-gray-700 rounded-xl shadow-2xl w-full max-w-md mx-4 overflow-hidden"
+      >
+        <div className="flex items-center justify-between px-5 py-4 border-b border-gray-800">
+          <h3 className="text-sm font-medium text-white">New tenant</h3>
+          <button
+            type="button"
+            onClick={onClose}
+            className="text-gray-500 hover:text-white text-lg leading-none"
+          >
+            ✕
+          </button>
+        </div>
+        <div className="px-5 py-4 space-y-3 text-sm">
+          <div>
+            <label className="block text-xs text-gray-500 mb-1 uppercase tracking-wide">Slug</label>
+            <input
+              autoFocus
+              value={slug}
+              onChange={(e) => setSlug(e.target.value)}
+              placeholder="acme"
+              pattern="[a-zA-Z0-9_-]+"
+              required
+              className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded font-mono focus:outline-none focus:border-blue-500"
+            />
+            <p className="text-xs text-gray-600 mt-1">Lowercase alphanumerics, '-', '_'. Permanent.</p>
+          </div>
+          <div>
+            <label className="block text-xs text-gray-500 mb-1 uppercase tracking-wide">Display name</label>
+            <input
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="Acme Corp"
+              required
+              className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded focus:outline-none focus:border-blue-500"
+            />
+          </div>
+          {err && <div className="text-red-400 text-xs">{err}</div>}
+        </div>
+        <div className="px-5 py-3 border-t border-gray-800 flex justify-end gap-2">
+          <button
+            type="button"
+            onClick={onClose}
+            className="text-sm px-3 py-1.5 rounded text-gray-400 hover:text-white"
+          >
+            Cancel
+          </button>
+          <button
+            type="submit"
+            disabled={busy || !slug.trim() || !name.trim()}
+            className="text-sm px-3 py-1.5 rounded bg-blue-600 text-white hover:bg-blue-500 disabled:opacity-40 disabled:cursor-not-allowed font-medium"
+          >
+            {busy ? 'Creating…' : 'Create'}
+          </button>
+        </div>
+      </form>
+    </div>
+  )
+}
+
 function TenantRow({
   tenant,
   onSave,
@@ -90,8 +184,10 @@ function TenantRow({
   return (
     <tr className="hover:bg-gray-800/30 transition-colors">
       <td className="px-4 py-3">
-        <div className="text-gray-200">{tenant.name}</div>
-        <code className="text-xs font-mono text-blue-300">{tenant.slug}</code>
+        <Link to={`/admin/tenants/${tenant.id}`} className="block hover:underline">
+          <div className="text-gray-200">{tenant.name}</div>
+          <code className="text-xs font-mono text-blue-300">{tenant.slug}</code>
+        </Link>
       </td>
       <td className="px-4 py-3 hidden md:table-cell text-gray-400">{tenant.users}</td>
       <td className="px-4 py-3 hidden md:table-cell text-gray-400">{tenant.jobs}</td>
@@ -143,7 +239,10 @@ const ROLE_COLORS: Record<string, string> = {
 
 export default function AdminPage() {
   const toast = useToast()
+  const { user: currentUser } = useAuth()
+  const isPlatformAdmin = currentUser?.is_platform_admin === true
   const [tab, setTab] = useState<Tab>('overview')
+  const [showCreateTenant, setShowCreateTenant] = useState(false)
   const [stats, setStats] = useState<SystemStats | null>(null)
   const [slos, setSlos] = useState<SLOState[] | null>(null)
   const [runbooks, setRunbooks] = useState<Runbook[]>([])
@@ -320,7 +419,17 @@ export default function AdminPage() {
           <p className="text-sm text-gray-500">{total} records</p>
         </div>
         <div className="flex gap-1 bg-gray-800/60 rounded-lg p-1">
-          {(['overview', 'jobs', 'dlq', 'runbooks', 'users', 'tenants', 'audit'] as Tab[]).map((t) => (
+          {(
+            [
+              'overview',
+              'jobs',
+              'dlq',
+              'runbooks',
+              'users',
+              ...(isPlatformAdmin ? (['tenants'] as Tab[]) : []),
+              'audit',
+            ] as Tab[]
+          ).map((t) => (
             <button
               key={t}
               onClick={() => { setTab(t); setPage(1) }}
@@ -676,33 +785,53 @@ export default function AdminPage() {
       )}
 
       {tab === 'tenants' && (
-        <div className="bg-gray-900 border border-gray-800 rounded-lg overflow-hidden">
-          {loading ? (
-            <table className="w-full text-sm">
-              <tbody className="divide-y divide-gray-800/60">
-                {Array.from({ length: 6 }).map((_, i) => <TableRowSkeleton key={i} />)}
-              </tbody>
-            </table>
-          ) : (
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="border-b border-gray-800 text-xs text-gray-500">
-                  <th className="text-left px-4 py-3 font-medium">Tenant</th>
-                  <th className="text-left px-4 py-3 font-medium hidden md:table-cell">Users</th>
-                  <th className="text-left px-4 py-3 font-medium hidden md:table-cell">Jobs</th>
-                  <th className="text-left px-4 py-3 font-medium">Rate (per min)</th>
-                  <th className="text-left px-4 py-3 font-medium">Monthly quota</th>
-                  <th className="px-4 py-3" />
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-gray-800/60">
-                {tenants.map((t) => (
-                  <TenantRow key={t.id} tenant={t} onSave={saveTenantLimits} />
-                ))}
-              </tbody>
-            </table>
+        <>
+          <div className="flex justify-end mb-3">
+            <button
+              onClick={() => setShowCreateTenant(true)}
+              className="text-sm px-3 py-1.5 rounded bg-blue-600 text-white hover:bg-blue-500 font-medium"
+            >
+              + New tenant
+            </button>
+          </div>
+          <div className="bg-gray-900 border border-gray-800 rounded-lg overflow-hidden">
+            {loading ? (
+              <table className="w-full text-sm">
+                <tbody className="divide-y divide-gray-800/60">
+                  {Array.from({ length: 6 }).map((_, i) => <TableRowSkeleton key={i} />)}
+                </tbody>
+              </table>
+            ) : (
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b border-gray-800 text-xs text-gray-500">
+                    <th className="text-left px-4 py-3 font-medium">Tenant</th>
+                    <th className="text-left px-4 py-3 font-medium hidden md:table-cell">Users</th>
+                    <th className="text-left px-4 py-3 font-medium hidden md:table-cell">Jobs</th>
+                    <th className="text-left px-4 py-3 font-medium">Rate (per min)</th>
+                    <th className="text-left px-4 py-3 font-medium">Monthly quota</th>
+                    <th className="px-4 py-3" />
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-gray-800/60">
+                  {tenants.map((t) => (
+                    <TenantRow key={t.id} tenant={t} onSave={saveTenantLimits} />
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </div>
+          {showCreateTenant && (
+            <CreateTenantModal
+              onClose={() => setShowCreateTenant(false)}
+              onCreated={(created) => {
+                setTenants((prev) => [created, ...prev])
+                setShowCreateTenant(false)
+                toast.success(`Tenant ${created.slug} created`)
+              }}
+            />
           )}
-        </div>
+        </>
       )}
 
       {tab === 'audit' && (

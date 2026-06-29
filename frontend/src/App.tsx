@@ -6,6 +6,7 @@ import RegisterPage from './pages/RegisterPage'
 import DashboardPage from './pages/DashboardPage'
 import JobDetailPage from './pages/JobDetailPage'
 import AdminPage from './pages/AdminPage'
+import AdminTenantDetailPage from './pages/AdminTenantDetailPage'
 import SagasPage from './pages/SagasPage'
 import SagaNewPage from './pages/SagaNewPage'
 import SagaDetailPage from './pages/SagaDetailPage'
@@ -63,6 +64,14 @@ export default function App() {
             element={
               <ProtectedRoute requiredRole="support">
                 <AdminPage />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="/admin/tenants/:id"
+            element={
+              <ProtectedRoute requiredRole="admin">
+                <AdminTenantDetailPage />
               </ProtectedRoute>
             }
           />

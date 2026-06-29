@@ -10,12 +10,17 @@ means counters can over-count under redelivery. A set keyed by job_id is
 idempotent — re-adding the same id is a no-op. SCARD then gives the count.
 
 Keys:
-  jobs:status:{status}                — set of all job_ids with that status (global)
-  jobs:user:{user_id}:status:{status} — set of all job_ids per user per status
+  jobs:tenant:{tenant_id}:status:{status} — per-tenant set of job_ids with that status
+  jobs:user:{user_id}:status:{status}     — per-user set of job_ids with that status
 
 Transitions are handled by removing the id from previous status sets and
 adding to the new one; we infer "previous" by trying to remove from every
 known status set (cheap O(N) where N = #statuses).
+
+Tenant scoping: keys include `tenant_id` so a tenant admin's overview
+cannot leak counts from sibling tenants. The pre-tenancy `jobs:status:*`
+global key is gone; cross-tenant "platform" aggregation, if ever needed,
+would sum across the per-tenant sets at read time.
 """
 
 from typing import Any
@@ -40,23 +45,25 @@ _EVENT_TO_STATUS: dict[str, str] = {
 }
 
 
-def _global_key(status: str) -> str:
-    return f"jobs:status:{status}"
+def _tenant_key(tenant_id: str, status: str) -> str:
+    return f"jobs:tenant:{tenant_id}:status:{status}"
 
 
 def _user_key(user_id: str, status: str) -> str:
     return f"jobs:user:{user_id}:status:{status}"
 
 
-async def _move(redis: Redis, user_id: str, job_id: str, new_status: str) -> None:
+async def _move(
+    redis: Redis, tenant_id: str, user_id: str, job_id: str, new_status: str
+) -> None:
     """Remove job_id from any other status set, then add to the new one."""
     # Remove from every other status (idempotent: SREM on non-member is a no-op).
     for st in _TRACKED_STATUSES:
         if st == new_status:
             continue
-        await redis.srem(_global_key(st), job_id)  # type: ignore[misc,unused-ignore]
+        await redis.srem(_tenant_key(tenant_id, st), job_id)  # type: ignore[misc,unused-ignore]
         await redis.srem(_user_key(user_id, st), job_id)  # type: ignore[misc,unused-ignore]
-    await redis.sadd(_global_key(new_status), job_id)  # type: ignore[misc,unused-ignore]
+    await redis.sadd(_tenant_key(tenant_id, new_status), job_id)  # type: ignore[misc,unused-ignore]
     await redis.sadd(_user_key(user_id, new_status), job_id)  # type: ignore[misc,unused-ignore]
 
 
@@ -86,8 +93,9 @@ class ReadModelProjector(BaseKafkaConsumer):
 
         job_id = value.get("job_id")
         user_id = value.get("user_id")
+        tenant_id = value.get("tenant_id")
         event_name = value.get("event")
-        if not (job_id and user_id and event_name):
+        if not (job_id and user_id and tenant_id and event_name):
             return
 
         # Determine the new status.
@@ -99,14 +107,22 @@ class ReadModelProjector(BaseKafkaConsumer):
                 return
             new_status = mapped
 
-        await _move(self.redis, str(user_id), str(job_id), new_status)
+        await _move(
+            self.redis, str(tenant_id), str(user_id), str(job_id), new_status
+        )
 
 
-async def read_global_stats(redis: Redis) -> dict[str, int]:
-    """Status → count across all jobs (denormalized)."""
+async def read_global_stats(redis: Redis, tenant_id: str) -> dict[str, int]:
+    """Status → count for one tenant (denormalized).
+
+    Naming is historical — the function used to return cross-tenant
+    counts, but post-Phase-12 it returns one tenant's view. Callers pass
+    the effective tenant_id (their own or, for platform admins, the
+    overridden one).
+    """
     out: dict[str, int] = {}
     for st in _TRACKED_STATUSES:
-        out[st] = int(await redis.scard(_global_key(st)))  # type: ignore[misc,unused-ignore]
+        out[st] = int(await redis.scard(_tenant_key(tenant_id, st)))  # type: ignore[misc,unused-ignore]
     return out
 
 

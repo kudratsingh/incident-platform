@@ -51,8 +51,19 @@ export default function Layout({ children }: { children: React.ReactNode }) {
               </span>
             )}
             <span className="text-xs text-gray-500 font-mono">{user?.email}</span>
-            <span className="text-xs px-1.5 py-0.5 rounded bg-gray-800 text-gray-400 font-mono border border-gray-700">
-              {user?.role}
+            <span
+              className={`text-xs px-1.5 py-0.5 rounded font-mono border ${
+                user?.is_platform_admin
+                  ? 'bg-purple-900/40 text-purple-300 border-purple-800/60'
+                  : 'bg-gray-800 text-gray-400 border-gray-700'
+              }`}
+              title={
+                user?.is_platform_admin
+                  ? 'Platform admin (cross-tenant)'
+                  : undefined
+              }
+            >
+              {user?.is_platform_admin ? `${user.role} · platform` : user?.role}
             </span>
             <button
               onClick={handleLogout}

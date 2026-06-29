@@ -1,7 +1,13 @@
 import uuid
 from typing import Any
 
-from app.dependencies import get_db, get_redis, require_role
+from app.dependencies import (
+    get_db,
+    get_redis,
+    require_platform_admin,
+    require_role,
+    resolve_admin_tenant,
+)
 from app.models.enums import UserRole
 from app.models.user import User
 from app.repositories.audit import AuditRepository
@@ -44,15 +50,17 @@ def _job_service(db: AsyncSession, redis: Redis) -> JobService:
 @router.get("/jobs", response_model=PaginatedResponse[JobResponse])
 async def admin_list_jobs(
     params: AdminJobListParams = Depends(),
+    tenant_id: uuid.UUID | None = None,
     current_user: User = Depends(_require_support_or_admin),
     db: AsyncSession = Depends(get_db),
     redis: Redis = Depends(get_redis),
 ) -> PaginatedResponse[JobResponse]:
+    effective_tenant = await resolve_admin_tenant(current_user, db, tenant_id)
     svc = _job_service(db, redis)
     jobs, total = await svc.list_jobs(
         requesting_user_id=current_user.id,
         user_role=current_user.role,
-        tenant_id=current_user.tenant_id,
+        tenant_id=effective_tenant,
         page=params.page,
         page_size=params.page_size,
         status=params.status,
@@ -104,7 +112,9 @@ async def replay_job(
 
 @router.get("/stats")
 async def system_stats(
+    tenant_id: uuid.UUID | None = None,
     current_user: User = Depends(_require_support_or_admin),
+    db: AsyncSession = Depends(get_db),
     redis: Redis = Depends(get_redis),
 ) -> dict[str, dict[str, int]]:
     """System-wide job counts by status, served from the CQRS read model.
@@ -113,7 +123,10 @@ async def system_stats(
     aggregate SQL on the jobs table. Numbers are eventually consistent
     with the write side (latency dominated by Kafka lag).
     """
-    return {"by_status": await read_global_stats(redis)}
+    # The CQRS read-model is keyed by tenant_id, so the override hits a
+    # different Redis set; we don't have to touch app.tenant_id here.
+    effective_tenant = await resolve_admin_tenant(current_user, db, tenant_id)
+    return {"by_status": await read_global_stats(redis, str(effective_tenant))}
 
 
 @router.get("/users/{user_id}/stats")
@@ -158,13 +171,13 @@ async def list_slos(
 async def admin_list_tenants(
     page: int = 1,
     page_size: int = 50,
-    current_user: User = Depends(_require_admin),
+    current_user: User = Depends(require_platform_admin),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
     """List every tenant in the system with per-tenant user + job counts.
 
-    Admin-only. In a later PR this becomes "root-admin-only" once we have a
-    way to designate platform operators vs per-tenant admins.
+    Platform-admin-only. Tenant admins (`role=admin` without the platform
+    flag) can't see sibling tenants; they're scoped to their own.
     """
     repo = TenantRepository(db)
     tenants, total = await repo.list_all(
@@ -192,7 +205,7 @@ async def admin_list_tenants(
 @router.post("/tenants", status_code=201)
 async def admin_create_tenant(
     body: dict[str, Any],
-    current_user: User = Depends(_require_admin),
+    current_user: User = Depends(require_platform_admin),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
     """Create a new tenant. Body: {slug, name}."""
@@ -221,7 +234,7 @@ async def admin_create_tenant(
 @router.get("/tenants/{tenant_id}")
 async def admin_get_tenant(
     tenant_id: uuid.UUID,
-    current_user: User = Depends(_require_admin),
+    current_user: User = Depends(require_platform_admin),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
     from app.core.exceptions import NotFoundError
@@ -248,7 +261,7 @@ async def admin_get_tenant(
 async def admin_update_tenant_limits(
     tenant_id: uuid.UUID,
     body: dict[str, Any],
-    current_user: User = Depends(_require_admin),
+    current_user: User = Depends(require_platform_admin),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
     """Update a tenant's rate limit and/or monthly job quota.
@@ -308,11 +321,13 @@ async def admin_get_runbook(
 
 @router.get("/dlq/stats")
 async def dlq_stats(
+    tenant_id: uuid.UUID | None = None,
     current_user: User = Depends(_require_support_or_admin),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
     """Counts of dead-lettered jobs for the admin DLQ badge / dashboard."""
-    total, by_type = await JobRepository(db).dlq_stats(current_user.tenant_id)
+    effective_tenant = await resolve_admin_tenant(current_user, db, tenant_id)
+    total, by_type = await JobRepository(db).dlq_stats(effective_tenant)
     return {"total": total, "by_type": by_type}
 
 
@@ -400,11 +415,17 @@ async def resolve_incident(
 async def list_users(
     page: int = 1,
     page_size: int = 20,
+    tenant_id: uuid.UUID | None = None,
     current_user: User = Depends(_require_admin),
     db: AsyncSession = Depends(get_db),
 ) -> PaginatedResponse[UserResponse]:
+    effective_tenant = await resolve_admin_tenant(current_user, db, tenant_id)
     repo = UserRepository(db)
-    users, total = await repo.list_all(offset=(page - 1) * page_size, limit=page_size)
+    users, total = await repo.list_all(
+        offset=(page - 1) * page_size,
+        limit=page_size,
+        tenant_id=effective_tenant,
+    )
     return PaginatedResponse.build(
         items=[UserResponse.model_validate(u) for u in users],
         total=total,

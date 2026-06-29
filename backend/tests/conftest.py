@@ -147,12 +147,15 @@ async def test_user(db_session: AsyncSession, default_tenant) -> User:  # type: 
 
 @pytest_asyncio.fixture
 async def admin_user(db_session: AsyncSession, default_tenant) -> User:  # type: ignore[no-untyped-def]
+    # Matches the d9c01a7e4f30 migration: default-tenant admins become
+    # platform admins on upgrade, so the test admin should too.
     user = User(
         tenant_id=default_tenant.id,
         email="admin@example.com",
         hashed_password=hash_password("password123"),
         role=UserRole.ADMIN,
         is_active=True,
+        is_platform_admin=True,
     )
     db_session.add(user)
     await db_session.flush()
