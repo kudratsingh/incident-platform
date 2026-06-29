@@ -3,13 +3,15 @@ from typing import TYPE_CHECKING
 
 from app.models.base import Base, TimestampMixin
 from app.models.enums import UserRole
-from sqlalchemy import Boolean, String
+from app.models.tenant import DEFAULT_TENANT_ID
+from sqlalchemy import Boolean, ForeignKey, String
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 if TYPE_CHECKING:
     from app.models.audit import AuditLog
     from app.models.job import Job
+    from app.models.tenant import Tenant
 
 
 class User(TimestampMixin, Base):
@@ -17,6 +19,13 @@ class User(TimestampMixin, Base):
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("tenants.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+        default=DEFAULT_TENANT_ID,
     )
     email: Mapped[str] = mapped_column(
         String(255), unique=True, index=True, nullable=False
@@ -27,6 +36,9 @@ class User(TimestampMixin, Base):
     )
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
+    tenant: Mapped["Tenant"] = relationship(
+        "Tenant", back_populates="users", lazy="noload"
+    )
     jobs: Mapped[list["Job"]] = relationship(
         "Job", back_populates="user", lazy="noload"
     )
@@ -35,4 +47,4 @@ class User(TimestampMixin, Base):
     )
 
     def __repr__(self) -> str:
-        return f"<User id={self.id} email={self.email} role={self.role}>"
+        return f"<User id={self.id} email={self.email} tenant={self.tenant_id}>"

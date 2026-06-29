@@ -10,6 +10,7 @@ from typing import Any
 request_id_var: ContextVar[str] = ContextVar("request_id", default="")
 trace_id_var: ContextVar[str] = ContextVar("trace_id", default="")
 user_id_var: ContextVar[str] = ContextVar("user_id", default="")
+tenant_id_var: ContextVar[str] = ContextVar("tenant_id", default="")
 job_id_var: ContextVar[str] = ContextVar("job_id", default="")
 
 
@@ -43,6 +44,7 @@ class JSONFormatter(logging.Formatter):
             "request_id": request_id_var.get("") or None,
             "trace_id": trace_id_var.get("") or None,
             "user_id": user_id_var.get("") or None,
+            "tenant_id": tenant_id_var.get("") or None,
             "job_id": job_id_var.get("") or None,
         }
 

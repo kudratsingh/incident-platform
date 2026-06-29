@@ -12,9 +12,22 @@ from sqlalchemy import select, update
 class OutboxRepository(BaseRepository[OutboxEvent]):
     model = OutboxEvent
 
-    async def add(self, topic: str, key: str, payload: dict[str, Any]) -> OutboxEvent:
-        """Insert an event into the outbox (committed with the surrounding tx)."""
-        return await self.create(topic=topic, key=key, payload=payload)
+    async def add(
+        self,
+        topic: str,
+        key: str,
+        payload: dict[str, Any],
+        *,
+        tenant_id: uuid.UUID | None = None,
+    ) -> OutboxEvent:
+        """Insert an event into the outbox (committed with the surrounding tx).
+
+        tenant_id is optional in this PR; omitting it falls back to the
+        model-level default tenant. Phase 12 PR B makes it required."""
+        kwargs: dict[str, Any] = {"topic": topic, "key": key, "payload": payload}
+        if tenant_id is not None:
+            kwargs["tenant_id"] = tenant_id
+        return await self.create(**kwargs)
 
     async def fetch_unpublished(self, limit: int = 100) -> list[OutboxEvent]:
         """Oldest unpublished events first, capped at `limit`."""

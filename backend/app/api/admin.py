@@ -9,6 +9,7 @@ from app.repositories.event_log import EventLogRepository
 from app.repositories.job import JobRepository
 from app.repositories.job_dependency import JobDependencyRepository
 from app.repositories.outbox import OutboxRepository
+from app.repositories.tenant import TenantRepository
 from app.repositories.triage import TriageRepository
 from app.repositories.user import UserRepository
 from app.schemas.common import PaginatedResponse
@@ -144,6 +145,92 @@ async def list_slos(
             }
             for s in states
         ]
+    }
+
+
+@router.get("/tenants")
+async def admin_list_tenants(
+    page: int = 1,
+    page_size: int = 50,
+    current_user: User = Depends(_require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """List every tenant in the system with per-tenant user + job counts.
+
+    Admin-only. In a later PR this becomes "root-admin-only" once we have a
+    way to designate platform operators vs per-tenant admins.
+    """
+    repo = TenantRepository(db)
+    tenants, total = await repo.list_all(
+        offset=(page - 1) * page_size, limit=page_size
+    )
+    items: list[dict[str, Any]] = []
+    for t in tenants:
+        counts = await repo.counts_for(t.id)
+        items.append(
+            {
+                "id": str(t.id),
+                "slug": t.slug,
+                "name": t.name,
+                "is_active": t.is_active,
+                "created_at": t.created_at.isoformat(),
+                "users": counts["users"],
+                "jobs": counts["jobs"],
+            }
+        )
+    return {"items": items, "total": total, "page": page, "page_size": page_size}
+
+
+@router.post("/tenants", status_code=201)
+async def admin_create_tenant(
+    body: dict[str, Any],
+    current_user: User = Depends(_require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Create a new tenant. Body: {slug, name}."""
+    from app.core.exceptions import ConflictError, RequestValidationError
+
+    slug = (body.get("slug") or "").strip()
+    name = (body.get("name") or "").strip()
+    if not slug or not name:
+        raise RequestValidationError("slug and name are required")
+    if not slug.replace("-", "").replace("_", "").isalnum():
+        raise RequestValidationError("slug may only contain alphanumerics, '-', '_'")
+
+    repo = TenantRepository(db)
+    if await repo.get_by_slug(slug) is not None:
+        raise ConflictError(f"Tenant slug already exists: {slug}")
+    tenant = await repo.create(slug=slug, name=name, is_active=True)
+    return {
+        "id": str(tenant.id),
+        "slug": tenant.slug,
+        "name": tenant.name,
+        "is_active": tenant.is_active,
+        "created_at": tenant.created_at.isoformat(),
+    }
+
+
+@router.get("/tenants/{tenant_id}")
+async def admin_get_tenant(
+    tenant_id: uuid.UUID,
+    current_user: User = Depends(_require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    from app.core.exceptions import NotFoundError
+
+    repo = TenantRepository(db)
+    tenant = await repo.get_by_id(tenant_id)
+    if tenant is None:
+        raise NotFoundError(f"Tenant {tenant_id} not found")
+    counts = await repo.counts_for(tenant.id)
+    return {
+        "id": str(tenant.id),
+        "slug": tenant.slug,
+        "name": tenant.name,
+        "is_active": tenant.is_active,
+        "created_at": tenant.created_at.isoformat(),
+        "users": counts["users"],
+        "jobs": counts["jobs"],
     }
 
 

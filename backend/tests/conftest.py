@@ -68,7 +68,9 @@ async def db_session(sqlite_engine) -> AsyncGenerator[AsyncSession, None]:  # ty
 # ---------------------------------------------------------------------------
 
 @pytest_asyncio.fixture
-async def client(db_session: AsyncSession) -> AsyncGenerator[AsyncClient, None]:
+async def client(  # type: ignore[no-untyped-def]
+    db_session: AsyncSession, default_tenant
+) -> AsyncGenerator[AsyncClient, None]:
     app = create_app()
 
     async def _override_db() -> AsyncGenerator[AsyncSession, None]:
@@ -102,8 +104,36 @@ async def client(db_session: AsyncSession) -> AsyncGenerator[AsyncClient, None]:
 # ---------------------------------------------------------------------------
 
 @pytest_asyncio.fixture
-async def test_user(db_session: AsyncSession) -> User:
+async def default_tenant(db_session: AsyncSession):  # type: ignore[no-untyped-def]
+    """Ensure the default-tenant row exists before any user is inserted.
+
+    Conftest uses Base.metadata.create_all rather than running migrations, so
+    the seed INSERT from the f8a1c4e23507 migration doesn't run automatically.
+    """
+    from app.models.tenant import DEFAULT_TENANT_ID, Tenant
+    from sqlalchemy import select
+
+    existing = (
+        await db_session.execute(select(Tenant).where(Tenant.id == DEFAULT_TENANT_ID))
+    ).scalar_one_or_none()
+    if existing is not None:
+        return existing
+
+    tenant = Tenant(
+        id=DEFAULT_TENANT_ID,
+        slug="default",
+        name="Default Tenant",
+        is_active=True,
+    )
+    db_session.add(tenant)
+    await db_session.flush()
+    return tenant
+
+
+@pytest_asyncio.fixture
+async def test_user(db_session: AsyncSession, default_tenant) -> User:  # type: ignore[no-untyped-def]
     user = User(
+        tenant_id=default_tenant.id,
         email="user@example.com",
         hashed_password=hash_password("password123"),
         role=UserRole.USER,
@@ -116,8 +146,9 @@ async def test_user(db_session: AsyncSession) -> User:
 
 
 @pytest_asyncio.fixture
-async def admin_user(db_session: AsyncSession) -> User:
+async def admin_user(db_session: AsyncSession, default_tenant) -> User:  # type: ignore[no-untyped-def]
     user = User(
+        tenant_id=default_tenant.id,
         email="admin@example.com",
         hashed_password=hash_password("password123"),
         role=UserRole.ADMIN,
@@ -131,12 +162,24 @@ async def admin_user(db_session: AsyncSession) -> User:
 
 @pytest.fixture
 def user_token(test_user: User) -> str:
-    return create_access_token({"sub": str(test_user.id), "role": test_user.role})
+    return create_access_token(
+        {
+            "sub": str(test_user.id),
+            "tenant_id": str(test_user.tenant_id),
+            "role": test_user.role,
+        }
+    )
 
 
 @pytest.fixture
 def admin_token(admin_user: User) -> str:
-    return create_access_token({"sub": str(admin_user.id), "role": admin_user.role})
+    return create_access_token(
+        {
+            "sub": str(admin_user.id),
+            "tenant_id": str(admin_user.tenant_id),
+            "role": admin_user.role,
+        }
+    )
 
 
 @pytest.fixture

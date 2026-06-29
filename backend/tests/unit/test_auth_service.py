@@ -29,7 +29,13 @@ def _make_user(**kwargs: object) -> User:
 def _make_service() -> tuple[AuthService, AsyncMock, AsyncMock]:
     user_repo = AsyncMock()
     audit_repo = AsyncMock()
-    svc = AuthService(user_repo, audit_repo)
+    tenant_repo = AsyncMock()
+    # Default to a valid tenant so `register` finds one.
+    fake_tenant = MagicMock()
+    fake_tenant.id = uuid.uuid4()
+    fake_tenant.is_active = True
+    tenant_repo.get_by_slug.return_value = fake_tenant
+    svc = AuthService(user_repo, audit_repo, tenant_repo)
     return svc, user_repo, audit_repo
 
 
