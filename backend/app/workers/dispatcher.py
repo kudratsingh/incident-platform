@@ -32,6 +32,7 @@ from app.models.enums import JobStatus, JobType
 from app.repositories.audit import AuditRepository
 from app.repositories.job import JobRepository
 from app.repositories.outbox import OutboxRepository
+from app.services import retry_policy
 from app.workers import (
     async_tasks,
     cpu_processors,
@@ -103,6 +104,7 @@ async def _run_job(
             tenant_id = job.tenant_id
             retry_count = job.retry_count
             max_retries = job.max_retries
+            prior_error = job.error_message  # filled when this is a retry
 
             await repo.update_status(job_id, JobStatus.RUNNING)
 
@@ -188,8 +190,48 @@ async def _run_job(
                 },
             )
 
-            if new_retry_count < max_retries:
-                delay = settings.job_retry_backoff_base ** new_retry_count
+            # Deterministic decision first; LLM only refines it when eligible.
+            deterministic_delay = settings.job_retry_backoff_base ** new_retry_count
+            llm_dead_lettered = False
+            llm_reasoning: str | None = None
+            delay = deterministic_delay
+            if (
+                new_retry_count < max_retries
+                and retry_policy.is_enabled()
+                and new_retry_count >= settings.llm_retry_policy_min_retry_count
+            ):
+                # Best-effort consult. Any failure (timeout, schema, network,
+                # missing API key) falls back to the deterministic backoff —
+                # the worker never blocks waiting on the API.
+                try:
+                    decision, _usage, _model = await retry_policy.decide_retry(
+                        job_type=job_type,
+                        error_message=str(exc),
+                        retry_count=new_retry_count,
+                        max_retries=max_retries,
+                        prior_error=prior_error,
+                    )
+                    llm_reasoning = decision.reasoning
+                    if decision.action == "dead_letter_now":
+                        llm_dead_lettered = True
+                    else:
+                        delay = decision.backoff_seconds
+                    logger.info(
+                        "retry policy decision",
+                        extra={
+                            "action": decision.action,
+                            "backoff_seconds": delay,
+                            "deterministic_backoff_seconds": deterministic_delay,
+                            "reasoning": decision.reasoning,
+                        },
+                    )
+                except Exception as policy_exc:
+                    logger.warning(
+                        "retry policy fell back to deterministic",
+                        extra={"error": str(policy_exc)},
+                    )
+
+            if new_retry_count < max_retries and not llm_dead_lettered:
                 async with session_factory() as session:
                     async with session.begin():
                         await JobRepository(session).update_status(
@@ -227,11 +269,23 @@ async def _run_job(
                             job_id, JobStatus.DEAD_LETTER,
                             extra={"retry_count": new_retry_count, "error_message": str(exc)},
                         )
+                        dlq_extra: dict[str, Any] = {
+                            "error": str(exc),
+                            "retry_count": new_retry_count,
+                        }
+                        if llm_dead_lettered:
+                            dlq_extra["dead_lettered_by"] = "llm_retry_policy"
+                            dlq_extra["reasoning"] = llm_reasoning
                         await audit.log(
                             "job.dead_letter",
                             tenant_id=tenant_id,
                             job_id=job_id,
-                            extra_data={"error": str(exc), "retry_count": new_retry_count},
+                            extra_data=dlq_extra,
+                        )
+                        dlq_message = (
+                            f"LLM dead-lettered: {llm_reasoning}"
+                            if llm_dead_lettered
+                            else f"Job exhausted after {new_retry_count} attempts: {exc}"
                         )
                         await OutboxRepository(session).add(
                             tenant_id=tenant_id,
@@ -244,9 +298,7 @@ async def _run_job(
                                 "user_id": str(user_id),
                                 "job_type": job_type,
                                 "error": str(exc),
-                                "message": (
-                                    f"Job exhausted after {new_retry_count} attempts: {exc}"
-                                ),
+                                "message": dlq_message,
                                 "retry_count": new_retry_count,
                                 "dead_lettered": True,
                             },
