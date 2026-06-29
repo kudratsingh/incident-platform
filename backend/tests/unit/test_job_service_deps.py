@@ -41,6 +41,7 @@ async def test_job_starts_pending_when_all_deps_already_completed() -> None:
 
     result = await svc.create_job(
         user_id=uuid.uuid4(),
+        tenant_id=uuid.uuid4(),
         job_type=JobType.CSV_UPLOAD,
         dependencies=[parent.id],
     )
@@ -68,6 +69,7 @@ async def test_job_starts_waiting_when_a_parent_is_not_complete() -> None:
 
     await svc.create_job(
         user_id=uuid.uuid4(),
+        tenant_id=uuid.uuid4(),
         job_type=JobType.CSV_UPLOAD,
         dependencies=[parent_done.id, parent_running.id],
     )
@@ -87,6 +89,7 @@ async def test_missing_dependency_raises_not_found() -> None:
     with pytest.raises(NotFoundError):
         await svc.create_job(
             user_id=uuid.uuid4(),
+            tenant_id=uuid.uuid4(),
             job_type=JobType.CSV_UPLOAD,
             dependencies=[uuid.uuid4()],
         )
@@ -98,7 +101,11 @@ async def test_no_dependencies_behaves_like_before() -> None:
     new_job = _job(status=JobStatus.PENDING)
     job_repo.create.return_value = new_job
 
-    await svc.create_job(user_id=uuid.uuid4(), job_type=JobType.CSV_UPLOAD)
+    await svc.create_job(
+        user_id=uuid.uuid4(),
+        tenant_id=uuid.uuid4(),
+        job_type=JobType.CSV_UPLOAD,
+    )
 
     dep_repo.add.assert_not_awaited()
     outbox_repo.add.assert_awaited_once()

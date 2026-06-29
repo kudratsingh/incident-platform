@@ -35,6 +35,7 @@ class JobService:
     async def create_job(
         self,
         user_id: uuid.UUID,
+        tenant_id: uuid.UUID,
         job_type: str,
         payload: dict[str, Any] | None = None,
         idempotency_key: str | None = None,
@@ -44,8 +45,11 @@ class JobService:
         saga_id: uuid.UUID | None = None,
     ) -> Job:
         # Idempotency: return the existing job if this key was already used
+        # in this tenant. (Different tenants can reuse the same key.)
         if idempotency_key:
-            existing = await self.job_repo.get_by_idempotency_key(idempotency_key)
+            existing = await self.job_repo.get_by_idempotency_key(
+                idempotency_key, tenant_id
+            )
             if existing:
                 logger.info(
                     "idempotent job returned",
@@ -76,6 +80,7 @@ class JobService:
             enriched_payload["__traceparent"] = otel_ctx
 
         job = await self.job_repo.create(
+            tenant_id=tenant_id,
             user_id=user_id,
             type=job_type,
             status=initial_status,
@@ -96,6 +101,7 @@ class JobService:
 
         await self.audit_repo.log(
             "job.created",
+            tenant_id=tenant_id,
             user_id=user_id,
             job_id=job.id,
             resource_type="job",
@@ -114,10 +120,12 @@ class JobService:
         if initial_status == JobStatus.PENDING:
             settings = get_settings()
             await self.outbox_repo.add(
+                tenant_id=tenant_id,
                 topic=settings.kafka_topic_job_submitted,
                 key=str(user_id),
                 payload={
                     "event": "job.submitted",
+                    "tenant_id": str(tenant_id),
                     "job_id": str(job.id),
                     "user_id": str(user_id),
                     "job_type": job_type,
@@ -143,9 +151,15 @@ class JobService:
         return job
 
     async def get_job(
-        self, job_id: uuid.UUID, requesting_user_id: uuid.UUID, user_role: str
+        self,
+        job_id: uuid.UUID,
+        requesting_user_id: uuid.UUID,
+        user_role: str,
+        tenant_id: uuid.UUID,
     ) -> Job:
-        job = await self.job_repo.get_by_id(job_id)
+        # Tenant scope first — a cross-tenant lookup is a 404, never an
+        # AuthorizationError, so the caller can't even infer the row exists.
+        job = await self.job_repo.get_for_tenant(job_id, tenant_id)
         if not job:
             raise NotFoundError(f"Job {job_id} not found")
         privileged = user_role in (UserRole.ADMIN, UserRole.SUPPORT)
@@ -157,6 +171,7 @@ class JobService:
         self,
         requesting_user_id: uuid.UUID,
         user_role: str,
+        tenant_id: uuid.UUID,
         page: int = 1,
         page_size: int = 20,
         status: str | None = None,
@@ -172,6 +187,7 @@ class JobService:
             effective_user_id = requesting_user_id
 
         return await self.job_repo.list_jobs(
+            tenant_id=tenant_id,
             offset=(page - 1) * page_size,
             limit=page_size,
             user_id=effective_user_id,
@@ -181,9 +197,9 @@ class JobService:
         )
 
     async def replay_job(
-        self, job_id: uuid.UUID, requesting_user_id: uuid.UUID
+        self, job_id: uuid.UUID, requesting_user_id: uuid.UUID, tenant_id: uuid.UUID
     ) -> Job:
-        job = await self.job_repo.get_by_id(job_id)
+        job = await self.job_repo.get_for_tenant(job_id, tenant_id)
         if not job:
             raise NotFoundError(f"Job {job_id} not found")
         if job.status not in (JobStatus.FAILED, JobStatus.DEAD_LETTER):
@@ -200,6 +216,7 @@ class JobService:
         )
         await self.audit_repo.log(
             "job.replayed",
+            tenant_id=job.tenant_id,
             user_id=requesting_user_id,
             job_id=job_id,
             resource_type="job",
@@ -212,10 +229,12 @@ class JobService:
         )
         settings = get_settings()
         await self.outbox_repo.add(
+            tenant_id=job.tenant_id,
             topic=settings.kafka_topic_job_submitted,
             key=str(job.user_id),
             payload={
                 "event": "job.submitted",
+                "tenant_id": str(job.tenant_id),
                 "job_id": str(job_id),
                 "user_id": str(job.user_id),
                 "job_type": job.type,
@@ -238,15 +257,16 @@ class JobService:
         return updated
 
     async def resolve_incident(
-        self, job_id: uuid.UUID, requesting_user_id: uuid.UUID
+        self, job_id: uuid.UUID, requesting_user_id: uuid.UUID, tenant_id: uuid.UUID
     ) -> Job:
-        job = await self.job_repo.get_by_id(job_id)
+        job = await self.job_repo.get_for_tenant(job_id, tenant_id)
         if not job:
             raise NotFoundError(f"Job {job_id} not found")
 
         updated = await self.job_repo.update_status(job_id, JobStatus.COMPLETED)
         await self.audit_repo.log(
             "incident.resolved",
+            tenant_id=job.tenant_id,
             user_id=requesting_user_id,
             job_id=job_id,
             resource_type="job",

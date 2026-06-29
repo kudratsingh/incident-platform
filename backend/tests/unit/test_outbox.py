@@ -17,12 +17,16 @@ async def test_repo_add_creates_row() -> None:
     repo = OutboxRepository(session)
     # BaseRepository.create() calls session.add (sync) then session.flush/refresh
     session.add = MagicMock()
+    tenant_id = uuid.uuid4()
 
-    await repo.add(topic="job.submitted", key="user-1", payload={"x": 1})
+    await repo.add(
+        tenant_id=tenant_id, topic="job.submitted", key="user-1", payload={"x": 1}
+    )
 
     session.add.assert_called_once()
     session.flush.assert_awaited()
     instance = session.add.call_args.args[0]
+    assert instance.tenant_id == tenant_id
     assert instance.topic == "job.submitted"
     assert instance.key == "user-1"
     assert instance.payload == {"x": 1}
@@ -166,11 +170,16 @@ async def test_job_service_create_writes_outbox() -> None:
 
     svc = JobService(job_repo, audit_repo, outbox_repo, redis)
     user_id = uuid.uuid4()
-    await svc.create_job(user_id=user_id, job_type=JobType.CSV_UPLOAD)
+    tenant_id = uuid.uuid4()
+    await svc.create_job(
+        user_id=user_id, tenant_id=tenant_id, job_type=JobType.CSV_UPLOAD
+    )
 
     outbox_repo.add.assert_awaited_once()
     kwargs = outbox_repo.add.await_args.kwargs
+    assert kwargs["tenant_id"] == tenant_id
     assert kwargs["topic"] == "job.submitted"
     assert kwargs["key"] == str(user_id)
     assert kwargs["payload"]["event"] == "job.submitted"
+    assert kwargs["payload"]["tenant_id"] == str(tenant_id)
     assert kwargs["payload"]["job_id"] == str(job.id)

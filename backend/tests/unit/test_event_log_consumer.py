@@ -28,11 +28,13 @@ async def test_appends_event_row_with_kafka_coords() -> None:
     consumer = EventLogConsumer(factory)
     job_id = uuid.uuid4()
 
+    tenant_id = uuid.uuid4()
     await consumer.handle_message(
         topic="job.submitted",
         key="u",
         value={
             "event": "job.submitted",
+            "tenant_id": str(tenant_id),
             "job_id": str(job_id),
             "user_id": str(uuid.uuid4()),
             "job_type": "csv_upload",
@@ -44,6 +46,7 @@ async def test_appends_event_row_with_kafka_coords() -> None:
     session.add.assert_called_once()
     row = session.add.call_args.args[0]
     assert row.event_name == "job.submitted"
+    assert row.tenant_id == tenant_id
     assert row.job_id == job_id
     assert row.kafka_topic == "job.submitted"
     assert row.kafka_partition == 2
@@ -67,6 +70,7 @@ async def test_swallows_integrity_error_on_redelivery() -> None:
         key="u",
         value={
             "event": "job.submitted",
+            "tenant_id": str(uuid.uuid4()),
             "job_id": str(uuid.uuid4()),
             "user_id": str(uuid.uuid4()),
         },
@@ -98,7 +102,11 @@ async def test_null_job_id_is_recorded() -> None:
     await consumer.handle_message(
         topic="job.progress",
         key="u",
-        value={"event": "job.progress", "job_id": "not-a-uuid"},
+        value={
+            "event": "job.progress",
+            "tenant_id": str(uuid.uuid4()),
+            "job_id": "not-a-uuid",
+        },
         partition=0,
         offset=7,
     )

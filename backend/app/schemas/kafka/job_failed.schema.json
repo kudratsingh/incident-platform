@@ -3,9 +3,10 @@
   "$id": "job.failed/v1",
   "title": "JobFailed",
   "type": "object",
-  "required": ["event", "job_id", "user_id", "job_type", "error", "dead_lettered"],
+  "required": ["event", "tenant_id", "job_id", "user_id", "job_type", "error", "dead_lettered"],
   "properties": {
     "event": { "const": "job.failed" },
+    "tenant_id": { "type": "string", "format": "uuid" },
     "job_id": { "type": "string", "format": "uuid" },
     "user_id": { "type": "string", "format": "uuid" },
     "job_type": { "type": "string", "minLength": 1 },

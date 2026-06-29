@@ -11,14 +11,29 @@ from sqlalchemy import and_, func, select, update
 class JobRepository(BaseRepository[Job]):
     model = Job
 
-    async def get_by_idempotency_key(self, key: str) -> Job | None:
+    async def get_by_idempotency_key(
+        self, key: str, tenant_id: uuid.UUID
+    ) -> Job | None:
         result = await self.session.execute(
-            select(Job).where(Job.idempotency_key == key)
+            select(Job).where(
+                Job.idempotency_key == key, Job.tenant_id == tenant_id
+            )
+        )
+        return result.scalar_one_or_none()
+
+    async def get_for_tenant(
+        self, job_id: uuid.UUID, tenant_id: uuid.UUID
+    ) -> Job | None:
+        """Tenant-scoped get_by_id. Returns None when the job belongs to a
+        different tenant — never raises, never leaks the row."""
+        result = await self.session.execute(
+            select(Job).where(Job.id == job_id, Job.tenant_id == tenant_id)
         )
         return result.scalar_one_or_none()
 
     async def list_jobs(
         self,
+        tenant_id: uuid.UUID,
         offset: int = 0,
         limit: int = 20,
         user_id: uuid.UUID | None = None,
@@ -26,7 +41,7 @@ class JobRepository(BaseRepository[Job]):
         job_type: str | None = None,
         trace_id: str | None = None,
     ) -> tuple[list[Job], int]:
-        filters = []
+        filters: list[Any] = [Job.tenant_id == tenant_id]
         if user_id is not None:
             filters.append(Job.user_id == user_id)
         if status is not None:
@@ -36,13 +51,16 @@ class JobRepository(BaseRepository[Job]):
         if trace_id is not None:
             filters.append(Job.trace_id == trace_id)
 
-        where = and_(*filters) if filters else None
-        total = await self._count(where) if where is not None else await self._count()
+        where = and_(*filters)
+        total = await self._count(where)
 
-        stmt = select(Job).order_by(Job.created_at.desc()).offset(offset).limit(limit)
-        if where is not None:
-            stmt = stmt.where(where)
-
+        stmt = (
+            select(Job)
+            .where(where)
+            .order_by(Job.created_at.desc())
+            .offset(offset)
+            .limit(limit)
+        )
         result = await self.session.execute(stmt)
         return list(result.scalars().all()), total
 
@@ -66,11 +84,14 @@ class JobRepository(BaseRepository[Job]):
         await self.session.flush()
         return await self.get_by_id(job_id)
 
-    async def dlq_stats(self) -> tuple[int, dict[str, int]]:
-        """Total DLQ count plus per-job-type breakdown."""
+    async def dlq_stats(self, tenant_id: uuid.UUID) -> tuple[int, dict[str, int]]:
+        """Total DLQ count plus per-job-type breakdown, scoped to one tenant."""
         stmt = (
             select(Job.type, func.count().label("n"))
-            .where(Job.status == JobStatus.DEAD_LETTER)
+            .where(
+                Job.status == JobStatus.DEAD_LETTER,
+                Job.tenant_id == tenant_id,
+            )
             .group_by(Job.type)
         )
         result = await self.session.execute(stmt)

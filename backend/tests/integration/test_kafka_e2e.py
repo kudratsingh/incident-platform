@@ -100,8 +100,10 @@ async def test_producer_consumer_round_trip(redpanda: str) -> None:
     topic = "job.submitted"
     user_id = str(uuid.uuid4())
     job_id = str(uuid.uuid4())
+    tenant_id = str(uuid.uuid4())
     payload = {
         "event": "job.submitted",
+        "tenant_id": tenant_id,
         "job_id": job_id,
         "user_id": user_id,
         "job_type": "csv_upload",

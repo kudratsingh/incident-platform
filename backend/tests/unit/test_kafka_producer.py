@@ -1,7 +1,13 @@
 """Unit tests for the Kafka producer module.
 
-The real AIOKafkaProducer is replaced with an AsyncMock so we can assert what
-the publish_* helpers send to each topic (key partitioning, payload shape).
+The real AIOKafkaProducer is replaced with an AsyncMock so we can assert the
+payload shape `publish_job_progress` and `publish_raw` send to the broker.
+
+Historical note: this module also used to expose `publish_job_submitted`,
+`publish_job_completed`, and `publish_job_failed` helpers. Those were
+superseded by the transactional outbox + `publish_raw` and are now gone —
+the only direct publish path left is `publish_job_progress` (high-frequency
+progress events that don't need outbox durability).
 """
 
 import uuid
@@ -26,39 +32,14 @@ def _kwargs(mock: AsyncMock) -> dict[str, Any]:
     return mock.send_and_wait.await_args.kwargs
 
 
-async def test_publish_job_submitted_keys_by_user_id(_mock_producer: AsyncMock) -> None:
-    job_id = uuid.uuid4()
-    user_id = uuid.uuid4()
-    await kafka_producer.publish_job_submitted(
-        job_id=job_id,
-        user_id=user_id,
-        job_type="csv_upload",
-        payload={"file": "x.csv"},
-        priority=1,
-        trace_id="trace-abc",
-    )
-
-    kwargs = _kwargs(_mock_producer)
-    settings = get_settings()
-    assert _mock_producer.send_and_wait.await_args.args[0] == settings.kafka_topic_job_submitted
-    assert kwargs["key"] == str(user_id)
-    assert kwargs["value"] == {
-        "event": "job.submitted",
-        "job_id": str(job_id),
-        "user_id": str(user_id),
-        "job_type": "csv_upload",
-        "payload": {"file": "x.csv"},
-        "priority": 1,
-        "trace_id": "trace-abc",
-    }
-
-
 async def test_publish_job_progress_payload(_mock_producer: AsyncMock) -> None:
     job_id = uuid.uuid4()
     user_id = uuid.uuid4()
+    tenant_id = uuid.uuid4()
     await kafka_producer.publish_job_progress(
         job_id=job_id,
         user_id=user_id,
+        tenant_id=tenant_id,
         status="running",
         percent=42,
         message="halfway",
@@ -69,68 +50,42 @@ async def test_publish_job_progress_payload(_mock_producer: AsyncMock) -> None:
     settings = get_settings()
     assert _mock_producer.send_and_wait.await_args.args[0] == settings.kafka_topic_job_progress
     assert kwargs["key"] == str(user_id)
-    assert kwargs["value"]["status"] == "running"
-    assert kwargs["value"]["percent"] == 42
-    assert kwargs["value"]["retry_count"] == 2
+    value = kwargs["value"]
+    assert value["tenant_id"] == str(tenant_id)
+    assert value["status"] == "running"
+    assert value["percent"] == 42
+    assert value["retry_count"] == 2
 
 
-async def test_publish_job_completed_payload(_mock_producer: AsyncMock) -> None:
-    job_id = uuid.uuid4()
-    user_id = uuid.uuid4()
-    await kafka_producer.publish_job_completed(
-        job_id=job_id,
-        user_id=user_id,
-        job_type="report_gen",
-        result={"rows": 100},
-        retry_count=0,
-    )
-
-    kwargs = _kwargs(_mock_producer)
-    settings = get_settings()
-    assert _mock_producer.send_and_wait.await_args.args[0] == settings.kafka_topic_job_completed
-    assert kwargs["value"]["result"] == {"rows": 100}
-
-
-async def test_publish_job_failed_routes_to_failed_topic(_mock_producer: AsyncMock) -> None:
-    await kafka_producer.publish_job_failed(
-        job_id=uuid.uuid4(),
-        user_id=uuid.uuid4(),
-        job_type="bulk_api_sync",
-        error="timeout",
-        retry_count=1,
-        dead_lettered=False,
-    )
-    settings = get_settings()
-    assert _mock_producer.send_and_wait.await_args.args[0] == settings.kafka_topic_job_failed
-    assert _mock_producer.send_and_wait.await_args.kwargs["value"]["dead_lettered"] is False
-
-
-async def test_publish_job_failed_routes_to_dlq_when_dead_lettered(
+async def test_publish_progress_swallows_broker_errors(
     _mock_producer: AsyncMock,
 ) -> None:
-    await kafka_producer.publish_job_failed(
-        job_id=uuid.uuid4(),
-        user_id=uuid.uuid4(),
-        job_type="bulk_api_sync",
-        error="exhausted",
-        retry_count=3,
-        dead_lettered=True,
-    )
-    settings = get_settings()
-    assert _mock_producer.send_and_wait.await_args.args[0] == settings.kafka_topic_job_dlq
-    assert _mock_producer.send_and_wait.await_args.kwargs["value"]["dead_lettered"] is True
-
-
-async def test_publish_swallows_broker_errors(
-    monkeypatch: pytest.MonkeyPatch, _mock_producer: AsyncMock
-) -> None:
-    """A failed send must not propagate — the API/worker can't be blocked by Kafka."""
+    """A failed send must not propagate — the worker can't be blocked by Kafka."""
     _mock_producer.send_and_wait.side_effect = RuntimeError("broker down")
-    # Must not raise.
+    # Should not raise.
     await kafka_producer.publish_job_progress(
         job_id=uuid.uuid4(),
         user_id=uuid.uuid4(),
+        tenant_id=uuid.uuid4(),
         status="running",
-        percent=0,
+        percent=10,
         message="x",
     )
+
+
+async def test_publish_raw_propagates_errors(_mock_producer: AsyncMock) -> None:
+    """publish_raw (used by the outbox relay) must let errors propagate so the
+    relay can leave the row unpublished."""
+    _mock_producer.send_and_wait.side_effect = RuntimeError("broker down")
+    with pytest.raises(RuntimeError, match="broker down"):
+        await kafka_producer.publish_raw(
+            topic="job.submitted",
+            key="user-1",
+            payload={
+                "event": "job.submitted",
+                "tenant_id": str(uuid.uuid4()),
+                "job_id": str(uuid.uuid4()),
+                "user_id": str(uuid.uuid4()),
+                "job_type": "csv_upload",
+            },
+        )

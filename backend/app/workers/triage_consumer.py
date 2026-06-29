@@ -67,6 +67,18 @@ class LlmTriageConsumer(BaseKafkaConsumer):
             logger.warning("triage skipping invalid job_id", extra={"job_id": job_id_str})
             return
 
+        tenant_id_str = value.get("tenant_id")
+        if not isinstance(tenant_id_str, str):
+            logger.warning(
+                "triage skipping event without tenant_id",
+                extra={"job_id": str(job_id)},
+            )
+            return
+        try:
+            tenant_id = uuid.UUID(tenant_id_str)
+        except ValueError:
+            return
+
         try:
             analysis, usage, model_used = await triage_service.triage_failure(
                 job_type=str(value.get("job_type", "")),
@@ -90,6 +102,7 @@ class LlmTriageConsumer(BaseKafkaConsumer):
             async with session.begin():
                 await TriageRepository(session).upsert(
                     job_id=job_id,
+                    tenant_id=tenant_id,
                     root_cause_category=analysis.root_cause_category,
                     summary=analysis.summary,
                     suggested_fix=analysis.suggested_fix,

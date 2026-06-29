@@ -111,6 +111,7 @@ async def create_saga(
     svc = _saga_service(db, redis)
     saga = await svc.create_saga(
         user_id=current_user.id,
+        tenant_id=current_user.tenant_id,
         name=body.name,
         steps=[
             SagaStep(type=s.type, payload=s.payload, priority=s.priority)

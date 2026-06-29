@@ -27,12 +27,14 @@ async def test_audit_consumer_writes_event_submitted_row() -> None:
     job_id = uuid.uuid4()
     user_id = uuid.uuid4()
 
+    tenant_id = uuid.uuid4()
     with patch("app.workers.audit_consumer.AuditRepository", return_value=audit_repo):
         await consumer.handle_message(
             topic="job.submitted",
             key=str(user_id),
             value={
                 "event": "job.submitted",
+                "tenant_id": str(tenant_id),
                 "job_id": str(job_id),
                 "user_id": str(user_id),
                 "job_type": "csv_upload",
@@ -46,11 +48,13 @@ async def test_audit_consumer_writes_event_submitted_row() -> None:
     kwargs = audit_repo.log.await_args.kwargs
     args = audit_repo.log.await_args.args
     assert args[0] == "event.job.submitted"
+    assert kwargs["tenant_id"] == tenant_id
     assert kwargs["user_id"] == user_id
     assert kwargs["job_id"] == job_id
     assert kwargs["extra_data"]["job_type"] == "csv_upload"
-    # event/job_id/user_id stripped from extra_data
+    # event/tenant_id/job_id/user_id stripped from extra_data
     assert "event" not in kwargs["extra_data"]
+    assert "tenant_id" not in kwargs["extra_data"]
     assert "job_id" not in kwargs["extra_data"]
 
 
@@ -65,6 +69,7 @@ async def test_audit_consumer_splits_failed_vs_dead_letter() -> None:
             key="u",
             value={
                 "event": "job.failed",
+                "tenant_id": str(uuid.uuid4()),
                 "job_id": str(uuid.uuid4()),
                 "user_id": str(uuid.uuid4()),
                 "dead_lettered": False,
@@ -77,6 +82,7 @@ async def test_audit_consumer_splits_failed_vs_dead_letter() -> None:
             key="u",
             value={
                 "event": "job.failed",
+                "tenant_id": str(uuid.uuid4()),
                 "job_id": str(uuid.uuid4()),
                 "user_id": str(uuid.uuid4()),
                 "dead_lettered": True,

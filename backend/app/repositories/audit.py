@@ -13,7 +13,7 @@ class AuditRepository(BaseRepository[AuditLog]):
         self,
         action: str,
         *,
-        tenant_id: uuid.UUID | None = None,
+        tenant_id: uuid.UUID,
         user_id: uuid.UUID | None = None,
         job_id: uuid.UUID | None = None,
         resource_type: str | None = None,
@@ -22,25 +22,18 @@ class AuditRepository(BaseRepository[AuditLog]):
         ip_address: str | None = None,
         extra_data: dict[str, Any] | None = None,
     ) -> AuditLog:
-        """Convenience wrapper — callers name what happened, repo writes the row.
-
-        tenant_id is optional in this PR: omitting it lets the AuditLog
-        model's column-level default drop the row into the bootstrap tenant.
-        Phase 12 PR B makes it required and threads it through every call site.
-        """
-        kwargs: dict[str, Any] = {
-            "action": action,
-            "user_id": user_id,
-            "job_id": job_id,
-            "resource_type": resource_type,
-            "resource_id": resource_id,
-            "request_id": request_id,
-            "ip_address": ip_address,
-            "extra_data": extra_data,
-        }
-        if tenant_id is not None:
-            kwargs["tenant_id"] = tenant_id
-        return await self.create(**kwargs)
+        """Convenience wrapper — callers name what happened, repo writes the row."""
+        return await self.create(
+            action=action,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            job_id=job_id,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            request_id=request_id,
+            ip_address=ip_address,
+            extra_data=extra_data,
+        )
 
     async def list_logs(
         self,

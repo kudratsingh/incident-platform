@@ -85,33 +85,10 @@ async def publish_raw(topic: str, key: str, payload: dict[str, Any]) -> None:
     await _get_producer().send_and_wait(topic, value=payload, key=key)
 
 
-async def publish_job_submitted(
-    job_id: uuid.UUID,
-    user_id: uuid.UUID,
-    job_type: str,
-    payload: dict[str, Any],
-    priority: int,
-    trace_id: str | None,
-) -> None:
-    settings = get_settings()
-    await _publish(
-        topic=settings.kafka_topic_job_submitted,
-        key=str(user_id),  # partition by user_id for ordered per-user processing
-        payload={
-            "event": "job.submitted",
-            "job_id": str(job_id),
-            "user_id": str(user_id),
-            "job_type": job_type,
-            "payload": payload,
-            "priority": priority,
-            "trace_id": trace_id,
-        },
-    )
-
-
 async def publish_job_progress(
     job_id: uuid.UUID,
     user_id: uuid.UUID,
+    tenant_id: uuid.UUID,
     status: str,
     percent: int,
     message: str,
@@ -123,6 +100,7 @@ async def publish_job_progress(
         key=str(user_id),
         payload={
             "event": "job.progress",
+            "tenant_id": str(tenant_id),
             "job_id": str(job_id),
             "user_id": str(user_id),
             "status": status,
@@ -133,48 +111,3 @@ async def publish_job_progress(
     )
 
 
-async def publish_job_completed(
-    job_id: uuid.UUID,
-    user_id: uuid.UUID,
-    job_type: str,
-    result: dict[str, Any],
-    retry_count: int,
-) -> None:
-    settings = get_settings()
-    await _publish(
-        topic=settings.kafka_topic_job_completed,
-        key=str(user_id),
-        payload={
-            "event": "job.completed",
-            "job_id": str(job_id),
-            "user_id": str(user_id),
-            "job_type": job_type,
-            "result": result,
-            "retry_count": retry_count,
-        },
-    )
-
-
-async def publish_job_failed(
-    job_id: uuid.UUID,
-    user_id: uuid.UUID,
-    job_type: str,
-    error: str,
-    retry_count: int,
-    dead_lettered: bool,
-) -> None:
-    settings = get_settings()
-    topic = settings.kafka_topic_job_dlq if dead_lettered else settings.kafka_topic_job_failed
-    await _publish(
-        topic=topic,
-        key=str(user_id),
-        payload={
-            "event": "job.failed",
-            "job_id": str(job_id),
-            "user_id": str(user_id),
-            "job_type": job_type,
-            "error": error,
-            "retry_count": retry_count,
-            "dead_lettered": dead_lettered,
-        },
-    )
