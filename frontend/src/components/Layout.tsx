@@ -42,6 +42,14 @@ export default function Layout({ children }: { children: React.ReactNode }) {
               navLink('/admin', 'Admin')}
           </nav>
           <div className="ml-auto flex items-center gap-3">
+            {user?.tenant_slug && (
+              <span
+                className="text-xs px-1.5 py-0.5 rounded bg-blue-900/40 text-blue-300 font-mono border border-blue-800/60"
+                title={`Tenant: ${user.tenant_slug} (${user.tenant_id})`}
+              >
+                {user.tenant_slug}
+              </span>
+            )}
             <span className="text-xs text-gray-500 font-mono">{user?.email}</span>
             <span className="text-xs px-1.5 py-0.5 rounded bg-gray-800 text-gray-400 font-mono border border-gray-700">
               {user?.role}

@@ -122,7 +122,7 @@ class JobService:
             await self.outbox_repo.add(
                 tenant_id=tenant_id,
                 topic=settings.kafka_topic_job_submitted,
-                key=str(user_id),
+                key=f"{tenant_id}:{user_id}",
                 payload={
                     "event": "job.submitted",
                     "tenant_id": str(tenant_id),
@@ -231,7 +231,7 @@ class JobService:
         await self.outbox_repo.add(
             tenant_id=job.tenant_id,
             topic=settings.kafka_topic_job_submitted,
-            key=str(job.user_id),
+            key=f"{job.tenant_id}:{job.user_id}",
             payload={
                 "event": "job.submitted",
                 "tenant_id": str(job.tenant_id),

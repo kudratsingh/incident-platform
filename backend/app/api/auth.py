@@ -64,5 +64,18 @@ async def refresh(
 
 
 @router.get("/me", response_model=UserResponse)
-async def me(current_user: User = Depends(get_current_user)) -> UserResponse:
-    return UserResponse.model_validate(current_user)
+async def me(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> UserResponse:
+    # The user.tenant relationship is lazy=noload, so explicitly fetch the slug
+    # — the header chip in the frontend shows it.
+    from app.models.tenant import Tenant
+    from sqlalchemy import select
+
+    slug = (
+        await db.execute(select(Tenant.slug).where(Tenant.id == current_user.tenant_id))
+    ).scalar_one_or_none()
+    resp = UserResponse.model_validate(current_user)
+    resp.tenant_slug = slug
+    return resp

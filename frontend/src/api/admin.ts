@@ -8,6 +8,7 @@ import type {
   Runbook,
   SLOState,
   SystemStats,
+  Tenant,
   User,
 } from '../types'
 import type { JobListParams } from './jobs'
@@ -57,6 +58,16 @@ export const adminApi = {
 
   listUsers: (page = 1) =>
     api.get<PaginatedResponse<User>>(`/admin/users?page=${page}&page_size=50`),
+
+  listTenants: (page = 1) =>
+    api.get<{ items: Tenant[]; total: number; page: number; page_size: number }>(
+      `/admin/tenants?page=${page}&page_size=50`,
+    ),
+
+  updateTenantLimits: (
+    id: string,
+    body: { rate_limit_per_minute?: number; quota_jobs_per_month?: number },
+  ) => api.patch<Tenant>(`/admin/tenants/${id}`, body),
 
   listAuditLogs: (params: { page?: number; job_id?: string; user_id?: string; action?: string } = {}) => {
     const qs = new URLSearchParams()

@@ -136,7 +136,7 @@ async def _run_job(
                 await OutboxRepository(session).add(
                     tenant_id=tenant_id,
                     topic=settings.kafka_topic_job_failed,
-                    key=str(user_id),
+                    key=f"{tenant_id}:{user_id}",
                     payload={
                         "event": "job.failed",
                         "tenant_id": str(tenant_id),
@@ -199,7 +199,7 @@ async def _run_job(
                         await OutboxRepository(session).add(
                             tenant_id=tenant_id,
                             topic=settings.kafka_topic_job_failed,
-                            key=str(user_id),
+                            key=f"{tenant_id}:{user_id}",
                             payload={
                                 "event": "job.failed",
                                 "tenant_id": str(tenant_id),
@@ -236,7 +236,7 @@ async def _run_job(
                         await OutboxRepository(session).add(
                             tenant_id=tenant_id,
                             topic=settings.kafka_topic_job_dlq,
-                            key=str(user_id),
+                            key=f"{tenant_id}:{user_id}",
                             payload={
                                 "event": "job.failed",
                                 "tenant_id": str(tenant_id),
@@ -277,7 +277,7 @@ async def _run_job(
                 await OutboxRepository(session).add(
                     tenant_id=tenant_id,
                     topic=settings.kafka_topic_job_completed,
-                    key=str(user_id),
+                    key=f"{tenant_id}:{user_id}",
                     payload={
                         "event": "job.completed",
                         "tenant_id": str(tenant_id),
@@ -418,7 +418,7 @@ async def _promote_delayed_loop(
                         await OutboxRepository(session).add(
                             tenant_id=job.tenant_id,
                             topic=settings.kafka_topic_job_submitted,
-                            key=str(job.user_id),
+                            key=f"{job.tenant_id}:{job.user_id}",
                             payload={
                                 "event": "job.submitted",
                                 "tenant_id": str(job.tenant_id),

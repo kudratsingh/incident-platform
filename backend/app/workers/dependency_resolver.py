@@ -78,7 +78,7 @@ class DependencyResolver(BaseKafkaConsumer):
                     await outbox_repo.add(
                         tenant_id=child.tenant_id,
                         topic=settings.kafka_topic_job_submitted,
-                        key=str(child.user_id),
+                        key=f"{child.tenant_id}:{child.user_id}",
                         payload={
                             "event": "job.submitted",
                             "tenant_id": str(child.tenant_id),

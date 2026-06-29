@@ -138,7 +138,7 @@ class SagaCoordinator(BaseKafkaConsumer):
             await outbox_repo.add(
                 tenant_id=saga.tenant_id,
                 topic=settings.kafka_topic_job_submitted,
-                key=str(user_id),
+                key=f"{saga.tenant_id}:{user_id}",
                 payload={
                     "event": "job.submitted",
                     "tenant_id": str(saga.tenant_id),

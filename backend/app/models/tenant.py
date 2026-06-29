@@ -20,7 +20,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 from app.models.base import Base
-from sqlalchemy import Boolean, DateTime, String, func
+from sqlalchemy import Boolean, DateTime, Integer, String, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -54,6 +54,15 @@ class Tenant(Base):
     )
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    # 0 disables the rate limit / quota check for this tenant. The defaults
+    # are intentionally generous — multi-tenancy is an enforcement mechanism
+    # at the column level, not a billing knob; product decides real limits.
+    rate_limit_per_minute: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=120, server_default="120"
+    )
+    quota_jobs_per_month: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=100_000, server_default="100000"
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

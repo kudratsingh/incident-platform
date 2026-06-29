@@ -20,7 +20,13 @@ class OutboxRepository(BaseRepository[OutboxEvent]):
         key: str,
         payload: dict[str, Any],
     ) -> OutboxEvent:
-        """Insert an event into the outbox (committed with the surrounding tx)."""
+        """Insert an event into the outbox (committed with the surrounding tx).
+
+        Partition key convention is f"{tenant_id}:{user_id}" — tenants
+        distribute evenly across partitions while per-user ordering is
+        preserved within a tenant. Callers build that string themselves
+        because they have the local context.
+        """
         return await self.create(
             tenant_id=tenant_id, topic=topic, key=key, payload=payload
         )

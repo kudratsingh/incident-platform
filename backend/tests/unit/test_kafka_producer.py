@@ -49,7 +49,8 @@ async def test_publish_job_progress_payload(_mock_producer: AsyncMock) -> None:
     kwargs = _kwargs(_mock_producer)
     settings = get_settings()
     assert _mock_producer.send_and_wait.await_args.args[0] == settings.kafka_topic_job_progress
-    assert kwargs["key"] == str(user_id)
+    # Partition key is now composite: tenant_id first, user_id second.
+    assert kwargs["key"] == f"{tenant_id}:{user_id}"
     value = kwargs["value"]
     assert value["tenant_id"] == str(tenant_id)
     assert value["status"] == "running"

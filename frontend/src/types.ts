@@ -24,10 +24,24 @@ export type SagaStatus =
 
 export interface User {
   id: string
+  tenant_id: string
+  tenant_slug: string | null
   email: string
   role: UserRole
   is_active: boolean
   created_at: string
+}
+
+export interface Tenant {
+  id: string
+  slug: string
+  name: string
+  is_active: boolean
+  created_at: string
+  users: number
+  jobs: number
+  rate_limit_per_minute: number
+  quota_jobs_per_month: number
 }
 
 export interface Job {

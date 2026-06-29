@@ -182,6 +182,8 @@ async def admin_list_tenants(
                 "created_at": t.created_at.isoformat(),
                 "users": counts["users"],
                 "jobs": counts["jobs"],
+                "rate_limit_per_minute": t.rate_limit_per_minute,
+                "quota_jobs_per_month": t.quota_jobs_per_month,
             }
         )
     return {"items": items, "total": total, "page": page, "page_size": page_size}
@@ -237,6 +239,48 @@ async def admin_get_tenant(
         "created_at": tenant.created_at.isoformat(),
         "users": counts["users"],
         "jobs": counts["jobs"],
+        "rate_limit_per_minute": tenant.rate_limit_per_minute,
+        "quota_jobs_per_month": tenant.quota_jobs_per_month,
+    }
+
+
+@router.patch("/tenants/{tenant_id}")
+async def admin_update_tenant_limits(
+    tenant_id: uuid.UUID,
+    body: dict[str, Any],
+    current_user: User = Depends(_require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Update a tenant's rate limit and/or monthly job quota.
+
+    Body fields (both optional): `rate_limit_per_minute`, `quota_jobs_per_month`.
+    Each must be a non-negative integer (0 disables the relevant check).
+    """
+    from app.core.exceptions import NotFoundError, RequestValidationError
+
+    repo = TenantRepository(db)
+    tenant = await repo.get_by_id(tenant_id)
+    if tenant is None:
+        raise NotFoundError(f"Tenant {tenant_id} not found")
+
+    changed = False
+    for field in ("rate_limit_per_minute", "quota_jobs_per_month"):
+        if field in body:
+            value = body[field]
+            if not isinstance(value, int) or value < 0:
+                raise RequestValidationError(f"{field} must be a non-negative integer")
+            setattr(tenant, field, value)
+            changed = True
+    if changed:
+        await db.flush()
+
+    return {
+        "id": str(tenant.id),
+        "slug": tenant.slug,
+        "name": tenant.name,
+        "is_active": tenant.is_active,
+        "rate_limit_per_minute": tenant.rate_limit_per_minute,
+        "quota_jobs_per_month": tenant.quota_jobs_per_month,
     }
 
 
