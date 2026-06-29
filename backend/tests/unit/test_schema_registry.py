@@ -12,6 +12,7 @@ def test_valid_job_submitted_passes() -> None:
         "job.submitted",
         {
             "event": "job.submitted",
+            "tenant_id": str(uuid.uuid4()),
             "job_id": str(uuid.uuid4()),
             "user_id": str(uuid.uuid4()),
             "job_type": "csv_upload",
@@ -81,6 +82,7 @@ def test_dlq_uses_same_shape_as_failed() -> None:
         "job.dlq",
         {
             "event": "job.failed",
+            "tenant_id": str(uuid.uuid4()),
             "job_id": str(uuid.uuid4()),
             "user_id": str(uuid.uuid4()),
             "job_type": "csv_upload",

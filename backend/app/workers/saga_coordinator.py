@@ -96,6 +96,7 @@ class SagaCoordinator(BaseKafkaConsumer):
             await session.flush()
             await AuditRepository(session).log(
                 "saga.completed",
+                tenant_id=saga.tenant_id,
                 resource_type="saga",
                 resource_id=str(saga_id),
                 extra_data={"step_count": len(all_jobs)},
@@ -135,10 +136,12 @@ class SagaCoordinator(BaseKafkaConsumer):
         completed = await saga_repo.completed_steps(saga_id)
         for done in reversed(completed):
             await outbox_repo.add(
+                tenant_id=saga.tenant_id,
                 topic=settings.kafka_topic_job_submitted,
                 key=str(user_id),
                 payload={
                     "event": "job.submitted",
+                    "tenant_id": str(saga.tenant_id),
                     "job_id": str(uuid.uuid4()),
                     "user_id": str(user_id),
                     "job_type": f"{done.type}{COMPENSATE_SUFFIX}",
@@ -153,6 +156,7 @@ class SagaCoordinator(BaseKafkaConsumer):
 
         await audit.log(
             "saga.compensating",
+            tenant_id=saga.tenant_id,
             resource_type="saga",
             resource_id=str(saga_id),
             extra_data={

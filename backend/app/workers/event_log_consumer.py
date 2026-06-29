@@ -63,7 +63,24 @@ class EventLogConsumer(BaseKafkaConsumer):
             except ValueError:
                 pass
 
+        tenant_id_str = value.get("tenant_id")
+        if not isinstance(tenant_id_str, str):
+            logger.warning(
+                "event-log skipping message without tenant_id",
+                extra={"topic": topic, "partition": partition, "offset": offset},
+            )
+            return
+        try:
+            tenant_id = uuid.UUID(tenant_id_str)
+        except ValueError:
+            logger.warning(
+                "event-log skipping message with malformed tenant_id",
+                extra={"tenant_id": tenant_id_str},
+            )
+            return
+
         event = JobEvent(
+            tenant_id=tenant_id,
             job_id=job_id,
             event_name=str(event_name),
             payload=dict(value),

@@ -3,7 +3,6 @@ from typing import TYPE_CHECKING
 
 from app.models.base import Base, TimestampMixin
 from app.models.enums import UserRole
-from app.models.tenant import DEFAULT_TENANT_ID
 from sqlalchemy import Boolean, ForeignKey, String
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -25,7 +24,6 @@ class User(TimestampMixin, Base):
         ForeignKey("tenants.id", ondelete="RESTRICT"),
         nullable=False,
         index=True,
-        default=DEFAULT_TENANT_ID,
     )
     email: Mapped[str] = mapped_column(
         String(255), unique=True, index=True, nullable=False

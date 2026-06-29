@@ -139,6 +139,7 @@ async def test_admin_dlq_stats_counts_by_type(
     for jt in (JobType.CSV_UPLOAD, JobType.CSV_UPLOAD, JobType.BULK_API_SYNC):
         db_session.add(
             Job(
+                tenant_id=admin_user.tenant_id,
                 user_id=admin_user.id,
                 type=jt,
                 status=JobStatus.DEAD_LETTER,
@@ -175,6 +176,7 @@ async def test_admin_job_timeline_returns_events_in_order(
     for i, name in enumerate(["job.submitted", "job.progress", "job.completed"]):
         db_session.add(
             JobEvent(
+                tenant_id=admin_user.tenant_id,
                 job_id=job_id,
                 event_name=name,
                 payload={"event": name, "job_id": str(job_id)},
@@ -255,6 +257,7 @@ async def test_admin_slos_reflects_dead_letter_failures(
     for _ in range(8):
         db_session.add(
             Job(
+                tenant_id=admin_user.tenant_id,
                 user_id=admin_user.id,
                 type=JobType.CSV_UPLOAD,
                 status=JobStatus.COMPLETED,
@@ -266,6 +269,7 @@ async def test_admin_slos_reflects_dead_letter_failures(
     for _ in range(2):
         db_session.add(
             Job(
+                tenant_id=admin_user.tenant_id,
                 user_id=admin_user.id,
                 type=JobType.CSV_UPLOAD,
                 status=JobStatus.DEAD_LETTER,
@@ -303,6 +307,7 @@ async def test_admin_triage_returns_404_when_missing(
     from app.models.job import Job
 
     job = Job(
+        tenant_id=admin_user.tenant_id,
         user_id=admin_user.id,
         type=JobType.CSV_UPLOAD,
         status=JobStatus.DEAD_LETTER,
@@ -338,6 +343,7 @@ async def test_admin_triage_returns_row_when_present(
     from app.models.triage import JobTriage
 
     job = Job(
+        tenant_id=admin_user.tenant_id,
         user_id=admin_user.id,
         type=JobType.CSV_UPLOAD,
         status=JobStatus.DEAD_LETTER,
@@ -350,6 +356,7 @@ async def test_admin_triage_returns_row_when_present(
     await db_session.flush()
 
     triage = JobTriage(
+        tenant_id=admin_user.tenant_id,
         job_id=job.id,
         root_cause_category="external_api_failure",
         summary="Upstream HTTP 504 from analytics.example.com.",
@@ -402,6 +409,7 @@ async def test_admin_replay_resets_retry_count(
     from app.models.job import Job
 
     job = Job(
+        tenant_id=admin_user.tenant_id,
         user_id=admin_user.id,
         type=JobType.CSV_UPLOAD,
         status=JobStatus.DEAD_LETTER,

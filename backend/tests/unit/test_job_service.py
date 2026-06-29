@@ -14,6 +14,7 @@ def _make_job(**kwargs: object) -> Job:
     defaults: dict[str, object] = {
         "id": uuid.uuid4(),
         "user_id": uuid.uuid4(),
+        "tenant_id": uuid.uuid4(),
         "type": JobType.CSV_UPLOAD,
         "status": JobStatus.PENDING,
         "idempotency_key": None,
@@ -53,7 +54,9 @@ async def test_create_job_success() -> None:
     job_repo.create.return_value = new_job
 
     result = await svc.create_job(
-        user_id=uuid.uuid4(), job_type=JobType.CSV_UPLOAD
+        user_id=uuid.uuid4(),
+        tenant_id=uuid.uuid4(),
+        job_type=JobType.CSV_UPLOAD,
     )
 
     job_repo.create.assert_awaited_once()
@@ -68,6 +71,7 @@ async def test_create_job_idempotency_returns_existing() -> None:
 
     result = await svc.create_job(
         user_id=uuid.uuid4(),
+        tenant_id=uuid.uuid4(),
         job_type=JobType.CSV_UPLOAD,
         idempotency_key="key-123",
     )
@@ -84,37 +88,40 @@ async def test_create_job_idempotency_returns_existing() -> None:
 async def test_get_job_owner_can_access() -> None:
     svc, job_repo, _, _ = _make_service()
     owner_id = uuid.uuid4()
-    job = _make_job(user_id=owner_id)
-    job_repo.get_by_id.return_value = job
+    tenant_id = uuid.uuid4()
+    job = _make_job(user_id=owner_id, tenant_id=tenant_id)
+    job_repo.get_for_tenant.return_value = job
 
-    result = await svc.get_job(job.id, owner_id, UserRole.USER)
+    result = await svc.get_job(job.id, owner_id, UserRole.USER, tenant_id)
     assert result is job
 
 
 async def test_get_job_non_owner_raises() -> None:
     svc, job_repo, _, _ = _make_service()
-    job = _make_job(user_id=uuid.uuid4())
-    job_repo.get_by_id.return_value = job
+    tenant_id = uuid.uuid4()
+    job = _make_job(user_id=uuid.uuid4(), tenant_id=tenant_id)
+    job_repo.get_for_tenant.return_value = job
 
     with pytest.raises(AuthorizationError):
-        await svc.get_job(job.id, uuid.uuid4(), UserRole.USER)
+        await svc.get_job(job.id, uuid.uuid4(), UserRole.USER, tenant_id)
 
 
 async def test_get_job_admin_can_access_any() -> None:
     svc, job_repo, _, _ = _make_service()
-    job = _make_job(user_id=uuid.uuid4())
-    job_repo.get_by_id.return_value = job
+    tenant_id = uuid.uuid4()
+    job = _make_job(user_id=uuid.uuid4(), tenant_id=tenant_id)
+    job_repo.get_for_tenant.return_value = job
 
-    result = await svc.get_job(job.id, uuid.uuid4(), UserRole.ADMIN)
+    result = await svc.get_job(job.id, uuid.uuid4(), UserRole.ADMIN, tenant_id)
     assert result is job
 
 
 async def test_get_job_not_found_raises() -> None:
     svc, job_repo, _, _ = _make_service()
-    job_repo.get_by_id.return_value = None
+    job_repo.get_for_tenant.return_value = None
 
     with pytest.raises(NotFoundError):
-        await svc.get_job(uuid.uuid4(), uuid.uuid4(), UserRole.ADMIN)
+        await svc.get_job(uuid.uuid4(), uuid.uuid4(), UserRole.ADMIN, uuid.uuid4())
 
 
 # ---------------------------------------------------------------------------
@@ -124,12 +131,15 @@ async def test_get_job_not_found_raises() -> None:
 
 async def test_replay_failed_job() -> None:
     svc, job_repo, audit_repo, _ = _make_service()
-    failed_job = _make_job(status=JobStatus.FAILED)
-    replayed_job = _make_job(status=JobStatus.PENDING, id=failed_job.id)
-    job_repo.get_by_id.return_value = failed_job
+    tenant_id = uuid.uuid4()
+    failed_job = _make_job(status=JobStatus.FAILED, tenant_id=tenant_id)
+    replayed_job = _make_job(
+        status=JobStatus.PENDING, id=failed_job.id, tenant_id=tenant_id
+    )
+    job_repo.get_for_tenant.return_value = failed_job
     job_repo.update_status.return_value = replayed_job
 
-    result = await svc.replay_job(failed_job.id, uuid.uuid4())
+    result = await svc.replay_job(failed_job.id, uuid.uuid4(), tenant_id)
 
     job_repo.update_status.assert_awaited_once()
     audit_repo.log.assert_awaited_once()
@@ -140,16 +150,18 @@ async def test_replay_resets_retry_count_and_error() -> None:
     """A DLQ'd job at max retries must get a clean retry budget on replay,
     or the next failure dead-letters it again immediately."""
     svc, job_repo, audit_repo, _ = _make_service()
+    tenant_id = uuid.uuid4()
     dead_job = _make_job(
         status=JobStatus.DEAD_LETTER,
         retry_count=3,
         max_retries=3,
         error_message="last attempt boom",
+        tenant_id=tenant_id,
     )
-    job_repo.get_by_id.return_value = dead_job
+    job_repo.get_for_tenant.return_value = dead_job
     job_repo.update_status.return_value = dead_job
 
-    await svc.replay_job(dead_job.id, uuid.uuid4())
+    await svc.replay_job(dead_job.id, uuid.uuid4(), tenant_id)
 
     extra = job_repo.update_status.await_args.kwargs["extra"]
     assert extra["retry_count"] == 0
@@ -163,8 +175,9 @@ async def test_replay_resets_retry_count_and_error() -> None:
 
 async def test_replay_non_failed_job_raises() -> None:
     svc, job_repo, _, _ = _make_service()
-    running_job = _make_job(status=JobStatus.RUNNING)
-    job_repo.get_by_id.return_value = running_job
+    tenant_id = uuid.uuid4()
+    running_job = _make_job(status=JobStatus.RUNNING, tenant_id=tenant_id)
+    job_repo.get_for_tenant.return_value = running_job
 
     with pytest.raises(JobError, match="replayed"):
-        await svc.replay_job(running_job.id, uuid.uuid4())
+        await svc.replay_job(running_job.id, uuid.uuid4(), tenant_id)

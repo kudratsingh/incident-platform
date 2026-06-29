@@ -14,7 +14,6 @@ from typing import TYPE_CHECKING
 
 from app.models.base import Base
 from app.models.enums import SagaStatus
-from app.models.tenant import DEFAULT_TENANT_ID
 from sqlalchemy import DateTime, ForeignKey, String, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -34,7 +33,6 @@ class Saga(Base):
         ForeignKey("tenants.id", ondelete="RESTRICT"),
         nullable=False,
         index=True,
-        default=DEFAULT_TENANT_ID,
     )
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     status: Mapped[str] = mapped_column(

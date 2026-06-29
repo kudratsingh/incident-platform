@@ -100,6 +100,7 @@ async def _run_job(
             payload = dict(job.payload or {})
             job_type = job.type
             user_id = job.user_id
+            tenant_id = job.tenant_id
             retry_count = job.retry_count
             max_retries = job.max_retries
 
@@ -108,6 +109,7 @@ async def _run_job(
     await kafka_producer.publish_job_progress(
         job_id=job_id,
         user_id=user_id,
+        tenant_id=tenant_id,
         status="running",
         percent=0,
         message="Job started",
@@ -132,10 +134,12 @@ async def _run_job(
                     extra={"error_message": f"No processor for type: {job_type}"},
                 )
                 await OutboxRepository(session).add(
+                    tenant_id=tenant_id,
                     topic=settings.kafka_topic_job_failed,
                     key=str(user_id),
                     payload={
                         "event": "job.failed",
+                        "tenant_id": str(tenant_id),
                         "job_id": job_id_str,
                         "user_id": str(user_id),
                         "job_type": job_type,
@@ -152,6 +156,7 @@ async def _run_job(
         await kafka_producer.publish_job_progress(
             job_id=job_id,
             user_id=user_id,
+            tenant_id=tenant_id,
             status="running",
             percent=pct,
             message=message,
@@ -192,10 +197,12 @@ async def _run_job(
                             extra={"retry_count": new_retry_count, "error_message": str(exc)},
                         )
                         await OutboxRepository(session).add(
+                            tenant_id=tenant_id,
                             topic=settings.kafka_topic_job_failed,
                             key=str(user_id),
                             payload={
                                 "event": "job.failed",
+                                "tenant_id": str(tenant_id),
                                 "job_id": job_id_str,
                                 "user_id": str(user_id),
                                 "job_type": job_type,
@@ -222,14 +229,17 @@ async def _run_job(
                         )
                         await audit.log(
                             "job.dead_letter",
+                            tenant_id=tenant_id,
                             job_id=job_id,
                             extra_data={"error": str(exc), "retry_count": new_retry_count},
                         )
                         await OutboxRepository(session).add(
+                            tenant_id=tenant_id,
                             topic=settings.kafka_topic_job_dlq,
                             key=str(user_id),
                             payload={
                                 "event": "job.failed",
+                                "tenant_id": str(tenant_id),
                                 "job_id": job_id_str,
                                 "user_id": str(user_id),
                                 "job_type": job_type,
@@ -260,14 +270,17 @@ async def _run_job(
                 )
                 await audit.log(
                     "job.completed",
+                    tenant_id=tenant_id,
                     job_id=job_id,
                     extra_data={"type": job_type, "retry_count": retry_count},
                 )
                 await OutboxRepository(session).add(
+                    tenant_id=tenant_id,
                     topic=settings.kafka_topic_job_completed,
                     key=str(user_id),
                     payload={
                         "event": "job.completed",
+                        "tenant_id": str(tenant_id),
                         "job_id": job_id_str,
                         "user_id": str(user_id),
                         "job_type": job_type,
@@ -403,10 +416,12 @@ async def _promote_delayed_loop(
                             )
                             continue
                         await OutboxRepository(session).add(
+                            tenant_id=job.tenant_id,
                             topic=settings.kafka_topic_job_submitted,
                             key=str(job.user_id),
                             payload={
                                 "event": "job.submitted",
+                                "tenant_id": str(job.tenant_id),
                                 "job_id": str(job.id),
                                 "user_id": str(job.user_id),
                                 "job_type": job.type,

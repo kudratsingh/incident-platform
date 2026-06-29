@@ -4,8 +4,7 @@ from typing import TYPE_CHECKING, Any
 
 from app.models.base import Base, PortableJSON, TimestampMixin
 from app.models.enums import JobStatus
-from app.models.tenant import DEFAULT_TENANT_ID
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -26,7 +25,6 @@ class Job(TimestampMixin, Base):
         ForeignKey("tenants.id", ondelete="RESTRICT"),
         nullable=False,
         index=True,
-        default=DEFAULT_TENANT_ID,
     )
     user_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
@@ -38,10 +36,10 @@ class Job(TimestampMixin, Base):
     status: Mapped[str] = mapped_column(
         String(50), default=JobStatus.PENDING, nullable=False, index=True
     )
-    # Caller-supplied key for idempotent creation — same key → same job returned
-    idempotency_key: Mapped[str | None] = mapped_column(
-        String(255), unique=True, nullable=True
-    )
+    # Caller-supplied key for idempotent creation — same key → same job returned.
+    # Uniqueness is scoped per-tenant (composite constraint below) so different
+    # tenants can reuse the same key without colliding.
+    idempotency_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
     payload: Mapped[dict[str, Any] | None] = mapped_column(PortableJSON, nullable=True)
     result: Mapped[dict[str, Any] | None] = mapped_column(PortableJSON, nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -70,6 +68,12 @@ class Job(TimestampMixin, Base):
     )
     audit_logs: Mapped[list["AuditLog"]] = relationship(
         "AuditLog", back_populates="job", lazy="noload"
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id", "idempotency_key", name="uq_jobs_tenant_idempotency_key"
+        ),
     )
 
     def __repr__(self) -> str:

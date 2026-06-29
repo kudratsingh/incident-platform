@@ -50,18 +50,22 @@ class SagaService:
     async def create_saga(
         self,
         user_id: uuid.UUID,
+        tenant_id: uuid.UUID,
         name: str,
         steps: list[SagaStep],
     ) -> Saga:
         if not steps:
             raise RequestValidationError("Saga must have at least one step")
 
-        saga = await self.saga_repo.create(name=name, status=SagaStatus.RUNNING)
+        saga = await self.saga_repo.create(
+            tenant_id=tenant_id, name=name, status=SagaStatus.RUNNING
+        )
 
         prev_id: uuid.UUID | None = None
         for step in steps:
             job = await self.job_service.create_job(
                 user_id=user_id,
+                tenant_id=tenant_id,
                 job_type=step.type,
                 payload=step.payload,
                 priority=step.priority,
@@ -72,6 +76,7 @@ class SagaService:
 
         await self.audit_repo.log(
             "saga.created",
+            tenant_id=tenant_id,
             user_id=user_id,
             resource_type="saga",
             resource_id=str(saga.id),

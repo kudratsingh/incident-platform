@@ -20,6 +20,7 @@ class TriageRepository(BaseRepository[JobTriage]):
         self,
         *,
         job_id: uuid.UUID,
+        tenant_id: uuid.UUID,
         root_cause_category: str,
         summary: str,
         suggested_fix: str,
@@ -49,6 +50,7 @@ class TriageRepository(BaseRepository[JobTriage]):
 
         triage = JobTriage(
             job_id=job_id,
+            tenant_id=tenant_id,
             root_cause_category=root_cause_category,
             summary=summary,
             suggested_fix=suggested_fix,

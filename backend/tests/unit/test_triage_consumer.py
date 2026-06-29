@@ -23,6 +23,7 @@ def _dlq_value(**overrides: object) -> dict[str, object]:
     base: dict[str, object] = {
         "event": "job.failed",
         "dead_lettered": True,
+        "tenant_id": str(uuid.uuid4()),
         "job_id": str(uuid.uuid4()),
         "user_id": str(uuid.uuid4()),
         "job_type": "csv_upload",

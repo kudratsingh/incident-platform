@@ -52,6 +52,7 @@ async def admin_list_jobs(
     jobs, total = await svc.list_jobs(
         requesting_user_id=current_user.id,
         user_role=current_user.role,
+        tenant_id=current_user.tenant_id,
         page=params.page,
         page_size=params.page_size,
         status=params.status,
@@ -79,6 +80,7 @@ async def admin_get_job(
         job_id=job_id,
         requesting_user_id=current_user.id,
         user_role=current_user.role,
+        tenant_id=current_user.tenant_id,
     )
     return JobResponse.model_validate(job)
 
@@ -91,7 +93,11 @@ async def replay_job(
     redis: Redis = Depends(get_redis),
 ) -> JobResponse:
     svc = _job_service(db, redis)
-    job = await svc.replay_job(job_id=job_id, requesting_user_id=current_user.id)
+    job = await svc.replay_job(
+        job_id=job_id,
+        requesting_user_id=current_user.id,
+        tenant_id=current_user.tenant_id,
+    )
     await JobCache.delete(redis, job_id)
     return JobResponse.model_validate(job)
 
@@ -262,7 +268,7 @@ async def dlq_stats(
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
     """Counts of dead-lettered jobs for the admin DLQ badge / dashboard."""
-    total, by_type = await JobRepository(db).dlq_stats()
+    total, by_type = await JobRepository(db).dlq_stats(current_user.tenant_id)
     return {"total": total, "by_type": by_type}
 
 
@@ -337,7 +343,11 @@ async def resolve_incident(
     redis: Redis = Depends(get_redis),
 ) -> JobResponse:
     svc = _job_service(db, redis)
-    job = await svc.resolve_incident(job_id=job_id, requesting_user_id=current_user.id)
+    job = await svc.resolve_incident(
+        job_id=job_id,
+        requesting_user_id=current_user.id,
+        tenant_id=current_user.tenant_id,
+    )
     await JobCache.delete(redis, job_id)
     return JobResponse.model_validate(job)
 

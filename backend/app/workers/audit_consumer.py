@@ -72,17 +72,25 @@ class AuditConsumer(BaseKafkaConsumer):
 
         job_id = _parse_uuid(value.get("job_id"))
         user_id = _parse_uuid(value.get("user_id"))
+        tenant_id = _parse_uuid(value.get("tenant_id"))
+        if tenant_id is None:
+            logger.warning(
+                "audit consumer skipping event without tenant_id",
+                extra={"topic": topic, "event": event_name},
+            )
+            return
 
         extra_data = {
             k: v
             for k, v in value.items()
-            if k not in ("event", "job_id", "user_id")
+            if k not in ("event", "tenant_id", "job_id", "user_id")
         }
 
         async with self.session_factory() as session:
             async with session.begin():
                 await AuditRepository(session).log(
                     action,
+                    tenant_id=tenant_id,
                     user_id=user_id,
                     job_id=job_id,
                     resource_type="job",

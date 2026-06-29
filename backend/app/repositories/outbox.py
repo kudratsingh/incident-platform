@@ -14,20 +14,16 @@ class OutboxRepository(BaseRepository[OutboxEvent]):
 
     async def add(
         self,
+        *,
+        tenant_id: uuid.UUID,
         topic: str,
         key: str,
         payload: dict[str, Any],
-        *,
-        tenant_id: uuid.UUID | None = None,
     ) -> OutboxEvent:
-        """Insert an event into the outbox (committed with the surrounding tx).
-
-        tenant_id is optional in this PR; omitting it falls back to the
-        model-level default tenant. Phase 12 PR B makes it required."""
-        kwargs: dict[str, Any] = {"topic": topic, "key": key, "payload": payload}
-        if tenant_id is not None:
-            kwargs["tenant_id"] = tenant_id
-        return await self.create(**kwargs)
+        """Insert an event into the outbox (committed with the surrounding tx)."""
+        return await self.create(
+            tenant_id=tenant_id, topic=topic, key=key, payload=payload
+        )
 
     async def fetch_unpublished(self, limit: int = 100) -> list[OutboxEvent]:
         """Oldest unpublished events first, capped at `limit`."""

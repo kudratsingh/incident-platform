@@ -15,7 +15,6 @@ from datetime import datetime
 from typing import Any
 
 from app.models.base import Base, PortableJSON
-from app.models.tenant import DEFAULT_TENANT_ID
 from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
@@ -32,7 +31,6 @@ class OutboxEvent(Base):
         ForeignKey("tenants.id", ondelete="RESTRICT"),
         nullable=False,
         index=True,
-        default=DEFAULT_TENANT_ID,
     )
     topic: Mapped[str] = mapped_column(String(255), nullable=False)
     # Partition key — usually the user_id so per-user ordering is preserved.

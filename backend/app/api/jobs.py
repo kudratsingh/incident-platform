@@ -43,6 +43,7 @@ async def create_job(
     svc = _job_service(db, redis)
     job = await svc.create_job(
         user_id=current_user.id,
+        tenant_id=current_user.tenant_id,
         job_type=body.type,
         payload=body.payload,
         idempotency_key=body.idempotency_key,
@@ -63,6 +64,7 @@ async def list_jobs(
     jobs, total = await svc.list_jobs(
         requesting_user_id=current_user.id,
         user_role=current_user.role,
+        tenant_id=current_user.tenant_id,
         page=params.page,
         page_size=params.page_size,
         status=params.status,
@@ -98,6 +100,7 @@ async def get_job(
         job_id=job_id,
         requesting_user_id=current_user.id,
         user_role=current_user.role,
+        tenant_id=current_user.tenant_id,
     )
     response = JobResponse.model_validate(job)
     await JobCache.set(redis, job_id, response.model_dump(mode="json"))
