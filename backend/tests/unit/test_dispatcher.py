@@ -114,6 +114,76 @@ async def test_run_job_dead_letters_after_exhaustion() -> None:
     assert JobStatus.DEAD_LETTER in calls
 
 
+async def test_run_job_llm_policy_forces_dead_letter_before_exhaustion() -> None:
+    """When the LLM-guided policy says dead_letter_now, the dispatcher must
+    honor it even though there are deterministic retries remaining."""
+    from app.services.retry_policy import RetryDecision
+
+    job = _make_job(type=JobType.BULK_API_SYNC, retry_count=1, max_retries=5)
+    factory, job_repo, audit_repo = _make_session_factory(job)
+    redis = AsyncMock()
+
+    processor = AsyncMock(side_effect=RuntimeError("401 Unauthorized"))
+    fake_decision = RetryDecision(
+        action="dead_letter_now",
+        backoff_seconds=0,
+        reasoning="Auth failure won't recover.",
+    )
+    with patch("app.workers.dispatcher.JobRepository", return_value=job_repo), \
+         patch("app.workers.dispatcher.AuditRepository", return_value=audit_repo), \
+         patch(
+             "app.workers.dispatcher.OutboxRepository",
+             new=MagicMock(return_value=AsyncMock()),
+         ), \
+         patch.dict(dispatcher._PROCESSORS, {JobType.BULK_API_SYNC: processor}), \
+         patch(
+             "app.workers.dispatcher.retry_policy.is_enabled", return_value=True
+         ), \
+         patch(
+             "app.workers.dispatcher.retry_policy.decide_retry",
+             new=AsyncMock(return_value=(fake_decision, {}, "claude-opus-4-7")),
+         ), \
+         patch("app.workers.dispatcher.queue.push_delayed", new=AsyncMock()) as mock_delay:
+        await dispatcher._run_job(str(job.id), factory, redis)
+
+    # Did NOT enqueue another retry — went straight to DLQ.
+    mock_delay.assert_not_awaited()
+    calls = [c.args[1] for c in job_repo.update_status.call_args_list]
+    assert JobStatus.DEAD_LETTER in calls
+
+
+async def test_run_job_llm_policy_failure_falls_back_to_deterministic() -> None:
+    """If the LLM call raises (timeout, network, schema mismatch), the
+    deterministic exponential-backoff retry still happens — the worker
+    can never block on the API being unhealthy."""
+    job = _make_job(type=JobType.BULK_API_SYNC, retry_count=1, max_retries=5)
+    factory, job_repo, audit_repo = _make_session_factory(job)
+    redis = AsyncMock()
+
+    processor = AsyncMock(side_effect=RuntimeError("HTTP 500"))
+    with patch("app.workers.dispatcher.JobRepository", return_value=job_repo), \
+         patch("app.workers.dispatcher.AuditRepository", return_value=audit_repo), \
+         patch(
+             "app.workers.dispatcher.OutboxRepository",
+             new=MagicMock(return_value=AsyncMock()),
+         ), \
+         patch.dict(dispatcher._PROCESSORS, {JobType.BULK_API_SYNC: processor}), \
+         patch(
+             "app.workers.dispatcher.retry_policy.is_enabled", return_value=True
+         ), \
+         patch(
+             "app.workers.dispatcher.retry_policy.decide_retry",
+             new=AsyncMock(side_effect=RuntimeError("API down")),
+         ), \
+         patch("app.workers.dispatcher.queue.push_delayed", new=AsyncMock()) as mock_delay:
+        await dispatcher._run_job(str(job.id), factory, redis)
+
+    mock_delay.assert_awaited_once()
+    calls = [c.args[1] for c in job_repo.update_status.call_args_list]
+    assert JobStatus.PENDING in calls
+    assert JobStatus.DEAD_LETTER not in calls
+
+
 async def test_run_job_skips_unknown_job() -> None:
     begin_ctx = MagicMock()
     begin_ctx.__aenter__ = AsyncMock(return_value=None)

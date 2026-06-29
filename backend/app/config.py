@@ -86,6 +86,20 @@ class Settings(BaseSettings):
     llm_triage_enabled: bool = False
     llm_triage_model: str = "claude-opus-4-7"
 
+    # LLM-guided retry policy. When enabled, after the first deterministic
+    # retry the worker asks Claude whether to keep retrying (with what
+    # backoff) or to dead-letter immediately. Off by default; any error /
+    # timeout from the LLM call falls back to the deterministic policy so
+    # the worker never blocks waiting for the API.
+    llm_retry_policy_enabled: bool = False
+    llm_retry_policy_model: str = "claude-opus-4-7"
+    # Lower bound on retry_count before we consult Claude. First failure is
+    # almost always worth retrying; consulting on attempt 0 wastes tokens.
+    llm_retry_policy_min_retry_count: int = 1
+    # Hard wall-clock limit on the LLM call. The worker would rather use
+    # the deterministic backoff than block on a slow API.
+    llm_retry_policy_timeout_seconds: float = 10.0
+
     # Tracing — set to http://localhost:4318 locally (Jaeger), or X-Ray OTLP endpoint in prod
     otlp_endpoint: str | None = None
 

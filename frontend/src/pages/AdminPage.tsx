@@ -710,6 +710,14 @@ export default function AdminPage() {
                         <span className="text-xs font-mono text-gray-400">
                           {job.retry_count}/{job.max_retries}
                         </span>
+                        {job.retry_count < job.max_retries && (
+                          <span
+                            className="ml-2 text-[10px] px-1.5 py-0.5 rounded bg-purple-900/40 text-purple-300 font-mono border border-purple-800/60"
+                            title="LLM-guided retry policy dead-lettered this job before its retries were exhausted. See audit log for reasoning."
+                          >
+                            LLM
+                          </span>
+                        )}
                       </td>
                       <td className="px-4 py-3 hidden lg:table-cell text-gray-500 text-xs align-top">
                         {job.completed_at ? formatDate(job.completed_at) : '—'}
