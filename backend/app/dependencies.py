@@ -3,7 +3,7 @@ from collections.abc import AsyncGenerator
 
 from app.config import get_settings
 from app.core.exceptions import AuthenticationError, AuthorizationError
-from app.core.logging import user_id_var
+from app.core.logging import tenant_id_var, user_id_var
 from app.core.redis import get_redis as _get_redis
 from app.core.security import decode_token
 from app.models.enums import UserRole
@@ -54,7 +54,16 @@ async def get_current_user(
     if not user.is_active:
         raise AuthenticationError("Account is disabled")
 
+    # Guard against tenant-claim drift: if the token's tenant_id doesn't match
+    # the user's actual tenant_id, refuse the request rather than silently
+    # picking one. Tokens minted before the multi-tenancy migration won't
+    # carry the claim — accept them only when they match the user's tenant.
+    token_tenant_id = payload.get("tenant_id")
+    if token_tenant_id is not None and token_tenant_id != str(user.tenant_id):
+        raise AuthenticationError("Token tenant_id does not match user")
+
     user_id_var.set(str(user.id))
+    tenant_id_var.set(str(user.tenant_id))
     return user
 
 

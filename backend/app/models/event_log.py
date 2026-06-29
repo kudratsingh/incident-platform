@@ -14,7 +14,17 @@ from datetime import datetime
 from typing import Any
 
 from app.models.base import Base, PortableJSON
-from sqlalchemy import BigInteger, DateTime, Index, Integer, String, UniqueConstraint, func
+from app.models.tenant import DEFAULT_TENANT_ID
+from sqlalchemy import (
+    BigInteger,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    UniqueConstraint,
+    func,
+)
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -24,6 +34,13 @@ class JobEvent(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("tenants.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+        default=DEFAULT_TENANT_ID,
     )
     job_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), nullable=True, index=True

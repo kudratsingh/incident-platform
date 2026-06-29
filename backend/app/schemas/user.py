@@ -9,12 +9,14 @@ class UserCreate(BaseModel):
     email: EmailStr
     password: str = Field(min_length=8)
     role: UserRole = UserRole.USER
+    tenant_slug: str = Field(default="default", min_length=1, max_length=64)
 
 
 class UserResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
+    tenant_id: uuid.UUID
     email: str
     role: str
     is_active: bool

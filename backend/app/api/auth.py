@@ -1,6 +1,7 @@
 from app.dependencies import get_current_user, get_db
 from app.models.user import User
 from app.repositories.audit import AuditRepository
+from app.repositories.tenant import TenantRepository
 from app.repositories.user import UserRepository
 from app.schemas.auth import LoginRequest, RefreshRequest, TokenResponse
 from app.schemas.user import UserCreate, UserResponse
@@ -13,7 +14,9 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 
 
 def _auth_service(db: AsyncSession) -> AuthService:
-    return AuthService(UserRepository(db), AuditRepository(db))
+    return AuthService(
+        UserRepository(db), AuditRepository(db), TenantRepository(db)
+    )
 
 
 @router.post("/register", response_model=UserResponse, status_code=201)
@@ -28,6 +31,7 @@ async def register(
         email=body.email,
         password=body.password,
         role=body.role,
+        tenant_slug=body.tenant_slug,
         ip_address=request.client.host if request.client else None,
     )
     return UserResponse.model_validate(user)
