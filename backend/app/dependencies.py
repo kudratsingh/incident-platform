@@ -12,6 +12,7 @@ from app.repositories.user import UserRepository
 from fastapi import Depends
 from fastapi.security import OAuth2PasswordBearer
 from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 _settings = get_settings()
@@ -64,6 +65,17 @@ async def get_current_user(
 
     user_id_var.set(str(user.id))
     tenant_id_var.set(str(user.tenant_id))
+
+    # Postgres row-level security. The policies on tenant-scoped tables read
+    # `current_setting('app.tenant_id', true)` and gate every row by it.
+    # Setting it here means any query that escapes the repository helpers
+    # (raw SQL, a forgotten filter) still can't leak across tenants.
+    # Silent no-op on SQLite (tests) — `SET LOCAL` doesn't exist there.
+    if db.bind is not None and db.bind.dialect.name == "postgresql":
+        await db.execute(
+            text("SELECT set_config('app.tenant_id', :tid, true)"),
+            {"tid": str(user.tenant_id)},
+        )
     return user
 
 

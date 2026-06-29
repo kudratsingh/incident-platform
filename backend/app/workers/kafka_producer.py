@@ -97,7 +97,7 @@ async def publish_job_progress(
     settings = get_settings()
     await _publish(
         topic=settings.kafka_topic_job_progress,
-        key=str(user_id),
+        key=f"{tenant_id}:{user_id}",
         payload={
             "event": "job.progress",
             "tenant_id": str(tenant_id),

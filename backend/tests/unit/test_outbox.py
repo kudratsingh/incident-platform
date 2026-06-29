@@ -179,7 +179,9 @@ async def test_job_service_create_writes_outbox() -> None:
     kwargs = outbox_repo.add.await_args.kwargs
     assert kwargs["tenant_id"] == tenant_id
     assert kwargs["topic"] == "job.submitted"
-    assert kwargs["key"] == str(user_id)
+    # Composite partition key — tenants spread across partitions, ordering
+    # preserved per (tenant, user).
+    assert kwargs["key"] == f"{tenant_id}:{user_id}"
     assert kwargs["payload"]["event"] == "job.submitted"
     assert kwargs["payload"]["tenant_id"] == str(tenant_id)
     assert kwargs["payload"]["job_id"] == str(job.id)

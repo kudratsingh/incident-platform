@@ -4,12 +4,12 @@ import Layout from '../components/Layout'
 import StatusBadge from '../components/StatusBadge'
 import { TableRowSkeleton } from '../components/Skeleton'
 import { useToast } from '../components/Toast'
-import type { AuditLog, Job, Runbook, SLOState, SystemStats, User } from '../types'
+import type { AuditLog, Job, Runbook, SLOState, SystemStats, Tenant, User } from '../types'
 import { adminApi } from '../api/admin'
 import { AppError } from '../api/client'
 import { formatDate, JOB_TYPE_LABELS } from '../utils/format'
 
-type Tab = 'overview' | 'jobs' | 'dlq' | 'runbooks' | 'users' | 'audit'
+type Tab = 'overview' | 'jobs' | 'dlq' | 'runbooks' | 'users' | 'tenants' | 'audit'
 
 function AuditLogModal({ log, onClose }: { log: AuditLog; onClose: () => void }) {
   return (
@@ -54,6 +54,78 @@ function AuditLogModal({ log, onClose }: { log: AuditLog; onClose: () => void })
   )
 }
 
+function TenantRow({
+  tenant,
+  onSave,
+}: {
+  tenant: Tenant
+  onSave: (id: string, rate: number, quota: number) => Promise<void>
+}) {
+  const [rate, setRate] = useState(String(tenant.rate_limit_per_minute))
+  const [quota, setQuota] = useState(String(tenant.quota_jobs_per_month))
+  const [busy, setBusy] = useState(false)
+
+  // Reset when the tenant prop refreshes (after save the parent rebroadcasts).
+  useEffect(() => {
+    setRate(String(tenant.rate_limit_per_minute))
+    setQuota(String(tenant.quota_jobs_per_month))
+  }, [tenant.rate_limit_per_minute, tenant.quota_jobs_per_month])
+
+  const dirty =
+    rate !== String(tenant.rate_limit_per_minute) ||
+    quota !== String(tenant.quota_jobs_per_month)
+
+  async function handleSave() {
+    const r = Number(rate)
+    const q = Number(quota)
+    if (!Number.isInteger(r) || r < 0 || !Number.isInteger(q) || q < 0) return
+    setBusy(true)
+    try {
+      await onSave(tenant.id, r, q)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <tr className="hover:bg-gray-800/30 transition-colors">
+      <td className="px-4 py-3">
+        <div className="text-gray-200">{tenant.name}</div>
+        <code className="text-xs font-mono text-blue-300">{tenant.slug}</code>
+      </td>
+      <td className="px-4 py-3 hidden md:table-cell text-gray-400">{tenant.users}</td>
+      <td className="px-4 py-3 hidden md:table-cell text-gray-400">{tenant.jobs}</td>
+      <td className="px-4 py-3">
+        <input
+          type="number"
+          min={0}
+          value={rate}
+          onChange={(e) => setRate(e.target.value)}
+          className="w-24 px-2 py-1 bg-gray-800 border border-gray-700 rounded text-sm font-mono focus:outline-none focus:border-blue-500"
+        />
+      </td>
+      <td className="px-4 py-3">
+        <input
+          type="number"
+          min={0}
+          value={quota}
+          onChange={(e) => setQuota(e.target.value)}
+          className="w-32 px-2 py-1 bg-gray-800 border border-gray-700 rounded text-sm font-mono focus:outline-none focus:border-blue-500"
+        />
+      </td>
+      <td className="px-4 py-3 text-right">
+        <button
+          disabled={!dirty || busy}
+          onClick={handleSave}
+          className="text-xs font-medium px-2.5 py-1 rounded bg-blue-600 text-white hover:bg-blue-500 disabled:opacity-40 disabled:cursor-not-allowed"
+        >
+          {busy ? 'Saving…' : 'Save'}
+        </button>
+      </td>
+    </tr>
+  )
+}
+
 function Row({ label, value, mono }: { label: string; value: string; mono?: boolean }) {
   return (
     <div className="flex gap-3">
@@ -87,6 +159,7 @@ export default function AdminPage() {
   const [selectedLog, setSelectedLog] = useState<AuditLog | null>(null)
   const [dlqStats, setDlqStats] = useState<{ total: number; by_type: Record<string, number> } | null>(null)
   const [dlqJobs, setDlqJobs] = useState<Job[]>([])
+  const [tenants, setTenants] = useState<Tenant[]>([])
 
   const loadJobs = useCallback(async () => {
     setLoading(true)
@@ -160,6 +233,36 @@ export default function AdminPage() {
     }
   }, [])
 
+  const loadTenants = useCallback(async () => {
+    setLoading(true)
+    try {
+      const r = await adminApi.listTenants(page)
+      setTenants(r.items)
+      setTotal(r.total)
+    } finally {
+      setLoading(false)
+    }
+  }, [page])
+
+  async function saveTenantLimits(
+    id: string,
+    rate: number,
+    quota: number,
+  ): Promise<void> {
+    try {
+      const updated = await adminApi.updateTenantLimits(id, {
+        rate_limit_per_minute: rate,
+        quota_jobs_per_month: quota,
+      })
+      setTenants((prev) =>
+        prev.map((t) => (t.id === id ? { ...t, ...updated } : t)),
+      )
+      toast.success(`Limits saved for ${updated.slug}`)
+    } catch (err) {
+      toast.error(err instanceof AppError ? err.message : 'Failed to update limits')
+    }
+  }
+
   const loadRunbooks = useCallback(async () => {
     setLoading(true)
     try {
@@ -184,8 +287,9 @@ export default function AdminPage() {
     else if (tab === 'dlq') void loadDlq()
     else if (tab === 'runbooks') void loadRunbooks()
     else if (tab === 'users') void loadUsers()
+    else if (tab === 'tenants') void loadTenants()
     else void loadLogs()
-  }, [tab, loadJobs, loadDlq, loadRunbooks, loadUsers, loadLogs])
+  }, [tab, loadJobs, loadDlq, loadRunbooks, loadUsers, loadTenants, loadLogs])
 
   async function replay(jobId: string) {
     try {
@@ -216,7 +320,7 @@ export default function AdminPage() {
           <p className="text-sm text-gray-500">{total} records</p>
         </div>
         <div className="flex gap-1 bg-gray-800/60 rounded-lg p-1">
-          {(['overview', 'jobs', 'dlq', 'runbooks', 'users', 'audit'] as Tab[]).map((t) => (
+          {(['overview', 'jobs', 'dlq', 'runbooks', 'users', 'tenants', 'audit'] as Tab[]).map((t) => (
             <button
               key={t}
               onClick={() => { setTab(t); setPage(1) }}
@@ -564,6 +668,36 @@ export default function AdminPage() {
                       <code className="text-xs font-mono text-gray-600">{u.id.slice(0, 8)}…</code>
                     </td>
                   </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      )}
+
+      {tab === 'tenants' && (
+        <div className="bg-gray-900 border border-gray-800 rounded-lg overflow-hidden">
+          {loading ? (
+            <table className="w-full text-sm">
+              <tbody className="divide-y divide-gray-800/60">
+                {Array.from({ length: 6 }).map((_, i) => <TableRowSkeleton key={i} />)}
+              </tbody>
+            </table>
+          ) : (
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b border-gray-800 text-xs text-gray-500">
+                  <th className="text-left px-4 py-3 font-medium">Tenant</th>
+                  <th className="text-left px-4 py-3 font-medium hidden md:table-cell">Users</th>
+                  <th className="text-left px-4 py-3 font-medium hidden md:table-cell">Jobs</th>
+                  <th className="text-left px-4 py-3 font-medium">Rate (per min)</th>
+                  <th className="text-left px-4 py-3 font-medium">Monthly quota</th>
+                  <th className="px-4 py-3" />
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-800/60">
+                {tenants.map((t) => (
+                  <TenantRow key={t.id} tenant={t} onSave={saveTenantLimits} />
                 ))}
               </tbody>
             </table>

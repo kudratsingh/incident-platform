@@ -17,6 +17,7 @@ class UserResponse(BaseModel):
 
     id: uuid.UUID
     tenant_id: uuid.UUID
+    tenant_slug: str | None = None
     email: str
     role: str
     is_active: bool
