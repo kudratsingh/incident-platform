@@ -29,6 +29,7 @@ export interface User {
   email: string
   role: UserRole
   is_active: boolean
+  is_platform_admin: boolean
   created_at: string
 }
 

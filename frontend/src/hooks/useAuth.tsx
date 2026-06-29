@@ -4,11 +4,16 @@ import type { User } from '../types'
 import { authApi } from '../api/auth'
 import { setTokens, clearTokens, isLoggedIn } from '../utils/tokens'
 
+interface RegisterOpts {
+  tenantSlug?: string
+  newTenantName?: string
+}
+
 interface AuthState {
   user: User | null
   loading: boolean
   login: (email: string, password: string) => Promise<void>
-  register: (email: string, password: string) => Promise<void>
+  register: (email: string, password: string, opts?: RegisterOpts) => Promise<void>
   logout: () => void
 }
 
@@ -38,10 +43,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setUser(me)
   }, [])
 
-  const register = useCallback(async (email: string, password: string) => {
-    await authApi.register(email, password)
-    await login(email, password)
-  }, [login])
+  const register = useCallback(
+    async (email: string, password: string, opts: RegisterOpts = {}) => {
+      await authApi.register(email, password, opts)
+      await login(email, password)
+    },
+    [login],
+  )
 
   const logout = useCallback(() => {
     clearTokens()

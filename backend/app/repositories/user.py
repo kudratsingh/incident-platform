@@ -1,6 +1,8 @@
+import uuid
+
 from app.models.user import User
 from app.repositories.base import BaseRepository
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 
 class UserRepository(BaseRepository[User]):
@@ -12,9 +14,25 @@ class UserRepository(BaseRepository[User]):
         )
         return result.scalar_one_or_none()
 
-    async def list_all(self, offset: int = 0, limit: int = 20) -> tuple[list[User], int]:
-        total = await self._count()
+    async def list_all(
+        self,
+        offset: int = 0,
+        limit: int = 20,
+        tenant_id: uuid.UUID | None = None,
+    ) -> tuple[list[User], int]:
+        base = select(User)
+        if tenant_id is not None:
+            base = base.where(User.tenant_id == tenant_id)
+            total = (
+                await self.session.execute(
+                    select(func.count())
+                    .select_from(User)
+                    .where(User.tenant_id == tenant_id)
+                )
+            ).scalar_one()
+        else:
+            total = await self._count()
         result = await self.session.execute(
-            select(User).order_by(User.created_at.desc()).offset(offset).limit(limit)
+            base.order_by(User.created_at.desc()).offset(offset).limit(limit)
         )
         return list(result.scalars().all()), total

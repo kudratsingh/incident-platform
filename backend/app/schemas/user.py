@@ -10,6 +10,10 @@ class UserCreate(BaseModel):
     password: str = Field(min_length=8)
     role: UserRole = UserRole.USER
     tenant_slug: str = Field(default="default", min_length=1, max_length=64)
+    # When set, the slug is created on the fly if it doesn't exist and the
+    # registering user becomes its admin. Used by the "start a new
+    # workspace" path on the register page.
+    new_tenant_name: str | None = Field(default=None, min_length=1, max_length=128)
 
 
 class UserResponse(BaseModel):
@@ -21,4 +25,5 @@ class UserResponse(BaseModel):
     email: str
     role: str
     is_active: bool
+    is_platform_admin: bool = False
     created_at: datetime

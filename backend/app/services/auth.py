@@ -35,6 +35,7 @@ class AuthService:
         password: str,
         role: str = "user",
         tenant_slug: str = DEFAULT_TENANT_SLUG,
+        new_tenant_name: str | None = None,
         ip_address: str | None = None,
     ) -> User:
         existing = await self.user_repo.get_by_email(email)
@@ -42,6 +43,16 @@ class AuthService:
             raise ConflictError(f"Email already registered: {email}")
 
         tenant = await self.tenant_repo.get_by_slug(tenant_slug)
+        if tenant is None and new_tenant_name:
+            # Self-service tenant creation: register-time bootstrap.
+            # The registering user becomes the tenant's admin so there's
+            # always at least one operator. This deliberately does NOT
+            # set is_platform_admin — that's reserved for the cross-tenant
+            # operator role and is only granted by an existing platform admin.
+            tenant = await self.tenant_repo.create(
+                slug=tenant_slug, name=new_tenant_name, is_active=True
+            )
+            role = "admin"
         if tenant is None or not tenant.is_active:
             raise NotFoundError(f"Tenant {tenant_slug} not found or inactive")
 

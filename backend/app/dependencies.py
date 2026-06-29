@@ -101,3 +101,43 @@ def require_role(*roles: UserRole) -> "type[User]":
         return current_user
 
     return _dependency  # type: ignore[return-value]
+
+
+async def require_platform_admin(
+    current_user: User = Depends(get_current_user),
+) -> User:
+    """Dependency for endpoints that may cross tenant boundaries.
+
+    Platform admins additionally bypass the per-tenant RLS scope when they
+    pass `?tenant_id=` on the few endpoints that accept it. Ordinary
+    `role=admin` users remain scoped to their own tenant.
+    """
+    if not current_user.is_platform_admin:
+        raise AuthorizationError("Platform admin role required")
+    return current_user
+
+
+async def resolve_admin_tenant(
+    current_user: User,
+    db: AsyncSession,
+    requested: uuid.UUID | None,
+) -> uuid.UUID:
+    """Resolve the tenant_id an admin request should run against.
+
+    Platform admins may override via `?tenant_id=...`; for ordinary admins
+    and support users the override is silently ignored (we never want a
+    misconfigured client to escalate scope by accident).
+
+    When the effective tenant differs from the user's own, we also re-issue
+    `set_config('app.tenant_id', ...)` so the Postgres RLS policies let the
+    cross-tenant query through. No-op on SQLite.
+    """
+    if requested is None or not current_user.is_platform_admin:
+        return current_user.tenant_id
+    if requested != current_user.tenant_id and db.bind is not None:
+        if db.bind.dialect.name == "postgresql":
+            await db.execute(
+                text("SELECT set_config('app.tenant_id', :tid, true)"),
+                {"tid": str(requested)},
+            )
+    return requested

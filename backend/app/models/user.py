@@ -33,6 +33,13 @@ class User(TimestampMixin, Base):
         String(50), default=UserRole.USER, nullable=False
     )
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    # Cross-tenant operator flag. `role=admin` means "can manage this tenant";
+    # platform admin additionally means "can see across tenants and create new
+    # ones." Defaults to False; set True via Alembic seed for the bootstrap
+    # admin (default tenant) or by a sibling platform admin.
+    is_platform_admin: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
 
     tenant: Mapped["Tenant"] = relationship(
         "Tenant", back_populates="users", lazy="noload"

@@ -15,6 +15,7 @@ import type { JobListParams } from './jobs'
 
 export interface AdminJobListParams extends JobListParams {
   user_id?: string
+  tenant_id?: string
 }
 
 export const adminApi = {
@@ -26,6 +27,7 @@ export const adminApi = {
     if (params.type) qs.set('type', params.type)
     if (params.trace_id) qs.set('trace_id', params.trace_id)
     if (params.user_id) qs.set('user_id', params.user_id)
+    if (params.tenant_id) qs.set('tenant_id', params.tenant_id)
     const q = qs.toString()
     return api.get<PaginatedResponse<Job>>(`/admin/jobs${q ? `?${q}` : ''}`)
   },
@@ -39,7 +41,8 @@ export const adminApi = {
   dlqStats: () =>
     api.get<{ total: number; by_type: Record<string, number> }>(`/admin/dlq/stats`),
 
-  systemStats: () => api.get<SystemStats>(`/admin/stats`),
+  systemStats: (tenantId?: string) =>
+    api.get<SystemStats>(`/admin/stats${tenantId ? `?tenant_id=${tenantId}` : ''}`),
 
   userStats: (userId: string) =>
     api.get<SystemStats>(`/admin/users/${userId}/stats`),
@@ -56,13 +59,22 @@ export const adminApi = {
 
   runbook: (id: string) => api.get<Runbook>(`/admin/runbooks/${id}`),
 
-  listUsers: (page = 1) =>
-    api.get<PaginatedResponse<User>>(`/admin/users?page=${page}&page_size=50`),
+  listUsers: (page = 1, tenantId?: string) => {
+    const tail = tenantId ? `&tenant_id=${tenantId}` : ''
+    return api.get<PaginatedResponse<User>>(
+      `/admin/users?page=${page}&page_size=50${tail}`,
+    )
+  },
 
   listTenants: (page = 1) =>
     api.get<{ items: Tenant[]; total: number; page: number; page_size: number }>(
       `/admin/tenants?page=${page}&page_size=50`,
     ),
+
+  getTenant: (id: string) => api.get<Tenant>(`/admin/tenants/${id}`),
+
+  createTenant: (slug: string, name: string) =>
+    api.post<Tenant>('/admin/tenants', { slug, name }),
 
   updateTenantLimits: (
     id: string,

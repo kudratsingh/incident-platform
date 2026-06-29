@@ -135,6 +135,94 @@ async def test_admin_get_unknown_tenant_returns_404(
     assert resp.status_code == 404
 
 
+async def test_tenant_admin_without_platform_flag_cannot_list_tenants(
+    client: AsyncClient,
+    db_session,  # type: ignore[no-untyped-def]
+    default_tenant,  # type: ignore[no-untyped-def]
+) -> None:
+    """A tenant admin (role=admin, is_platform_admin=False) must not be able
+    to list sibling tenants. Only platform admins cross tenant boundaries."""
+    from app.core.security import create_access_token, hash_password
+    from app.models.enums import UserRole
+    from app.models.user import User
+
+    tenant_admin = User(
+        tenant_id=default_tenant.id,
+        email="tenantadmin@example.com",
+        hashed_password=hash_password("password123"),
+        role=UserRole.ADMIN,
+        is_active=True,
+        is_platform_admin=False,
+    )
+    db_session.add(tenant_admin)
+    await db_session.flush()
+    await db_session.refresh(tenant_admin)
+    token = create_access_token(
+        {
+            "sub": str(tenant_admin.id),
+            "tenant_id": str(tenant_admin.tenant_id),
+            "role": tenant_admin.role,
+        }
+    )
+    resp = await client.get(
+        "/api/v1/admin/tenants",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 403
+
+
+async def test_register_creates_new_tenant_on_demand(
+    client: AsyncClient,
+) -> None:
+    """Self-service tenant creation: the registering user becomes the admin
+    of a brand-new tenant when both new_tenant_name and a free slug are
+    provided."""
+    resp = await client.post(
+        "/api/v1/auth/register",
+        json={
+            "email": "founder@acme.example",
+            "password": "password123",
+            "tenant_slug": "acme",
+            "new_tenant_name": "Acme Corp",
+        },
+    )
+    assert resp.status_code == 201
+    body = resp.json()
+    # Founder of a self-created tenant is its admin, regardless of what
+    # role they requested.
+    assert body["role"] == "admin"
+    # is_platform_admin is NOT auto-granted — that's reserved for
+    # cross-tenant operators.
+    assert body["is_platform_admin"] is False
+
+
+async def test_platform_admin_cross_tenant_scope(
+    client: AsyncClient,
+    admin_headers: dict[str, str],
+) -> None:
+    """A platform admin can pass ?tenant_id= and the endpoint scopes to it.
+
+    We can't fully verify RLS in SQLite, but we can verify the parameter is
+    plumbed through to the read-model lookup.
+    """
+    # First, create a second tenant via the platform admin.
+    create_resp = await client.post(
+        "/api/v1/admin/tenants",
+        json={"slug": "beta", "name": "Beta"},
+        headers=admin_headers,
+    )
+    assert create_resp.status_code == 201
+    other_tenant_id = create_resp.json()["id"]
+
+    # Now query stats scoped to that tenant — should not 403 / 404.
+    resp = await client.get(
+        f"/api/v1/admin/stats?tenant_id={other_tenant_id}",
+        headers=admin_headers,
+    )
+    assert resp.status_code == 200
+    assert "by_status" in resp.json()
+
+
 async def test_token_with_mismatched_tenant_id_is_rejected(
     client: AsyncClient,
     test_user,  # type: ignore[no-untyped-def]
