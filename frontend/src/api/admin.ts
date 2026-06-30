@@ -1,6 +1,7 @@
 import { api } from './client'
 import type {
   AuditLog,
+  IncidentDigest,
   Job,
   JobTimeline,
   JobTriage,
@@ -84,6 +85,21 @@ export const adminApi = {
       items: Job[]
       total: number
     }>('/admin/query', { question }),
+
+  listDigests: (tenantId?: string, limit = 20) => {
+    const params = new URLSearchParams()
+    params.set('limit', String(limit))
+    if (tenantId) params.set('tenant_id', tenantId)
+    return api.get<{ items: IncidentDigest[]; count: number }>(
+      `/admin/digests?${params.toString()}`,
+    )
+  },
+
+  generateDigest: (hours?: number) =>
+    api.post<
+      | IncidentDigest
+      | { summary: null; window_start: string; window_end: string }
+    >('/admin/digests/generate', hours ? { hours } : {}),
 
   updateTenantLimits: (
     id: string,

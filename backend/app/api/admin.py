@@ -11,6 +11,7 @@ from app.dependencies import (
 from app.models.enums import UserRole
 from app.models.user import User
 from app.repositories.audit import AuditRepository
+from app.repositories.digest import DigestRepository
 from app.repositories.event_log import EventLogRepository
 from app.repositories.job import JobRepository
 from app.repositories.job_dependency import JobDependencyRepository
@@ -21,7 +22,7 @@ from app.repositories.user import UserRepository
 from app.schemas.common import PaginatedResponse
 from app.schemas.job import AdminJobListParams, JobResponse
 from app.schemas.user import UserResponse
-from app.services import nl_query
+from app.services import incident_digest, nl_query
 from app.services.job import JobService
 from app.services.runbooks import get as get_runbook
 from app.services.runbooks import list_all as list_runbooks
@@ -233,6 +234,119 @@ async def list_slos(
             for s in states
         ]
     }
+
+
+def _serialize_digest(row: Any) -> dict[str, Any]:
+    return {
+        "id": str(row.id),
+        "tenant_id": str(row.tenant_id),
+        "window_start": row.window_start.isoformat(),
+        "window_end": row.window_end.isoformat(),
+        "summary": row.summary,
+        "highlights": row.highlights or {},
+        "model_used": row.model_used,
+        "usage": row.usage or {},
+        "created_at": row.created_at.isoformat(),
+    }
+
+
+@router.get("/digests")
+async def admin_list_digests(
+    tenant_id: uuid.UUID | None = None,
+    limit: int = 20,
+    current_user: User = Depends(_require_support_or_admin),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Recent incident digests for the caller's tenant (or, for platform
+    admins passing ?tenant_id=, the named tenant)."""
+    effective_tenant = await resolve_admin_tenant(current_user, db, tenant_id)
+    limit = max(1, min(100, limit))
+    rows = await DigestRepository(db).list_for_tenant(effective_tenant, limit=limit)
+    return {"items": [_serialize_digest(r) for r in rows], "count": len(rows)}
+
+
+@router.post("/digests/generate", status_code=201)
+async def admin_generate_digest(
+    body: dict[str, Any] | None = None,
+    tenant_id: uuid.UUID | None = None,
+    current_user: User = Depends(_require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Generate a digest for the caller's tenant immediately, without
+    waiting for the periodic loop. Useful for incident-response time.
+
+    503 if the feature flag is off. The window is the last
+    `llm_digest_window_hours` (or `?hours=N` override, 1..168)."""
+    from datetime import UTC, datetime, timedelta
+
+    from app.core.exceptions import AppError
+
+    class DigestUnavailable(AppError):
+        status_code = 503
+        error_code = "digest_unavailable"
+
+    if not incident_digest.is_enabled():
+        raise DigestUnavailable(
+            "Incident digests are disabled. Set LLM_DIGEST_ENABLED=1."
+        )
+
+    from app.config import get_settings
+
+    settings = get_settings()
+    hours_raw = (body or {}).get("hours") if body else None
+    try:
+        hours = int(hours_raw) if hours_raw is not None else settings.llm_digest_window_hours
+    except (TypeError, ValueError):
+        hours = settings.llm_digest_window_hours
+    hours = max(1, min(168, hours))
+
+    effective_tenant = await resolve_admin_tenant(current_user, db, tenant_id)
+    tenant_row = await TenantRepository(db).get_by_id(effective_tenant)
+    if tenant_row is None:
+        from app.core.exceptions import NotFoundError
+        raise NotFoundError(f"Tenant {effective_tenant} not found")
+
+    window_end = datetime.now(UTC)
+    window_start = window_end - timedelta(hours=hours)
+    try:
+        row = await incident_digest.run_digest_for_tenant(
+            db, tenant_row, window_start, window_end
+        )
+    except incident_digest.DigestDisabledError as exc:
+        raise DigestUnavailable(str(exc)) from exc
+    except Exception as exc:
+        raise DigestUnavailable(f"LLM call failed: {exc}") from exc
+
+    if row is None:
+        # Empty window — no jobs to summarize. Return a 200-ish shape so the
+        # UI can show "nothing happened" without a special error path.
+        return {
+            "summary": None,
+            "window_start": window_start.isoformat(),
+            "window_end": window_end.isoformat(),
+        }
+    return _serialize_digest(row)
+
+
+@router.get("/digests/{digest_id}")
+async def admin_get_digest(
+    digest_id: uuid.UUID,
+    current_user: User = Depends(_require_support_or_admin),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    from app.core.exceptions import AuthorizationError, NotFoundError
+
+    row = await DigestRepository(db).get_by_id(digest_id)
+    if row is None:
+        raise NotFoundError(f"Digest {digest_id} not found")
+    # Tenant scope: a non-platform-admin can only read their own tenant's
+    # digests. Platform admins can read any.
+    if (
+        not current_user.is_platform_admin
+        and row.tenant_id != current_user.tenant_id
+    ):
+        raise AuthorizationError("Cross-tenant access denied")
+    return _serialize_digest(row)
 
 
 @router.get("/tenants")
