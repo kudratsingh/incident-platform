@@ -259,6 +259,10 @@ export default function AdminPage() {
   const [dlqStats, setDlqStats] = useState<{ total: number; by_type: Record<string, number> } | null>(null)
   const [dlqJobs, setDlqJobs] = useState<Job[]>([])
   const [tenants, setTenants] = useState<Tenant[]>([])
+  const [nlQuestion, setNlQuestion] = useState('')
+  const [nlBusy, setNlBusy] = useState(false)
+  const [nlSpec, setNlSpec] = useState<Record<string, unknown> | null>(null)
+  const [nlError, setNlError] = useState<string | null>(null)
 
   const loadJobs = useCallback(async () => {
     setLoading(true)
@@ -342,6 +346,39 @@ export default function AdminPage() {
       setLoading(false)
     }
   }, [page])
+
+  async function runNlQuery(question: string): Promise<void> {
+    const trimmed = question.trim()
+    if (!trimmed) return
+    setNlBusy(true)
+    setNlError(null)
+    try {
+      const resp = await adminApi.nlQuery(trimmed)
+      setJobs(resp.items)
+      setTotal(resp.total)
+      setNlSpec(resp.spec)
+      // Clear the structured filters so the user sees that the NL spec is
+      // what's currently applied — otherwise it looks ambiguous.
+      setStatusFilter('')
+      setTraceFilter('')
+      setPage(1)
+    } catch (err) {
+      setNlError(
+        err instanceof AppError
+          ? err.message
+          : 'Could not run that query. Try rephrasing or check that LLM_NL_QUERY_ENABLED is set.',
+      )
+    } finally {
+      setNlBusy(false)
+    }
+  }
+
+  function clearNl(): void {
+    setNlQuestion('')
+    setNlSpec(null)
+    setNlError(null)
+    void loadJobs()
+  }
 
   async function saveTenantLimits(
     id: string,
@@ -567,6 +604,55 @@ export default function AdminPage() {
 
       {tab === 'jobs' && (
         <>
+          {/* Natural-language query */}
+          <form
+            onSubmit={(e) => {
+              e.preventDefault()
+              void runNlQuery(nlQuestion)
+            }}
+            className="mb-3 flex gap-2"
+          >
+            <div className="relative flex-1">
+              <span className="absolute left-3 top-1/2 -translate-y-1/2 text-purple-400 text-xs font-mono pointer-events-none">
+                ask
+              </span>
+              <input
+                type="text"
+                value={nlQuestion}
+                onChange={(e) => setNlQuestion(e.target.value)}
+                placeholder='e.g. "dead-lettered CSV uploads in the last hour with at least 2 retries"'
+                className="w-full bg-gray-800/60 border border-purple-900/40 rounded pl-12 pr-3 py-1.5 text-sm text-gray-200 placeholder-gray-600 focus:outline-none focus:border-purple-500/60"
+              />
+            </div>
+            <button
+              type="submit"
+              disabled={nlBusy || !nlQuestion.trim()}
+              className="text-sm px-3 py-1.5 rounded bg-purple-600 text-white hover:bg-purple-500 disabled:opacity-40 disabled:cursor-not-allowed font-medium"
+            >
+              {nlBusy ? 'Asking…' : 'Ask'}
+            </button>
+            {nlSpec && (
+              <button
+                type="button"
+                onClick={clearNl}
+                className="text-xs text-gray-400 hover:text-white px-2"
+              >
+                Clear
+              </button>
+            )}
+          </form>
+          {nlError && (
+            <div className="mb-3 text-xs text-red-400 bg-red-900/20 border border-red-800/30 rounded px-3 py-2">
+              {nlError}
+            </div>
+          )}
+          {nlSpec && (
+            <div className="mb-3 text-xs text-gray-400 bg-purple-900/15 border border-purple-800/40 rounded px-3 py-2">
+              <span className="text-purple-300 font-mono mr-2">filter</span>
+              <code className="font-mono text-gray-300">{JSON.stringify(nlSpec)}</code>
+            </div>
+          )}
+
           {/* Filters */}
           <div className="flex gap-3 mb-4">
             <input

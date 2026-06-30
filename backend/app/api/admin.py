@@ -21,6 +21,7 @@ from app.repositories.user import UserRepository
 from app.schemas.common import PaginatedResponse
 from app.schemas.job import AdminJobListParams, JobResponse
 from app.schemas.user import UserResponse
+from app.services import nl_query
 from app.services.job import JobService
 from app.services.runbooks import get as get_runbook
 from app.services.runbooks import list_all as list_runbooks
@@ -74,6 +75,73 @@ async def admin_list_jobs(
         page=params.page,
         page_size=params.page_size,
     )
+
+
+@router.post("/query")
+async def admin_nl_query(
+    body: dict[str, Any],
+    tenant_id: uuid.UUID | None = None,
+    current_user: User = Depends(_require_support_or_admin),
+    db: AsyncSession = Depends(get_db),
+    redis: Redis = Depends(get_redis),
+) -> dict[str, Any]:
+    """Translate a plain-English question into a constrained job filter, apply
+    it via the existing list_jobs path, and return both the spec and the
+    rows. Body: `{"question": "..."}`.
+
+    503 when the feature flag is off. The spec is a Pydantic model with
+    enum/literal fields — the model can never smuggle raw SQL or unsafe
+    field names into the query.
+    """
+    from app.core.exceptions import AppError, RequestValidationError
+
+    class NLQueryUnavailable(AppError):
+        status_code = 503
+        error_code = "nl_query_unavailable"
+
+    question = (body.get("question") or "").strip()
+    if not question:
+        raise RequestValidationError("question is required")
+    if len(question) > 500:
+        raise RequestValidationError("question is too long (max 500 chars)")
+
+    if not nl_query.is_enabled():
+        raise NLQueryUnavailable(
+            "Natural-language queries are disabled. Set LLM_NL_QUERY_ENABLED=1."
+        )
+
+    try:
+        spec, usage, model = await nl_query.parse_question(question)
+    except nl_query.NLQueryDisabledError as exc:
+        raise NLQueryUnavailable(str(exc)) from exc
+    except Exception as exc:
+        # Network blips / schema mismatches / timeouts shouldn't 500 — return
+        # a 503 so the UI can show a friendly "try again" rather than a stack.
+        raise NLQueryUnavailable(f"LLM call failed: {exc}") from exc
+
+    effective_tenant = await resolve_admin_tenant(current_user, db, tenant_id)
+    svc = _job_service(db, redis)
+    jobs, total = await svc.list_jobs(
+        requesting_user_id=current_user.id,
+        user_role=current_user.role,
+        tenant_id=effective_tenant,
+        page=1,
+        page_size=spec.limit,
+        status=spec.status,
+        job_type=spec.type,
+        trace_id=spec.trace_id,
+        created_after=spec.created_after,
+        created_before=spec.created_before,
+        retry_count_min=spec.retry_count_min,
+        retry_count_max=spec.retry_count_max,
+    )
+    return {
+        "spec": spec.model_dump(mode="json"),
+        "model": model,
+        "usage": usage,
+        "items": [JobResponse.model_validate(j).model_dump(mode="json") for j in jobs],
+        "total": total,
+    }
 
 
 @router.get("/jobs/{job_id}", response_model=JobResponse)
