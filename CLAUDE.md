@@ -6,7 +6,26 @@ A production-style **Incident & Workflow Platform** — an internal enterprise o
 
 This is NOT a generic CRUD app. It intentionally forces: concurrency model decisions, structured logging with trace IDs, retry/idempotency patterns, background job orchestration, event-driven architecture, real debugging workflows, and production deployment concerns.
 
-The project is structured as a sequence of milestone phases (Phase 1 through Phase 13). Each phase ships as one or more pull requests against `master`. The plan is *aspirational on the right-hand side* (Phases 8+ are not yet built) and *historical on the left* (Phases 1–7 are merged and running) — see the per-phase status markers in the milestone plan below.
+The project is structured as a sequence of milestone phases (Phase 1 through Phase 13). Each phase ships as one or more pull requests against `master`. The plan is *aspirational on the right-hand side* (Phases 8, 9, 11, 13 are not yet built) and *historical on the left* (Phases 1–7, 10, 12 are merged and running) — see the per-phase status markers in the milestone plan below.
+
+---
+
+## Documentation map
+
+This file (`CLAUDE.md`) is the high-signal index. Treat it as the entry point — everything below points at deeper docs when detail matters.
+
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — runtime topology, request lifecycles (annotated traces for the 5 most-touched paths), concurrency model, failure mode catalog, auth & tenant matrix, cost model
+- [`docs/DATA_MODEL.md`](docs/DATA_MODEL.md) — every table, every column, every index, every constraint, with a one-line *why*
+- [`docs/KAFKA.md`](docs/KAFKA.md) — topic catalog, schema-evolution rules, partition strategy, consumer-group catalog with failure isolation
+- [`docs/REDIS.md`](docs/REDIS.md) — key catalog (writer / reader / TTL / eviction-safe?), what degrades when Redis dies
+- [`docs/ADR/`](docs/ADR/) — architecture decision records. Read these to understand *why* the platform looks the way it does:
+  - [0001 — Outbox over CDC](docs/ADR/0001-outbox-vs-cdc.md)
+  - [0002 — JSON Schema over Protobuf](docs/ADR/0002-json-schema-vs-protobuf.md)
+  - [0003 — Postgres RLS as defense-in-depth](docs/ADR/0003-rls-as-defense-in-depth.md)
+  - [0004 — Composite tenant_id:user_id Kafka partition key](docs/ADR/0004-tenant-id-in-kafka-partition-key.md)
+  - [0005 — LLM features fail open](docs/ADR/0005-llm-features-fail-open.md)
+- [`docs/ROADMAP.md`](docs/ROADMAP.md) — open extension ideas, sized + categorized
+- [`runbooks/`](runbooks/) — machine-readable on-call playbooks for every CloudWatch alarm + SLO
 
 ---
 
@@ -25,25 +44,30 @@ What's actually shipped (as of the most recent merge):
 | 7 — Kafka + Advanced Patterns | ✅ Complete | foundations `#28`, CQRS + event sourcing `#29`, DAG + sagas `#30`, frontend `#31` |
 | 8 — Platform Engineering & Scale | 🟡 Not started | — |
 | 9 — Security Hardening | 🟡 Not started | — |
-| 10 — AI / LLM Integration | 🟧 In progress | DLQ triage |
+| 10 — AI / LLM Integration | ✅ Complete | DLQ triage `#34`, retry policy `#39`, NL queries `#40`, digests `#41` |
 | 11 — Real-time Stream Analytics | 🟡 Not started | — |
-| 12 — Multi-tenancy | 🟡 Not started | — |
+| 12 — Multi-tenancy | ✅ Complete | model + auth `#35`, enforcement `#36`, RLS + partitioning + quotas `#37`, platform admin `#38` |
 | 13 — Disaster Recovery & Chaos | 🟡 Not started | — |
 
-**Runtime topology that's actually running** (Phase 7 endpoint):
+**Runtime topology that's actually running** (post-Phase-12):
 
-- **One FastAPI app** behind the ALB. `POST /jobs` is rate-limited, backpressure-gated, and writes both the job row and an `outbox_events` row in a single DB transaction.
-- **Seven Kafka consumer groups** running concurrently inside the worker process (`worker_loop` in `app/workers/dispatcher.py`):
+- **One FastAPI app** behind the ALB. `POST /jobs` is rate-limited (per-client + per-tenant), backpressure-gated, quota-checked, and writes both the job row and an `outbox_events` row in a single DB transaction.
+- **Eight Kafka consumer groups** running concurrently inside the worker process (`worker_loop` in `app/workers/dispatcher.py`):
   1. `worker-dispatcher` — pops `job.submitted`, runs the actual processor
   2. `audit-writer` — appends `event.*` rows to `audit_logs`
   3. `sse-broadcaster` — bridges Kafka events to the Redis pub/sub channel SSE clients read
   4. `event-log` — appends every lifecycle event to the immutable `job_events` table (event sourcing)
-  5. `read-model` — maintains Redis-backed denormalized job-status sets (CQRS read side)
+  5. `read-model` — maintains Redis-backed denormalized per-tenant + per-user job-status sets (CQRS read side; tenant-keyed since Phase 12 PR D)
   6. `dependency-resolver` — promotes `WAITING` jobs to `PENDING` when their parents complete
   7. `saga-coordinator` — drives saga-level state and compensation on failure
-- **One outbox relay loop** inside the same worker process, polling `outbox_events` every second and publishing to Kafka.
-- **One delayed-retry promote loop** moving exponentially-backed-off retries from a Redis sorted-set back into Kafka (still through the outbox).
-- **One metrics loop** emitting CloudWatch gauges (`QueueDepth`, `InFlightJobs`, `ConsumerLag`) and caching the lag in Redis for the backpressure check.
+  8. `llm-triage` (Phase 10) — calls Claude on every `job.dlq` to write a `JobTriage` row
+- **Four background loops** also running in the same process:
+  - **Outbox relay** — polls `outbox_events` every second and publishes to Kafka
+  - **Delayed-retry promote** — moves exponentially-backed-off retries from a Redis sorted-set back into Kafka via the outbox
+  - **Metrics loop** — emits CloudWatch gauges (`QueueDepth`, `InFlightJobs`, `ConsumerLag`) and caches the lag in Redis for the backpressure check
+  - **Digest loop** (Phase 10) — every `LLM_DIGEST_INTERVAL_HOURS` (default 24), generates a per-tenant incident summary via Claude and persists it to `incident_summaries`
+
+See [`docs/KAFKA.md`](docs/KAFKA.md) for the full consumer-group catalog (failure isolation, partition strategy, schema-evolution rules) and [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#per-task-responsibilities) for the worker-loop responsibilities table.
 
 Per-PR breakdown of Phase 7 specifically (for reference when reading the code):
 
@@ -53,19 +77,33 @@ Per-PR breakdown of Phase 7 specifically (for reference when reading the code):
 - **`#31` — frontend**: Sagas browse / create / detail pages, Kafka event timeline on `JobDetailPage` (admin only), CQRS stats overview tab, optional dependencies field on the job form, `backpressure` 503 toast.
 - **`#32` — Phase 6 gaps**: `GET /admin/slos` with budget-remaining + burn-rate per objective, `runbooks/*.yaml` (7 runbooks for every CloudWatch alarm and SLO), `GET /admin/runbooks/{id}`, SLO scorecards + runbook modal in the admin UI, two new fast-burn alarms in Terraform.
 
+Phase 10 — AI / LLM Integration:
+
+- **`#34` — DLQ triage**: `app/services/triage.py` calls Claude on every `job.dlq`. Pydantic-typed analysis (root_cause_category, summary, suggested_fix, is_retryable, confidence) persisted to `job_triages`. Admin UI shows the analysis on the DLQ row + the job detail page.
+- **`#39` — LLM-guided retry policy**: after the first deterministic retry, the worker consults Claude to decide retry-with-backoff (with recommended seconds) vs dead-letter-now. Falls back to deterministic on any error. Audit log records `dead_lettered_by: llm_retry_policy` + reasoning. Small purple LLM badge in the admin DLQ tab.
+- **`#40` — Natural-language admin queries**: `POST /admin/query` translates plain English into a constrained `JobFilterSpec` Pydantic model, then runs through `JobService.list_jobs`. Injection-safe by construction (the LLM can only fill enum/literal fields). Off-by-default + 503 on any failure.
+- **`#41` — Periodic incident summaries**: `_digest_loop` runs every N hours, aggregates per-tenant failure stats (counts + top recurring error fingerprints), asks Claude for a one-paragraph narrative + key concerns + recommended actions, persists to `incident_summaries`. New admin Digests tab.
+
+Phase 12 — Multi-tenancy:
+
+- **`#35` — model + auth context**: `tenants` table, `tenant_id` on every domain table, `DEFAULT_TENANT_ID` bootstrap (mixed-hex UUID for SQLite compat). JWT carries `tenant_id` claim. `tenant_id_var` contextvar logged in every structured entry.
+- **`#36` — enforce tenant_id everywhere**: every repository / service / outbox call site threads tenant_id through. Per-tenant composite UNIQUE on `(tenant_id, idempotency_key)` replaces the global UNIQUE. Cascading signature changes across ~30 call sites.
+- **`#37` — RLS + Kafka partition key + quotas**: Postgres row-level security policy on 6 tables; `get_current_user` sets `app.tenant_id` via `set_config`; Kafka partition key changes to composite `{tenant_id}:{user_id}` across all 9 producer call sites; `tenants.rate_limit_per_minute` + `tenants.quota_jobs_per_month` columns; `check_tenant_limits` runs at top of `POST /jobs`. Header chip + admin Tenants tab. Testcontainers Postgres integration test.
+- **`#38` — platform admin role**: `users.is_platform_admin` boolean (data migration backfills for default-tenant admins); `require_platform_admin` dependency; `?tenant_id=` cross-tenant scope override on list endpoints; CQRS read-model keyed by tenant_id (fixed a Phase 12 leak); self-service tenant creation at `/auth/register` via `new_tenant_name`; admin Tenants tab with create-modal + drill-down page.
+
 ---
 
 ## Stack
 
 ### Backend
 - **Python 3.12+ / FastAPI** — async API gateway
-- **PostgreSQL** — system of record. Tables: `users`, `jobs`, `audit_logs`, `outbox_events`, `job_events`, `job_dependencies`, `sagas`, `job_triages` (Phase 10 WIP).
+- **PostgreSQL** — system of record. Tables: `users`, `tenants`, `jobs`, `audit_logs`, `outbox_events`, `job_events`, `job_dependencies`, `sagas`, `job_triages`, `incident_summaries`. Full reference in [`docs/DATA_MODEL.md`](docs/DATA_MODEL.md).
 - **Redis** — cache, locks, rate limits, pub/sub progress events, CQRS read-model sets, cached backpressure lag value.
 - **Kafka** (Redpanda locally, Amazon MSK in production) — durable event log; decouples job submission from execution, powers event sourcing and fan-out. Topics: `job.submitted` / `job.progress` / `job.completed` / `job.failed` / `job.dlq`.
 - **JSON Schema** — every Kafka topic has a schema in `backend/app/schemas/kafka/`; producer and consumer validate on every message.
 - **Object storage** — S3 in production, MinIO locally — for uploaded files and artifacts.
 - **Worker layer** — asyncio tasks for I/O-heavy work, a threading adapter for blocking SDKs, a multiprocessing pool for CPU-heavy transforms.
-- **Anthropic SDK** (Phase 10) — Claude API integration for LLM-driven triage of dead-lettered jobs.
+- **Anthropic SDK** (Phase 10, complete) — Claude API for DLQ triage, LLM-guided retry policy, natural-language admin queries, and periodic incident summaries. All features off-by-default; fail open on any API issue. See [ADR 0005](docs/ADR/0005-llm-features-fail-open.md).
 
 ### Frontend
 - **React + Vite + TypeScript + Tailwind**
@@ -665,3 +703,152 @@ The project uses the **Anthropic Python SDK** to add LLM-powered features. The f
 - **Add a CloudWatch alarm:** add it to `infra/cloudwatch.tf`, then add the matching `runbooks/rb-*.yaml` file and reference its `/admin/runbooks/{id}` URL in the alarm description.
 - **Add an SLO:** declare in `SLOS` in `app/services/slo.py`, write a `runbooks/rb-slo-*.yaml`, and (optionally) add a fast-burn alarm in `infra/cloudwatch.tf`.
 - **Memory:** the user's auto-memory directory at `~/.claude/projects/.../memory/MEMORY.md` carries durable preferences across sessions — including branching convention (always feature branch, open PR, let user review), no Claude co-authoring on commits, and `.venv/bin/python` for everything.
+
+---
+
+## Glossary
+
+Terms used throughout this codebase. When in doubt, use these exact words.
+
+- **Backpressure** — the API's rejection of new job submissions when the dispatcher's Kafka consumer group is more than `Settings.backpressure_lag_threshold` messages behind. Raises `BackpressureError` (503). Lag is cached in Redis with TTL 90s by the metrics loop; the API never round-trips to Kafka for this check.
+- **Burn rate** — the multiplier of SLO error budget being consumed. 1× = budget burns at the rate that exhausts it exactly at the end of the window; 14.4× = budget exhausted in 1 hour out of a 24h window. Fast-burn alarms fire at 14.4×.
+- **Compensation** — saga rollback action. When a saga step dead-letters, the coordinator enqueues `{type}.compensate` jobs for already-completed prior steps in reverse order. Application is responsible for registering processors for `*.compensate` types — an unregistered compensation job will dead-letter, which is the intended forcing function.
+- **CQRS read model** — Redis-backed denormalized job-status sets keyed by `(tenant_id, status)` and `(user_id, status)`. The `read-model` Kafka consumer projects writes from the lifecycle topics; `GET /admin/stats` reads via `SCARD` with no SQL aggregate.
+- **Dead-letter** — a job's terminal failure state after exhausting retries (or after the LLM-guided retry policy decides not to retry). Distinct from `failed`; jobs in `failed` will retry, jobs in `dead_letter` won't. Surfaced in `job.dlq` topic and on the admin DLQ tab.
+- **Dispatch latency** — wall-clock time from `pending` to `running`. The `job_dispatch_latency` SLO targets 95% within 30s.
+- **Error budget** — the inverse of the SLO. 99% SLO → 1% error budget. The Overview tab shows budget remaining %; fast-burn alarms fire when burn rate threatens to consume the budget early.
+- **Event-sourced** — describes the `audit_logs` and `job_events` tables. Every Kafka lifecycle event is appended as a row, in arrival order, immutably. The mutable `jobs.status` is a *projection* of these events.
+- **Fail open** — when a non-critical dependency is unavailable, allow the request through rather than blocking it. Rate limits fail open on Redis outage; LLM features fail open on Anthropic outage. See [ADR 0005](docs/ADR/0005-llm-features-fail-open.md).
+- **Fast-burn alarm** — CloudWatch alarm watching SLO burn rate over a short window. Fires before the budget is fully consumed so the team can react.
+- **Fingerprint (digest)** — the digit-normalized truncation of an error message used by the incident-summary feature to bucket recurring errors. "attempt 1" and "attempt 27" fingerprint to "attempt #" — same bucket.
+- **Idempotency key** — caller-supplied string on `POST /jobs`. Composite UNIQUE on `(tenant_id, idempotency_key)`. Re-submitting with the same key returns the existing job rather than creating a duplicate.
+- **In-flight** — describes a job that's been popped from Kafka and is currently executing in the dispatcher's task set. Tracked in `consumer.in_flight`; emitted as the `InFlightJobs` CloudWatch gauge.
+- **JobFilterSpec** — the constrained Pydantic shape Claude returns from the NL query feature. Enum/literal fields only; the model can never smuggle SQL.
+- **LLM badge** — small purple `LLM` tag on the admin DLQ row indicating the LLM-guided retry policy forced the dead-letter before retries were exhausted.
+- **Outbox** — the transactional handoff between DB state changes and Kafka publication. Same transaction writes the state change and the `outbox_events` row; a background relay publishes within ~1s. See [ADR 0001](docs/ADR/0001-outbox-vs-cdc.md).
+- **Partition key** — `{tenant_id}:{user_id}` composite string. Preserves per-tenant + per-user ordering. See [ADR 0004](docs/ADR/0004-tenant-id-in-kafka-partition-key.md).
+- **Platform admin** — `users.is_platform_admin = true`. Cross-tenant operator who can list/create tenants and pass `?tenant_id=` to scope list/stats endpoints to any tenant. Distinct from a `role=admin` (tenant admin).
+- **RLS policy** — Postgres row-level security; the second line of defense against cross-tenant data leaks. Defense in depth on top of the application-layer `tenant_id` filter. See [ADR 0003](docs/ADR/0003-rls-as-defense-in-depth.md).
+- **Saga step** — a job inside a saga (`saga_id IS NOT NULL`). Steps are linearly ordered via `job_dependencies` (step N depends on step N-1). Saga lifecycle is driven by the `saga-coordinator` consumer.
+- **Tenant admin** — `role=admin` without the platform flag. Can manage everything within their own tenant; cannot see sibling tenants.
+- **Trace ID** — the OTel trace identifier, propagated from browser → API → worker → DB. Logged on every entry, stored on `jobs.trace_id`, paste-filterable on the admin Jobs tab.
+- **Triage analysis** — the LLM-produced classification of a dead-lettered job. Persisted to `job_triages`; one row per job (UNIQUE constraint makes Kafka redelivery a no-op).
+
+---
+
+## Auth & tenant matrix (quick reference)
+
+Three role tiers, with `is_platform_admin` as an additive cross-tenant flag. Full matrix and per-tab permissions in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#auth--tenant-matrix). Quick read:
+
+| Capability | `user` | `support` | `admin` (tenant) | `+is_platform_admin` |
+|---|---|---|---|---|
+| Create + see own jobs | ✓ | ✓ | ✓ | ✓ |
+| See other users' jobs (own tenant) | — | ✓ | ✓ | ✓ |
+| Replay / resolve | — | ✓ | ✓ | ✓ |
+| Admin Tenants tab | — | — | — | ✓ |
+| Cross-tenant `?tenant_id=` | — | — | — | ✓ |
+| Manage tenant limits | — | — | — | ✓ |
+
+Enforcement is layered: application-layer filter in `JobService.list_jobs` + Postgres RLS via `set_config('app.tenant_id', …)` in `get_current_user`. RLS catches the bug class "forgot a WHERE clause".
+
+---
+
+## Failure mode catalog (quick reference)
+
+What degrades when a component dies. Full detail in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#failure-mode-catalog).
+
+| Component down | What still works | What degrades |
+|---|---|---|
+| Postgres | Nothing | All API requests 500 |
+| Redis | API, DB writes, workers | Rate limits / backpressure / cache / SSE updates fail open |
+| Kafka (MSK) | API accepts new jobs (outbox queues them) | New job execution stalls; SSE updates stop |
+| Anthropic API | Everything | DLQ triages absent; retry policy → deterministic; NL queries return 503; digests stall |
+| Worker process | API accepts new jobs (outbox queues them) | No job execution; restart resumes from committed offsets |
+| API process | Worker, other replicas | New HTTP requests fail until replica restarts |
+
+The truth lives in Postgres + Kafka. Redis and Anthropic are performance + UX dependencies, never correctness ones.
+
+---
+
+## LLM cost model (quick reference)
+
+Approximate per-call costs at Opus 4.7 pricing. Full breakdown + cache-hit telemetry shape in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#cost-model-llm-features).
+
+| Feature | Per call | Typical cadence | Per month (representative) |
+|---|---|---|---|
+| DLQ triage | ~$0.012 | every dead-letter | ~$3 |
+| Retry policy | ~$0.005 | every retry past first | ~$15 |
+| NL admin query | ~$0.006 | per admin search | ~$5 |
+| Incident digest | ~$0.018 | per tenant per day | ~$2 |
+
+Total Phase-10 LLM spend: <$30/mo in a representative setup. Cache hit rates and token counts are stored on every record (`usage` JSONB column on `job_triages` and `incident_summaries`).
+
+---
+
+## Conventions (expanded)
+
+### Errors
+
+Custom exception hierarchy rooted at `AppError` (`backend/app/core/exceptions.py`). Each subclass declares `status_code` and `error_code`. The middleware catches `AppError` and produces a uniform JSON envelope:
+
+```json
+{
+  "error_code": "quota_exceeded",
+  "message": "Monthly job quota reached for tenant acme (100000 / 100000).",
+  "details": {},
+  "request_id": "..."
+}
+```
+
+When adding a new error: subclass `AppError`, set `status_code` + `error_code`, raise from the service layer. Don't catch and re-wrap arbitrary exceptions — the middleware turns uncaught exceptions into 500s with `error_code: internal_error`.
+
+### Migrations
+
+- One migration per logical change.
+- Always include `downgrade()`. Even if it's `op.execute("...")` with state we can't fully undo, the down path must exist.
+- Inline a rationale at the top of every migration. Six months from now, the *why* is the most valuable thing in the file.
+- Never edit a generated revision after it's merged. New change = new revision.
+- After `alembic revision --autogenerate`, **read the diff** — autogenerate misses enum updates, partial indexes, and data-only changes.
+
+### Tests
+
+Three layers, each with a clear purpose. Picking the right one matters:
+
+- **Unit (`backend/tests/unit/`)** — services, processors, validators, repositories, consumers. **No I/O**. SQLite in-memory if a DB is needed (via the `db_session` fixture); mocks for Redis/Kafka/Anthropic. ~150 tests.
+- **API contract (`backend/tests/api/`)** — full FastAPI app via httpx ASGITransport, dependency overrides swap in SQLite + mock Redis. Tests request/response shape + auth + error envelope. ~30 tests.
+- **Integration (`backend/tests/integration/`)** — real Postgres or Redpanda via Testcontainers. Docker-gated (skipped on `RUN_RLS_TEST=1` for the RLS test, etc.). Tests the things only a real DB / broker can prove (RLS enforcement, Kafka redelivery, schema validation end-to-end).
+
+When in doubt: write a unit test. Move up only when you need the real thing.
+
+### Audit log entries
+
+The convention is `<resource>.<verb>` snake-case: `job.created`, `job.replayed`, `saga.completed`, `tenant.created`, `user.registered`, `incident.resolved`. Resource-only events (`job.dead_letter`) drop the verb when the action *is* the state change.
+
+`extra_data` carries event-specific freeform JSON. e.g. `job.dead_letter` includes `{error, retry_count}` plus `{dead_lettered_by, reasoning}` when the LLM forced it.
+
+### Structured logs
+
+Every entry carries `request_id` / `trace_id` / `tenant_id` / `user_id` / `job_id` as context vars. Logger names are module-scoped (`app.workers.dispatcher`). Levels: `DEBUG` for chatter, `INFO` for state transitions, `WARNING` for fall-through behavior (LLM fell back to deterministic; rate limit failed open), `ERROR` for things that need investigation.
+
+### What goes in the audit log vs. structured logs vs. metrics
+
+- **Audit log**: who did what, when. Always tied to a user/tenant/resource. Queryable from the admin Audit tab. The historical record.
+- **Structured logs**: ephemeral operational signal. What the system is doing. CloudWatch Logs. Hot for ~30 days.
+- **Metrics**: numerical aggregates over time. Time-series. CloudWatch Metrics. Drives alarms + dashboards.
+
+A job creation gets all three: audit log row (`job.created`), structured log entry (`INFO: job created`), metric (`JobCreated` counter).
+
+---
+
+## Common pitfalls
+
+- **Adding a new endpoint that lists rows without filtering by `tenant_id`.** RLS will catch it for tenant admins, but platform admins implicitly bypass via `set_config('app.tenant_id', other)`. Always filter explicitly at the application layer; let RLS be the safety net.
+- **Forgetting to seed the default tenant in a test fixture.** The `default_tenant` fixture in `conftest.py` is the source of truth; new fixtures that create users must depend on it.
+- **Adding a Kafka producer without going through the outbox.** Direct publish (`publish_*`) skips the atomicity guarantee. Only `job.progress` uses the direct path; everything else routes through `outbox_events`.
+- **Renaming a Kafka field.** Backward-incompatible. Add a new field, deprecate the old, drop after every consumer reads the new one. See the rules in [`docs/KAFKA.md`](docs/KAFKA.md#schema-evolution-rules).
+- **Mutating an event log row.** `job_events` is immutable. The `UNIQUE (kafka_topic, kafka_partition, kafka_offset)` constraint is what makes redelivery idempotent.
+- **Calling Anthropic from a request handler synchronously.** All LLM features are async. Wrap with `asyncio.wait_for` if you need a timeout; never block the worker indefinitely.
+- **Reading from `jobs:status:*` (pre-Phase-12 keys).** They don't exist anymore. Use the per-tenant keys `jobs:tenant:{tid}:status:{status}`. See [Phase 12 PR D](https://github.com/kudratsingh/incident-platform/pull/38).
+- **Catching `AppError` and re-raising as a different type.** The middleware needs the type to know the status code. Re-raise the same instance or let it propagate.
+- **Hand-editing a generated Alembic revision after merging.** Future migrations chain off the revision ID; changing it breaks the chain. Make a new revision.
+- **Skipping the schema check on a new Kafka topic.** Producers without validation send malformed events; consumers without validation accept them. Every topic in `Settings.kafka_topic_*` must have a matching `.schema.json`.
