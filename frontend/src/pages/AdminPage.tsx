@@ -4,13 +4,30 @@ import Layout from '../components/Layout'
 import StatusBadge from '../components/StatusBadge'
 import { TableRowSkeleton } from '../components/Skeleton'
 import { useToast } from '../components/Toast'
-import type { AuditLog, Job, Runbook, SLOState, SystemStats, Tenant, User } from '../types'
+import type {
+  AuditLog,
+  IncidentDigest,
+  Job,
+  Runbook,
+  SLOState,
+  SystemStats,
+  Tenant,
+  User,
+} from '../types'
 import { adminApi } from '../api/admin'
 import { AppError } from '../api/client'
 import { useAuth } from '../hooks/useAuth'
 import { formatDate, JOB_TYPE_LABELS } from '../utils/format'
 
-type Tab = 'overview' | 'jobs' | 'dlq' | 'runbooks' | 'users' | 'tenants' | 'audit'
+type Tab =
+  | 'overview'
+  | 'jobs'
+  | 'dlq'
+  | 'runbooks'
+  | 'users'
+  | 'tenants'
+  | 'digests'
+  | 'audit'
 
 function AuditLogModal({ log, onClose }: { log: AuditLog; onClose: () => void }) {
   return (
@@ -263,6 +280,9 @@ export default function AdminPage() {
   const [nlBusy, setNlBusy] = useState(false)
   const [nlSpec, setNlSpec] = useState<Record<string, unknown> | null>(null)
   const [nlError, setNlError] = useState<string | null>(null)
+  const [digests, setDigests] = useState<IncidentDigest[]>([])
+  const [digestBusy, setDigestBusy] = useState(false)
+  const [digestError, setDigestError] = useState<string | null>(null)
 
   const loadJobs = useCallback(async () => {
     setLoading(true)
@@ -380,6 +400,39 @@ export default function AdminPage() {
     void loadJobs()
   }
 
+  const loadDigests = useCallback(async () => {
+    setLoading(true)
+    try {
+      const r = await adminApi.listDigests()
+      setDigests(r.items)
+    } finally {
+      setLoading(false)
+    }
+  }, [])
+
+  async function generateDigestNow(): Promise<void> {
+    setDigestBusy(true)
+    setDigestError(null)
+    try {
+      const resp = await adminApi.generateDigest()
+      if ('summary' in resp && resp.summary === null) {
+        setDigestError(
+          'No jobs in the last window — nothing to summarize. Try a wider hours range.',
+        )
+      } else {
+        await loadDigests()
+      }
+    } catch (err) {
+      setDigestError(
+        err instanceof AppError
+          ? err.message
+          : 'Failed to generate digest. Check that LLM_DIGEST_ENABLED is set.',
+      )
+    } finally {
+      setDigestBusy(false)
+    }
+  }
+
   async function saveTenantLimits(
     id: string,
     rate: number,
@@ -424,8 +477,9 @@ export default function AdminPage() {
     else if (tab === 'runbooks') void loadRunbooks()
     else if (tab === 'users') void loadUsers()
     else if (tab === 'tenants') void loadTenants()
+    else if (tab === 'digests') void loadDigests()
     else void loadLogs()
-  }, [tab, loadJobs, loadDlq, loadRunbooks, loadUsers, loadTenants, loadLogs])
+  }, [tab, loadJobs, loadDlq, loadRunbooks, loadUsers, loadTenants, loadDigests, loadLogs])
 
   async function replay(jobId: string) {
     try {
@@ -464,6 +518,7 @@ export default function AdminPage() {
               'runbooks',
               'users',
               ...(isPlatformAdmin ? (['tenants'] as Tab[]) : []),
+              'digests',
               'audit',
             ] as Tab[]
           ).map((t) => (
@@ -924,6 +979,87 @@ export default function AdminPage() {
                 toast.success(`Tenant ${created.slug} created`)
               }}
             />
+          )}
+        </>
+      )}
+
+      {tab === 'digests' && (
+        <>
+          <div className="flex justify-between items-center mb-3">
+            <p className="text-xs text-gray-500">
+              Daily LLM-written digests of failures, recurring patterns, and recommended actions for your tenant.
+            </p>
+            <button
+              onClick={() => void generateDigestNow()}
+              disabled={digestBusy}
+              className="text-sm px-3 py-1.5 rounded bg-purple-600 text-white hover:bg-purple-500 disabled:opacity-40 disabled:cursor-not-allowed font-medium"
+            >
+              {digestBusy ? 'Generating…' : 'Generate now'}
+            </button>
+          </div>
+          {digestError && (
+            <div className="mb-3 text-xs text-red-400 bg-red-900/20 border border-red-800/30 rounded px-3 py-2">
+              {digestError}
+            </div>
+          )}
+          {loading ? (
+            <div className="space-y-3">
+              {Array.from({ length: 3 }).map((_, i) => (
+                <div
+                  key={i}
+                  className="bg-gray-900 border border-gray-800 rounded-lg h-32 animate-pulse"
+                />
+              ))}
+            </div>
+          ) : digests.length === 0 ? (
+            <div className="bg-gray-900 border border-gray-800 rounded-lg p-8 text-sm text-gray-500 text-center">
+              No digests yet. Click "Generate now" to write one for the last 24 hours.
+            </div>
+          ) : (
+            <div className="space-y-3">
+              {digests.map((d) => (
+                <article
+                  key={d.id}
+                  className="bg-gray-900 border border-gray-800 rounded-lg p-4"
+                >
+                  <header className="flex items-center justify-between mb-2 text-xs text-gray-500">
+                    <span className="font-mono">
+                      {formatDate(d.window_start)} → {formatDate(d.window_end)}
+                    </span>
+                    <span className="font-mono text-gray-600">
+                      {d.model_used}
+                    </span>
+                  </header>
+                  <p className="text-sm text-gray-200 leading-relaxed">
+                    {d.summary}
+                  </p>
+                  {!!d.highlights?.key_concerns?.length && (
+                    <div className="mt-3">
+                      <h4 className="text-xs uppercase tracking-wide text-gray-500 mb-1">
+                        Key concerns
+                      </h4>
+                      <ul className="list-disc list-inside text-xs text-gray-300 space-y-0.5">
+                        {d.highlights.key_concerns!.map((c, i) => (
+                          <li key={i}>{c}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                  {!!d.highlights?.recommended_actions?.length && (
+                    <div className="mt-3">
+                      <h4 className="text-xs uppercase tracking-wide text-gray-500 mb-1">
+                        Recommended actions
+                      </h4>
+                      <ul className="list-disc list-inside text-xs text-green-300 space-y-0.5">
+                        {d.highlights.recommended_actions!.map((a, i) => (
+                          <li key={i}>{a}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                </article>
+              ))}
+            </div>
           )}
         </>
       )}

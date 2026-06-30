@@ -560,6 +560,32 @@ BACKPRESSURE_LAG_KEY = "kafka:consumer_lag:worker-dispatcher"
 BACKPRESSURE_LAG_TTL = 90  # seconds — must exceed metrics loop interval (60s)
 
 
+async def _digest_loop(session_factory: async_sessionmaker[AsyncSession]) -> None:
+    """Periodic incident-summary digest worker.
+
+    Runs forever, sleeping `llm_digest_interval_hours` between batches.
+    When the feature flag is off, the body short-circuits and we still
+    sleep so the loop doesn't busy-wait.
+    """
+    from app.services import incident_digest
+
+    while True:
+        try:
+            settings = get_settings()
+            interval_seconds = max(60, settings.llm_digest_interval_hours * 3600)
+            await asyncio.sleep(interval_seconds)
+            if not incident_digest.is_enabled():
+                continue
+            written = await incident_digest.run_digest_for_all_active_tenants(
+                session_factory
+            )
+            logger.info("digest batch finished", extra={"written": written})
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            logger.error("digest loop error", extra={"error": str(exc)})
+
+
 async def _metrics_loop(redis: Any, consumer: JobDispatcherConsumer) -> None:
     """Emit queue/in-flight/consumer-lag gauges every ~60s.
 
@@ -595,6 +621,7 @@ async def worker_loop(
       4. _promote_delayed_loop  — re-publishes delayed retries via the outbox.
       5. _outbox_relay_loop     — publishes outbox rows to Kafka.
       6. _metrics_loop          — emits queue/in-flight gauges to CloudWatch.
+      7. _digest_loop           — periodic LLM incident summaries (off by default).
 
     Cancel signal: cancel all, wait for in-flight jobs, stop all consumers.
     Independent consumer groups — failure in one doesn't affect the others.
@@ -644,6 +671,7 @@ async def worker_loop(
             asyncio.create_task(_promote_delayed_loop(session_factory, redis)),
             asyncio.create_task(_outbox_relay_loop(session_factory)),
             asyncio.create_task(_metrics_loop(redis, dispatcher)),
+            asyncio.create_task(_digest_loop(session_factory)),
         ]
     )
 

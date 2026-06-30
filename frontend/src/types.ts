@@ -144,6 +144,23 @@ export interface Runbook {
   related_dashboards?: string[]
 }
 
+export interface IncidentDigest {
+  id: string
+  tenant_id: string
+  window_start: string
+  window_end: string
+  summary: string
+  highlights: {
+    key_concerns?: string[]
+    recommended_actions?: string[]
+    by_status?: Record<string, number>
+    failed_by_type?: Record<string, number>
+  }
+  model_used: string
+  usage: Record<string, number>
+  created_at: string
+}
+
 export interface AuditLog {
   id: string
   user_id: string | null

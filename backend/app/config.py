@@ -106,6 +106,17 @@ class Settings(BaseSettings):
     llm_nl_query_enabled: bool = False
     llm_nl_query_model: str = "claude-opus-4-7"
 
+    # Periodic incident summaries. The digest worker runs every
+    # `llm_digest_interval_hours` and writes one row per active tenant
+    # summarising the trailing `llm_digest_window_hours` of failures.
+    llm_digest_enabled: bool = False
+    llm_digest_model: str = "claude-opus-4-7"
+    llm_digest_interval_hours: int = 24
+    llm_digest_window_hours: int = 24
+    # Cap the number of error_message rows we fingerprint per tenant; the
+    # service deduplicates anyway, but pulling 100k rows is wasteful.
+    llm_digest_max_error_samples: int = 1000
+
     # Tracing — set to http://localhost:4318 locally (Jaeger), or X-Ray OTLP endpoint in prod
     otlp_endpoint: str | None = None
 
