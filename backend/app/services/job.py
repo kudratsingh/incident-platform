@@ -178,6 +178,10 @@ class JobService:
         job_type: str | None = None,
         trace_id: str | None = None,
         filter_user_id: uuid.UUID | None = None,
+        created_after: Any = None,
+        created_before: Any = None,
+        retry_count_min: int | None = None,
+        retry_count_max: int | None = None,
     ) -> tuple[list[Job], int]:
         # Non-admins can only see their own jobs
         effective_user_id: uuid.UUID | None
@@ -194,6 +198,10 @@ class JobService:
             status=status,
             job_type=job_type,
             trace_id=trace_id,
+            created_after=created_after,
+            created_before=created_before,
+            retry_count_min=retry_count_min,
+            retry_count_max=retry_count_max,
         )
 
     async def replay_job(

@@ -40,6 +40,10 @@ class JobRepository(BaseRepository[Job]):
         status: str | None = None,
         job_type: str | None = None,
         trace_id: str | None = None,
+        created_after: Any = None,
+        created_before: Any = None,
+        retry_count_min: int | None = None,
+        retry_count_max: int | None = None,
     ) -> tuple[list[Job], int]:
         filters: list[Any] = [Job.tenant_id == tenant_id]
         if user_id is not None:
@@ -50,6 +54,14 @@ class JobRepository(BaseRepository[Job]):
             filters.append(Job.type == job_type)
         if trace_id is not None:
             filters.append(Job.trace_id == trace_id)
+        if created_after is not None:
+            filters.append(Job.created_at >= created_after)
+        if created_before is not None:
+            filters.append(Job.created_at <= created_before)
+        if retry_count_min is not None:
+            filters.append(Job.retry_count >= retry_count_min)
+        if retry_count_max is not None:
+            filters.append(Job.retry_count <= retry_count_max)
 
         where = and_(*filters)
         total = await self._count(where)

@@ -100,6 +100,12 @@ class Settings(BaseSettings):
     # the deterministic backoff than block on a slow API.
     llm_retry_policy_timeout_seconds: float = 10.0
 
+    # Natural-language admin queries. Translates a plain-English question into
+    # a constrained JobFilterSpec the platform applies to /admin/jobs. Off by
+    # default. When disabled, the API returns 503.
+    llm_nl_query_enabled: bool = False
+    llm_nl_query_model: str = "claude-opus-4-7"
+
     # Tracing — set to http://localhost:4318 locally (Jaeger), or X-Ray OTLP endpoint in prod
     otlp_endpoint: str | None = None
 

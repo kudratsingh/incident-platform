@@ -76,6 +76,15 @@ export const adminApi = {
   createTenant: (slug: string, name: string) =>
     api.post<Tenant>('/admin/tenants', { slug, name }),
 
+  nlQuery: (question: string) =>
+    api.post<{
+      spec: Record<string, unknown>
+      model: string
+      usage: Record<string, number>
+      items: Job[]
+      total: number
+    }>('/admin/query', { question }),
+
   updateTenantLimits: (
     id: string,
     body: { rate_limit_per_minute?: number; quota_jobs_per_month?: number },
