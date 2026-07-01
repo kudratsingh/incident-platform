@@ -184,6 +184,93 @@ async def test_run_job_llm_policy_failure_falls_back_to_deterministic() -> None:
     assert JobStatus.DEAD_LETTER not in calls
 
 
+async def test_run_job_dead_letters_compensation_when_no_processor() -> None:
+    """Saga compensation jobs have type=`{parent}.compensate`, which is NOT a
+    valid JobType member. Before the fix, this raised ValueError inside
+    _run_job outside any try/except, stranding the job in RUNNING and the
+    saga in COMPENSATING. Now the dispatcher must:
+
+      * NOT raise
+      * mark the job DEAD_LETTER (not FAILED)
+      * enqueue a `job.dlq` outbox row so the saga coordinator settles
+    """
+    outbox_mock = AsyncMock()
+    outbox_ctor = MagicMock(return_value=outbox_mock)
+
+    # `type` is the compensate string, not a JobType member.
+    job = _make_job(type="csv_upload.compensate", retry_count=0, max_retries=3)
+    factory, job_repo, audit_repo = _make_session_factory(job)
+    redis = AsyncMock()
+
+    with patch("app.workers.dispatcher.JobRepository", return_value=job_repo), \
+         patch("app.workers.dispatcher.AuditRepository", return_value=audit_repo), \
+         patch("app.workers.dispatcher.OutboxRepository", new=outbox_ctor), \
+         patch.dict(dispatcher._PROCESSORS, {}, clear=False):
+        # Must NOT raise — the pre-fix code raised ValueError here.
+        await dispatcher._run_job(str(job.id), factory, redis)
+
+    # DEAD_LETTER, not FAILED.
+    calls = [c.args[1] for c in job_repo.update_status.call_args_list]
+    assert JobStatus.DEAD_LETTER in calls
+    assert JobStatus.FAILED not in calls
+
+    # An outbox row was enqueued on the DLQ topic with dead_lettered=True
+    # so the saga coordinator can settle the saga.
+    outbox_mock.add.assert_awaited()
+    outbox_payload = outbox_mock.add.await_args.kwargs["payload"]
+    assert outbox_payload["dead_lettered"] is True
+    assert outbox_payload["job_type"] == "csv_upload.compensate"
+
+    # And an audit row was written so the incident is visible in /audit/logs.
+    audit_repo.log.assert_awaited()
+    action = audit_repo.log.await_args.args[0]
+    assert action == "job.dead_letter"
+
+
+async def test_run_job_dead_letters_when_type_string_is_junk() -> None:
+    """Same bug class: any job.type that isn't a JobType member (typo,
+    schema drift, adversarial input) must dead-letter, not raise."""
+    job = _make_job(type="totally_not_a_real_type")
+    factory, job_repo, audit_repo = _make_session_factory(job)
+    redis = AsyncMock()
+
+    outbox_mock = AsyncMock()
+    with patch("app.workers.dispatcher.JobRepository", return_value=job_repo), \
+         patch("app.workers.dispatcher.AuditRepository", return_value=audit_repo), \
+         patch("app.workers.dispatcher.OutboxRepository", new=MagicMock(return_value=outbox_mock)):
+        await dispatcher._run_job(str(job.id), factory, redis)
+
+    calls = [c.args[1] for c in job_repo.update_status.call_args_list]
+    assert JobStatus.DEAD_LETTER in calls
+
+
+async def test_run_and_release_force_dead_letters_on_unhandled_exception() -> None:
+    """Last-resort safety net: if _run_job escapes with an unhandled
+    exception (a future bug), the safety net must mark the job DEAD_LETTER
+    and log loudly rather than silently swallowing the error and stranding
+    the job in RUNNING.
+    """
+    factory, job_repo, audit_repo = _make_session_factory(_make_job())
+    redis = AsyncMock()
+    consumer = dispatcher.JobDispatcherConsumer(factory, redis)
+    consumer.session_factory = factory
+    consumer.redis = redis
+
+    job_id = str(uuid.uuid4())
+
+    with patch(
+        "app.workers.dispatcher._run_job",
+        new=AsyncMock(side_effect=RuntimeError("boom past guards")),
+    ), patch("app.workers.dispatcher.JobRepository", return_value=job_repo), \
+       patch("app.workers.dispatcher.AuditRepository", return_value=audit_repo):
+        # Must NOT re-raise.
+        await consumer._run_and_release(job_id)
+
+    # The safety net force-dead-lettered the job.
+    calls = [c.args[1] for c in job_repo.update_status.call_args_list]
+    assert JobStatus.DEAD_LETTER in calls
+
+
 async def test_run_job_skips_unknown_job() -> None:
     begin_ctx = MagicMock()
     begin_ctx.__aenter__ = AsyncMock(return_value=None)

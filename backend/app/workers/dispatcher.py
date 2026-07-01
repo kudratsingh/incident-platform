@@ -127,17 +127,52 @@ async def _run_job(
     # ------------------------------------------------------------------ #
     # 2. Execute processor                                                  #
     # ------------------------------------------------------------------ #
-    processor = _PROCESSORS.get(JobType(job_type))
+    # Resolve the processor. Two things can go wrong here, and both must
+    # end in DEAD_LETTER (never leave the job in RUNNING or FAILED-without-retry):
+    #
+    #   1. The job's `type` string isn't a valid JobType member. This is
+    #      the common case for saga compensation jobs, whose type is
+    #      `{parent_type}.compensate` (e.g. "csv_upload.compensate") and
+    #      is NOT a JobType enum value. Applications register their own
+    #      compensation processors in _PROCESSORS keyed by the compensate
+    #      string; if they haven't, the job must dead-letter so the saga
+    #      status settles instead of hanging in COMPENSATING forever.
+    #   2. The string IS a valid JobType but no processor is registered
+    #      for it. Same terminal outcome for the same reason.
+    #
+    # Historical bug: `JobType(job_type)` was evaluated outside the None
+    # check, so a `.compensate` string raised ValueError, which propagated
+    # into _run_and_release's fire-and-forget task and was silently
+    # swallowed — leaving the job stuck in RUNNING and the saga stuck in
+    # COMPENSATING.
+    processor: Any = None
+    try:
+        processor = _PROCESSORS.get(JobType(job_type))
+    except ValueError:
+        # Not a JobType member — could still be a registered compensation
+        # type (though currently _PROCESSORS is keyed by JobType only; kept
+        # as a future extension point). Fall through to the DEAD_LETTER path.
+        processor = None
+
     if processor is None:
+        error = f"No processor for type: {job_type}"
         async with session_factory() as session:
             async with session.begin():
-                await JobRepository(session).update_status(
-                    job_id, JobStatus.FAILED,
-                    extra={"error_message": f"No processor for type: {job_type}"},
+                repo = JobRepository(session)
+                audit = AuditRepository(session)
+                await repo.update_status(
+                    job_id, JobStatus.DEAD_LETTER,
+                    extra={"retry_count": retry_count, "error_message": error},
+                )
+                await audit.log(
+                    "job.dead_letter",
+                    tenant_id=tenant_id,
+                    job_id=job_id,
+                    extra_data={"error": error, "reason": "unregistered_type"},
                 )
                 await OutboxRepository(session).add(
                     tenant_id=tenant_id,
-                    topic=settings.kafka_topic_job_failed,
+                    topic=settings.kafka_topic_job_dlq,
                     key=f"{tenant_id}:{user_id}",
                     payload={
                         "event": "job.failed",
@@ -145,12 +180,14 @@ async def _run_job(
                         "job_id": job_id_str,
                         "user_id": str(user_id),
                         "job_type": job_type,
-                        "error": f"Unknown job type: {job_type}",
-                        "message": f"Unknown job type: {job_type}",
+                        "error": error,
+                        "message": error,
                         "retry_count": retry_count,
-                        "dead_lettered": False,
+                        "dead_lettered": True,
                     },
                 )
+        logger.error("job dead-lettered — unregistered type", extra={"job_type": job_type})
+        await metrics.emit_count("JobDeadLettered", dimensions={"JobType": str(job_type)})
         job_id_var.reset(token)
         return
 
@@ -405,8 +442,52 @@ class JobDispatcherConsumer(BaseKafkaConsumer):
     async def _run_and_release(self, job_id_str: str) -> None:
         try:
             await _run_job(job_id_str, self.session_factory, self.redis)
+        except Exception as exc:
+            # Last-resort safety net. `_run_job` is expected to handle its
+            # own failures and settle the job in a terminal state; if it
+            # somehow escapes with an exception, this task is fire-and-forget
+            # (spawned via asyncio.create_task) so the exception would
+            # otherwise be silently swallowed and the job would stay in
+            # RUNNING forever. Log loudly and mark the job DEAD_LETTER so an
+            # admin sees it in the DLQ tab rather than losing it.
+            logger.exception(
+                "run_job escaped with unhandled exception — force-dead-lettering",
+                extra={"job_id": job_id_str, "error": str(exc)},
+            )
+            try:
+                await self._force_dead_letter(job_id_str, str(exc))
+            except Exception:
+                logger.exception(
+                    "force_dead_letter itself failed — job may be stranded",
+                    extra={"job_id": job_id_str},
+                )
         finally:
             self.semaphore.release()
+
+    async def _force_dead_letter(self, job_id_str: str, error: str) -> None:
+        """Best-effort: mark a job DEAD_LETTER when _run_job escapes with an
+        unhandled exception. Used only from the _run_and_release safety net."""
+        try:
+            job_id = uuid.UUID(job_id_str)
+        except ValueError:
+            return
+        async with self.session_factory() as session:
+            async with session.begin():
+                repo = JobRepository(session)
+                job = await repo.get_by_id(job_id)
+                if job is None or job.status == JobStatus.DEAD_LETTER:
+                    return
+                await repo.update_status(
+                    job_id,
+                    JobStatus.DEAD_LETTER,
+                    extra={"error_message": f"Dispatcher escape: {error}"},
+                )
+                await AuditRepository(session).log(
+                    "job.dead_letter",
+                    tenant_id=job.tenant_id,
+                    job_id=job_id,
+                    extra_data={"error": error, "reason": "dispatcher_escape"},
+                )
 
     async def consumer_lag(self) -> int:
         """Sum of (log_end_offset - committed_offset) across all assigned partitions.
