@@ -11,7 +11,7 @@ For per-component reference, see [`docs/DATA_MODEL.md`](DATA_MODEL.md), [`docs/K
 The platform runs as **three logical processes**:
 
 1. **API process** — FastAPI behind an ALB. Serves `/api/v1/*`. One ECS task with autoscaling target on CPU.
-2. **Worker process** — runs `worker_loop` from `app/workers/dispatcher.py`. Hosts seven Kafka consumer groups + four background loops. One ECS task today (autoscaling on queue depth is a Phase 8 item).
+2. **Worker process** — runs `worker_loop` from `app/workers/dispatcher.py`. Hosts eight Kafka consumer groups + four background loops. One ECS task today (autoscaling on queue depth is a Phase 8 item).
 3. **Frontend** — Nginx serving the React SPA. Same ALB, different listener rule.
 
 External dependencies, all managed:
@@ -56,7 +56,7 @@ The three processes share nothing in-process but coordinate via Postgres, Redis,
                 │  Worker process  │
                 │  (one ECS task)  │
                 │                  │
-                │  7 Kafka groups: │
+                │  8 Kafka groups: │
                 │   dispatcher     │
                 │   audit-writer   │
                 │   sse-broadcast  │
@@ -265,7 +265,7 @@ The platform uses **all three Python concurrency models deliberately**, picked p
 The API process is fully asyncio. So is the entire worker process. Reasoning:
 
 - HTTP I/O dominates the API path (DB / Redis / Kafka / Anthropic).
-- The worker's seven Kafka consumers and four loops are all I/O-bound.
+- The worker's eight Kafka consumers and four loops are all I/O-bound.
 - Switching between them on socket reads is what FastAPI + aiokafka were designed for.
 
 Within the worker, every consumer runs as a separate asyncio task (`asyncio.create_task(c.run())`). The `worker_loop` orchestrates startup, graceful shutdown (cancels all tasks, waits for in-flight messages), and per-task error isolation (one consumer's failure doesn't kill others).
@@ -301,7 +301,7 @@ Register the new processor in `_PROCESSORS` in `dispatcher.py`.
 
 `worker_loop` in `app/workers/dispatcher.py` is the entry point. On startup it:
 
-1. Starts seven Kafka consumers (each with its own consumer group, started best-effort — one's failure doesn't kill the others).
+1. Starts eight Kafka consumers (each with its own consumer group, started best-effort — one's failure doesn't kill the others).
 2. Validates the dispatcher consumer specifically — if that one fails to start, the worker exits since no jobs can run.
 3. Spawns the four background loops as asyncio tasks.
 

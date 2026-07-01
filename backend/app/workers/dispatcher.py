@@ -695,17 +695,26 @@ async def worker_loop(
     """
     Start the Kafka consumers and the supporting background loops.
 
-    Concurrent tasks that make up the worker:
-      1. dispatcher.run()       — consumes `job.submitted`, spawns _run_job.
-      2. audit.run()            — consumes lifecycle events, writes audit rows.
-      3. sse.run()              — consumes lifecycle events, bridges to Redis pub/sub.
-      4. _promote_delayed_loop  — re-publishes delayed retries via the outbox.
-      5. _outbox_relay_loop     — publishes outbox rows to Kafka.
-      6. _metrics_loop          — emits queue/in-flight gauges to CloudWatch.
-      7. _digest_loop           — periodic LLM incident summaries (off by default).
+    Concurrent tasks that make up the worker — 8 Kafka consumers + 4 loops:
+
+      Kafka consumers (each its own group, so failure of one doesn't
+      affect the others):
+        1. dispatcher.run()       — consumes `job.submitted`, spawns _run_job.
+        2. audit.run()            — consumes lifecycle events, writes audit rows.
+        3. sse.run()              — consumes lifecycle events, bridges to Redis pub/sub.
+        4. event_log.run()        — appends every lifecycle event to `job_events`.
+        5. read_model.run()       — projects per-tenant/per-user status sets in Redis.
+        6. dep_resolver.run()     — promotes WAITING children to PENDING on parent completion.
+        7. saga.run()             — settles sagas; enqueues compensation on DLQ.
+        8. triage.run()           — Phase 10: LLM classification of dead-lettered jobs.
+
+      Background loops:
+        1. _promote_delayed_loop  — re-publishes delayed retries via the outbox.
+        2. _outbox_relay_loop     — publishes outbox rows to Kafka.
+        3. _metrics_loop          — emits queue/in-flight/lag gauges + cached lag for backpressure.
+        4. _digest_loop           — Phase 10: per-tenant LLM incident summaries (off by default).
 
     Cancel signal: cancel all, wait for in-flight jobs, stop all consumers.
-    Independent consumer groups — failure in one doesn't affect the others.
     """
     dispatcher = JobDispatcherConsumer(session_factory, redis)
     audit = AuditConsumer(session_factory)
