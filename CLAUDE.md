@@ -122,7 +122,7 @@ Phase 12 — Multi-tenancy:
 - `mypy --strict` in CI on the `app` package.
 - `ruff check backend/` in CI.
 - Coverage gate at 70% (see `pyproject.toml`).
-- Current test count: **180+** passing.
+- Current test count: **240+** passing (161 unit + 82 API + 3 gated integration).
 
 ---
 
@@ -162,7 +162,7 @@ The actual runtime topology after Phase 7:
            ┌────────────────┼────────────────────────────────┐
            │   Worker process (single ECS task)              │
            │                                                 │
-           │   Seven Kafka consumer groups (concurrent):     │
+           │   Eight Kafka consumer groups (concurrent):     │
            │     1. worker-dispatcher   → _run_job           │
            │     2. audit-writer        → audit_logs rows    │
            │     3. sse-broadcaster     → Redis pub/sub      │
@@ -170,11 +170,13 @@ The actual runtime topology after Phase 7:
            │     5. read-model          → Redis sets         │
            │     6. dependency-resolver → promote children   │
            │     7. saga-coordinator    → compensation       │
+           │     8. llm-triage          → job_triages rows   │
            │                                                 │
-           │   Three supporting loops:                       │
+           │   Four supporting loops:                        │
            │     • outbox relay (DB → Kafka)                 │
            │     • delayed-retry promote (Redis → outbox)    │
            │     • metrics loop (gauges + lag cache)         │
+           │     • digest loop (per-tenant LLM summary)      │
            │                                                 │
            │   Three concurrency models:                     │
            │     • asyncio  → bulk_api_sync                  │
@@ -290,8 +292,8 @@ Logs must be queryable by trace ID end-to-end: browser → API → worker → re
 ## Testing Strategy
 
 ### Layers
-1. **Unit tests** (`backend/tests/unit/`) — services, processors, validators, repositories, consumers. ~150 tests. No I/O.
-2. **API contract tests** (`backend/tests/api/`) — full FastAPI app with dependency overrides; SQLite in-memory DB; mocked Redis. ~30 tests.
+1. **Unit tests** (`backend/tests/unit/`) — services, processors, validators, repositories, consumers. 161 tests. No I/O.
+2. **API contract tests** (`backend/tests/api/`) — full FastAPI app with dependency overrides; SQLite in-memory DB; mocked Redis. 82 tests.
 3. **Integration tests** (`backend/tests/integration/`) — Testcontainers with Redpanda. Docker-gated; opt-in via `pytest backend/tests/integration/`.
 4. **Load tests** (`backend/tests/load/`) — Locust scenarios for the job submission path.
 5. **Failure-mode tests** — circuit-breaker open/close, schema validation rejecting bad payloads, redelivery dedup via unique constraints.
@@ -368,8 +370,8 @@ Concrete implementation pointers for each pattern this project demonstrates end-
 | **Saga pattern** | `app/services/saga.py` (creation) + `app/workers/saga_coordinator.py` (lifecycle + compensation) | `{type}.compensate` jobs enqueued in reverse order on DLQ |
 | **Job dependency DAG** | `job_dependencies` table; `DependencyResolver` consumer; `JobStatus.WAITING` | Cycle-free by construction (deps reference only existing jobs) |
 | **Schema evolution** | `backend/app/schemas/kafka/*.schema.json` validated on both producer and consumer | `additionalProperties: true` for backward compatibility |
-| **Dead-letter queue** | `job.dlq` topic; `dead_letter` job status; `/admin/dlq/*` endpoints; `LlmTriageConsumer` (Phase 10 WIP) analyses each entry | Admin replay resets `retry_count` |
-| **Fan-out / fan-in** | Five Kafka consumer groups subscribed to the lifecycle topics, all processing independently | No coordination needed; each group has its own offset |
+| **Dead-letter queue** | `job.dlq` topic; `dead_letter` job status; `/admin/dlq/*` endpoints; `LlmTriageConsumer` (Phase 10) analyses each entry | Admin replay resets `retry_count`; unregistered `.compensate` types also route here |
+| **Fan-out / fan-in** | Seven Kafka consumer groups subscribed to the lifecycle topics, all processing independently | No coordination needed; each group has its own offset |
 | **Consumer group isolation** | Each consumer in `worker_loop` is its own group; failure of one doesn't affect others | `started: list[BaseKafkaConsumer]` filters out failed starters |
 | **Distributed locking** | Redis `SETNX` for job deduplication (open opportunity in the rate-limit code path) | Idempotency key is the primary dedup mechanism today |
 | **Connection pool sizing** | SQLAlchemy `pool_pre_ping=True`; pool tuning is a Phase 8 item (PgBouncer) | — |
@@ -388,30 +390,29 @@ Concrete implementation pointers for each pattern this project demonstrates end-
 
 ---
 
-## LLM Integration (Phase 10 — In Progress)
+## LLM Integration (Phase 10 — Complete)
 
-The project uses the **Anthropic Python SDK** to add LLM-powered features. The first feature is DLQ triage (in progress on `feat/phase10-ai-triage`).
+The project uses the **Anthropic Python SDK** to add four LLM-powered features. All shipped, all off by default, all fail open (the platform runs fine without an `ANTHROPIC_API_KEY`).
 
-### Conventions
+### The four features
 
-- **Default model**: `claude-opus-4-7` with `thinking: {type: "adaptive"}`. Failure diagnosis is an intelligence-sensitive task and the per-DLQ cost is small.
-- **Structured outputs** — every LLM call uses `client.messages.parse()` with a Pydantic schema (see `TriageAnalysis` in `app/services/triage.py`). The model's response is shape-checked before it ever reaches the DB.
-- **Prompt caching** — the frozen system prompt (the failure-classification taxonomy + the platform description) is cached. The volatile per-job context goes into the user message, after the cache breakpoint, so the cache hits across triages.
-- **Feature flag** — `settings.llm_triage_enabled` defaults to `False`. Without an `ANTHROPIC_API_KEY`, the consumer logs and skips; tests pass without network access.
-- **Cost telemetry** — `usage.cache_read_input_tokens` / `cache_creation_input_tokens` / `input_tokens` / `output_tokens` are persisted on each `JobTriage` row so we can see cache hit rates over time.
+1. **DLQ triage** (PR #34) — `LlmTriageConsumer` subscribes to `job.dlq`; Claude classifies the failure. Persisted to `job_triages`; surfaced on the admin DLQ tab and `JobDetailPage`.
+2. **LLM-guided retry policy** (PR #39) — after the first deterministic retry, the worker asks Claude retry-with-backoff vs dead-letter-now. Falls back to deterministic on any error; audit log records `dead_lettered_by: llm_retry_policy` + reasoning.
+3. **Natural-language admin queries** (PR #40) — `POST /admin/query` translates plain English into a Pydantic `JobFilterSpec` (enum/literal fields only → injection-safe by construction).
+4. **Periodic incident summaries** (PR #41) — the `_digest_loop` runs every `LLM_DIGEST_INTERVAL_HOURS` and writes a one-paragraph per-tenant digest to `incident_summaries`.
 
-### Surface
+### Shared conventions
 
-- New Kafka consumer group `llm-triage` subscribed to `job.dlq` (joins the existing seven in `worker_loop`).
-- `job_triages` table (Alembic `e7f4c2a91b08`) with `UNIQUE (job_id)` so redelivery is a no-op.
-- `GET /admin/jobs/{id}/triage` returns the analysis.
-- Admin UI: triage card on `JobDetailPage` showing category, summary, suggested fix, retryability, and confidence; a badge in the DLQ list when a triage row exists.
+- **Default model**: `claude-opus-4-7` with `thinking: {type: "adaptive"}`. Failure diagnosis and retry classification are intelligence-sensitive; the per-call cost is small.
+- **Structured outputs** — every LLM call uses `client.messages.parse()` with a Pydantic `output_format`. The response is shape-checked before it ever reaches the DB.
+- **Prompt caching** — every service caches its frozen system prompt via `cache_control: {"type": "ephemeral"}`. Volatile per-call context goes into the user message, after the cache breakpoint.
+- **Feature flags** — `LLM_TRIAGE_ENABLED`, `LLM_RETRY_POLICY_ENABLED`, `LLM_NL_QUERY_ENABLED`, `LLM_DIGEST_ENABLED`. All default `False`. Tests pass without network access.
+- **Fail open** — see [ADR 0005](docs/ADR/0005-llm-features-fail-open.md). Any API error / timeout / schema mismatch falls back to a deterministic non-LLM path (or 503 for NL queries, or a skipped digest).
+- **Cost telemetry** — `usage.cache_read_input_tokens` / `cache_creation_input_tokens` / `input_tokens` / `output_tokens` are persisted on each row for cache-hit visibility.
 
-### Future LLM features (post-Phase 10)
+### One caveat worth flagging
 
-- Natural-language admin queries over the audit + event log (LLM returns a constrained filter spec, not raw SQL).
-- LLM-guided retry policy: given the failure, classify "retry now / retry with longer backoff / dead-letter immediately."
-- Periodic incident summaries (one paragraph: "what happened, what we did, what we learned") generated from the event log.
+All four services target the exact Anthropic SDK surface `client.messages.parse(..., output_format=SomePydanticModel, thinking={"type":"adaptive"})` and read `response.parsed_output` on model `claude-opus-4-7`. Since every feature is off by default, none of the four has been exercised end-to-end against a live API key in this repo. Verify the SDK surface still matches the current `anthropic` package before enabling one in a demo.
 
 ---
 
@@ -454,7 +455,7 @@ The project uses the **Anthropic Python SDK** to add LLM-powered features. The f
 ### Phase 7: Kafka + Advanced Architecture Patterns ✅
 - **Kafka integration (end-to-end)** ✅
   - **Producer**: `app/workers/kafka_producer.py` publishes lifecycle events; `publish_raw` propagates schema-validation errors so the outbox can mark rows failed.
-  - **Consumer groups**: seven, all running concurrently in the worker process. See "Current Implementation Status" above for the full list.
+  - **Consumer groups**: eight, all running concurrently in the worker process (seven were shipped in Phase 7; `llm-triage` joined in Phase 10). See "Current Implementation Status" above for the full list.
   - **Partitioning strategy**: every event keyed by `user_id` so per-user ordering is preserved within each consumer group.
   - **Offset management**: committed only after `handle_message` returns successfully — at-least-once. Combined with idempotency keys (jobs) and a unique constraint (event log) to avoid double effects.
   - **Dead-letter topic**: `job.dlq`. Admin UI inspects (with per-type breakdown) and replays. Replay resets `retry_count` (a bug we fixed in `#27`).
@@ -491,16 +492,13 @@ The project uses the **Anthropic Python SDK** to add LLM-powered features. The f
 - **Least-privilege IAM** — audit and tighten ECS task role to exact S3 paths and exact Secrets Manager ARNs; no wildcard permissions.
 - **Focus:** defence in depth, compliance readiness, zero-trust networking.
 
-### Phase 10: AI / LLM Integration 🟧 (In Progress)
-- **LLM-driven DLQ triage** — Anthropic SDK; per dead-lettered job, Claude classifies the root cause, summarises the failure, suggests a fix, and rates retryability + confidence. Persisted to `job_triages`. Surfaced on the DLQ tab and `JobDetailPage`.
-  - Schema enforced via `client.messages.parse()` + a Pydantic `TriageAnalysis` model — no raw JSON parsing.
-  - Frozen system prompt (~1.5 KB of failure taxonomy + platform description) carries `cache_control: ephemeral` so it caches across triages.
-  - `claude-opus-4-7` with `thinking: {type: "adaptive"}`. Per-triage `usage` block stored alongside the analysis for cost telemetry.
-  - Feature-flagged off by default (`LLM_TRIAGE_ENABLED=true` to enable). Without an `ANTHROPIC_API_KEY` the consumer logs and skips; tests pass without network.
-- **Natural-language admin queries** (future) — admin types "CSV uploads that failed in the last hour with retry_count ≥ 2"; LLM returns a constrained filter object (not raw SQL); we apply via the existing list endpoint. Pre-defined allowed fields + values prevent injection.
-- **LLM-guided retry policy** (future) — on failure, Claude sees the error + context and decides "retry / longer backoff / dead-letter now". Falls back to the deterministic policy if the LLM is unavailable.
-- **Periodic incident summaries** (future) — one-paragraph daily / weekly digest generated from the event log, posted to the Slack #ops channel.
-- **Focus:** structured outputs, prompt caching for cost, graceful degradation when the LLM is offline, observable cost telemetry.
+### Phase 10: AI / LLM Integration ✅
+- **LLM-driven DLQ triage** (PR #34) — Anthropic SDK; per dead-lettered job, Claude classifies the root cause, summarises the failure, suggests a fix, and rates retryability + confidence. Persisted to `job_triages`. Surfaced on the DLQ tab and `JobDetailPage`.
+- **LLM-guided retry policy** (PR #39) — after the first deterministic retry, Claude sees the error + context and decides "retry with backoff" (with recommended seconds) vs "dead-letter now". Falls back to deterministic on any error. Audit log records `dead_lettered_by: llm_retry_policy` + reasoning.
+- **Natural-language admin queries** (PR #40) — `POST /admin/query` translates plain English into a constrained Pydantic `JobFilterSpec`; the model can only fill enum/literal fields so the query is injection-safe by construction. Off by default → 503 on failure.
+- **Periodic incident summaries** (PR #41) — the `_digest_loop` runs every `LLM_DIGEST_INTERVAL_HOURS`, aggregates per-tenant failure stats (digit-normalized fingerprints, top 5 recurring errors), asks Claude for a one-paragraph narrative + key concerns + recommended actions, persists to `incident_summaries`.
+- **Shared conventions**: `client.messages.parse()` with a Pydantic `output_format` (no raw JSON); frozen system prompt with `cache_control: ephemeral`; `claude-opus-4-7` with adaptive thinking; usage block persisted for cost telemetry; every feature off by default.
+- **Focus:** structured outputs, prompt caching for cost, graceful degradation when the LLM is offline, observable cost telemetry. See [ADR 0005](docs/ADR/0005-llm-features-fail-open.md).
 
 ### Phase 11: Real-time Stream Analytics 🟡
 - **Kafka Streams or Flink** topology consuming the lifecycle topics; materialized views for live customer-facing dashboards (per-tenant throughput, latency percentiles).
@@ -555,13 +553,19 @@ The project uses the **Anthropic Python SDK** to add LLM-powered features. The f
 │   └── rb-slo-dispatch-latency.yaml
 │
 ├── backend/
-│   ├── alembic/                    # DB migrations
+│   ├── alembic/                    # DB migrations (11, head: e1d24a8b50c2)
 │   │   └── versions/
 │   │       ├── a01d04e830dc_initial_schema.py
 │   │       ├── b2a8f9c7e103_outbox_events.py
 │   │       ├── c3e9f1a4d802_job_events.py
 │   │       ├── d4b1a8e60305_dag_and_sagas.py
-│   │       └── e7f4c2a91b08_job_triages.py
+│   │       ├── e7f4c2a91b08_job_triages.py
+│   │       ├── f8a1c4e23507_multi_tenancy.py
+│   │       ├── a9c2d1e83104_per_tenant_idempotency.py
+│   │       ├── b3d8e7a52116_tenant_quotas.py
+│   │       ├── c4f8e9a52340_row_level_security.py
+│   │       ├── d9c01a7e4f30_platform_admin.py
+│   │       └── e1d24a8b50c2_incident_summaries.py
 │   ├── app/
 │   │   ├── main.py                 # FastAPI app factory + lifespan (start_producer, worker_loop)
 │   │   ├── config.py               # Settings / env config (pydantic-settings)
@@ -578,45 +582,55 @@ The project uses the **Anthropic Python SDK** to add LLM-powered features. The f
 │   │   ├── models/                 # SQLAlchemy models
 │   │   │   ├── base.py             # Base + PortableJSON + TimestampMixin
 │   │   │   ├── enums.py            # UserRole, JobType, JobStatus, SagaStatus
-│   │   │   ├── user.py
+│   │   │   ├── tenant.py           # Phase 12 — tenants table + DEFAULT_TENANT_ID
+│   │   │   ├── user.py             # + is_platform_admin (Phase 12 PR D)
 │   │   │   ├── job.py
 │   │   │   ├── job_dependency.py   # many-to-many self-join on jobs
 │   │   │   ├── audit.py
 │   │   │   ├── outbox.py           # outbox_events
 │   │   │   ├── event_log.py        # job_events (event sourcing)
 │   │   │   ├── saga.py
-│   │   │   └── triage.py           # job_triages (Phase 10 WIP)
+│   │   │   ├── triage.py           # job_triages (Phase 10)
+│   │   │   └── digest.py           # incident_summaries (Phase 10 PR #41)
 │   │   │
 │   │   ├── schemas/                # Pydantic request/response DTOs
 │   │   │   ├── kafka/              # JSON Schema for each Kafka topic
 │   │   │   │   ├── job_submitted.schema.json
 │   │   │   │   ├── job_progress.schema.json
 │   │   │   │   ├── job_completed.schema.json
-│   │   │   │   └── job_failed.schema.json
+│   │   │   │   └── job_failed.schema.json    # also used by job.dlq
 │   │   │   ├── job.py
 │   │   │   ├── user.py
+│   │   │   ├── auth.py
+│   │   │   ├── audit.py
 │   │   │   └── common.py           # PaginationParams, PaginatedResponse
 │   │   │
 │   │   ├── repositories/
 │   │   │   ├── base.py             # generic BaseRepository[ModelT]
+│   │   │   ├── tenant.py
 │   │   │   ├── user.py
 │   │   │   ├── job.py
 │   │   │   ├── job_dependency.py
 │   │   │   ├── audit.py
 │   │   │   ├── outbox.py
 │   │   │   ├── event_log.py
-│   │   │   └── saga.py
+│   │   │   ├── saga.py
+│   │   │   ├── triage.py
+│   │   │   └── digest.py
 │   │   │
 │   │   ├── services/
-│   │   │   ├── auth.py
+│   │   │   ├── auth.py             # + self-service tenant creation (Phase 12 PR D)
 │   │   │   ├── job.py              # JobService — create_job, replay_job, list_jobs
 │   │   │   ├── saga.py             # SagaService — create_saga (chain of jobs)
 │   │   │   ├── slo.py              # SLO computation from jobs table
 │   │   │   ├── runbooks.py         # YAML loader
-│   │   │   └── triage.py           # Phase 10 — Anthropic SDK call with Pydantic schema + caching
+│   │   │   ├── triage.py           # Phase 10 — DLQ triage LLM service
+│   │   │   ├── retry_policy.py     # Phase 10 — LLM-guided retry policy
+│   │   │   ├── nl_query.py         # Phase 10 — NL admin queries → JobFilterSpec
+│   │   │   └── incident_digest.py  # Phase 10 — periodic per-tenant digests
 │   │   │
 │   │   ├── workers/
-│   │   │   ├── dispatcher.py       # JobDispatcherConsumer + worker_loop (starts all 7 consumers)
+│   │   │   ├── dispatcher.py       # JobDispatcherConsumer + worker_loop (starts all 8 consumers + 4 loops)
 │   │   │   ├── async_tasks.py      # asyncio — bulk_api_sync
 │   │   │   ├── thread_adapters.py  # threading — csv_upload
 │   │   │   ├── cpu_processors.py   # multiprocessing — doc_analysis, report_gen
@@ -628,23 +642,23 @@ The project uses the **Anthropic Python SDK** to add LLM-powered features. The f
 │   │   │   ├── audit_consumer.py        # group: audit-writer
 │   │   │   ├── sse_consumer.py          # group: sse-broadcaster
 │   │   │   ├── event_log_consumer.py    # group: event-log
-│   │   │   ├── read_model.py            # group: read-model
+│   │   │   ├── read_model.py            # group: read-model (per-tenant keys since PR #38)
 │   │   │   ├── dependency_resolver.py   # group: dependency-resolver
 │   │   │   ├── saga_coordinator.py      # group: saga-coordinator
-│   │   │   ├── triage_consumer.py       # group: llm-triage (Phase 10 WIP)
+│   │   │   ├── triage_consumer.py       # group: llm-triage (Phase 10)
 │   │   │   │
 │   │   │   ├── queue.py            # Redis priority queue (delayed retries; pop_ready_delayed)
 │   │   │   └── progress.py         # Redis pub/sub progress events (SSE bridge target)
 │   │   │
 │   │   ├── core/                   # exceptions, logging, middleware, redis, security, tracing, metrics
-│   │   └── utils/                  # rate_limit, cache, decorators, mixins, backpressure, circuit_breaker
+│   │   └── utils/                  # rate_limit, quota, cache, decorators, mixins, backpressure, circuit_breaker
 │   │
 │   └── tests/
-│       ├── unit/                   # ~150 tests
-│       ├── api/                    # ~30 tests
-│       ├── integration/            # Testcontainers (Docker-gated)
+│       ├── unit/                   # 161 tests
+│       ├── api/                    # 82 tests
+│       ├── integration/            # Testcontainers (Docker-gated: Redpanda, Postgres for RLS)
 │       ├── load/                   # Locust
-│       └── conftest.py             # SQLite-in-memory + dependency overrides
+│       └── conftest.py             # SQLite-in-memory + dependency overrides + default_tenant fixture
 │
 ├── frontend/
 │   ├── Dockerfile                  # Node build → Nginx
@@ -814,8 +828,8 @@ When adding a new error: subclass `AppError`, set `status_code` + `error_code`, 
 
 Three layers, each with a clear purpose. Picking the right one matters:
 
-- **Unit (`backend/tests/unit/`)** — services, processors, validators, repositories, consumers. **No I/O**. SQLite in-memory if a DB is needed (via the `db_session` fixture); mocks for Redis/Kafka/Anthropic. ~150 tests.
-- **API contract (`backend/tests/api/`)** — full FastAPI app via httpx ASGITransport, dependency overrides swap in SQLite + mock Redis. Tests request/response shape + auth + error envelope. ~30 tests.
+- **Unit (`backend/tests/unit/`)** — services, processors, validators, repositories, consumers. **No I/O**. SQLite in-memory if a DB is needed (via the `db_session` fixture); mocks for Redis/Kafka/Anthropic. 161 tests.
+- **API contract (`backend/tests/api/`)** — full FastAPI app via httpx ASGITransport, dependency overrides swap in SQLite + mock Redis. Tests request/response shape + auth + error envelope. 82 tests.
 - **Integration (`backend/tests/integration/`)** — real Postgres or Redpanda via Testcontainers. Docker-gated (skipped on `RUN_RLS_TEST=1` for the RLS test, etc.). Tests the things only a real DB / broker can prove (RLS enforcement, Kafka redelivery, schema validation end-to-end).
 
 When in doubt: write a unit test. Move up only when you need the real thing.
@@ -852,3 +866,5 @@ A job creation gets all three: audit log row (`job.created`), structured log ent
 - **Catching `AppError` and re-raising as a different type.** The middleware needs the type to know the status code. Re-raise the same instance or let it propagate.
 - **Hand-editing a generated Alembic revision after merging.** Future migrations chain off the revision ID; changing it breaks the chain. Make a new revision.
 - **Skipping the schema check on a new Kafka topic.** Producers without validation send malformed events; consumers without validation accept them. Every topic in `Settings.kafka_topic_*` must have a matching `.schema.json`.
+- **Calling `JobType(job.type)` outside a try/except.** `JobType` is a `StrEnum` with no `_missing_` hook. Saga compensation types (`csv_upload.compensate`) are NOT valid enum members and coercion raises `ValueError`. A historical bug had `_run_job` doing exactly this — see `test_run_job_dead_letters_compensation_when_no_processor`. If you need to coerce a job type string safely, wrap the call and route unknowns to the DEAD_LETTER path.
+- **Fire-and-forget `asyncio.create_task` without exception handling.** The dispatcher spawns `_run_job` this way. Its `_run_and_release` wrapper has a `try/except` safety net that logs + force-dead-letters on escape; anything else you spawn similarly needs its own guard, or exceptions vanish silently.

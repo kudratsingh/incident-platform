@@ -46,7 +46,7 @@ Pre-Phase-12 events were keyed by `user_id` only. The migration to composite hap
 
 ## Consumer groups
 
-Seven consumer groups run concurrently inside the worker process (`worker_loop` in `app/workers/dispatcher.py`). Each one is its own group, so they all receive every event independently — failure in one doesn't affect the others.
+Eight consumer groups run concurrently inside the worker process (`worker_loop` in `app/workers/dispatcher.py`). Each one is its own group, so they all receive every event independently — failure in one doesn't affect the others.
 
 | Consumer group | Subscribes to | What it does | Critical for | Failure mode |
 |---|---|---|---|---|

@@ -15,7 +15,7 @@ Built as an intentional showcase of senior-level distributed-systems patterns: t
 - **LLM features** (Claude via Anthropic SDK): DLQ triage, retry-policy advisor, natural-language admin queries, periodic incident summaries — all off-by-default and fail-open.
 - **Full AWS deployment** via Terraform: VPC + ECS Fargate + RDS + ElastiCache + MSK + S3 + ALB + CloudWatch alarms with linked runbooks.
 
-Current test suite: **240+ passing tests** across unit, API contract, and Testcontainers-based integration. `mypy --strict` clean; 70% coverage gate.
+Current test suite: **243 passing tests** (161 unit + 82 API contract + 3 gated Testcontainers integration). `mypy --strict` clean; 70% coverage gate.
 
 ---
 
@@ -236,9 +236,9 @@ Load tests live in `backend/tests/load/` (Locust).
 │   │   └── main.py                 app factory + lifespan
 │   ├── alembic/versions/           11 migrations (through incident_summaries)
 │   └── tests/
-│       ├── unit/                   ~180 tests
-│       ├── api/                    ~50 tests
-│       ├── integration/            Testcontainers (Postgres for RLS, Redpanda for Kafka)
+│       ├── unit/                   161 tests
+│       ├── api/                    82 tests
+│       ├── integration/            Testcontainers (Postgres for RLS, Redpanda for Kafka; opt-in)
 │       └── load/                   Locust
 ├── frontend/
 │   └── src/
