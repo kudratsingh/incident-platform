@@ -254,6 +254,86 @@ const ROLE_COLORS: Record<string, string> = {
   user: 'bg-gray-500/20 text-gray-300 border-gray-500/30',
 }
 
+function UserStatsModal({ user, onClose }: { user: User; onClose: () => void }) {
+  const [stats, setStats] = useState<SystemStats | null>(null)
+  const [err, setErr] = useState<string | null>(null)
+
+  useEffect(() => {
+    let cancelled = false
+    adminApi
+      .userStats(user.id)
+      .then((s) => {
+        if (!cancelled) setStats(s)
+      })
+      .catch((e) => {
+        if (!cancelled) setErr(e instanceof AppError ? e.message : 'Failed to load stats')
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [user.id])
+
+  const totals = stats?.by_status ?? {}
+  const total = Object.values(totals).reduce((a, b) => a + b, 0)
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
+      onClick={onClose}
+    >
+      <div
+        className="bg-gray-900 border border-gray-700 rounded-xl shadow-2xl w-full max-w-lg mx-4 overflow-hidden"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between px-5 py-4 border-b border-gray-800">
+          <div>
+            <p className="text-sm font-medium text-white">{user.email}</p>
+            <p className="text-xs text-gray-500 mt-0.5">
+              {user.role} · joined {formatDate(user.created_at)}
+            </p>
+          </div>
+          <button onClick={onClose} className="text-gray-500 hover:text-white text-lg leading-none">✕</button>
+        </div>
+        <div className="px-5 py-4 space-y-3 text-sm">
+          <Row label="User ID" value={user.id} mono />
+          <Row label="Total jobs" value={String(total)} />
+          {err && (
+            <div className="text-xs text-red-400 bg-red-900/20 border border-red-800/30 rounded px-3 py-2">
+              {err}
+            </div>
+          )}
+          {!err && stats === null && (
+            <p className="text-xs text-gray-500">Loading…</p>
+          )}
+          {!err && stats && (
+            <div>
+              <p className="text-xs text-gray-500 mb-2 font-medium uppercase tracking-wide">By status</p>
+              {total === 0 ? (
+                <p className="text-xs text-gray-600">No jobs yet.</p>
+              ) : (
+                <div className="grid grid-cols-2 gap-2">
+                  {Object.entries(totals)
+                    .filter(([, n]) => n > 0)
+                    .sort(([, a], [, b]) => b - a)
+                    .map(([status, n]) => (
+                      <div
+                        key={status}
+                        className="flex items-center justify-between bg-gray-800/60 rounded px-3 py-1.5"
+                      >
+                        <StatusBadge status={status as never} />
+                        <span className="font-mono text-xs text-gray-300">{n}</span>
+                      </div>
+                    ))}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
 export default function AdminPage() {
   const toast = useToast()
   const { user: currentUser } = useAuth()
@@ -273,6 +353,7 @@ export default function AdminPage() {
   const [traceFilter, setTraceFilter] = useState('')
   const [loading, setLoading] = useState(true)
   const [selectedLog, setSelectedLog] = useState<AuditLog | null>(null)
+  const [selectedUser, setSelectedUser] = useState<User | null>(null)
   const [dlqStats, setDlqStats] = useState<{ total: number; by_type: Record<string, number> } | null>(null)
   const [dlqJobs, setDlqJobs] = useState<Job[]>([])
   const [tenants, setTenants] = useState<Tenant[]>([])
@@ -907,7 +988,11 @@ export default function AdminPage() {
               </thead>
               <tbody className="divide-y divide-gray-800/60">
                 {users.map((u) => (
-                  <tr key={u.id} className="hover:bg-gray-800/30 transition-colors">
+                  <tr
+                    key={u.id}
+                    onClick={() => setSelectedUser(u)}
+                    className="hover:bg-gray-800/30 transition-colors cursor-pointer"
+                  >
                     <td className="px-4 py-3 text-gray-200">{u.email}</td>
                     <td className="px-4 py-3">
                       <span className={`inline-flex px-2 py-0.5 rounded-full text-xs font-medium border ${ROLE_COLORS[u.role] ?? ROLE_COLORS.user}`}>
@@ -1126,6 +1211,9 @@ export default function AdminPage() {
         </div>
       )}
       {selectedLog && <AuditLogModal log={selectedLog} onClose={() => setSelectedLog(null)} />}
+      {selectedUser && (
+        <UserStatsModal user={selectedUser} onClose={() => setSelectedUser(null)} />
+      )}
       {selectedRunbook && (
         <RunbookModal runbook={selectedRunbook} onClose={() => setSelectedRunbook(null)} />
       )}
