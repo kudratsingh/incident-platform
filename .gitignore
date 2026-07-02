@@ -40,3 +40,19 @@ frontend/node_modules/
 # OS
 .DS_Store
 Thumbs.db
+
+# Terraform — local state can contain resource IDs, ARNs, and (with some
+# providers) plaintext secrets from data sources. Never commit it; the
+# planned Phase 8 move to S3 remote state makes this even more of a hazard
+# to have sitting untracked in the working tree.
+**/.terraform/
+**/.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+crash.log
+crash.*.log
+
+# Claude Code local config
+.claude/
