@@ -25,6 +25,7 @@ from typing import Any, Literal
 import anthropic
 from app.config import get_settings
 from app.core.logging import get_logger
+from app.services._llm_usage import extract_usage
 from pydantic import BaseModel, Field
 
 logger = get_logger(__name__)
@@ -164,14 +165,4 @@ async def decide_retry(
         raise RuntimeError(
             f"retry policy parse returned no output (stop_reason={response.stop_reason})"
         )
-    usage = {
-        "input_tokens": response.usage.input_tokens,
-        "output_tokens": response.usage.output_tokens,
-        "cache_creation_input_tokens": getattr(
-            response.usage, "cache_creation_input_tokens", 0
-        ),
-        "cache_read_input_tokens": getattr(
-            response.usage, "cache_read_input_tokens", 0
-        ),
-    }
-    return decision, usage, settings.llm_retry_policy_model
+    return decision, extract_usage(response), settings.llm_retry_policy_model
