@@ -48,6 +48,48 @@ async def test_create_job_idempotency(
     assert resp1.json()["id"] == resp2.json()["id"]
 
 
+async def test_create_job_idempotency_race_returns_201_not_500(
+    client: AsyncClient, auth_headers: dict[str, str]
+) -> None:
+    """End-to-end guard on the check-then-insert race.
+
+    Simulates the race by patching JobRepository.get_by_idempotency_key
+    to return None on the first (pre-check) call — as if the second
+    concurrent request's read landed in the window before the first's
+    commit. The subsequent DB insert then hits the composite UNIQUE
+    constraint. Pre-fix, that returned 500. Post-fix, the service catches
+    the IntegrityError, re-fetches, and returns the winner with 201.
+    """
+    from unittest.mock import patch
+
+    from app.repositories.job import JobRepository
+
+    payload = {"type": "csv_upload", "idempotency_key": "race-key-xyz"}
+    # First request wins normally.
+    resp1 = await client.post("/api/v1/jobs", json=payload, headers=auth_headers)
+    assert resp1.status_code == 201
+    winner_id = resp1.json()["id"]
+
+    # Second request: patch the pre-check to miss (simulating the race
+    # window). The DB constraint will then reject the insert, and the
+    # service's IntegrityError handler must recover.
+    real_getter = JobRepository.get_by_idempotency_key
+    call_count = {"n": 0}
+
+    async def _flaky(self, key: str, tenant_id):  # type: ignore[no-untyped-def]
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return None  # simulate the race — pre-check misses
+        return await real_getter(self, key, tenant_id)
+
+    with patch.object(JobRepository, "get_by_idempotency_key", _flaky):
+        resp2 = await client.post("/api/v1/jobs", json=payload, headers=auth_headers)
+
+    # 201, not 500. And the same job id — we returned the winner.
+    assert resp2.status_code == 201
+    assert resp2.json()["id"] == winner_id
+
+
 async def test_list_jobs_returns_paginated(
     client: AsyncClient, auth_headers: dict[str, str]
 ) -> None:

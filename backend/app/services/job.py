@@ -12,6 +12,7 @@ from app.repositories.job import JobRepository
 from app.repositories.job_dependency import JobDependencyRepository
 from app.repositories.outbox import OutboxRepository
 from redis.asyncio import Redis
+from sqlalchemy.exc import IntegrityError
 
 logger = get_logger(__name__)
 
@@ -78,18 +79,51 @@ class JobService:
         if otel_ctx:
             enriched_payload["__traceparent"] = otel_ctx
 
-        job = await self.job_repo.create(
-            tenant_id=tenant_id,
-            user_id=user_id,
-            type=job_type,
-            status=initial_status,
-            idempotency_key=idempotency_key,
-            payload=enriched_payload,
-            priority=priority,
-            max_retries=max_retries,
-            trace_id=trace_id_var.get("") or None,
-            saga_id=saga_id,
-        )
+        # Idempotency guard against the check-then-insert race: two concurrent
+        # POST /jobs with the same key both pass the pre-check above, both
+        # reach here, and the composite UNIQUE on (tenant_id, idempotency_key)
+        # rejects the loser with IntegrityError. Without catching it, that
+        # request 500s instead of returning the winner's row.
+        #
+        # Fix: wrap the create in a savepoint. On collision, roll back only
+        # the savepoint (leaving the outer request tx alive), then re-fetch
+        # by idempotency key. If the re-fetch finds a row, it's the winner —
+        # return it. If not, the IntegrityError was from some OTHER
+        # constraint and we surface it (should be impossible with the
+        # current schema but staying defensive).
+        session = self.job_repo.session
+        try:
+            async with session.begin_nested():
+                job = await self.job_repo.create(
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    type=job_type,
+                    status=initial_status,
+                    idempotency_key=idempotency_key,
+                    payload=enriched_payload,
+                    priority=priority,
+                    max_retries=max_retries,
+                    trace_id=trace_id_var.get("") or None,
+                    saga_id=saga_id,
+                )
+        except IntegrityError:
+            if idempotency_key is None:
+                raise
+            winner = await self.job_repo.get_by_idempotency_key(
+                idempotency_key, tenant_id
+            )
+            if winner is None:
+                # Not the idempotency race — some other constraint failed.
+                raise
+            logger.info(
+                "idempotency race resolved — returning winner",
+                extra={
+                    "idempotency_key": idempotency_key,
+                    "job_id": str(winner.id),
+                    "tenant_id": str(tenant_id),
+                },
+            )
+            return winner
 
         if deps:
             if self.dep_repo is None:
