@@ -33,8 +33,6 @@ export const adminApi = {
     return api.get<PaginatedResponse<Job>>(`/admin/jobs${q ? `?${q}` : ''}`)
   },
 
-  getJob: (id: string) => api.get<Job>(`/admin/jobs/${id}`),
-
   replayJob: (id: string) => api.post<Job>(`/admin/jobs/${id}/replay`),
 
   resolveIncident: (id: string) => api.post<Job>(`/admin/incidents/${id}/resolve`),
