@@ -11,7 +11,6 @@ from app.repositories.audit import AuditRepository
 from app.repositories.job import JobRepository
 from app.repositories.job_dependency import JobDependencyRepository
 from app.repositories.outbox import OutboxRepository
-from app.workers import queue
 from redis.asyncio import Redis
 
 logger = get_logger(__name__)
@@ -134,7 +133,6 @@ class JobService:
                     "trace_id": job.trace_id,
                 },
             )
-            await queue.push(self.redis, str(job.id), priority=priority)
 
         logger.info(
             "job.created",
@@ -251,7 +249,6 @@ class JobService:
                 "trace_id": job.trace_id,
             },
         )
-        await queue.push(self.redis, str(job_id), priority=0)
         logger.info(
             "job.replayed",
             extra={
