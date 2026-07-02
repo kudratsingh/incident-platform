@@ -156,6 +156,13 @@ async def test_job_service_create_writes_outbox() -> None:
     from app.services.job import JobService
 
     job_repo = AsyncMock()
+    # JobService.create_job wraps the DB insert in `session.begin_nested()`.
+    savepoint_ctx = MagicMock()
+    savepoint_ctx.__aenter__ = AsyncMock(return_value=None)
+    savepoint_ctx.__aexit__ = AsyncMock(return_value=False)
+    job_repo.session = MagicMock()
+    job_repo.session.begin_nested = MagicMock(return_value=savepoint_ctx)
+
     audit_repo = AsyncMock()
     outbox_repo = AsyncMock()
     redis = AsyncMock()

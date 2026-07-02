@@ -35,6 +35,15 @@ def _make_job(**kwargs: object) -> Job:
 
 def _make_service() -> tuple[JobService, AsyncMock, AsyncMock, AsyncMock]:
     job_repo = AsyncMock()
+    # The idempotency-race guard wraps job_repo.create in
+    # `async with session.begin_nested()`. Give the mock a working
+    # savepoint context so the wrapping doesn't break every other test.
+    savepoint_ctx = MagicMock()
+    savepoint_ctx.__aenter__ = AsyncMock(return_value=None)
+    savepoint_ctx.__aexit__ = AsyncMock(return_value=False)
+    job_repo.session = MagicMock()
+    job_repo.session.begin_nested = MagicMock(return_value=savepoint_ctx)
+
     audit_repo = AsyncMock()
     outbox_repo = AsyncMock()
     redis = AsyncMock()
@@ -78,6 +87,87 @@ async def test_create_job_idempotency_returns_existing() -> None:
 
     job_repo.create.assert_not_awaited()
     assert result is existing
+
+
+async def test_create_job_idempotency_race_returns_winner() -> None:
+    """The check-then-insert race: two concurrent requests with the same key
+    both pass the pre-check (get_by_idempotency_key returns None), both
+    reach the create, and the DB rejects the loser with IntegrityError.
+
+    The loser must catch it, re-fetch by key, and return the winner's row
+    — never surface a 500 to the caller.
+    """
+    from sqlalchemy.exc import IntegrityError
+
+    svc, job_repo, audit_repo, outbox_repo = _make_service()
+    tenant_id = uuid.uuid4()
+    winner = _make_job(idempotency_key="key-123", tenant_id=tenant_id)
+
+    # Pre-check misses (this is the racer that lost the check-then-insert race).
+    # Post-collision re-fetch finds the winner.
+    job_repo.get_by_idempotency_key.side_effect = [None, winner]
+    job_repo.create.side_effect = IntegrityError(
+        "duplicate key value violates unique constraint",
+        params={},
+        orig=Exception("uq"),
+    )
+
+    result = await svc.create_job(
+        user_id=uuid.uuid4(),
+        tenant_id=tenant_id,
+        job_type=JobType.CSV_UPLOAD,
+        idempotency_key="key-123",
+    )
+
+    # Loser returned the winner's row. No audit / outbox side-effects
+    # happened for the loser — they belong to the winner's request.
+    assert result is winner
+    audit_repo.log.assert_not_awaited()
+    outbox_repo.add.assert_not_awaited()
+
+
+async def test_create_job_reraises_integrity_when_no_idempotency_key() -> None:
+    """If we hit IntegrityError but the caller didn't use an idempotency
+    key, it's not the race — surface the error rather than silently
+    returning nothing."""
+    from sqlalchemy.exc import IntegrityError
+
+    svc, job_repo, _, _ = _make_service()
+    job_repo.get_by_idempotency_key.return_value = None
+    job_repo.create.side_effect = IntegrityError(
+        "some other unique violation", params={}, orig=Exception("x")
+    )
+
+    with pytest.raises(IntegrityError):
+        await svc.create_job(
+            user_id=uuid.uuid4(),
+            tenant_id=uuid.uuid4(),
+            job_type=JobType.CSV_UPLOAD,
+            # No idempotency_key
+        )
+
+
+async def test_create_job_reraises_integrity_when_refetch_finds_nothing() -> None:
+    """If we hit IntegrityError with an idempotency key BUT the re-fetch
+    still returns None, the constraint violation is something else (e.g.
+    an FK we didn't validate). Surface it — silently swallowing would
+    lose the diagnostic."""
+    from sqlalchemy.exc import IntegrityError
+
+    svc, job_repo, _, _ = _make_service()
+    # Pre-check misses, and re-fetch also misses.
+    job_repo.get_by_idempotency_key.side_effect = [None, None]
+    job_repo.create.side_effect = IntegrityError(
+        "FK violation on user_id", params={}, orig=Exception("fk")
+    )
+
+    with pytest.raises(IntegrityError):
+        await svc.create_job(
+            user_id=uuid.uuid4(),
+            tenant_id=uuid.uuid4(),
+            job_type=JobType.CSV_UPLOAD,
+            idempotency_key="key-race",
+        )
 
 
 # ---------------------------------------------------------------------------
