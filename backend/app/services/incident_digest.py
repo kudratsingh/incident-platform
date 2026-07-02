@@ -35,6 +35,7 @@ from app.core.logging import get_logger
 from app.models.digest import IncidentDigest as DigestRow
 from app.models.tenant import Tenant
 from app.repositories.digest import DigestRepository
+from app.services._llm_usage import extract_usage
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -202,17 +203,7 @@ async def generate_digest(
         raise RuntimeError(
             f"digest parse returned no output (stop_reason={response.stop_reason})"
         )
-    usage = {
-        "input_tokens": response.usage.input_tokens,
-        "output_tokens": response.usage.output_tokens,
-        "cache_creation_input_tokens": getattr(
-            response.usage, "cache_creation_input_tokens", 0
-        ),
-        "cache_read_input_tokens": getattr(
-            response.usage, "cache_read_input_tokens", 0
-        ),
-    }
-    return digest, usage, settings.llm_digest_model
+    return digest, extract_usage(response), settings.llm_digest_model
 
 
 async def run_digest_for_tenant(

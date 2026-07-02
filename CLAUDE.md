@@ -410,9 +410,9 @@ The project uses the **Anthropic Python SDK** to add four LLM-powered features. 
 - **Fail open** — see [ADR 0005](docs/ADR/0005-llm-features-fail-open.md). Any API error / timeout / schema mismatch falls back to a deterministic non-LLM path (or 503 for NL queries, or a skipped digest).
 - **Cost telemetry** — `usage.cache_read_input_tokens` / `cache_creation_input_tokens` / `input_tokens` / `output_tokens` are persisted on each row for cache-hit visibility.
 
-### One caveat worth flagging
+### SDK surface (verified against `anthropic 0.112.0`)
 
-All four services target the exact Anthropic SDK surface `client.messages.parse(..., output_format=SomePydanticModel, thinking={"type":"adaptive"})` and read `response.parsed_output` on model `claude-opus-4-7`. Since every feature is off by default, none of the four has been exercised end-to-end against a live API key in this repo. Verify the SDK surface still matches the current `anthropic` package before enabling one in a demo.
+All four services use `client.messages.parse(..., output_format=SomePydanticModel, thinking={"type":"adaptive"})` and read `response.parsed_output` on model `claude-opus-4-7`. Verified against the installed SDK: `messages.parse` accepts all these kwargs; `ThinkingConfigAdaptiveParam` accepts `{"type":"adaptive"}`; `ParsedMessage.parsed_output` exists; `claude-opus-4-7` is in the model literal. Cache-hit fields (`cache_read_input_tokens`, `cache_creation_input_tokens`) are `Optional[int]` on `Usage` — the shared `_llm_usage.extract_usage` helper coerces `None` to `0` so downstream aggregation works.
 
 ---
 

@@ -26,6 +26,7 @@ import anthropic
 from app.config import get_settings
 from app.core.logging import get_logger
 from app.models.enums import JobStatus, JobType
+from app.services._llm_usage import extract_usage
 from pydantic import BaseModel, Field
 
 logger = get_logger(__name__)
@@ -178,14 +179,4 @@ async def parse_question(question: str) -> tuple[JobFilterSpec, dict[str, int], 
         raise RuntimeError(
             f"nl query parse returned no output (stop_reason={response.stop_reason})"
         )
-    usage = {
-        "input_tokens": response.usage.input_tokens,
-        "output_tokens": response.usage.output_tokens,
-        "cache_creation_input_tokens": getattr(
-            response.usage, "cache_creation_input_tokens", 0
-        ),
-        "cache_read_input_tokens": getattr(
-            response.usage, "cache_read_input_tokens", 0
-        ),
-    }
-    return spec, usage, settings.llm_nl_query_model
+    return spec, extract_usage(response), settings.llm_nl_query_model
