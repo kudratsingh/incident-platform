@@ -1,12 +1,22 @@
 """
-Redis-backed priority job queue.
+Redis sorted set for delayed retries.
 
-Two sorted sets:
-  - jobs:queue   — ready jobs, score = priority (ZPOPMAX → highest priority first)
-  - jobs:delayed — jobs waiting for retry, score = unix timestamp when ready
+Historical note
+---------------
+Before Phase 7 this module also held the primary job queue (`jobs:queue`,
+scored by priority, popped by the worker). Phase 7 replaced that path with
+Kafka: jobs are now dispatched via `job.submitted` and consumed by
+`JobDispatcherConsumer`. The `jobs:queue` sorted set was orphaned — pushed
+to on every create/replay but never consumed. Removed in PR fixing the
+"write-only queue leak" (a code-review engineer caught it walking the
+codebase against the docs).
 
-The worker calls `promote_delayed()` each tick to move ready delayed jobs into
-the main queue, then calls `pop()` to get the next job to process.
+What survives
+-------------
+The delayed set is still needed for the retry path. When a job fails and
+still has retries, the dispatcher pushes it into `jobs:delayed` scored by
+`time.time() + backoff_seconds`. The `_promote_delayed_loop` polls, pops
+the ready entries, and republishes them via the outbox → `job.submitted`.
 """
 
 import time
@@ -14,13 +24,7 @@ from typing import cast
 
 from redis.asyncio import Redis
 
-QUEUE_KEY = "jobs:queue"
 DELAYED_KEY = "jobs:delayed"
-
-
-async def push(redis: Redis, job_id: str, priority: int = 0) -> None:
-    """Enqueue a job for immediate processing."""
-    await redis.zadd(QUEUE_KEY, {job_id: priority})
 
 
 async def push_delayed(redis: Redis, job_id: str, delay_seconds: float) -> None:
@@ -29,43 +33,11 @@ async def push_delayed(redis: Redis, job_id: str, delay_seconds: float) -> None:
     await redis.zadd(DELAYED_KEY, {job_id: run_at})
 
 
-async def pop(redis: Redis) -> str | None:
-    """Pop the highest-priority ready job. Returns job_id or None."""
-    result = await redis.zpopmax(QUEUE_KEY, count=1)
-    if not result:
-        return None
-    # zpopmax returns list of (member, score) tuples
-    job_id = cast(str, result[0][0])
-    return job_id
-
-
-async def promote_delayed(redis: Redis) -> int:
-    """Move all delayed jobs whose run_at has passed into the main queue.
-
-    Returns the number of jobs promoted.
-    """
-    now = time.time()
-    # Fetch all jobs with score <= now (i.e. ready to run)
-    raw = await redis.zrangebyscore(DELAYED_KEY, "-inf", now, withscores=True)
-    ready = cast(list[tuple[str, float]], raw)
-    if not ready:
-        return 0
-
-    pipe = redis.pipeline()
-    for job_id, _score in ready:
-        pipe.zrem(DELAYED_KEY, job_id)
-        # Re-enqueue with priority 0 (retries don't get boosted priority)
-        pipe.zadd(QUEUE_KEY, {job_id: 0})
-    await pipe.execute()
-    return len(ready)
-
-
 async def pop_ready_delayed(redis: Redis) -> list[str]:
     """Atomically remove and return all delayed jobs whose run_at has passed.
 
-    Unlike `promote_delayed`, this does NOT re-enqueue them — the caller decides
-    where they go next. Used by the Kafka dispatcher to re-publish ready retries
-    to the `job.submitted` topic instead of the Redis active queue.
+    Used by the dispatcher's `_promote_delayed_loop` to republish ready
+    retries to the `job.submitted` Kafka topic (via the outbox).
     """
     now = time.time()
     raw = await redis.zrangebyscore(DELAYED_KEY, "-inf", now, withscores=True)
@@ -78,10 +50,6 @@ async def pop_ready_delayed(redis: Redis) -> list[str]:
         pipe.zrem(DELAYED_KEY, job_id)
     await pipe.execute()
     return [job_id for job_id, _score in ready]
-
-
-async def queue_length(redis: Redis) -> int:
-    return int(await redis.zcard(QUEUE_KEY))
 
 
 async def delayed_length(redis: Redis) -> int:

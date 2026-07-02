@@ -1,5 +1,5 @@
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from app.models.enums import JobStatus
@@ -85,10 +85,15 @@ class JobRepository(BaseRepository[Job]):
         values: dict[str, Any] = {"status": status}
         if extra:
             values.update(extra)
+        # Always aware UTC — the columns are TIMESTAMP WITH TIME ZONE and
+        # downstream Python math (SLO service, digest window computation)
+        # uses aware datetimes. Mixing naive `utcnow()` here with aware
+        # `datetime.now(UTC)` elsewhere raises TypeError the moment those
+        # code paths meet on a real Postgres value.
         if status == "running" and "started_at" not in values:
-            values["started_at"] = datetime.utcnow()
+            values["started_at"] = datetime.now(UTC)
         if status in ("completed", "failed", "dead_letter") and "completed_at" not in values:
-            values["completed_at"] = datetime.utcnow()
+            values["completed_at"] = datetime.now(UTC)
 
         await self.session.execute(
             update(Job).where(Job.id == job_id).values(**values)
