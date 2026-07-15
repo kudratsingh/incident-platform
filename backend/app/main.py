@@ -111,13 +111,22 @@ def create_app() -> FastAPI:
     # Routers
     # ---------------------------------------------------------------------------
 
-    from app.api import admin, audit, auth, jobs, sagas, streaming
+    from app.api import (
+        admin,
+        audit,
+        auth,
+        jobs,
+        sagas,
+        service_accounts,
+        streaming,
+    )
 
     prefix = settings.api_v1_prefix
     app.include_router(auth.router, prefix=prefix)
     app.include_router(jobs.router, prefix=prefix)
     app.include_router(sagas.router, prefix=prefix)
     app.include_router(admin.router, prefix=prefix)
+    app.include_router(service_accounts.router, prefix=prefix)
     app.include_router(audit.router, prefix=prefix)
     app.include_router(streaming.router, prefix=prefix)
 
