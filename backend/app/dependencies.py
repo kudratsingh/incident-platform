@@ -1,14 +1,26 @@
 import uuid
 from collections.abc import AsyncGenerator
+from dataclasses import dataclass
 
 from app.config import get_settings
 from app.core.exceptions import AuthenticationError, AuthorizationError
 from app.core.logging import tenant_id_var, user_id_var
 from app.core.redis import get_redis as _get_redis
+from app.core.scopes import Scope
 from app.core.security import decode_token
 from app.models.enums import UserRole
+from app.models.service_account import ServiceAccount
 from app.models.user import User
+from app.repositories.audit import AuditRepository
+from app.repositories.service_account import (
+    ServiceAccountRepository,
+    ServiceAccountTokenRepository,
+)
 from app.repositories.user import UserRepository
+from app.services.service_account import (
+    ServiceAccountService,
+    looks_like_service_account_token,
+)
 from fastapi import Depends
 from fastapi.security import OAuth2PasswordBearer
 from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor
@@ -115,6 +127,111 @@ async def require_platform_admin(
     if not current_user.is_platform_admin:
         raise AuthorizationError("Platform admin role required")
     return current_user
+
+
+# ---------------------------------------------------------------------------
+# Machine-principal auth
+#
+# Machine principals (service accounts) speak to the platform with opaque
+# `sa_<random>` bearer tokens. The auth dependency below routes on the token
+# prefix: JWT → user path (existing), sa_ → service-account path (new).
+# Downstream code that doesn't care which kind of principal is calling
+# depends on `get_current_principal`; endpoints reserved for humans keep
+# depending on `get_current_user`.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Principal:
+    """Unified caller identity — either a human `User` or a `ServiceAccount`.
+
+    Every request is one or the other. The scope check (`require_scope`)
+    reads `.scopes` and refuses human callers by construction; the tenant
+    context vars and RLS setting are populated the same way for both."""
+
+    kind: str  # "user" | "service_account"
+    tenant_id: uuid.UUID
+    user: User | None = None
+    service_account: ServiceAccount | None = None
+    scopes: frozenset[str] = frozenset()
+
+    @property
+    def id(self) -> uuid.UUID:
+        if self.kind == "user":
+            assert self.user is not None
+            return self.user.id
+        assert self.service_account is not None
+        return self.service_account.id
+
+
+async def _apply_tenant_context(db: AsyncSession, tenant_id: uuid.UUID) -> None:
+    """Set contextvars + Postgres RLS setting for this request. Shared by
+    both auth paths so machine and human principals get identical isolation."""
+    tenant_id_var.set(str(tenant_id))
+    if db.bind is not None and db.bind.dialect.name == "postgresql":
+        await db.execute(
+            text("SELECT set_config('app.tenant_id', :tid, true)"),
+            {"tid": str(tenant_id)},
+        )
+
+
+async def get_current_principal(
+    token: str = Depends(_oauth2_scheme),
+    db: AsyncSession = Depends(get_db),
+) -> Principal:
+    """Unified auth entry point. Route on token prefix.
+
+    Endpoints scope-guarded with `require_scope` chain off this dependency
+    so both human and machine callers are recognized (the scope check then
+    refuses humans). Endpoints strictly for humans keep depending on
+    `get_current_user`, which continues to reject sa_ tokens by decoding
+    them as JWTs and failing."""
+    if looks_like_service_account_token(token):
+        service = ServiceAccountService(
+            ServiceAccountRepository(db),
+            ServiceAccountTokenRepository(db),
+            AuditRepository(db),
+        )
+        sa, sa_token = await service.verify_token(token)
+        user_id_var.set(str(sa.id))
+        await _apply_tenant_context(db, sa.tenant_id)
+        return Principal(
+            kind="service_account",
+            tenant_id=sa.tenant_id,
+            service_account=sa,
+            scopes=frozenset(sa_token.scopes),
+        )
+
+    user = await get_current_user(token=token, db=db)
+    return Principal(
+        kind="user",
+        tenant_id=user.tenant_id,
+        user=user,
+    )
+
+
+def require_scope(*required: Scope) -> "type[Principal]":
+    """Factory that returns a dependency requiring the caller's token carries
+    every listed scope. Refuses human callers — scopes are machine-only
+    (see ADR 0007)."""
+
+    required_strs = frozenset(s.value for s in required)
+
+    async def _dependency(
+        principal: Principal = Depends(get_current_principal),
+    ) -> Principal:
+        if principal.kind != "service_account":
+            raise AuthorizationError(
+                "This endpoint requires a service-account token"
+            )
+        missing = required_strs - principal.scopes
+        if missing:
+            raise AuthorizationError(
+                f"Missing required scope(s): {sorted(missing)}"
+            )
+        return principal
+
+    return _dependency  # type: ignore[return-value]
 
 
 async def resolve_admin_tenant(
