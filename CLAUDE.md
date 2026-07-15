@@ -24,6 +24,9 @@ This file (`CLAUDE.md`) is the high-signal index. Treat it as the entry point �
   - [0003 — Postgres RLS as defense-in-depth](docs/ADR/0003-rls-as-defense-in-depth.md)
   - [0004 — Composite tenant_id:user_id Kafka partition key](docs/ADR/0004-tenant-id-in-kafka-partition-key.md)
   - [0005 — LLM features fail open](docs/ADR/0005-llm-features-fail-open.md)
+  - [0006 — MCP server as thin adapter over service layer](docs/ADR/0006-mcp-server-thin-adapter.md) *(proposed)*
+  - [0007 — Machine principals with a scope model separate from human roles](docs/ADR/0007-machine-principal-scope-model.md) *(proposed)*
+  - [0008 — Chaos framework is triple-gated and never in production](docs/ADR/0008-chaos-gating.md) *(proposed)*
 - [`docs/ROADMAP.md`](docs/ROADMAP.md) — open extension ideas, sized + categorized
 - [`runbooks/`](runbooks/) — machine-readable on-call playbooks for every CloudWatch alarm + SLO
 
@@ -90,6 +93,61 @@ Phase 12 — Multi-tenancy:
 - **`#36` — enforce tenant_id everywhere**: every repository / service / outbox call site threads tenant_id through. Per-tenant composite UNIQUE on `(tenant_id, idempotency_key)` replaces the global UNIQUE. Cascading signature changes across ~30 call sites.
 - **`#37` — RLS + Kafka partition key + quotas**: Postgres row-level security policy on 6 tables; `get_current_user` sets `app.tenant_id` via `set_config`; Kafka partition key changes to composite `{tenant_id}:{user_id}` across all 9 producer call sites; `tenants.rate_limit_per_minute` + `tenants.quota_jobs_per_month` columns; `check_tenant_limits` runs at top of `POST /jobs`. Header chip + admin Tenants tab. Testcontainers Postgres integration test.
 - **`#38` — platform admin role**: `users.is_platform_admin` boolean (data migration backfills for default-tenant admins); `require_platform_admin` dependency; `?tenant_id=` cross-tenant scope override on list endpoints; CQRS read-model keyed by tenant_id (fixed a Phase 12 leak); self-service tenant creation at `/auth/register` via `new_tenant_name`; admin Tenants tab with create-modal + drill-down page.
+
+---
+
+## Agent-facing surface (in progress — Step 0)
+
+A new program is layered on top of Phases 1–12: **make the platform safely operable by a machine principal** — an autonomous agent that speaks to the platform through the Model Context Protocol (MCP). The agent lives in a separate repo and consumes a contract artifact (`agent-tools.json`) published from this one.
+
+This section is the durable index for the program. It fixes the vocabulary so tools, scopes, and audit events don't drift as PRs land. The rationale for each decision is in the three ADRs below; the naming below is normative — new code must use these exact strings.
+
+### Where it fits
+
+- **Step 0 (this branch)** — write ADRs, lock in naming, add this section. No runtime code.
+- **Wave 1 (~6 PRs, blocking):** machine principals + scoped tokens; operator audit log; MCP scaffold + `get_consumer_lag`; chaos framework + `kill_consumer`; alert emission (signed webhook + poll fallback); release engineering (`agent-tools.json` on tag).
+- **Wave 2 (lands during agent Phases 1–3):** full read tool set (`list_dlq_messages`, `get_trace` / `search_traces`, `get_deploy_history`, `get_dag_state`, `get_redis_health`, `get_postgres_health`, `get_incident` / `list_incidents`); remaining chaos hooks (`poison_message`, `saturate_redis`, `inject_latency`, `bad_deploy`) added JIT per scenario family.
+- **Wave 3 (before agent Phase 6):** Tier 1 actions (`restart_consumer_group`, `replay_dlq_messages`, `pause_dag`, `invalidate_cache_key`) with `Idempotency-Key`; approvals subsystem (propose / approve / execute state machine with param-hash binding, expiry, single-use); approvals inbox view in the existing frontend; Tier 2 actions (`scale_service`, `rollback_deploy`, `modify_retry_policy`, `trigger_saga_compensation`) requiring approval reference + global kill switch on the agent principal.
+
+The design decisions locked in Step 0:
+
+- [ADR 0006 — MCP server as thin adapter over the service layer](docs/ADR/0006-mcp-server-thin-adapter.md) — the MCP server is a separate process (`mcp-server/`) that calls the platform's HTTP API. No direct DB, Redis, or Kafka access. Guarantees inherit from the HTTP middleware stack (tenant scoping, quotas, audit).
+- [ADR 0007 — Machine principals with a scope model separate from human roles](docs/ADR/0007-machine-principal-scope-model.md) — new `service_accounts` table; opaque bearer tokens; scopes are non-hierarchical, additive, and orthogonal to the human role enum.
+- [ADR 0008 — Chaos framework is triple-gated and never in production](docs/ADR/0008-chaos-gating.md) — `CHAOS_ENABLED` env flag + `chaos:invoke` scope + per-tool blast-radius check; Terraform validation refuses `CHAOS_ENABLED=true` in the production workspace.
+
+### Naming conventions (normative)
+
+**Tool names** — verb-first `snake_case`, one function per tool. Examples: `get_consumer_lag`, `list_dlq_messages`, `restart_consumer_group`, `replay_dlq_messages`, `pause_dag`, `invalidate_cache_key`, `kill_consumer`, `poison_message`, `saturate_redis`, `inject_latency`, `bad_deploy`. The `snake_case` matches Pydantic field style and serializes cleanly into `agent-tools.json`.
+
+**Scopes** — `<domain>:<verb>`, fixed enum. Adding a scope is a decision; renaming or splitting one is a token migration. The five scopes:
+
+| Scope | Grants |
+|---|---|
+| `telemetry:read` | Observability read surface — consumer lag, queue depth, in-flight counts, traces, health snapshots. |
+| `incidents:read` | Incident-response read surface — DLQ contents, incident summaries, saga state, per-job history. |
+| `actions:propose` | Create a proposal for a Tier 1 or Tier 2 action; does not execute. |
+| `actions:execute` | Execute an approved proposal (Tier 1 idempotent, Tier 2 requires an approval reference). |
+| `chaos:invoke` | Invoke chaos framework tools. Additionally gated by `CHAOS_ENABLED`. |
+
+The seed principal `incident-commander` gets `telemetry:read + incidents:read` and nothing else.
+
+**Audit events** — same `<resource>.<verb>` snake-case shape as existing events. Every machine-principal action carries `principal_type='service_account'` on the audit row:
+
+- `service_account.created` / `service_account.token_minted` / `service_account.token_revoked`
+- `agent.tool_invoked` — every MCP tool call; `extra_data` carries `tool_name`, `arguments`, `scope_used`, `latency_ms`, `outcome`.
+- `agent.action_proposed` / `agent.action_approved` / `agent.action_executed` / `agent.action_rejected`
+- `chaos.tool_invoked` / `chaos.tool_denied` — chaos activity is a separate stream from `agent.tool_invoked` so it filters cleanly on the Audit tab.
+
+### What ships from this repo vs the agent repo
+
+This repo publishes:
+
+- The HTTP API the agent talks to (existing, extended per PR).
+- `mcp-server/` — the thin adapter process.
+- `agent-tools.json` — the generated tool contract, released as an artifact on git tag (`ghcr.io/kudratsingh/incident-platform:v*`).
+- `runbooks/*.yaml` — the same runbooks humans use; the agent reads them via a tool call.
+
+The agent repo consumes `agent-tools.json` and holds all the LLM plumbing, prompt design, and evaluation harness. This repo has no LLM code specific to the agent — the Phase 10 Anthropic integration is unrelated (it triages DLQs, it doesn't call agent tools).
 
 ---
 
