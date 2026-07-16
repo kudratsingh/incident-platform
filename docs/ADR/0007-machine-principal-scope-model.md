@@ -6,7 +6,7 @@
 
 Today the platform has one principal shape: a `User` row with a `role` enum of `user | support | admin` plus an additive `is_platform_admin` boolean. Every request is authenticated as a human. The role is coarse and hierarchical — a `support` user can do everything a `user` can, an `admin` can do everything a `support` can.
 
-The agent-platform program introduces a second principal shape: a **machine principal** representing a service account that speaks to the platform via the MCP adapter ([ADR 0006](0006-mcp-server-thin-adapter.md)). The first such principal will be `incident-commander`, seeded read-only.
+The agent-platform program introduces a second principal shape: a **machine principal** representing a service account that speaks to the platform via the MCP server ([ADR 0006](0006-mcp-server-standalone-process.md)). The first such principal will be `incident-commander`, seeded read-only.
 
 We need to decide:
 
@@ -112,7 +112,7 @@ Mint one token per MCP tool the agent needs. Extreme least-privilege.
 - **New table, new migration, new dependency function.** ~200 lines of code to introduce in Wave 1 PR #1 (machine principals + scoped tokens). Modest, but real.
 - **Two auth paths to secure.** JWT for humans, opaque token for service accounts. Both go through the same middleware but the middleware branches. Tested via `test_scope_enforcement.py` (wrong-scope → 403; revoked → 401; per-SA rate limit trips before per-tenant).
 - **Scope model is fixed at Step 0.** Adding a new scope later is easy; renaming or splitting an existing one is a token-migration operation. This is why the set was decided upfront and locked before shipping code.
-- **The MCP adapter must map "which tool needs which scope" and enforce it before dispatch.** The endpoint will also enforce (defense in depth), but a mistake in the adapter surfaces as a 403 rather than as silent success.
+- **The MCP handler must declare "which tool needs which scope" and enforce it before dispatch.** The service-layer call underneath does not know it came from MCP, so the handler owns the scope check. A mistake surfaces as a 403 rather than as silent success.
 
 ### Reversibility
 
@@ -122,11 +122,11 @@ Dropping the scope model means folding all scopes into a single role bundle — 
 
 - Unit tests: token minting, scope-subset validation at mint time, expiry checks, revocation behaviour.
 - API tests: `wrong-scope 403`, `revoked-token 401`, `expired-token 401`, `per-sa rate limit 429`, `no scope required → allowed` (per PR-1 test bar).
-- Integration test: full MCP round-trip through the adapter using a real seeded `incident-commander` token against a read-only endpoint.
+- Integration test: full MCP round-trip through the standalone MCP process using a real seeded `incident-commander` token against a read-only endpoint.
 
 ## Pointers
 
-- `backend/app/models/service_account.py` (to be created in Wave 1 PR #1)
-- `backend/app/dependencies.py` — new `get_current_principal` fanning in both auth paths
+- `backend/app/models/service_account.py` — the SQLAlchemy models (Wave 1 PR #1, shipped)
+- `backend/app/dependencies.py` — `get_current_principal` fanning in both auth paths
 - `backend/app/core/scopes.py` — the fixed scope enum + `require_scope` dependency factory
-- Related ADRs: [0006 — MCP server as thin adapter](0006-mcp-server-thin-adapter.md), [0008 — Chaos gating](0008-chaos-gating.md)
+- Related ADRs: [0006 — MCP server standalone process](0006-mcp-server-standalone-process.md), [0008 — Chaos gating](0008-chaos-gating.md)
