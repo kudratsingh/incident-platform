@@ -20,7 +20,7 @@ The chaos framework is **triple-gated**. All three gates must be open, independe
 
 3. **Per-tool authorization** — each chaos tool declares its blast radius; the middleware refuses to dispatch if the current environment's `CHAOS_MAX_BLAST_RADIUS` is lower. A `kill_consumer` on a single consumer group is low; `saturate_redis` is higher; `bad_deploy` is highest.
 
-If gate 1 is closed, the chaos tools are not registered on the MCP server at startup — they don't appear in `agent-tools.json` for that environment. If gate 1 is open but gate 2 is closed, the call returns 403 with `error_code: scope_required`. If gates 1 and 2 are open but gate 3 refuses the tool, the call returns 403 with `error_code: blast_radius_exceeded`.
+If gate 1 is closed, the chaos tools are not registered on the MCP server at startup — they don't appear in the `tools/list` response for that environment. If gate 1 is open but gate 2 is closed, the call returns 403 with `error_code: scope_required`. If gates 1 and 2 are open but gate 3 refuses the tool, the call returns 403 with `error_code: blast_radius_exceeded`.
 
 ### Why three gates and not one strict one
 
@@ -92,7 +92,7 @@ Each call requires a fresh MFA-style token.
 ### Positive
 
 - **Production is provably safe.** Terraform validation prevents `CHAOS_ENABLED=true` in the production workspace; app boot refuses the combination even if Terraform were somehow bypassed. Two independent checks on the same invariant.
-- **Chaos tools are invisible to prod agents.** They're not in `agent-tools.json` for the production environment. The agent can't even *try* to call them because it doesn't know they exist.
+- **Chaos tools are invisible to prod agents.** They aren't registered on the production MCP process at startup, so `tools/list` never advertises them. The agent can't even *try* to call them because it doesn't know they exist.
 - **Kill switch is per-scope.** Revoke the `chaos:invoke` scope on the principal → chaos tools become uncallable within one middleware pass. Rest of the agent's capabilities keep working.
 - **Auditability of chaos activity is a first-class signal.** Separate `chaos.*` event stream, admin Audit tab filter, and (eventually) a CloudWatch alarm on the rate of chaos denials.
 
@@ -100,22 +100,22 @@ Each call requires a fresh MFA-style token.
 
 - **Three gates means three places to verify when chaos "doesn't work".** Debugging a legitimately-disabled chaos tool in a staging env involves checking the flag, the scope, and the blast-radius setting. Mitigated by a startup log line that dumps the state of all three gates on boot.
 - **Adds an environment variable that must be set explicitly per environment.** Every future ECS task definition and every developer's `.env.example` must carry it. Documented in the setup guide.
-- **The MCP adapter has to filter its tool registry by environment.** When `CHAOS_ENABLED=false`, chaos tools aren't just refused — they're not surfaced. This means the adapter reads the flag at startup. If the flag changes, the adapter needs a restart; acceptable given the flag is deploy-time.
+- **The MCP process has to filter its tool registry by environment.** When `CHAOS_ENABLED=false`, chaos tools aren't just refused — they're not surfaced. This means the process reads the flag at startup. If the flag changes, the process needs a restart; acceptable given the flag is deploy-time.
 
 ### Reversibility
 
-Removing the framework entirely is deletion of `mcp-server/chaos_tools/`, deletion of the `chaos:invoke` scope, deletion of the `CHAOS_ENABLED` variable. No downstream code depends on chaos being available. Fully reversible in one PR.
+Removing the framework entirely is deletion of `backend/app/mcp/chaos_tools/`, deletion of the `chaos:invoke` scope, deletion of the `CHAOS_ENABLED` variable. No downstream code depends on chaos being available. Fully reversible in one PR.
 
 ## Verification
 
 - Unit tests: each gate rejects independently; two open gates + one closed → 403 with the right `error_code`.
 - Startup test: `CHAOS_ENABLED=true, ENVIRONMENT=production` raises `AssertionError` before uvicorn binds.
 - Terraform test: `terraform plan` with `chaos_enabled=true, environment=production` fails with the validation message.
-- Integration test: MCP adapter in a chaos-enabled test env exposes `kill_consumer`; adapter in a chaos-disabled env does not list it in its tool registry.
+- Integration test: MCP process in a chaos-enabled test env exposes `kill_consumer` via `tools/list`; process in a chaos-disabled env does not list it.
 
 ## Pointers
 
 - `backend/app/config.py` — the boot-time assertion (to be added in Wave 1 PR #4)
 - `infra/variables.tf` — the Terraform validation
-- `mcp-server/chaos_tools/` — the tool implementations (to be created in Wave 1 PR #4)
-- Related ADRs: [0006 — MCP server as thin adapter](0006-mcp-server-thin-adapter.md), [0007 — Machine-principal scope model](0007-machine-principal-scope-model.md)
+- `backend/app/mcp/chaos_tools/` — the tool implementations (to be created in Wave 1 PR #4)
+- Related ADRs: [0006 — MCP server standalone process](0006-mcp-server-standalone-process.md), [0007 — Machine-principal scope model](0007-machine-principal-scope-model.md)

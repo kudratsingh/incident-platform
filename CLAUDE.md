@@ -24,7 +24,7 @@ This file (`CLAUDE.md`) is the high-signal index. Treat it as the entry point �
   - [0003 — Postgres RLS as defense-in-depth](docs/ADR/0003-rls-as-defense-in-depth.md)
   - [0004 — Composite tenant_id:user_id Kafka partition key](docs/ADR/0004-tenant-id-in-kafka-partition-key.md)
   - [0005 — LLM features fail open](docs/ADR/0005-llm-features-fail-open.md)
-  - [0006 — MCP server as thin adapter over service layer](docs/ADR/0006-mcp-server-thin-adapter.md) *(proposed)*
+  - [0006 — MCP server as a standalone process from the platform codebase](docs/ADR/0006-mcp-server-standalone-process.md) *(accepted)*
   - [0007 — Machine principals with a scope model separate from human roles](docs/ADR/0007-machine-principal-scope-model.md) *(proposed)*
   - [0008 — Chaos framework is triple-gated and never in production](docs/ADR/0008-chaos-gating.md) *(proposed)*
 - [`docs/ROADMAP.md`](docs/ROADMAP.md) — open extension ideas, sized + categorized
@@ -96,28 +96,33 @@ Phase 12 — Multi-tenancy:
 
 ---
 
-## Agent-facing surface (in progress — Step 0)
+## Agent-facing surface
 
-A new program is layered on top of Phases 1–12: **make the platform safely operable by a machine principal** — an autonomous agent that speaks to the platform through the Model Context Protocol (MCP). The agent lives in a separate repo and consumes a contract artifact (`agent-tools.json`) published from this one.
+The platform exposes an MCP server for machine principals such as `incident-commander`. The code lives at `backend/app/mcp/` and deploys as a standalone process from the same image, with handlers calling the service layer directly. Every MCP request authenticates as a scoped service account, is rate-limited per principal, and writes an immutable audit record. Topology rationale and rejected alternatives (mounted sub-app, API-proxy à la Sentry, separate repo) are in [ADR 0006](docs/ADR/0006-mcp-server-standalone-process.md). Tool changes always start with a PR here, never in the agent repo.
 
-This section is the durable index for the program. It fixes the vocabulary so tools, scopes, and audit events don't drift as PRs land. The rationale for each decision is in the three ADRs below; the naming below is normative — new code must use these exact strings.
+### Repo boundary
+
+- **This repo (`incident-platform`)** owns everything on the platform side of the wire: backend, frontend, service layer, `backend/app/mcp/` server code, chaos hooks, approvals subsystem, audit log, infra. The MCP server is part of the lock, not the visitor.
+- **Agent repo (`incident-commander`)** owns the MCP *client* and the orchestrator around it: hypothesis engine, memory, skills, evals, demo compose that pulls the platform image by digest. It never imports platform code — it talks to `PLATFORM_MCP_URL` with a bearer token.
+
+Same mental model as Sentry / GitHub / Stripe / Linear: the MCP server ships inside the org whose data it fronts; callers live wherever their builders keep them.
 
 ### Where it fits
 
-- **Step 0 (this branch)** — write ADRs, lock in naming, add this section. No runtime code.
-- **Wave 1 (~6 PRs, blocking):** machine principals + scoped tokens; operator audit log; MCP scaffold + `get_consumer_lag`; chaos framework + `kill_consumer`; alert emission (signed webhook + poll fallback); release engineering (`agent-tools.json` on tag).
+- **Step 0 (merged, PR #51)** — ADRs 0006–0008, agent-facing surface section, naming locked in.
+- **Wave 1 (~6 PRs, blocking):** machine principals + scoped tokens *(PR #52, merged)*; operator audit log; MCP scaffold at `backend/app/mcp/` + `get_consumer_lag` only; chaos framework + `kill_consumer` (`CHAOS_ENABLED=false` by default); alert emission (HMAC-signed webhook + `list_active_alerts` poll fallback); release engineering — pinned platform image (`ghcr.io/kudratsingh/incident-platform`) on tag, agent repo consumes by digest.
 - **Wave 2 (lands during agent Phases 1–3):** full read tool set (`list_dlq_messages`, `get_trace` / `search_traces`, `get_deploy_history`, `get_dag_state`, `get_redis_health`, `get_postgres_health`, `get_incident` / `list_incidents`); remaining chaos hooks (`poison_message`, `saturate_redis`, `inject_latency`, `bad_deploy`) added JIT per scenario family.
 - **Wave 3 (before agent Phase 6):** Tier 1 actions (`restart_consumer_group`, `replay_dlq_messages`, `pause_dag`, `invalidate_cache_key`) with `Idempotency-Key`; approvals subsystem (propose / approve / execute state machine with param-hash binding, expiry, single-use); approvals inbox view in the existing frontend; Tier 2 actions (`scale_service`, `rollback_deploy`, `modify_retry_policy`, `trigger_saga_compensation`) requiring approval reference + global kill switch on the agent principal.
 
-The design decisions locked in Step 0:
+### Design decisions locked in Step 0
 
-- [ADR 0006 — MCP server as thin adapter over the service layer](docs/ADR/0006-mcp-server-thin-adapter.md) — the MCP server is a separate process (`mcp-server/`) that calls the platform's HTTP API. No direct DB, Redis, or Kafka access. Guarantees inherit from the HTTP middleware stack (tenant scoping, quotas, audit).
-- [ADR 0007 — Machine principals with a scope model separate from human roles](docs/ADR/0007-machine-principal-scope-model.md) — new `service_accounts` table; opaque bearer tokens; scopes are non-hierarchical, additive, and orthogonal to the human role enum.
+- [ADR 0006 — MCP server as a standalone process from the platform codebase](docs/ADR/0006-mcp-server-standalone-process.md) — code at `backend/app/mcp/`, standalone process built from the same image, handlers call the service layer directly. Import-linter rule enforces `app.mcp → app.services` one-directional. Revisit trigger: collapse to mounted if operating two services proves to be real friction (one-line change).
+- [ADR 0007 — Machine principals with a scope model separate from human roles](docs/ADR/0007-machine-principal-scope-model.md) — `service_accounts` table; opaque `sa_<random>` bearer tokens; five fixed scopes, non-hierarchical, additive, orthogonal to the human role enum. Shipped in PR #52.
 - [ADR 0008 — Chaos framework is triple-gated and never in production](docs/ADR/0008-chaos-gating.md) — `CHAOS_ENABLED` env flag + `chaos:invoke` scope + per-tool blast-radius check; Terraform validation refuses `CHAOS_ENABLED=true` in the production workspace.
 
 ### Naming conventions (normative)
 
-**Tool names** — verb-first `snake_case`, one function per tool. Examples: `get_consumer_lag`, `list_dlq_messages`, `restart_consumer_group`, `replay_dlq_messages`, `pause_dag`, `invalidate_cache_key`, `kill_consumer`, `poison_message`, `saturate_redis`, `inject_latency`, `bad_deploy`. The `snake_case` matches Pydantic field style and serializes cleanly into `agent-tools.json`.
+**Tool names** — verb-first `snake_case`, one function per tool. Examples: `get_consumer_lag`, `list_dlq_messages`, `restart_consumer_group`, `replay_dlq_messages`, `pause_dag`, `invalidate_cache_key`, `kill_consumer`, `poison_message`, `saturate_redis`, `inject_latency`, `bad_deploy`. `snake_case` matches Pydantic field style and serializes cleanly through the MCP `tools/list` response.
 
 **Scopes** — `<domain>:<verb>`, fixed enum. Adding a scope is a decision; renaming or splitting one is a token migration. The five scopes:
 
@@ -138,16 +143,12 @@ The seed principal `incident-commander` gets `telemetry:read + incidents:read` a
 - `agent.action_proposed` / `agent.action_approved` / `agent.action_executed` / `agent.action_rejected`
 - `chaos.tool_invoked` / `chaos.tool_denied` — chaos activity is a separate stream from `agent.tool_invoked` so it filters cleanly on the Audit tab.
 
-### What ships from this repo vs the agent repo
+### Runtime shape
 
-This repo publishes:
-
-- The HTTP API the agent talks to (existing, extended per PR).
-- `mcp-server/` — the thin adapter process.
-- `agent-tools.json` — the generated tool contract, released as an artifact on git tag (`ghcr.io/kudratsingh/incident-platform:v*`).
-- `runbooks/*.yaml` — the same runbooks humans use; the agent reads them via a tool call.
-
-The agent repo consumes `agent-tools.json` and holds all the LLM plumbing, prompt design, and evaluation harness. This repo has no LLM code specific to the agent — the Phase 10 Anthropic integration is unrelated (it triages DLQs, it doesn't call agent tools).
+- Two deployables from one image: `api` (the existing FastAPI app) and `mcp` (the ASGI entrypoint at `backend/app/mcp/standalone.py`). Same commit, same schemas, same service layer.
+- Each process gets its own DB pool sized to its rate limits — the MCP process runs a small pool.
+- The agent points at `PLATFORM_MCP_URL` for tools and `PLATFORM_REST_URL` for anything else (there shouldn't be much — everything the agent needs should surface as an MCP tool over time).
+- Contract stability between agent and platform is verified by contract snapshot testing against the pinned image, per agent-repo ADR 0007.
 
 ---
 
