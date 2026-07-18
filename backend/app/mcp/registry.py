@@ -51,6 +51,11 @@ class ToolDefinition:
     # `settings.chaos_enabled=True`. The dispatch layer reads this flag
     # to route the audit row into the chaos stream.
     is_chaos: bool = False
+    # Tier 1 action tools require an `idempotency_key` argument. The
+    # dispatch layer looks it up before invoking the handler; a repeat
+    # call with the same (tenant, principal, key) returns the cached
+    # response verbatim rather than re-running the tool.
+    is_idempotent: bool = False
 
     def input_json_schema(self) -> dict[str, Any]:
         """JSON Schema for the input model, emitted verbatim in
@@ -70,6 +75,7 @@ def tool[InputT: BaseModel, OutputT: BaseModel](
     output_model: type[OutputT],
     required_scope: Scope | None = None,
     is_chaos: bool = False,
+    is_idempotent: bool = False,
 ) -> Callable[[ToolHandler], ToolHandler]:
     """Decorator: register `func` as a tool.
 
@@ -91,6 +97,7 @@ def tool[InputT: BaseModel, OutputT: BaseModel](
             output_model=output_model,
             handler=func,
             is_chaos=is_chaos,
+            is_idempotent=is_idempotent,
         )
         return func
 
