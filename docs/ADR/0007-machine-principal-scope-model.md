@@ -1,6 +1,6 @@
 # ADR 0007 — Machine principals with a scope model separate from human roles
 
-**Status:** Proposed (agent-platform Step 0) · **Date:** 2026 Q3 · **Owner:** Platform
+**Status:** Accepted (Wave 1 PR #52) · **Date:** 2026 Q3 · **Owner:** Platform
 
 ## Context
 
@@ -28,7 +28,7 @@ Introduce two new concepts:
 | Scope | What it grants |
 |---|---|
 | `telemetry:read` | Consumer lag, queue depth, in-flight counts, trace lookups, health snapshots — the observability read surface. |
-| `incidents:read` | DLQ contents, incident summaries, saga state, per-job history — the incident-response read surface. |
+| `incidents:read` | DLQ contents, incident summaries, saga state, per-job history, and the audit log (via `list_audit_events`) — the incident-response read surface. |
 | `actions:propose` | Create a *proposal* for a Tier 1 or Tier 2 action; does not execute. |
 | `actions:execute` | Execute an approved proposal (Tier 1 idempotent, Tier 2 requires approval reference). |
 | `chaos:invoke` | Invoke chaos framework tools. Gated additionally by `CHAOS_ENABLED` — see [ADR 0008](0008-chaos-gating.md). |

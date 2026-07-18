@@ -15,6 +15,7 @@ from app.mcp.tools import (  # noqa: F401
     health,
     incidents,
     list_active_alerts,
+    list_audit_events,
     list_dlq_messages,
     traces,
 )
