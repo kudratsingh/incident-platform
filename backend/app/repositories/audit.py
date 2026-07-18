@@ -1,7 +1,11 @@
 import uuid
 from typing import Any
 
-from app.models.audit import AuditLog
+from app.models.audit import (
+    PRINCIPAL_TYPE_SERVICE_ACCOUNT,
+    PRINCIPAL_TYPE_USER,
+    AuditLog,
+)
 from app.repositories.base import BaseRepository
 from sqlalchemy import and_, select
 
@@ -15,6 +19,8 @@ class AuditRepository(BaseRepository[AuditLog]):
         *,
         tenant_id: uuid.UUID,
         user_id: uuid.UUID | None = None,
+        principal_type: str | None = None,
+        principal_id: uuid.UUID | None = None,
         job_id: uuid.UUID | None = None,
         resource_type: str | None = None,
         resource_id: str | None = None,
@@ -22,11 +28,25 @@ class AuditRepository(BaseRepository[AuditLog]):
         ip_address: str | None = None,
         extra_data: dict[str, Any] | None = None,
     ) -> AuditLog:
-        """Convenience wrapper — callers name what happened, repo writes the row."""
+        """Convenience wrapper — callers name what happened, repo writes the row.
+
+        Principal identity: pass either `user_id` (human path, kept for
+        backward compat with all existing callers) or an explicit
+        `principal_type` + `principal_id` pair (machine path). When only
+        `user_id` is provided we default `principal_type='user'` and mirror
+        the value into `principal_id`, so every row has a populated
+        principal_type going forward.
+        """
+        if principal_type is None:
+            principal_type = PRINCIPAL_TYPE_USER
+        if principal_id is None and principal_type == PRINCIPAL_TYPE_USER:
+            principal_id = user_id
         return await self.create(
             action=action,
             tenant_id=tenant_id,
             user_id=user_id,
+            principal_type=principal_type,
+            principal_id=principal_id,
             job_id=job_id,
             resource_type=resource_type,
             resource_id=resource_id,
@@ -42,6 +62,8 @@ class AuditRepository(BaseRepository[AuditLog]):
         user_id: uuid.UUID | None = None,
         job_id: uuid.UUID | None = None,
         action: str | None = None,
+        principal_type: str | None = None,
+        tenant_id: uuid.UUID | None = None,
     ) -> tuple[list[AuditLog], int]:
         filters = []
         if user_id is not None:
@@ -50,6 +72,10 @@ class AuditRepository(BaseRepository[AuditLog]):
             filters.append(AuditLog.job_id == job_id)
         if action is not None:
             filters.append(AuditLog.action == action)
+        if principal_type is not None:
+            filters.append(AuditLog.principal_type == principal_type)
+        if tenant_id is not None:
+            filters.append(AuditLog.tenant_id == tenant_id)
 
         where = and_(*filters) if filters else None
         total = await self._count(where) if where is not None else await self._count()
@@ -65,3 +91,10 @@ class AuditRepository(BaseRepository[AuditLog]):
 
         result = await self.session.execute(stmt)
         return list(result.scalars().all()), total
+
+
+__all__ = [
+    "PRINCIPAL_TYPE_SERVICE_ACCOUNT",
+    "PRINCIPAL_TYPE_USER",
+    "AuditRepository",
+]

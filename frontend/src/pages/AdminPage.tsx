@@ -353,6 +353,9 @@ export default function AdminPage() {
   const [traceFilter, setTraceFilter] = useState('')
   const [loading, setLoading] = useState(true)
   const [selectedLog, setSelectedLog] = useState<AuditLog | null>(null)
+  const [principalFilter, setPrincipalFilter] = useState<
+    'all' | 'user' | 'service_account'
+  >('all')
   const [selectedUser, setSelectedUser] = useState<User | null>(null)
   const [dlqStats, setDlqStats] = useState<{ total: number; by_type: Record<string, number> } | null>(null)
   const [dlqJobs, setDlqJobs] = useState<Job[]>([])
@@ -395,13 +398,16 @@ export default function AdminPage() {
   const loadLogs = useCallback(async () => {
     setLoading(true)
     try {
-      const res = await adminApi.listAuditLogs({ page })
+      const res = await adminApi.listAuditLogs({
+        page,
+        principal_type: principalFilter === 'all' ? undefined : principalFilter,
+      })
       setLogs(res.items)
       setTotal(res.total)
     } finally {
       setLoading(false)
     }
-  }, [page])
+  }, [page, principalFilter])
 
   const loadDlq = useCallback(async () => {
     setLoading(true)
@@ -1150,6 +1156,26 @@ export default function AdminPage() {
       )}
 
       {tab === 'audit' && (
+        <>
+        <div className="flex items-center gap-2 mb-3">
+          <span className="text-xs text-gray-500 uppercase tracking-wide">Actor</span>
+          {(['all', 'user', 'service_account'] as const).map((v) => (
+            <button
+              key={v}
+              onClick={() => {
+                setPrincipalFilter(v)
+                setPage(1)
+              }}
+              className={`px-2 py-1 rounded text-xs transition-colors ${
+                principalFilter === v
+                  ? 'bg-blue-500/20 text-blue-300 border border-blue-500/40'
+                  : 'text-gray-400 border border-gray-800 hover:text-white'
+              }`}
+            >
+              {v === 'all' ? 'All' : v === 'user' ? 'Human' : 'Agent'}
+            </button>
+          ))}
+        </div>
         <div className="bg-gray-900 border border-gray-800 rounded-lg overflow-hidden">
           {loading ? (
             <table className="w-full text-sm">
@@ -1175,7 +1201,17 @@ export default function AdminPage() {
                     onClick={() => setSelectedLog(log)}
                   >
                     <td className="px-4 py-3">
-                      <code className="text-xs font-mono text-blue-300">{log.action}</code>
+                      <div className="flex items-center gap-2">
+                        <code className="text-xs font-mono text-blue-300">{log.action}</code>
+                        {log.principal_type === 'service_account' && (
+                          <span
+                            className="px-1.5 py-0.5 rounded text-[10px] uppercase tracking-wider bg-purple-500/15 text-purple-300 border border-purple-500/30"
+                            title="Machine principal (service account)"
+                          >
+                            agent
+                          </span>
+                        )}
+                      </div>
                     </td>
                     <td className="px-4 py-3 hidden md:table-cell text-xs text-gray-500 font-mono">
                       {log.resource_type ? `${log.resource_type}:${(log.resource_id ?? '').slice(0, 8)}…` : '—'}
@@ -1194,6 +1230,7 @@ export default function AdminPage() {
             </table>
           )}
         </div>
+        </>
       )}
 
       {/* Pagination */}

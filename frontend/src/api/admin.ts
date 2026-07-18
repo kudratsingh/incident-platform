@@ -104,12 +104,21 @@ export const adminApi = {
     body: { rate_limit_per_minute?: number; quota_jobs_per_month?: number },
   ) => api.patch<Tenant>(`/admin/tenants/${id}`, body),
 
-  listAuditLogs: (params: { page?: number; job_id?: string; user_id?: string; action?: string } = {}) => {
+  listAuditLogs: (
+    params: {
+      page?: number
+      job_id?: string
+      user_id?: string
+      action?: string
+      principal_type?: 'user' | 'service_account'
+    } = {},
+  ) => {
     const qs = new URLSearchParams()
     if (params.page) qs.set('page', String(params.page))
     if (params.job_id) qs.set('job_id', params.job_id)
     if (params.user_id) qs.set('user_id', params.user_id)
     if (params.action) qs.set('action', params.action)
+    if (params.principal_type) qs.set('principal_type', params.principal_type)
     const q = qs.toString()
     return api.get<PaginatedResponse<AuditLog>>(`/audit/logs${q ? `?${q}` : ''}`)
   },
