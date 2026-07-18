@@ -151,6 +151,10 @@ async def handle_tools_call(
             f"unknown tool: {call_params.name}",
         )
 
+    # Chaos tools route to the `chaos.tool_invoked` / `chaos.tool_denied`
+    # audit stream (see ADR 0008). Compute once so every branch gets it.
+    is_chaos = tool_def.is_chaos
+
     # Scope check. Machine-only surface — humans presenting a JWT are
     # rejected upstream by the auth dependency, but a machine principal
     # missing the specific scope hits this branch.
@@ -166,6 +170,8 @@ async def handle_tools_call(
                 outcome=OUTCOME_UNAUTHORIZED,
                 error_message="missing required scope",
                 request_id=request_id_var.get("") or None,
+                is_chaos=is_chaos,
+                denied_by="scope_check" if is_chaos else None,
             )
             return _error(
                 request_id,
@@ -187,6 +193,7 @@ async def handle_tools_call(
             outcome=OUTCOME_ERROR,
             error_message="invalid arguments",
             request_id=request_id_var.get("") or None,
+            is_chaos=is_chaos,
         )
         return _error(
             request_id,
@@ -213,6 +220,7 @@ async def handle_tools_call(
             outcome=OUTCOME_UNAUTHORIZED,
             error_message=exc.message,
             request_id=request_id_var.get("") or None,
+            is_chaos=is_chaos,
         )
         return _error(request_id, p.MCP_UNAUTHORIZED, exc.message)
     except AuthorizationError as exc:
@@ -227,6 +235,7 @@ async def handle_tools_call(
             outcome=OUTCOME_UNAUTHORIZED,
             error_message=exc.message,
             request_id=request_id_var.get("") or None,
+            is_chaos=is_chaos,
         )
         return _error(request_id, p.MCP_FORBIDDEN, exc.message)
     except AppError as exc:
@@ -241,6 +250,7 @@ async def handle_tools_call(
             outcome=OUTCOME_ERROR,
             error_message=exc.message,
             request_id=request_id_var.get("") or None,
+            is_chaos=is_chaos,
         )
         return _error(
             request_id,
@@ -261,6 +271,7 @@ async def handle_tools_call(
             outcome=OUTCOME_ERROR,
             error_message=str(exc),
             request_id=request_id_var.get("") or None,
+            is_chaos=is_chaos,
         )
         return _error(
             request_id, p.JSONRPC_INTERNAL_ERROR, "internal tool error"
@@ -276,6 +287,7 @@ async def handle_tools_call(
         latency_ms=latency_ms,
         outcome=OUTCOME_SUCCESS,
         request_id=request_id_var.get("") or None,
+        is_chaos=is_chaos,
     )
 
     # Emit the tool result as a single text content block whose body is

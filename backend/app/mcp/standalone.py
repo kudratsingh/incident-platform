@@ -12,6 +12,7 @@ needs is a JSON-RPC method on that endpoint.
 
 from typing import Any
 
+from app.config import assert_chaos_gate
 from app.core.exceptions import AppError, AuthenticationError
 from app.core.logging import get_logger
 from app.core.middleware import RequestContextMiddleware
@@ -35,6 +36,10 @@ def create_mcp_app() -> FastAPI:
     """FastAPI factory for the MCP process. Kept as a factory so tests
     can build fresh instances with dependency overrides without touching
     the module-level singleton."""
+
+    # Chaos framework triple-gate — enforce the "never in production"
+    # invariant before we even mount routes. See ADR 0008.
+    assert_chaos_gate()
 
     app = FastAPI(
         title="incident-platform MCP",

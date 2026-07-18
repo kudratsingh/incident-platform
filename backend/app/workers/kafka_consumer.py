@@ -23,6 +23,30 @@ from app.workers.schema_registry import validate as validate_schema
 logger = get_logger(__name__)
 
 
+def kill_key_for(group_id: str) -> str:
+    """Redis key the chaos `kill_consumer` tool sets to shut a specific
+    consumer group down. Consumers check this key at the top of every
+    poll iteration."""
+    return f"chaos:kill:{group_id}"
+
+
+async def _check_chaos_kill(group_id: str) -> bool:
+    """Return True when a `chaos:kill:<group>` key exists in Redis.
+
+    Best-effort — Redis unavailable → return False. We never want the
+    chaos check to block real message processing on a Redis blip.
+    Import is deferred so plain-Kafka test paths don't spin up a real
+    Redis client."""
+    try:
+        from app.core.redis import get_redis_client
+
+        client = get_redis_client()
+        val = await client.get(kill_key_for(group_id))
+        return val is not None
+    except Exception:
+        return False
+
+
 class BaseKafkaConsumer(ABC):
     """
     Base class for all Kafka consumers in this application.
@@ -81,6 +105,20 @@ class BaseKafkaConsumer(ABC):
             raise RuntimeError("Consumer not started — call start() first")
 
         while self._running:
+            # Chaos framework kill switch (ADR 0008). If the
+            # `kill_consumer` MCP tool has flipped the group's kill key,
+            # exit the loop cleanly; the worker's supervisor decides
+            # whether to restart. Only active when CHAOS_ENABLED=true;
+            # otherwise the check short-circuits without a Redis call.
+            if get_settings().chaos_enabled and await _check_chaos_kill(
+                self.group_id
+            ):
+                logger.warning(
+                    "kafka consumer stopped by chaos kill_consumer",
+                    extra={"group_id": self.group_id},
+                )
+                break
+
             try:
                 # getmany() batches up to 10 messages per poll for efficiency
                 records: dict[Any, list[ConsumerRecord]] = await asyncio.wait_for(

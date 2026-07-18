@@ -46,6 +46,11 @@ class ToolDefinition:
     input_model: type[BaseModel]
     output_model: type[BaseModel]
     handler: ToolHandler
+    # Chaos tools use a distinct audit action (`chaos.tool_invoked` vs
+    # `agent.tool_invoked`) and are only registered when
+    # `settings.chaos_enabled=True`. The dispatch layer reads this flag
+    # to route the audit row into the chaos stream.
+    is_chaos: bool = False
 
     def input_json_schema(self) -> dict[str, Any]:
         """JSON Schema for the input model, emitted verbatim in
@@ -64,6 +69,7 @@ def tool[InputT: BaseModel, OutputT: BaseModel](
     input_model: type[InputT],
     output_model: type[OutputT],
     required_scope: Scope | None = None,
+    is_chaos: bool = False,
 ) -> Callable[[ToolHandler], ToolHandler]:
     """Decorator: register `func` as a tool.
 
@@ -84,6 +90,7 @@ def tool[InputT: BaseModel, OutputT: BaseModel](
             input_model=input_model,
             output_model=output_model,
             handler=func,
+            is_chaos=is_chaos,
         )
         return func
 

@@ -2,7 +2,7 @@ import asyncio
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
-from app.config import get_settings
+from app.config import assert_chaos_gate, get_settings
 from app.core.exceptions import AppError
 from app.core.logging import get_logger, request_id_var, setup_logging
 from app.core.middleware import RequestContextMiddleware
@@ -25,7 +25,14 @@ logger = get_logger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     settings = get_settings()
-    logger.info("startup", extra={"environment": settings.environment})
+    assert_chaos_gate(settings)
+    logger.info(
+        "startup",
+        extra={
+            "environment": settings.environment,
+            "chaos_enabled": settings.chaos_enabled,
+        },
+    )
 
     # Import here to avoid circular imports at module load time
     from app.dependencies import _engine, get_session_factory

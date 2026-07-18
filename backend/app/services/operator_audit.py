@@ -24,6 +24,10 @@ from app.models.audit import (
 from app.repositories.audit import AuditRepository
 
 TOOL_INVOKED_ACTION = "agent.tool_invoked"
+# Chaos tool activity is a separate audit stream so operators can filter
+# it independently — see ADR 0008 + CLAUDE.md agent-facing surface.
+CHAOS_TOOL_INVOKED_ACTION = "chaos.tool_invoked"
+CHAOS_TOOL_DENIED_ACTION = "chaos.tool_denied"
 
 # Outcome values recorded on tool invocation rows. Kept as a fixed set so
 # admin filters and dashboards can rely on it.
@@ -58,8 +62,15 @@ async def record_tool_invocation(
     outcome: str,
     error_message: str | None = None,
     request_id: str | None = None,
+    is_chaos: bool = False,
+    denied_by: str | None = None,
 ) -> None:
     """Write an `agent.tool_invoked` row for a single MCP tool call.
+
+    When `is_chaos=True` the action is `chaos.tool_invoked` (or
+    `chaos.tool_denied` if `denied_by` is set), so chaos activity
+    filters cleanly on the admin Audit tab as a separate stream from
+    general agent traffic — see ADR 0008.
 
     Never raises — audit failures must not turn a successful tool call
     into a client-visible error. If persistence fails the row is dropped
@@ -74,9 +85,18 @@ async def record_tool_invocation(
     }
     if error_message is not None:
         extra["error_message"] = error_message
+    if denied_by is not None:
+        extra["denied_by"] = denied_by
+
+    if is_chaos:
+        action = (
+            CHAOS_TOOL_DENIED_ACTION if denied_by is not None else CHAOS_TOOL_INVOKED_ACTION
+        )
+    else:
+        action = TOOL_INVOKED_ACTION
 
     await audit_repo.log(
-        TOOL_INVOKED_ACTION,
+        action,
         tenant_id=principal.tenant_id,
         resource_type="mcp_tool",
         resource_id=tool_name,
@@ -87,6 +107,8 @@ async def record_tool_invocation(
 
 
 __all__ = [
+    "CHAOS_TOOL_DENIED_ACTION",
+    "CHAOS_TOOL_INVOKED_ACTION",
     "OUTCOME_ERROR",
     "OUTCOME_SUCCESS",
     "OUTCOME_UNAUTHORIZED",
