@@ -1,6 +1,6 @@
 # ADR 0008 — Chaos framework is triple-gated and never enabled in production
 
-**Status:** Proposed (agent-platform Step 0) · **Date:** 2026 Q3 · **Owner:** Platform
+**Status:** Accepted (Wave 1 PR #56, extended by Wave 2 PR #58) · **Date:** 2026 Q3 · **Owner:** Platform
 
 ## Context
 

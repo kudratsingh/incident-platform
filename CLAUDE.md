@@ -14,6 +14,12 @@ The project is structured as a sequence of milestone phases (Phase 1 through Pha
 
 This file (`CLAUDE.md`) is the high-signal index. Treat it as the entry point — everything below points at deeper docs when detail matters.
 
+**Prose conventions** (documented so reviews don't rediscover them as violations):
+- Em-dashes ( — ) are used freely across docs, ADRs, and PR bodies. Not stylistic churn — match the pattern.
+- ADR status labels appear in the H1 subtitle only. The doc-map above intentionally omits *(proposed)* / *(accepted)* markers to avoid drift when statuses flip.
+- Machine-principal identity on `audit_logs` uses `principal_type` (string discriminator) + `principal_id` (plain UUID, no FK). Not `service_account_id` — that shape was rejected because the same column has to reference either `users.id` or `service_accounts.id` depending on the discriminator. See [ADR 0007](docs/ADR/0007-machine-principal-scope-model.md).
+- The agent contract with this platform is validated by snapshot-testing the agent repo against the pinned platform image (agent-repo ADR 0007). There is deliberately no `agent-tools.json` artifact — that shape was proposed in early drafts and dropped when [ADR 0006](docs/ADR/0006-mcp-server-standalone-process.md) landed.
+
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — runtime topology, request lifecycles (annotated traces for the 5 most-touched paths), concurrency model, failure mode catalog, auth & tenant matrix, cost model
 - [`docs/DATA_MODEL.md`](docs/DATA_MODEL.md) — every table, every column, every index, every constraint, with a one-line *why*
 - [`docs/KAFKA.md`](docs/KAFKA.md) — topic catalog, schema-evolution rules, partition strategy, consumer-group catalog with failure isolation
@@ -24,9 +30,9 @@ This file (`CLAUDE.md`) is the high-signal index. Treat it as the entry point �
   - [0003 — Postgres RLS as defense-in-depth](docs/ADR/0003-rls-as-defense-in-depth.md)
   - [0004 — Composite tenant_id:user_id Kafka partition key](docs/ADR/0004-tenant-id-in-kafka-partition-key.md)
   - [0005 — LLM features fail open](docs/ADR/0005-llm-features-fail-open.md)
-  - [0006 — MCP server as a standalone process from the platform codebase](docs/ADR/0006-mcp-server-standalone-process.md) *(accepted)*
-  - [0007 — Machine principals with a scope model separate from human roles](docs/ADR/0007-machine-principal-scope-model.md) *(proposed)*
-  - [0008 — Chaos framework is triple-gated and never in production](docs/ADR/0008-chaos-gating.md) *(proposed)*
+  - [0006 — MCP server as a standalone process from the platform codebase](docs/ADR/0006-mcp-server-standalone-process.md)
+  - [0007 — Machine principals with a scope model separate from human roles](docs/ADR/0007-machine-principal-scope-model.md)
+  - [0008 — Chaos framework is triple-gated and never in production](docs/ADR/0008-chaos-gating.md)
 - [`docs/ROADMAP.md`](docs/ROADMAP.md) — open extension ideas, sized + categorized
 - [`runbooks/`](runbooks/) — machine-readable on-call playbooks for every CloudWatch alarm + SLO
 
@@ -122,7 +128,7 @@ Same mental model as Sentry / GitHub / Stripe / Linear: the MCP server ships ins
 
 ### Naming conventions (normative)
 
-**Tool names** — verb-first `snake_case`, one function per tool. Examples: `get_consumer_lag`, `list_dlq_messages`, `restart_consumer_group`, `replay_dlq_messages`, `pause_dag`, `invalidate_cache_key`, `kill_consumer`, `poison_message`, `saturate_redis`, `inject_latency`, `bad_deploy`. `snake_case` matches Pydantic field style and serializes cleanly through the MCP `tools/list` response.
+**Tool names** — verb-first `snake_case`, one function per tool. Examples: `get_consumer_lag`, `list_dlq_messages`, `list_audit_events`, `restart_consumer_group`, `replay_dlq_messages`, `pause_dag`, `invalidate_cache_key`, `kill_consumer`, `poison_message`, `saturate_redis`, `inject_latency`, `bad_deploy`. `snake_case` matches Pydantic field style and serializes cleanly through the MCP `tools/list` response.
 
 **Scopes** — `<domain>:<verb>`, fixed enum. Adding a scope is a decision; renaming or splitting one is a token migration. The five scopes:
 

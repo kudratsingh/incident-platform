@@ -62,6 +62,7 @@ class AuditRepository(BaseRepository[AuditLog]):
         user_id: uuid.UUID | None = None,
         job_id: uuid.UUID | None = None,
         action: str | None = None,
+        action_prefix: str | None = None,
         principal_type: str | None = None,
         tenant_id: uuid.UUID | None = None,
     ) -> tuple[list[AuditLog], int]:
@@ -72,6 +73,10 @@ class AuditRepository(BaseRepository[AuditLog]):
             filters.append(AuditLog.job_id == job_id)
         if action is not None:
             filters.append(AuditLog.action == action)
+        if action_prefix is not None:
+            # `agent.*` / `chaos.*` grouping — used by the MCP audit
+            # tool to isolate machine-principal activity streams.
+            filters.append(AuditLog.action.like(f"{action_prefix}%"))
         if principal_type is not None:
             filters.append(AuditLog.principal_type == principal_type)
         if tenant_id is not None:
