@@ -30,6 +30,12 @@ def kill_key_for(group_id: str) -> str:
     return f"chaos:kill:{group_id}"
 
 
+def latency_key_for(group_id: str) -> str:
+    """Redis key the chaos `inject_latency` tool sets. Value is an int
+    number of milliseconds to sleep before each poll iteration."""
+    return f"chaos:latency:{group_id}"
+
+
 async def _check_chaos_kill(group_id: str) -> bool:
     """Return True when a `chaos:kill:<group>` key exists in Redis.
 
@@ -45,6 +51,22 @@ async def _check_chaos_kill(group_id: str) -> bool:
         return val is not None
     except Exception:
         return False
+
+
+async def _check_chaos_latency(group_id: str) -> int:
+    """Return the sleep duration in milliseconds from the chaos latency
+    key, or 0 when unset / on any error. Best-effort like the kill
+    check."""
+    try:
+        from app.core.redis import get_redis_client
+
+        client = get_redis_client()
+        val = await client.get(latency_key_for(group_id))
+        if val is None:
+            return 0
+        return int(val)
+    except Exception:
+        return 0
 
 
 class BaseKafkaConsumer(ABC):
@@ -110,14 +132,18 @@ class BaseKafkaConsumer(ABC):
             # exit the loop cleanly; the worker's supervisor decides
             # whether to restart. Only active when CHAOS_ENABLED=true;
             # otherwise the check short-circuits without a Redis call.
-            if get_settings().chaos_enabled and await _check_chaos_kill(
-                self.group_id
-            ):
-                logger.warning(
-                    "kafka consumer stopped by chaos kill_consumer",
-                    extra={"group_id": self.group_id},
-                )
-                break
+            if get_settings().chaos_enabled:
+                if await _check_chaos_kill(self.group_id):
+                    logger.warning(
+                        "kafka consumer stopped by chaos kill_consumer",
+                        extra={"group_id": self.group_id},
+                    )
+                    break
+                # Injected latency — sleep the requested milliseconds
+                # before each poll. Capped inside the tool at 60_000 ms.
+                latency_ms = await _check_chaos_latency(self.group_id)
+                if latency_ms > 0:
+                    await asyncio.sleep(latency_ms / 1000.0)
 
             try:
                 # getmany() batches up to 10 messages per poll for efficiency
