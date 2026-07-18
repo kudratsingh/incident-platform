@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from app.schemas.common import PaginationParams
 from pydantic import BaseModel, ConfigDict
@@ -11,6 +11,10 @@ class AuditLogResponse(BaseModel):
 
     id: uuid.UUID
     user_id: uuid.UUID | None
+    # Canonical actor identity going forward. `user_id` remains populated
+    # for human actors so existing clients don't break.
+    principal_type: str = "user"
+    principal_id: uuid.UUID | None = None
     job_id: uuid.UUID | None
     action: str
     resource_type: str | None
@@ -25,3 +29,6 @@ class AuditListParams(PaginationParams):
     user_id: uuid.UUID | None = None
     job_id: uuid.UUID | None = None
     action: str | None = None
+    # Isolate operator activity (`user`) from agent activity
+    # (`service_account`). Omit to see both.
+    principal_type: Literal["user", "service_account"] | None = None

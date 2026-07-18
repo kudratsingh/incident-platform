@@ -164,6 +164,8 @@ export interface IncidentDigest {
 export interface AuditLog {
   id: string
   user_id: string | null
+  principal_type: 'user' | 'service_account'
+  principal_id: string | null
   job_id: string | null
   action: string
   resource_type: string | null

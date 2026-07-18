@@ -25,6 +25,7 @@ async def list_audit_logs(
         user_id=params.user_id,
         job_id=params.job_id,
         action=params.action,
+        principal_type=params.principal_type,
     )
     return PaginatedResponse.build(
         items=[AuditLogResponse.model_validate(log) for log in logs],

@@ -11,9 +11,23 @@ if TYPE_CHECKING:
     from app.models.job import Job
     from app.models.user import User
 
+# Principal type discriminator on audit_logs.principal_type. Kept as string
+# literals rather than an enum so the DB constraint stays lax — new principal
+# shapes (Wave-3 approval bots, etc.) can be added without a schema change.
+PRINCIPAL_TYPE_USER = "user"
+PRINCIPAL_TYPE_SERVICE_ACCOUNT = "service_account"
+
 
 class AuditLog(Base):
-    """Immutable append-only record of every significant action in the system."""
+    """Immutable append-only record of every significant action in the system.
+
+    Two principal shapes write here: humans (`principal_type='user'`,
+    `principal_id` = users.id, `user_id` also set for backward compat with
+    the FK-based path) and service accounts (`principal_type='service_account'`,
+    `principal_id` = service_accounts.id, `user_id` null). Consumers filter
+    on principal_type when they want to isolate operator activity from agent
+    activity.
+    """
 
     __tablename__ = "audit_logs"
 
@@ -26,11 +40,24 @@ class AuditLog(Base):
         nullable=False,
         index=True,
     )
+    # Kept for backward compat with existing queries; new machine-principal
+    # rows leave it null. See `principal_type` + `principal_id` for the
+    # canonical actor identity going forward.
     user_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("users.id", ondelete="SET NULL"),
         nullable=True,
         index=True,
+    )
+    principal_type: Mapped[str] = mapped_column(
+        String(32), nullable=False, default=PRINCIPAL_TYPE_USER,
+        server_default=PRINCIPAL_TYPE_USER,
+    )
+    # Plain UUID column, not an FK — points at users.id or service_accounts.id
+    # depending on principal_type. Kept unconstrained so a deleted principal
+    # doesn't cascade or block audit reads (the row is a historical record).
+    principal_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True
     )
     job_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
