@@ -10,7 +10,13 @@ the registry before the first request lands.
 from app.mcp.tools import (  # noqa: F401
     chaos,
     consumer_lag,
+    dag_state,
+    deploy_history,
+    health,
+    incidents,
     list_active_alerts,
+    list_dlq_messages,
+    traces,
 )
 
 __all__: list[str] = []
