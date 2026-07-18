@@ -1,0 +1,497 @@
+"""End-to-end tests for Wave 2 PR C — the 9 read tools.
+
+Same pattern as `test_mcp_standalone.py`: build the standalone MCP
+app, mint a scoped SA token, POST JSON-RPC, assert shape.
+
+One test class per tool grouping:
+  - list_dlq_messages
+  - get_trace / search_traces
+  - get_dag_state
+  - get_redis_health / get_postgres_health
+  - get_deploy_history
+  - get_incident / list_incidents
+"""
+
+from __future__ import annotations
+
+import json
+import uuid
+from datetime import UTC, datetime
+from typing import Any
+
+import pytest_asyncio
+from app.core.scopes import Scope
+from app.dependencies import get_db, get_redis
+from app.mcp import protocol
+from app.mcp.standalone import create_mcp_app
+from app.models.alert import Alert
+from app.models.enums import JobStatus, JobType
+from app.models.job import Job
+from app.models.job_dependency import JobDependency
+from app.repositories.audit import AuditRepository
+from app.repositories.service_account import (
+    ServiceAccountRepository,
+    ServiceAccountTokenRepository,
+)
+from app.services.service_account import ServiceAccountService
+from httpx import ASGITransport, AsyncClient
+from sqlalchemy.ext.asyncio import AsyncSession
+
+
+class _RedisStub:
+    """Enough of the async Redis surface for the tools we exercise:
+    `get`, `set`, `ping`, `info`."""
+
+    def __init__(self, info: dict[str, Any] | None = None) -> None:
+        self._store: dict[str, bytes | str] = {}
+        self._info = info or {
+            "connected_clients": 3,
+            "used_memory": 12_500_000,
+            "used_memory_human": "12M",
+            "keyspace_hits": 100,
+            "keyspace_misses": 7,
+        }
+
+    async def get(self, key: str) -> bytes | str | None:
+        return self._store.get(key)
+
+    async def set(self, key: str, value: bytes | str, ex: int | None = None) -> bool:
+        self._store[key] = value
+        return True
+
+    async def ping(self) -> bool:
+        return True
+
+    async def info(self) -> dict[str, Any]:
+        return dict(self._info)
+
+
+@pytest_asyncio.fixture
+async def mcp_client(  # type: ignore[no-untyped-def]
+    db_session: AsyncSession,
+    default_tenant,
+):
+    app = create_mcp_app()
+    redis_stub = _RedisStub()
+
+    async def _override_db():
+        yield db_session
+
+    async def _override_redis():
+        yield redis_stub
+
+    app.dependency_overrides[get_db] = _override_db
+    app.dependency_overrides[get_redis] = _override_redis
+    async with AsyncClient(
+        transport=ASGITransport(app=app, raise_app_exceptions=False),
+        base_url="http://test",
+    ) as ac:
+        yield ac, redis_stub
+
+
+async def _token(
+    db_session: AsyncSession, tenant_id: uuid.UUID, scopes: list[str]
+) -> str:
+    svc = ServiceAccountService(
+        ServiceAccountRepository(db_session),
+        ServiceAccountTokenRepository(db_session),
+        AuditRepository(db_session),
+    )
+    sa = await svc.create_service_account(
+        tenant_id=tenant_id,
+        name=f"probe-{uuid.uuid4().hex[:8]}",
+        scopes=scopes,
+        created_by_user_id=None,
+    )
+    _, plaintext = await svc.mint_token(
+        service_account=sa,
+        scopes=None,
+        ttl=None,
+        minted_by_user_id=None,
+    )
+    return plaintext
+
+
+def _rpc(method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    return {"jsonrpc": "2.0", "id": "1", "method": method, "params": params or {}}
+
+
+async def _call(
+    ac: AsyncClient, token: str, tool_name: str, arguments: dict[str, Any]
+) -> dict[str, Any]:
+    resp = await ac.post(
+        "/mcp",
+        json=_rpc("tools/call", {"name": tool_name, "arguments": arguments}),
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    return resp.json()
+
+
+def _content(body: dict[str, Any]) -> dict[str, Any]:
+    return json.loads(body["result"]["content"][0]["text"])
+
+
+# ---------------------------------------------------------------------------
+# list_dlq_messages
+# ---------------------------------------------------------------------------
+
+
+async def test_list_dlq_messages_returns_dead_letter_jobs(
+    mcp_client, db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
+) -> None:
+    ac, _ = mcp_client
+    db_session.add(
+        Job(
+            tenant_id=default_tenant.id,
+            user_id=test_user.id,
+            type=JobType.CSV_UPLOAD.value,
+            status=JobStatus.DEAD_LETTER.value,
+            error_message="csv parse failed",
+            retry_count=3,
+            trace_id="trace-dlq-1",
+        )
+    )
+    db_session.add(
+        Job(
+            tenant_id=default_tenant.id,
+            user_id=test_user.id,
+            type=JobType.BULK_API_SYNC.value,
+            status=JobStatus.COMPLETED.value,
+        )
+    )
+    await db_session.flush()
+
+    token = await _token(
+        db_session, default_tenant.id, [Scope.INCIDENTS_READ.value]
+    )
+    body = await _call(ac, token, "list_dlq_messages", {})
+    assert "result" in body, body
+    payload = _content(body)
+    assert payload["total"] == 1
+    assert payload["items"][0]["type"] == JobType.CSV_UPLOAD.value
+    assert payload["items"][0]["error_message"] == "csv parse failed"
+
+
+async def test_list_dlq_messages_wrong_scope_forbidden(
+    mcp_client, db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
+) -> None:
+    ac, _ = mcp_client
+    token = await _token(
+        db_session, default_tenant.id, [Scope.TELEMETRY_READ.value]
+    )
+    body = await _call(ac, token, "list_dlq_messages", {})
+    assert body["error"]["code"] == protocol.MCP_FORBIDDEN
+
+
+# ---------------------------------------------------------------------------
+# get_trace / search_traces
+# ---------------------------------------------------------------------------
+
+
+async def test_get_trace_returns_matching_job(
+    mcp_client, db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
+) -> None:
+    ac, _ = mcp_client
+    db_session.add(
+        Job(
+            tenant_id=default_tenant.id,
+            user_id=test_user.id,
+            type=JobType.CSV_UPLOAD.value,
+            status=JobStatus.COMPLETED.value,
+            trace_id="trace-abc-123",
+        )
+    )
+    await db_session.flush()
+
+    token = await _token(
+        db_session, default_tenant.id, [Scope.INCIDENTS_READ.value]
+    )
+    payload = _content(
+        await _call(
+            ac, token, "get_trace", {"trace_id": "trace-abc-123"}
+        )
+    )
+    assert payload["trace_id"] == "trace-abc-123"
+    assert len(payload["jobs"]) == 1
+    assert payload["jobs"][0]["status"] == JobStatus.COMPLETED.value
+
+
+async def test_search_traces_filters_by_status(
+    mcp_client, db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
+) -> None:
+    ac, _ = mcp_client
+    for i in range(3):
+        db_session.add(
+            Job(
+                tenant_id=default_tenant.id,
+                user_id=test_user.id,
+                type=JobType.CSV_UPLOAD.value,
+                status=JobStatus.FAILED.value,
+                trace_id=f"tr-failed-{i}",
+            )
+        )
+    db_session.add(
+        Job(
+            tenant_id=default_tenant.id,
+            user_id=test_user.id,
+            type=JobType.CSV_UPLOAD.value,
+            status=JobStatus.COMPLETED.value,
+            trace_id="tr-ok-1",
+        )
+    )
+    await db_session.flush()
+
+    token = await _token(
+        db_session, default_tenant.id, [Scope.INCIDENTS_READ.value]
+    )
+    payload = _content(
+        await _call(
+            ac,
+            token,
+            "search_traces",
+            {"status": JobStatus.FAILED.value, "limit": 10},
+        )
+    )
+    trace_ids = {m["trace_id"] for m in payload["matches"]}
+    assert trace_ids == {"tr-failed-0", "tr-failed-1", "tr-failed-2"}
+
+
+# ---------------------------------------------------------------------------
+# get_dag_state
+# ---------------------------------------------------------------------------
+
+
+async def test_get_dag_state_returns_parents_and_children(
+    mcp_client, db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
+) -> None:
+    ac, _ = mcp_client
+    parent = Job(
+        tenant_id=default_tenant.id,
+        user_id=test_user.id,
+        type=JobType.CSV_UPLOAD.value,
+        status=JobStatus.COMPLETED.value,
+    )
+    seed = Job(
+        tenant_id=default_tenant.id,
+        user_id=test_user.id,
+        type=JobType.REPORT_GEN.value,
+        status=JobStatus.RUNNING.value,
+    )
+    child = Job(
+        tenant_id=default_tenant.id,
+        user_id=test_user.id,
+        type=JobType.BULK_API_SYNC.value,
+        status=JobStatus.WAITING.value,
+    )
+    for j in (parent, seed, child):
+        db_session.add(j)
+    await db_session.flush()
+
+    db_session.add(JobDependency(job_id=seed.id, depends_on_job_id=parent.id))
+    db_session.add(JobDependency(job_id=child.id, depends_on_job_id=seed.id))
+    await db_session.flush()
+
+    token = await _token(
+        db_session, default_tenant.id, [Scope.INCIDENTS_READ.value]
+    )
+    payload = _content(
+        await _call(
+            ac, token, "get_dag_state", {"job_id": str(seed.id)}
+        )
+    )
+    ids = {n["id"] for n in payload["nodes"]}
+    assert ids == {str(parent.id), str(seed.id), str(child.id)}
+    # Two edges: seed -> parent (upward) and child -> seed (downward).
+    assert len(payload["edges"]) == 2
+
+
+async def test_get_dag_state_unknown_job_404(
+    mcp_client, db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
+) -> None:
+    ac, _ = mcp_client
+    token = await _token(
+        db_session, default_tenant.id, [Scope.INCIDENTS_READ.value]
+    )
+    body = await _call(
+        ac,
+        token,
+        "get_dag_state",
+        {"job_id": str(uuid.uuid4())},
+    )
+    assert body["error"]["code"] == protocol.MCP_TOOL_ERROR
+    assert body["error"]["data"]["error_code"] == "not_found"
+
+
+# ---------------------------------------------------------------------------
+# health
+# ---------------------------------------------------------------------------
+
+
+async def test_get_redis_health_returns_stats(
+    mcp_client, db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
+) -> None:
+    ac, _ = mcp_client
+    token = await _token(
+        db_session, default_tenant.id, [Scope.TELEMETRY_READ.value]
+    )
+    payload = _content(await _call(ac, token, "get_redis_health", {}))
+    assert payload["ok"] is True
+    assert payload["connected_clients"] == 3
+    assert payload["used_memory_bytes"] == 12_500_000
+
+
+async def test_get_postgres_health_reports_dialect(
+    mcp_client, db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
+) -> None:
+    ac, _ = mcp_client
+    token = await _token(
+        db_session, default_tenant.id, [Scope.TELEMETRY_READ.value]
+    )
+    payload = _content(await _call(ac, token, "get_postgres_health", {}))
+    assert payload["ok"] is True
+    assert payload["dialect"] == "sqlite"
+    # Non-Postgres branch skips the pg_stat_activity read.
+    assert payload["active_connections"] is None
+
+
+# ---------------------------------------------------------------------------
+# get_deploy_history
+# ---------------------------------------------------------------------------
+
+
+async def test_get_deploy_history_reads_env(
+    mcp_client, db_session: AsyncSession, default_tenant, monkeypatch  # type: ignore[no-untyped-def]
+) -> None:
+    ac, _ = mcp_client
+    monkeypatch.setenv("APP_VERSION", "v0.4.0-test")
+    monkeypatch.setenv("APP_REVISION", "abc1234")
+
+    token = await _token(
+        db_session, default_tenant.id, [Scope.TELEMETRY_READ.value]
+    )
+    payload = _content(await _call(ac, token, "get_deploy_history", {}))
+    assert payload["total"] == 1
+    entry = payload["entries"][0]
+    assert entry["version"] == "v0.4.0-test"
+    assert entry["revision"] == "abc1234"
+
+
+async def test_get_deploy_history_reports_unknown_when_env_missing(
+    mcp_client, db_session: AsyncSession, default_tenant, monkeypatch  # type: ignore[no-untyped-def]
+) -> None:
+    ac, _ = mcp_client
+    for k in ("APP_VERSION", "APP_REVISION", "BACKEND_IMAGE_TAG"):
+        monkeypatch.delenv(k, raising=False)
+    token = await _token(
+        db_session, default_tenant.id, [Scope.TELEMETRY_READ.value]
+    )
+    payload = _content(await _call(ac, token, "get_deploy_history", {}))
+    assert payload["entries"][0]["version"] == "unknown"
+
+
+# ---------------------------------------------------------------------------
+# list_incidents / get_incident
+# ---------------------------------------------------------------------------
+
+
+async def test_list_incidents_defaults_to_unresolved(
+    mcp_client, db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
+) -> None:
+    ac, _ = mcp_client
+    db_session.add(
+        Alert(
+            tenant_id=default_tenant.id,
+            severity="warning",
+            source="slo",
+            title="Active",
+        )
+    )
+    db_session.add(
+        Alert(
+            tenant_id=default_tenant.id,
+            severity="info",
+            source="dlq",
+            title="Resolved",
+            resolved_at=datetime.now(UTC),
+        )
+    )
+    await db_session.flush()
+
+    token = await _token(
+        db_session, default_tenant.id, [Scope.INCIDENTS_READ.value]
+    )
+    payload = _content(await _call(ac, token, "list_incidents", {}))
+    titles = {i["title"] for i in payload["incidents"]}
+    assert titles == {"Active"}
+
+
+async def test_list_incidents_include_resolved_returns_both(
+    mcp_client, db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
+) -> None:
+    ac, _ = mcp_client
+    db_session.add(
+        Alert(
+            tenant_id=default_tenant.id,
+            severity="info",
+            source="s",
+            title="A",
+        )
+    )
+    db_session.add(
+        Alert(
+            tenant_id=default_tenant.id,
+            severity="warning",
+            source="s",
+            title="B",
+            resolved_at=datetime.now(UTC),
+        )
+    )
+    await db_session.flush()
+
+    token = await _token(
+        db_session, default_tenant.id, [Scope.INCIDENTS_READ.value]
+    )
+    payload = _content(
+        await _call(ac, token, "list_incidents", {"include_resolved": True})
+    )
+    titles = {i["title"] for i in payload["incidents"]}
+    assert titles == {"A", "B"}
+
+
+async def test_get_incident_returns_row_by_id(
+    mcp_client, db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
+) -> None:
+    ac, _ = mcp_client
+    alert = Alert(
+        tenant_id=default_tenant.id,
+        severity="critical",
+        source="chaos",
+        title="Chaos test",
+        extra_data={"reason": "manual"},
+    )
+    db_session.add(alert)
+    await db_session.flush()
+
+    token = await _token(
+        db_session, default_tenant.id, [Scope.INCIDENTS_READ.value]
+    )
+    payload = _content(
+        await _call(ac, token, "get_incident", {"id": str(alert.id)})
+    )
+    assert payload["title"] == "Chaos test"
+    assert payload["severity"] == "critical"
+    assert payload["extra_data"] == {"reason": "manual"}
+
+
+async def test_get_incident_unknown_id_returns_not_found(
+    mcp_client, db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
+) -> None:
+    ac, _ = mcp_client
+    token = await _token(
+        db_session, default_tenant.id, [Scope.INCIDENTS_READ.value]
+    )
+    body = await _call(
+        ac, token, "get_incident", {"id": str(uuid.uuid4())}
+    )
+    assert body["error"]["code"] == protocol.MCP_TOOL_ERROR
+    assert body["error"]["data"]["error_code"] == "not_found"
