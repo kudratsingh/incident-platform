@@ -8,6 +8,7 @@ the registry before the first request lands.
 """
 
 from app.mcp.tools import (  # noqa: F401
+    actions,
     chaos,
     consumer_lag,
     dag_state,

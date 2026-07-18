@@ -25,6 +25,11 @@ from app.core.logging import get_logger, request_id_var
 from app.mcp import protocol as p
 from app.mcp.registry import ToolContext, get_tool, list_tools
 from app.repositories.audit import AuditRepository
+from app.repositories.idempotency import IdempotencyRepository
+from app.services.idempotency import (
+    IdempotencyKeyReusedError,
+    IdempotencyService,
+)
 from app.services.operator_audit import (
     OUTCOME_ERROR,
     OUTCOME_SUCCESS,
@@ -206,6 +211,81 @@ async def handle_tools_call(
     scope_used = (
         tool_def.required_scope.value if tool_def.required_scope else None
     )
+
+    # Idempotency check (Tier 1 actions only). A repeat call with the
+    # same (tenant, principal, key) + matching arguments returns the
+    # cached response without invoking the handler. Same key +
+    # different args refuses with IdempotencyKeyReusedError (409).
+    idempotency_key: str | None = None
+    idempotency_service: IdempotencyService | None = None
+    if tool_def.is_idempotent:
+        idempotency_service = IdempotencyService(IdempotencyRepository(ctx.db))
+        idempotency_key = _extract_idempotency_key(call_params.arguments)
+        if idempotency_key is None:
+            await record_tool_invocation(
+                audit_repo,
+                principal=ctx.principal,
+                tool_name=tool_def.name,
+                arguments=call_params.arguments,
+                scope_used=scope_used,
+                latency_ms=(time.perf_counter() - start) * 1000,
+                outcome=OUTCOME_ERROR,
+                error_message="idempotency_key required",
+                request_id=request_id_var.get("") or None,
+                is_chaos=is_chaos,
+            )
+            return _error(
+                request_id,
+                p.JSONRPC_INVALID_PARAMS,
+                "idempotency_key is required for this tool",
+            )
+        try:
+            hit = await idempotency_service.lookup(
+                principal=ctx.principal,
+                tool_name=tool_def.name,
+                idempotency_key=idempotency_key,
+                arguments=call_params.arguments,
+            )
+        except IdempotencyKeyReusedError as exc:
+            await record_tool_invocation(
+                audit_repo,
+                principal=ctx.principal,
+                tool_name=tool_def.name,
+                arguments=call_params.arguments,
+                scope_used=scope_used,
+                latency_ms=(time.perf_counter() - start) * 1000,
+                outcome=OUTCOME_ERROR,
+                error_message=exc.message,
+                request_id=request_id_var.get("") or None,
+                is_chaos=is_chaos,
+            )
+            return _error(
+                request_id,
+                p.MCP_TOOL_ERROR,
+                exc.message,
+                {"error_code": exc.error_code},
+            )
+        if hit is not None:
+            await record_tool_invocation(
+                audit_repo,
+                principal=ctx.principal,
+                tool_name=tool_def.name,
+                arguments=call_params.arguments,
+                scope_used=scope_used,
+                latency_ms=(time.perf_counter() - start) * 1000,
+                outcome=OUTCOME_SUCCESS,
+                request_id=request_id_var.get("") or None,
+                is_chaos=is_chaos,
+            )
+            result = p.ToolCallResult(
+                content=[
+                    p.ToolCallContent(
+                        text=_serialize_cached_response(hit.response)
+                    )
+                ]
+            )
+            return _ok(request_id, result.model_dump())
+
     try:
         output = await tool_def.handler(parsed_input, ctx)
     except AuthenticationError as exc:
@@ -290,6 +370,17 @@ async def handle_tools_call(
         is_chaos=is_chaos,
     )
 
+    # Persist the response under the idempotency key so a repeat call
+    # with the same key returns the same result verbatim.
+    if idempotency_service is not None and idempotency_key is not None:
+        await idempotency_service.store(
+            principal=ctx.principal,
+            tool_name=tool_def.name,
+            idempotency_key=idempotency_key,
+            arguments=call_params.arguments,
+            response=output.model_dump(mode="json"),
+        )
+
     # Emit the tool result as a single text content block whose body is
     # the JSON-serialized output model. Structured content is the norm
     # for our tools; the MCP `text` content type is a lowest-common
@@ -298,6 +389,26 @@ async def handle_tools_call(
         content=[p.ToolCallContent(text=output.model_dump_json())]
     )
     return _ok(request_id, result.model_dump())
+
+
+def _extract_idempotency_key(arguments: dict[str, Any]) -> str | None:
+    """Idempotent tools declare `idempotency_key: str` in their input
+    model. We read the value out of raw arguments (pre-Pydantic parse)
+    so the check can run before/after model validation without
+    ambiguity."""
+    value = arguments.get("idempotency_key")
+    if isinstance(value, str) and value:
+        return value
+    return None
+
+
+def _serialize_cached_response(response: dict[str, Any]) -> str:
+    """Re-serialize a cached response to the same wire shape a fresh
+    execution would produce. `default=str` mirrors what
+    `model_dump_json()` does for datetimes."""
+    import json as _json
+
+    return _json.dumps(response, default=str)
 
 
 # ---------------------------------------------------------------------------
