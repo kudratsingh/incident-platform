@@ -7,6 +7,10 @@ The MCP standalone app imports this package once at startup, populating
 the registry before the first request lands.
 """
 
-from app.mcp.tools import consumer_lag  # noqa: F401
+from app.mcp.tools import (  # noqa: F401
+    chaos,
+    consumer_lag,
+    list_active_alerts,
+)
 
 __all__: list[str] = []

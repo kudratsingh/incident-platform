@@ -117,6 +117,27 @@ class Settings(BaseSettings):
     # service deduplicates anyway, but pulling 100k rows is wasteful.
     llm_digest_max_error_samples: int = 1000
 
+    # ------------------------------------------------------------------
+    # Chaos framework — see ADR 0008.
+    #
+    # Off by default. Terraform validation refuses `chaos_enabled=true`
+    # in the production workspace; `assert_chaos_gate()` below enforces
+    # the same invariant at boot even if TF were somehow bypassed.
+    # ------------------------------------------------------------------
+    chaos_enabled: bool = False
+
+    # ------------------------------------------------------------------
+    # Alert emission — outbound signed webhook + poll fallback.
+    #
+    # `alert_webhook_url` is optional. When unset, alerts still get
+    # persisted (visible via `list_active_alerts` MCP tool), just not
+    # pushed. The secret signs the body with HMAC-SHA256; consumers
+    # verify with the same secret.
+    # ------------------------------------------------------------------
+    alert_webhook_url: str | None = None
+    alert_webhook_secret: str | None = None
+    alert_webhook_timeout_seconds: float = 5.0
+
     # Tracing — set to http://localhost:4318 locally (Jaeger), or X-Ray OTLP endpoint in prod
     otlp_endpoint: str | None = None
 
@@ -128,3 +149,20 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
+
+
+def assert_chaos_gate(settings: Settings | None = None) -> None:
+    """Refuse to boot when chaos is enabled in a production-labelled env.
+
+    Called from the main FastAPI lifespan and the MCP standalone
+    entrypoint — belt and braces on top of Terraform's own validation
+    (see `infra/variables.tf`). Any misconfiguration here should crash
+    the process at import/startup, never at first chaos-tool call.
+    """
+    if settings is None:
+        settings = get_settings()
+    if settings.chaos_enabled and settings.environment == "production":
+        raise RuntimeError(
+            "CHAOS_ENABLED is true but ENVIRONMENT is 'production'. "
+            "Chaos tools must never be reachable from prod. See ADR 0008."
+        )
