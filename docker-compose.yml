@@ -102,6 +102,34 @@ services:
       - ./backend:/app/backend
     command: uvicorn backend.app.main:app --host 0.0.0.0 --port 8000 --reload
 
+  mcp:
+    # Same image as `app`, different command. See ADR 0006 — the MCP
+    # server is a standalone process built from the same codebase and
+    # imports the service layer directly. Small DB pool matched to its
+    # rate limits.
+    build: .
+    ports:
+      - "8001:8001"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/incident_platform
+      REDIS_URL: redis://redis:6379/0
+      ENVIRONMENT: development
+      DEBUG: "true"
+      OTLP_ENDPOINT: http://jaeger:4318
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app/backend
+    command: uvicorn backend.app.mcp.standalone:app --host 0.0.0.0 --port 8001 --reload
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   frontend:
     build:
       context: ./frontend
