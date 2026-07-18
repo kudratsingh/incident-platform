@@ -31,7 +31,7 @@ class ToolContext:
     session, Redis client, and authenticated principal — no globals."""
 
     db: AsyncSession
-    redis: Redis  # type: ignore[type-arg]
+    redis: Redis
     principal: Principal
 
 

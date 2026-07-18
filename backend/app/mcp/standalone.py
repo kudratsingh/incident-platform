@@ -66,7 +66,7 @@ def create_mcp_app() -> FastAPI:
         payload: dict[str, Any],
         request: Request,
         db: AsyncSession = Depends(get_db),
-        redis: Redis = Depends(get_redis),  # type: ignore[type-arg]
+        redis: Redis = Depends(get_redis),
         principal_or_error: Principal | AppError = Depends(_principal_or_error),
     ) -> JSONResponse:
         try:

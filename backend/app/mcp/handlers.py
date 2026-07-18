@@ -297,7 +297,7 @@ async def dispatch(
     request: p.JsonRpcRequest,
     *,
     db: AsyncSession,
-    redis: Redis,  # type: ignore[type-arg]
+    redis: Redis,
     principal_or_error: Any,
 ) -> p.JsonRpcResponse:
     """Route a parsed JSON-RPC request to the right handler.
