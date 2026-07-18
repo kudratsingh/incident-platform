@@ -7,6 +7,12 @@ registry (see `app/mcp/chaos.py`).
 Add new chaos tools by importing their module below.
 """
 
-from app.mcp.tools.chaos import kill_consumer  # noqa: F401
+from app.mcp.tools.chaos import (  # noqa: F401
+    bad_deploy,
+    inject_latency,
+    kill_consumer,
+    poison_message,
+    saturate_redis,
+)
 
 __all__: list[str] = []
