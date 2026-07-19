@@ -42,15 +42,20 @@ def upgrade() -> None:
     # Backfill: every current role=admin user in the default tenant becomes
     # a platform admin. Without this, a freshly upgraded deployment would
     # have zero platform admins and no way to create tenants.
+    #
+    # The tenant id is interpolated as a literal rather than a bound
+    # parameter. `sa.text().bindparams()` inside `op.execute()` corrupts
+    # multi-line SQL on asyncpg (the WHERE clause gets eaten during
+    # parameter binding) — verified against alembic 1.13 + sqlalchemy
+    # 2.0 + asyncpg. Safe here because the value is a hardcoded
+    # constant, not user input.
     op.execute(
-        sa.text(
-            """
-            UPDATE users
-               SET is_platform_admin = true
-             WHERE role = 'admin'
-               AND tenant_id = :tid
-            """
-        ).bindparams(tid=_DEFAULT_TENANT_ID)
+        f"""
+        UPDATE users
+           SET is_platform_admin = true
+         WHERE role = 'admin'
+           AND tenant_id = '{_DEFAULT_TENANT_ID}'
+        """
     )
 
 

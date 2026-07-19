@@ -35,17 +35,18 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     )
 
     # Import here to avoid circular imports at module load time
-    from app.dependencies import _engine, get_session_factory
-    from app.models.base import Base
+    from app.dependencies import get_session_factory
     from app.workers.dispatcher import worker_loop
     from app.workers.kafka_producer import start_producer, stop_producer
 
-    # In production, run `alembic upgrade head` before starting the app.
-    # This create_all is kept only as a dev convenience for fresh environments.
-    if settings.environment != "production":
-        async with _engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
-        logger.info("database tables ready (dev: create_all)")
+    # Schema is materialised by `alembic upgrade head`, run from
+    # scripts/entrypoint.sh in prod and from the docker-compose
+    # `command:` in dev. A previous version of this lifespan also called
+    # `Base.metadata.create_all` here as a "dev convenience," which
+    # created a Frankenstein state on first boot: create_all built every
+    # current table but the alembic_version row still pointed at the
+    # initial revision, so the next alembic run would find tables already
+    # existing and refuse to advance. Removed.
 
     # Kafka producer — if broker is unreachable we log and continue so the API
     # still boots; publish_* calls will then no-op via the producer's internal
