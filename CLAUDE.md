@@ -57,6 +57,7 @@ What's actually shipped (as of the most recent merge):
 | 11 — Real-time Stream Analytics | 🟡 Not started | — |
 | 12 — Multi-tenancy | ✅ Complete | model + auth `#35`, enforcement `#36`, RLS + partitioning + quotas `#37`, platform admin `#38` |
 | 13 — Disaster Recovery & Chaos | 🟡 Not started | — |
+| 14 — Real Job Processors | 🟡 Deferred (post-agent) | — |
 
 **Runtime topology that's actually running** (post-Phase-12):
 
@@ -591,6 +592,17 @@ All four services use `client.messages.parse(..., output_format=SomePydanticMode
 - **Chaos tests in CI** — `litmus` or `gremlin` injects controlled failures: kill the dispatcher mid-job, drop the broker, partition the DB, simulate DNS failure. Each test asserts the system recovers within an expected window.
 - **Backup restore drill** — automated weekly job that restores from snapshot to a scratch RDS instance, runs a smoke test, and reports.
 - **Focus:** real distributed systems chops — verifying assumptions about failure modes rather than just talking about them.
+
+### Phase 14: Real Job Processors 🟡
+
+Deferred until the incident-commander agent is wired up and driving eval scenarios against the platform. Today's processors (`app/workers/async_tasks.py`, `thread_adapters.py`, `cpu_processors.py`) simulate work with sleeps + progress updates + deliberate failure paths — intentional for the agent story (deterministic behaviour, easy failure injection, no external side effects during eval runs). Once the agent's Phase 6 remediation loop is stable, these upgrade to do real work so the platform demo has substance beyond the infrastructure story.
+
+- **`csv_upload`** — accept a real file upload via `POST /jobs` multipart, stream to MinIO/S3, parse rows with progress updates every 1000 rows, write parse results back to storage, emit row counts to CloudWatch.
+- **`bulk_api_sync`** — hit a real third-party HTTP API (Anthropic, GitHub, or a stub echo service), page through results with rate-limit backoff, persist to the DB. Exercises the circuit-breaker from Phase 6.
+- **`report_gen`** — generate a real PDF from job data (matplotlib or WeasyPrint), upload to storage, emit a signed URL back on completion. Demonstrates the multiprocessing pool actually doing CPU-heavy work.
+- **`doc_analysis`** — extract text from an uploaded PDF (PyMuPDF or pdfplumber), run a real Anthropic call for summarisation when `LLM_TRIAGE_ENABLED=true`, persist the summary.
+- **Real failure modes** — each processor gains realistic failure surfaces: partial file corruption in `csv_upload`, 429s in `bulk_api_sync`, OOM guards in `doc_analysis`. These become new eval-scenario fodder for the agent.
+- **Focus:** turning the platform demo from "look at the infrastructure" into "look at the infrastructure moving real work through it" — mostly UX polish for stakeholders who don't read the audit log. Zero impact on the agent's investigation surface (observability is already there).
 
 ---
 
