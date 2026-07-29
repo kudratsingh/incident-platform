@@ -60,11 +60,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             import sys as _sys
 
             _sys.path.insert(0, "/app")
-            # `scripts/` lives outside the backend package and is
-            # mounted at runtime, so mypy can't see it during static
-            # analysis. This branch only runs when SEED_EVAL_FIXTURES=true,
-            # which requires the mount to exist.
-            from scripts.seed_eval_fixtures import (  # type: ignore[import-not-found]
+            # `scripts/` is mounted at runtime and picked up as an
+            # implicit namespace package (no __init__.py). This branch
+            # only runs when SEED_EVAL_FIXTURES=true, which requires
+            # the mount to exist. The two-code ignore covers both
+            # Python 3.12 (finds it via namespace) and 3.13 (doesn't).
+            from scripts.seed_eval_fixtures import (  # type: ignore[import-not-found,unused-ignore]
                 seed,
                 write_pins_json,
             )

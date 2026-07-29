@@ -46,6 +46,7 @@ import os
 import sys
 import uuid
 from datetime import UTC, datetime, timedelta
+from typing import Any, cast
 
 # Allow running from project root without installing the package.
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "backend"))
@@ -448,7 +449,9 @@ async def _seed_dlq(session: AsyncSession, tenant: Tenant, user: User) -> None:
         ).scalar_one_or_none()
         if existing_t is not None:
             continue
-        t = spec["triage"]
+        # `spec["triage"]` is typed as `object` in the container dict;
+        # cast to a concrete mapping so mypy on py3.12 can index it.
+        t = cast("dict[str, Any]", spec["triage"])
         session.add(
             JobTriage(
                 id=triage_id,
