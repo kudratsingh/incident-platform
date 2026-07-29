@@ -79,6 +79,25 @@ services:
     environment:
       COLLECTOR_OTLP_ENABLED: "true"
 
+  migrate:
+    # Single dedicated migration runner. app + mcp both `depends_on`
+    # this with `condition: service_completed_successfully`, so exactly
+    # one process ever executes `alembic upgrade head`. An earlier
+    # arrangement had app + mcp each run migrations on boot; concurrent
+    # `CREATE TABLE` statements race on Postgres's `pg_type` uniqueness
+    # and the loser 500s. Deterministic serialisation kills the race.
+    build: .
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/incident_platform
+      PYTHONPATH: /app/backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app/backend
+    command: ["alembic", "-c", "/app/alembic.ini", "upgrade", "head"]
+    restart: "no"
+
   app:
     build: .
     ports:
@@ -97,6 +116,12 @@ services:
       # compose `command:` below bypasses that script so we need this
       # explicitly. If you edit the command, keep PYTHONPATH aligned.
       PYTHONPATH: /app/backend
+      # Opt-in — populate deploy_markers / alerts / DLQ / dag with
+      # realistic data during boot. Idempotent. Off by default; the
+      # incident-commander agent flips this on in its own compose so
+      # `make eval-live` runs against a seeded platform without a
+      # separate step.
+      SEED_EVAL_FIXTURES: "false"
     depends_on:
       postgres:
         condition: service_healthy
@@ -104,6 +129,8 @@ services:
         condition: service_healthy
       redpanda:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     volumes:
       - ./backend:/app/backend
       # scripts/ isn't in the Dockerfile COPY list (only entrypoint.sh
@@ -111,20 +138,21 @@ services:
       # baked into the image. Mount the whole directory so
       # `docker compose exec app python scripts/<name>.py` just works.
       - ./scripts:/app/scripts
-    # Run alembic BEFORE uvicorn so schema is at head before requests
-    # land. Alembic reads /app/alembic.ini which points at
-    # /app/backend/alembic — hence WORKDIR=/app (Dockerfile default).
-    # PYTHONPATH above lets `app.main:app` resolve from any cwd.
     command:
-      - sh
-      - -c
-      - "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
+      - uvicorn
+      - app.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --reload
 
   mcp:
     # Same image as `app`, different command. See ADR 0006 — the MCP
     # server is a standalone process built from the same codebase and
     # imports the service layer directly. Small DB pool matched to its
-    # rate limits.
+    # rate limits. Depends on `migrate` completing, so schema is at
+    # head before any tool query lands.
     build: .
     ports:
       - "8001:8001"
@@ -134,23 +162,25 @@ services:
       ENVIRONMENT: development
       DEBUG: "true"
       OTLP_ENDPOINT: http://jaeger:4318
-      # See the `app` service PYTHONPATH note above — same reason.
       PYTHONPATH: /app/backend
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     volumes:
       - ./backend:/app/backend
-    # See the `app` service — same PYTHONPATH note, and we also wait
-    # for alembic to finish before starting uvicorn. Racing on
-    # migrations is safe (advisory lock) but starting the MCP process
-    # against a half-migrated schema isn't.
+      - ./scripts:/app/scripts
     command:
-      - sh
-      - -c
-      - "alembic upgrade head && uvicorn app.mcp.standalone:app --host 0.0.0.0 --port 8001 --reload"
+      - uvicorn
+      - app.mcp.standalone:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8001"
+      - --reload
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8001/healthz"]
       interval: 10s

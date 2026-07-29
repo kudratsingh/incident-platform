@@ -118,6 +118,17 @@ class Settings(BaseSettings):
     llm_digest_max_error_samples: int = 1000
 
     # ------------------------------------------------------------------
+    # Live-eval fixtures — set True in the incident-commander agent's
+    # compose so `docker compose up` produces a platform stack with
+    # realistic seed data on every boot. Runs `seed_eval_fixtures.py`
+    # from the app lifespan after migrations, before serving requests.
+    # Idempotent (all IDs are `uuid5`-derived) so re-boots are safe.
+    #
+    # Default False — production doesn't want synthetic DLQ jobs.
+    # ------------------------------------------------------------------
+    seed_eval_fixtures: bool = False
+
+    # ------------------------------------------------------------------
     # Chaos framework — see ADR 0008.
     #
     # Off by default. Terraform validation refuses `chaos_enabled=true`

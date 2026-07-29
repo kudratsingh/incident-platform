@@ -15,6 +15,7 @@ One test class per tool grouping:
 from __future__ import annotations
 
 import json
+import pathlib
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -459,6 +460,64 @@ async def test_get_deploy_history_environment_filter(
     assert payload["source"] == "deploy_markers"
     assert payload["total"] == 1
     assert payload["entries"][0]["environment"] == "prod"
+
+
+async def test_get_deploy_history_falls_back_to_env_on_db_error(
+    mcp_client, db_session: AsyncSession, default_tenant, monkeypatch  # type: ignore[no-untyped-def]
+) -> None:
+    """The P0 fix — if the deploy_markers query blows up (missing table
+    during a staged rollout, transient connection issue, etc.) the tool
+    must NOT surface HTTP 500. It falls back to the env-based synthetic
+    entry and stamps `source: env` with a note explaining the fallback."""
+    from sqlalchemy.exc import ProgrammingError
+
+    monkeypatch.setenv("APP_VERSION", "v0.9.9-fallback")
+
+    async def _boom(*args, **kwargs):
+        raise ProgrammingError(
+            "SELECT deploy_markers", {}, Exception("relation does not exist")
+        )
+
+    from app.repositories.deploy_marker import DeployMarkerRepository
+
+    monkeypatch.setattr(DeployMarkerRepository, "list_recent", _boom)
+
+    ac, _ = mcp_client
+    token = await _token(
+        db_session, default_tenant.id, [Scope.TELEMETRY_READ.value]
+    )
+    payload = _content(await _call(ac, token, "get_deploy_history", {}))
+    assert payload["source"] == "env"
+    assert payload["total"] == 1
+    entry = payload["entries"][0]
+    assert entry["version"] == "v0.9.9-fallback"
+    assert "deploy_markers query failed" in entry["notes"]
+
+
+async def test_seed_pins_manifest_shape() -> None:
+    """The pin manifest that the seed script writes to
+    `/app/eval-fixtures-pins.json` — scenarios pin against these UUIDs,
+    so the shape needs to be stable."""
+    import sys
+
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[3]))
+    from scripts.seed_eval_fixtures import collect_pins  # type: ignore
+
+    manifest = collect_pins()
+    assert "seed_user_id" in manifest
+    assert set(manifest["consumer_groups"]) >= {
+        "billing-consumer",
+        "orders-consumer",
+        "notifications-consumer",
+        "analytics-consumer",
+        "payments-consumer",
+        "shipping-consumer",
+        "healthy-consumer",
+    }
+    assert isinstance(manifest["alerts"], list) and len(manifest["alerts"]) >= 3
+    assert any(a["state"] == "active" for a in manifest["alerts"])
+    assert any(a["state"] == "resolved" for a in manifest["alerts"])
+    assert "dag" in manifest and "seed_job_id" in manifest["dag"]
 
 
 # ---------------------------------------------------------------------------

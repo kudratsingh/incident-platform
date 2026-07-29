@@ -48,6 +48,42 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # initial revision, so the next alembic run would find tables already
     # existing and refuse to advance. Removed.
 
+    # Live-eval fixtures — opt-in via SEED_EVAL_FIXTURES=true. Runs the
+    # same script the operator would invoke via `make seed-eval-fixtures`,
+    # inline in the lifespan so the agent's `docker compose up` produces
+    # a stack with realistic data without a separate step. Idempotent —
+    # every ID is `uuid5`-derived, so re-boots are safe. Runs after
+    # migrations (which the compose command executes first) so the
+    # deploy_markers / alerts / etc. tables exist.
+    if settings.seed_eval_fixtures:
+        try:
+            import sys as _sys
+
+            _sys.path.insert(0, "/app")
+            # `scripts/` lives outside the backend package and is
+            # mounted at runtime, so mypy can't see it during static
+            # analysis. This branch only runs when SEED_EVAL_FIXTURES=true,
+            # which requires the mount to exist.
+            from scripts.seed_eval_fixtures import (  # type: ignore[import-not-found]
+                seed,
+                write_pins_json,
+            )
+
+            await seed()
+            pins_path = write_pins_json()
+            logger.info(
+                "seeded eval fixtures",
+                extra={"pins_path": pins_path},
+            )
+        except Exception as exc:
+            # Never let a seed failure block boot — worst case the tools
+            # return empty responses (already handled defensively in each
+            # tool). Log loud so operators notice.
+            logger.error(
+                "eval fixture seed failed",
+                extra={"error_type": type(exc).__name__, "error": str(exc)[:400]},
+            )
+
     # Kafka producer — if broker is unreachable we log and continue so the API
     # still boots; publish_* calls will then no-op via the producer's internal
     # error handling.

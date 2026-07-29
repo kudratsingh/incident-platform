@@ -612,15 +612,21 @@ def _print_pins() -> None:
     print()
 
 
-async def main() -> None:
-    engine = create_async_engine(_DB_URL, echo=False)
+async def seed(
+    database_url: str = _DB_URL,
+    redis_url: str = _REDIS_URL,
+    tenant_slug: str = _TENANT_SLUG,
+) -> None:
+    """Programmatic entry point — usable from tests and the app
+    lifespan's `SEED_EVAL_FIXTURES=true` path. No stdout output."""
+    engine = create_async_engine(database_url, echo=False)
     factory = async_sessionmaker(engine, expire_on_commit=False)
-    redis = aioredis.from_url(_REDIS_URL, decode_responses=True)
+    redis = aioredis.from_url(redis_url, decode_responses=True)
 
     try:
         async with factory() as session:
             async with session.begin():
-                tenant = await _ensure_tenant(session, _TENANT_SLUG)
+                tenant = await _ensure_tenant(session, tenant_slug)
                 user = await _ensure_seed_user(session, tenant)
                 await _seed_deploys(session, tenant.id)
                 await _seed_alerts(session, tenant.id)
@@ -633,7 +639,69 @@ async def main() -> None:
         await redis.aclose()
         await engine.dispose()
 
+
+def collect_pins() -> dict[str, object]:
+    """Structured pin manifest — the JSON shape written to disk by
+    `write_pins_json`. Scenarios that pin specific IDs load this
+    instead of scraping stdout."""
+    return {
+        "seed_user_id": str(stable("seed-user")),
+        "consumer_groups": {
+            group: {"expected_lag": lag} for group, lag in _CONSUMER_LAGS.items()
+        },
+        "deploys": [
+            {
+                "version": spec["version"],
+                "environment": spec["environment"],
+                "notes": spec["notes"],
+            }
+            for spec in _deploy_rows(None)
+        ],
+        "alerts": [
+            {
+                "id": str(spec["id"]),
+                "source": spec["source"],
+                "severity": spec["severity"],
+                "state": "resolved" if spec["resolved_at"] else "active",
+            }
+            for spec in _alert_rows(uuid.uuid4())
+        ],
+        "dlq_jobs": [
+            {"id": str(spec["job_id"]), "type": spec["type"]}
+            for spec in _dlq_specs()
+        ],
+        "failed_traces": [
+            spec["trace_id"] for spec in _failed_trace_specs()
+        ],
+        "dag": {
+            "seed_job_id": str(stable("dag-seed-job")),
+            "parent_job_id": str(stable("dag-parent-job")),
+            "child_job_id": str(stable("dag-child-job")),
+        },
+    }
+
+
+def write_pins_json(path: str = "/app/eval-fixtures-pins.json") -> str:
+    """Write the pin manifest to `path` (default a well-known location
+    inside the app container). Returns the path so the caller can log
+    or print it."""
+    import json
+    import pathlib
+
+    p = pathlib.Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(collect_pins(), indent=2, sort_keys=True))
+    return str(p)
+
+
+async def main() -> None:
+    await seed()
+    try:
+        pins_path = write_pins_json()
+    except OSError as exc:
+        pins_path = f"(could not write pins file: {exc})"
     _print_pins()
+    print(f"pins manifest: {pins_path}")
     print("Done. All fixtures are idempotent — re-runs are safe.")
 
 
