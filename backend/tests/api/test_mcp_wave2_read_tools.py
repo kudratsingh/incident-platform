@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest_asyncio
@@ -359,7 +359,7 @@ async def test_get_postgres_health_reports_dialect(
 # ---------------------------------------------------------------------------
 
 
-async def test_get_deploy_history_reads_env(
+async def test_get_deploy_history_env_fallback_when_table_empty(
     mcp_client, db_session: AsyncSession, default_tenant, monkeypatch  # type: ignore[no-untyped-def]
 ) -> None:
     ac, _ = mcp_client
@@ -370,6 +370,7 @@ async def test_get_deploy_history_reads_env(
         db_session, default_tenant.id, [Scope.TELEMETRY_READ.value]
     )
     payload = _content(await _call(ac, token, "get_deploy_history", {}))
+    assert payload["source"] == "env"
     assert payload["total"] == 1
     entry = payload["entries"][0]
     assert entry["version"] == "v0.4.0-test"
@@ -386,7 +387,129 @@ async def test_get_deploy_history_reports_unknown_when_env_missing(
         db_session, default_tenant.id, [Scope.TELEMETRY_READ.value]
     )
     payload = _content(await _call(ac, token, "get_deploy_history", {}))
+    assert payload["source"] == "env"
     assert payload["entries"][0]["version"] == "unknown"
+
+
+async def test_get_deploy_history_prefers_deploy_markers_table(
+    mcp_client, db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
+) -> None:
+    """When rows exist in `deploy_markers`, the tool reads from there
+    instead of falling back to env — the source flips to
+    `deploy_markers` and rows come back in newest-first order."""
+    from app.models.deploy_marker import DeployMarker
+
+    now = datetime.now(UTC)
+    db_session.add(
+        DeployMarker(
+            version="v0.4.2",
+            revision="c9f4d02",
+            image_tag="v0.4.2",
+            environment="prod",
+            deployed_at=now - timedelta(hours=6),
+            notes="correlated with billing failures",
+        )
+    )
+    db_session.add(
+        DeployMarker(
+            version="v0.4.1",
+            environment="prod",
+            deployed_at=now - timedelta(hours=18),
+        )
+    )
+    await db_session.flush()
+
+    ac, _ = mcp_client
+    token = await _token(
+        db_session, default_tenant.id, [Scope.TELEMETRY_READ.value]
+    )
+    payload = _content(await _call(ac, token, "get_deploy_history", {}))
+    assert payload["source"] == "deploy_markers"
+    assert payload["total"] == 2
+    # Newest first
+    assert payload["entries"][0]["version"] == "v0.4.2"
+    assert (
+        payload["entries"][0]["notes"] == "correlated with billing failures"
+    )
+
+
+async def test_get_deploy_history_environment_filter(
+    mcp_client, db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
+) -> None:
+    from app.models.deploy_marker import DeployMarker
+
+    now = datetime.now(UTC)
+    db_session.add(
+        DeployMarker(version="v0.4.0", environment="prod", deployed_at=now)
+    )
+    db_session.add(
+        DeployMarker(
+            version="v0.4.0-rc1", environment="staging", deployed_at=now
+        )
+    )
+    await db_session.flush()
+
+    ac, _ = mcp_client
+    token = await _token(
+        db_session, default_tenant.id, [Scope.TELEMETRY_READ.value]
+    )
+    payload = _content(
+        await _call(ac, token, "get_deploy_history", {"environment": "prod"})
+    )
+    assert payload["source"] == "deploy_markers"
+    assert payload["total"] == 1
+    assert payload["entries"][0]["environment"] == "prod"
+
+
+# ---------------------------------------------------------------------------
+# get_consumer_lag — dynamic key derivation
+# ---------------------------------------------------------------------------
+
+
+async def test_get_consumer_lag_arbitrary_group_reads_correct_key(
+    mcp_client, db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
+) -> None:
+    """Any group name derives its Redis key — no hardcoded map."""
+    ac, redis_stub = mcp_client
+    redis_stub._store["kafka:consumer_lag:billing-consumer"] = "15000"
+
+    token = await _token(
+        db_session, default_tenant.id, [Scope.TELEMETRY_READ.value]
+    )
+    payload = _content(
+        await _call(
+            ac,
+            token,
+            "get_consumer_lag",
+            {"consumer_group": "billing-consumer"},
+        )
+    )
+    assert payload["consumer_group"] == "billing-consumer"
+    assert payload["lag"] == 15000
+    assert payload["cache_key"] == "kafka:consumer_lag:billing-consumer"
+
+
+async def test_get_consumer_lag_unknown_group_returns_null_not_error(
+    mcp_client, db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
+) -> None:
+    """Unknown groups return lag: null — never an error. Defensive per
+    the incident-commander live-eval spec (one scenario probes an
+    unknown group intentionally)."""
+    ac, _ = mcp_client
+    token = await _token(
+        db_session, default_tenant.id, [Scope.TELEMETRY_READ.value]
+    )
+    payload = _content(
+        await _call(
+            ac,
+            token,
+            "get_consumer_lag",
+            {"consumer_group": "never-existed"},
+        )
+    )
+    assert payload["consumer_group"] == "never-existed"
+    assert payload["lag"] is None
+    assert payload["cache_key"] == "kafka:consumer_lag:never-existed"
 
 
 # ---------------------------------------------------------------------------

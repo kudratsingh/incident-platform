@@ -190,6 +190,40 @@ Backend reads from environment directly. Key variables:
 docker compose up --build
 ```
 
+### Convenience Makefile targets
+
+Once the stack is up, `make help` lists every target. The ones you'll hit most:
+
+| Target | What it does |
+|---|---|
+| `make up` / `make down` | Bring the stack up (rebuild + detach) / stop it |
+| `make logs` | Tail the backend logs |
+| `make migrate` | Apply pending Alembic migrations (idempotent) |
+| `make seed-incident-commander` | Create the `incident-commander` service account and print a fresh scoped token (paste into the agent's `.env` as `PLATFORM_MCP_TOKEN`) |
+| `make seed-eval-fixtures` | Populate the platform with realistic data for the incident-commander agent's live eval suite |
+| `make mcp-probe STEP=<preset>` | Smoke-test one MCP surface via `scripts/mcp_probe.sh`. `STEP` is one of `initialize`, `tools`, `lag`, `dlq`, `audit`, `forbidden` |
+
+### Seeding realistic data for the agent's live eval suite
+
+The incident-commander agent's live eval scenarios (`use_live_mcp: true` in scenario definitions) probe the platform's MCP surface and grade the responses against expected shapes. On a fresh stack most tools return empty or null — realistic scenarios need seeded data.
+
+```bash
+make seed-eval-fixtures
+```
+
+That populates, idempotently:
+
+- **Redis consumer lag** for 8 groups (`billing-consumer` at 15k, `payments-consumer` at 30k, `shipping-consumer` at 100k, `healthy-consumer` at 0, etc.) — makes `get_consumer_lag` return realistic values instead of null
+- **`deploy_markers` table** — 6 recent deploys across `prod` and `staging`, one annotated `notes: "correlated with billing failures"` for the deploy-correlation scenario
+- **`alerts` table** — mix of 3 active + 2 resolved alerts across `kafka` / `dlq` / `api` / `db` sources (the alert-storm scenario expects `total >= 3` active)
+- **DLQ jobs + `job_triages`** — three realistic dead-lettered entries (send_email SMTP refused, process_payment Stripe timeout, csv_upload bad row) each with a populated triage block
+- **Failed jobs with trace_ids** — two jobs in the last hour with matching audit rows so `get_trace(trace_id)` returns a real graph
+- **Dependency DAG** — a stable three-node parent → seed → child that `get_dag_state(seed_id)` walks
+
+The script prints a **EVAL FIXTURE PINS** report on completion listing every deterministic UUID. Scenarios that pin specific IDs (e.g. "look up this DAG root") should paste from that report.
+
+Re-runs are safe (every ID is `uuid5`-derived, existing rows are skipped) so `make eval-live` on the agent side can rerun without churn.
+
 ---
 
 ## Testing

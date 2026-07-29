@@ -1,5 +1,6 @@
 from app.models.alert import Alert
 from app.models.audit import AuditLog
+from app.models.deploy_marker import DeployMarker
 from app.models.digest import IncidentDigest
 from app.models.event_log import JobEvent
 from app.models.idempotency import IdempotencyRecord
@@ -15,6 +16,7 @@ from app.models.user import User
 __all__ = [
     "Alert",
     "AuditLog",
+    "DeployMarker",
     "IdempotencyRecord",
     "IncidentDigest",
     "Job",
