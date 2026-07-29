@@ -1,34 +1,59 @@
 """
-`get_consumer_lag` — the first tool the incident-commander agent calls.
+`get_consumer_lag` — read the Redis-cached Kafka consumer lag.
 
-Reads the Redis-cached lag value the platform's metrics loop populates
-every ~60s (`kafka:consumer_lag:worker-dispatcher`). Doesn't touch
-Kafka — that would add latency and defeat the point of the cache. If
-the cache is empty or expired we return `null` and let the agent decide
-what "unknown" means.
+Reads `kafka:consumer_lag:{group}` from Redis. The key convention
+matches what the metrics loop writes for the platform's own
+`worker-dispatcher` group; the eval seed script populates the same
+key shape for the synthetic groups scenarios probe against.
 
-Requires `telemetry:read`. First real exercise of the whole pipeline:
-scope check → tool dispatch → service-layer call → audit row.
+Any group name is accepted. Unknown groups return `lag: null` rather
+than erroring — the agent's LLM decides what "unknown" means for the
+scenario at hand (defensive, matches the tool's original semantics).
+
+Requires `telemetry:read`.
 """
 
 from app.core.scopes import Scope
 from app.mcp.registry import ToolContext, tool
-from app.utils.backpressure import BACKPRESSURE_LAG_KEY
 from pydantic import BaseModel, ConfigDict, Field
+
+# Prefix must match what the metrics loop (`_metrics_loop` in
+# `app/workers/dispatcher.py`) and the eval seed script both use.
+# Kept as a module constant so any three call sites stay aligned.
+_CONSUMER_LAG_KEY_PREFIX = "kafka:consumer_lag:"
+
+
+def _redis_key(group: str) -> str:
+    return f"{_CONSUMER_LAG_KEY_PREFIX}{group}"
+
+
+# Groups the eval seed script populates. Advertised in the input
+# description so `tools/list` gives the agent a concrete menu.
+# Passing a name outside this list is still allowed — it just returns
+# `lag: null` if there's no Redis value for that key.
+SEEDED_CONSUMER_GROUPS = (
+    "worker-dispatcher",
+    "billing-consumer",
+    "orders-consumer",
+    "notifications-consumer",
+    "analytics-consumer",
+    "payments-consumer",
+    "shipping-consumer",
+    "healthy-consumer",
+)
 
 
 class GetConsumerLagInput(BaseModel):
-    """No arguments today. The `consumer_group` field is a forward hook
-    — once we expose more groups than `worker-dispatcher` (Wave 2), the
-    agent will pass a specific group name. Defaulting to
-    `worker-dispatcher` preserves the read shape until then."""
-
     model_config = ConfigDict(extra="forbid")
 
     consumer_group: str = Field(
         default="worker-dispatcher",
-        description="Kafka consumer group to inspect. Only "
-        "'worker-dispatcher' is exposed today.",
+        description=(
+            "Kafka consumer group to inspect. Seeded groups: "
+            + ", ".join(SEEDED_CONSUMER_GROUPS)
+            + ". Any other name is accepted and returns lag: null when "
+            "the platform has no cached value for it."
+        ),
     )
 
 
@@ -36,27 +61,25 @@ class GetConsumerLagOutput(BaseModel):
     consumer_group: str
     lag: int | None = Field(
         description="Messages the group is behind, per the metrics loop's "
-        "last emission. `null` means the cache is empty or expired — "
-        "typically <60s after worker startup or a Redis restart."
+        "last emission (or the eval seed script). `null` when the cache "
+        "is empty — typical for unknown groups or a Redis restart within "
+        "the last ~60s."
     )
     cache_key: str = Field(
         description="Diagnostic — the Redis key the value was read from."
     )
 
 
-# Only one group exposed today; the map exists so Wave 2 can add
-# `event-log`, `read-model`, etc. by adding a row.
-_KEY_BY_GROUP = {
-    "worker-dispatcher": BACKPRESSURE_LAG_KEY,
-}
-
-
 @tool(
     "get_consumer_lag",
     description=(
-        "Read the last-emitted Kafka consumer lag for one of the platform's "
-        "consumer groups. Values come from the metrics loop's Redis cache — "
-        "no live Kafka query. Returns null when the cache is empty."
+        "Read the last-emitted Kafka consumer lag for one of the "
+        "platform's consumer groups. Values come from a Redis cache — "
+        "no live Kafka query. Returns null when the cache is empty. "
+        "Advertised groups include worker-dispatcher (real platform "
+        "group) plus 7 eval-seed groups (billing-consumer, "
+        "orders-consumer, notifications-consumer, analytics-consumer, "
+        "payments-consumer, shipping-consumer, healthy-consumer)."
     ),
     input_model=GetConsumerLagInput,
     output_model=GetConsumerLagOutput,
@@ -65,16 +88,7 @@ _KEY_BY_GROUP = {
 async def get_consumer_lag(
     inp: GetConsumerLagInput, ctx: ToolContext
 ) -> GetConsumerLagOutput:
-    key = _KEY_BY_GROUP.get(inp.consumer_group)
-    if key is None:
-        # Unknown group — reveal exactly what we support so the agent's
-        # LLM can self-correct on the next call.
-        return GetConsumerLagOutput(
-            consumer_group=inp.consumer_group,
-            lag=None,
-            cache_key=f"(no cache key for group '{inp.consumer_group}')",
-        )
-
+    key = _redis_key(inp.consumer_group)
     raw = await ctx.redis.get(key)
     lag: int | None
     if raw is None:
@@ -84,9 +98,16 @@ async def get_consumer_lag(
             lag = int(raw)
         except (TypeError, ValueError):
             lag = None
-
     return GetConsumerLagOutput(
         consumer_group=inp.consumer_group,
         lag=lag,
         cache_key=key,
     )
+
+
+__all__ = [
+    "SEEDED_CONSUMER_GROUPS",
+    "GetConsumerLagInput",
+    "GetConsumerLagOutput",
+    "get_consumer_lag",
+]
