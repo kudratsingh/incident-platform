@@ -13,6 +13,18 @@ class ServiceAccountCreate(BaseModel):
     )
 
 
+class ServiceAccountScopesUpdate(BaseModel):
+    """PATCH payload — replaces the SA's scope set. Existing tokens
+    keep the scope subset they were minted with; fresh tokens use the
+    updated set."""
+
+    scopes: list[str] = Field(
+        min_length=0,
+        description="Full replacement scope list. Pass every scope the "
+        "account should have; anything omitted is dropped.",
+    )
+
+
 class ServiceAccountResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

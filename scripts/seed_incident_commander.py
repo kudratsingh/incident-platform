@@ -99,19 +99,35 @@ async def _ensure_service_account(
     name: str,
     scopes: list[str],
 ) -> tuple[object, bool]:
-    """Return (service_account, created). Idempotent — an existing SA
-    is returned as-is; scopes on it are NOT modified (that's an admin
-    operation, not a seed one)."""
-    sa_repo = ServiceAccountRepository(session)
-    existing = await sa_repo.get_by_name(tenant_id, name)
-    if existing is not None:
-        return existing, False
+    """Return (service_account, created). Idempotent.
 
+    On re-run against an existing SA, this now widens the scope set
+    to match the requested list (previously left it alone). That
+    matches the operator's expectation when re-running with a wider
+    SA_SCOPES — e.g. after Phase 6 needs `chaos:invoke` +
+    `actions:execute` added onto the existing incident-commander
+    account without recreating it (which would invalidate every
+    outstanding token).
+
+    `update_scopes` itself is a no-op when the sorted scope lists
+    match, so re-runs with identical SA_SCOPES don't flood the audit
+    log."""
+    sa_repo = ServiceAccountRepository(session)
     service = ServiceAccountService(
         sa_repo,
         ServiceAccountTokenRepository(session),
         AuditRepository(session),
     )
+
+    existing = await sa_repo.get_by_name(tenant_id, name)
+    if existing is not None:
+        await service.update_scopes(
+            service_account=existing,
+            scopes=scopes,
+            updated_by_user_id=None,
+        )
+        return existing, False
+
     sa = await service.create_service_account(
         tenant_id=tenant_id,
         name=name,

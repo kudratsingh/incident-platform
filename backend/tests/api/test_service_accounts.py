@@ -149,6 +149,160 @@ async def test_revoke_token_returns_204(
 
 
 # ---------------------------------------------------------------------------
+# PATCH /admin/service-accounts/{id} — scope updates
+# ---------------------------------------------------------------------------
+
+
+async def test_patch_widens_scopes(
+    client: AsyncClient, admin_headers: dict[str, str]
+) -> None:
+    sa = await _create_sa(client, admin_headers, [Scope.TELEMETRY_READ.value])
+    resp = await client.patch(
+        f"/api/v1/admin/service-accounts/{sa['id']}",
+        headers=admin_headers,
+        json={
+            "scopes": [
+                Scope.TELEMETRY_READ.value,
+                Scope.INCIDENTS_READ.value,
+                Scope.CHAOS_INVOKE.value,
+                Scope.ACTIONS_EXECUTE.value,
+            ]
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert set(body["scopes"]) == {
+        Scope.TELEMETRY_READ.value,
+        Scope.INCIDENTS_READ.value,
+        Scope.CHAOS_INVOKE.value,
+        Scope.ACTIONS_EXECUTE.value,
+    }
+
+
+async def test_patch_narrows_scopes(
+    client: AsyncClient, admin_headers: dict[str, str]
+) -> None:
+    """Dropping scopes is legitimate too — kill switch for a
+    compromised SA. Verify PATCH accepts a strictly smaller list."""
+    sa = await _create_sa(
+        client,
+        admin_headers,
+        [Scope.TELEMETRY_READ.value, Scope.CHAOS_INVOKE.value],
+    )
+    resp = await client.patch(
+        f"/api/v1/admin/service-accounts/{sa['id']}",
+        headers=admin_headers,
+        json={"scopes": [Scope.TELEMETRY_READ.value]},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["scopes"] == [Scope.TELEMETRY_READ.value]
+
+
+async def test_patch_unknown_scope_403(
+    client: AsyncClient, admin_headers: dict[str, str]
+) -> None:
+    sa = await _create_sa(client, admin_headers, [Scope.TELEMETRY_READ.value])
+    resp = await client.patch(
+        f"/api/v1/admin/service-accounts/{sa['id']}",
+        headers=admin_headers,
+        json={"scopes": ["not:a:scope"]},
+    )
+    assert resp.status_code == 403
+
+
+async def test_patch_missing_sa_404(
+    client: AsyncClient, admin_headers: dict[str, str]
+) -> None:
+    resp = await client.patch(
+        f"/api/v1/admin/service-accounts/{uuid.uuid4()}",
+        headers=admin_headers,
+        json={"scopes": [Scope.TELEMETRY_READ.value]},
+    )
+    assert resp.status_code == 404
+
+
+async def test_patch_non_admin_forbidden(
+    client: AsyncClient,
+    admin_headers: dict[str, str],
+    auth_headers: dict[str, str],
+) -> None:
+    sa = await _create_sa(client, admin_headers, [Scope.TELEMETRY_READ.value])
+    resp = await client.patch(
+        f"/api/v1/admin/service-accounts/{sa['id']}",
+        headers=auth_headers,
+        json={"scopes": [Scope.TELEMETRY_READ.value]},
+    )
+    assert resp.status_code == 403
+
+
+async def test_patch_idempotent_no_audit_row_when_unchanged(
+    client: AsyncClient, admin_headers: dict[str, str], db_session,  # type: ignore[no-untyped-def]
+) -> None:
+    """update_scopes short-circuits when the new list matches — no
+    audit row written. Confirms re-running seed scripts doesn't flood
+    the audit log."""
+    from app.models.audit import AuditLog
+    from sqlalchemy import select as _select
+
+    sa = await _create_sa(client, admin_headers, [Scope.TELEMETRY_READ.value])
+    # First PATCH — actual change
+    await client.patch(
+        f"/api/v1/admin/service-accounts/{sa['id']}",
+        headers=admin_headers,
+        json={
+            "scopes": [Scope.TELEMETRY_READ.value, Scope.INCIDENTS_READ.value]
+        },
+    )
+    # Second PATCH — same scopes
+    await client.patch(
+        f"/api/v1/admin/service-accounts/{sa['id']}",
+        headers=admin_headers,
+        json={
+            "scopes": [Scope.INCIDENTS_READ.value, Scope.TELEMETRY_READ.value]
+        },
+    )
+    rows = (
+        await db_session.execute(
+            _select(AuditLog).where(
+                AuditLog.action == "service_account.scopes_updated",
+                AuditLog.resource_id == sa["id"],
+            )
+        )
+    ).scalars().all()
+    # Only the first PATCH should have produced a row.
+    assert len(list(rows)) == 1
+
+
+async def test_patch_then_mint_yields_wider_token(
+    client: AsyncClient, admin_headers: dict[str, str]
+) -> None:
+    """After PATCH widens the SA, a newly minted token can carry the
+    added scopes. Old tokens keep their original set — that's the
+    whole point of tokens-are-immutable — but the fresh mint picks up
+    the new capability."""
+    sa = await _create_sa(client, admin_headers, [Scope.TELEMETRY_READ.value])
+    await client.patch(
+        f"/api/v1/admin/service-accounts/{sa['id']}",
+        headers=admin_headers,
+        json={
+            "scopes": [Scope.TELEMETRY_READ.value, Scope.CHAOS_INVOKE.value]
+        },
+    )
+    mint = await client.post(
+        f"/api/v1/admin/service-accounts/{sa['id']}/tokens",
+        headers=admin_headers,
+        json={
+            "scopes": [Scope.TELEMETRY_READ.value, Scope.CHAOS_INVOKE.value]
+        },
+    )
+    assert mint.status_code == 201
+    assert set(mint.json()["token"]["scopes"]) == {
+        Scope.TELEMETRY_READ.value,
+        Scope.CHAOS_INVOKE.value,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Scope-guarded endpoint round-trip
 #
 # We mount a throwaway probe endpoint that requires `telemetry:read` and

@@ -31,6 +31,7 @@ from app.schemas.common import PaginatedResponse
 from app.schemas.service_account import (
     ServiceAccountCreate,
     ServiceAccountResponse,
+    ServiceAccountScopesUpdate,
     TokenMintRequest,
     TokenMintResponse,
     TokenResponse,
@@ -93,6 +94,44 @@ async def list_service_accounts(
         page=page,
         page_size=page_size,
     )
+
+
+@router.patch(
+    "/{sa_id}",
+    response_model=ServiceAccountResponse,
+)
+async def update_service_account_scopes(
+    sa_id: uuid.UUID,
+    payload: ServiceAccountScopesUpdate,
+    tenant_id: uuid.UUID | None = None,
+    current_user: User = Depends(_require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> ServiceAccountResponse:
+    """Replace the service account's scope set.
+
+    Existing tokens keep the scope subset they were minted with —
+    tokens are immutable and independently scoped. Fresh tokens
+    (POST /{id}/tokens) pick up the new set. Common use:
+
+      1. `PATCH /admin/service-accounts/{id}` with the wider scope
+         list (e.g. add `chaos:invoke` + `actions:execute` when the
+         agent moves into Phase 6 remediation)
+      2. `POST /admin/service-accounts/{id}/tokens` to mint a fresh
+         token that carries the new scopes
+      3. Point the agent's PLATFORM_TOKEN at the new value
+
+    Idempotent — a call that changes nothing skips the audit row.
+    """
+    effective_tenant = await resolve_admin_tenant(current_user, db, tenant_id)
+    sa = await ServiceAccountRepository(db).get_by_id(sa_id)
+    if sa is None or sa.tenant_id != effective_tenant:
+        raise NotFoundError(f"Service account not found: {sa_id}")
+    updated = await _service(db).update_scopes(
+        service_account=sa,
+        scopes=payload.scopes,
+        updated_by_user_id=current_user.id,
+    )
+    return ServiceAccountResponse.model_validate(updated)
 
 
 @router.post(
