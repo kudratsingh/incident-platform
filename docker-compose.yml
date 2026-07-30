@@ -122,6 +122,15 @@ services:
       # `make eval-live` runs against a seeded platform without a
       # separate step.
       SEED_EVAL_FIXTURES: "false"
+      # Chaos framework — enabled here for local dev + agent live-eval
+      # remediation scenarios (Phase 6 needs a real broken state to
+      # fix, not a healthy platform to observe). Safe by construction:
+      # `assert_chaos_gate` in app + mcp startup refuses the
+      # (CHAOS_ENABLED=true, ENVIRONMENT=production) combination, and
+      # Terraform's `chaos_enabled` variable validation refuses it in
+      # the production workspace. See ADR 0008. Flip to "false" if you
+      # want a chaos-free local dev stack.
+      CHAOS_ENABLED: "true"
     depends_on:
       postgres:
         condition: service_healthy
@@ -163,6 +172,13 @@ services:
       DEBUG: "true"
       OTLP_ENDPOINT: http://jaeger:4318
       PYTHONPATH: /app/backend
+      # Chaos framework — must match the `app` service's setting.
+      # The @chaos_tool decorators evaluate this at MCP process import
+      # time, so with CHAOS_ENABLED=true the 5 chaos tools register
+      # (kill_consumer, poison_message, saturate_redis, inject_latency,
+      # bad_deploy); with false they're absent from tools/list. See
+      # ADR 0008 for the triple gate.
+      CHAOS_ENABLED: "true"
     depends_on:
       postgres:
         condition: service_healthy
