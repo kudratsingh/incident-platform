@@ -84,6 +84,7 @@ def _mcp_app_with_chaos_enabled(db_session: AsyncSession, redis_stub: _RedisStub
         importlib.reload(chaos_pkg.saturate_redis)  # type: ignore[attr-defined]
         importlib.reload(chaos_pkg.inject_latency)  # type: ignore[attr-defined]
         importlib.reload(chaos_pkg.bad_deploy)  # type: ignore[attr-defined]
+        importlib.reload(chaos_pkg.create_bad_data_job)  # type: ignore[attr-defined]
         from app.mcp.tools import consumer_lag as _cl
         from app.mcp.tools import list_active_alerts as _laa
 
@@ -384,6 +385,59 @@ async def test_poison_message_invokes_kafka_producer(
         teardown()
 
 
+async def test_poison_message_also_writes_replay_safe_dlq_entry(
+    db_session: AsyncSession,
+    default_tenant,  # type: ignore[no-untyped-def]
+    test_user,  # type: ignore[no-untyped-def]
+) -> None:
+    """The synthetic DLQ row is the observable side of the hook — real
+    consumers log-and-drop schema errors, so without this row the
+    agent's remediation loop has nothing to react to."""
+    from app.models.enums import RemediationHint
+    from app.models.job import Job
+    from sqlalchemy import select as _select
+
+    redis_stub = _RedisStub()
+    app, teardown = _mcp_app_with_chaos_enabled(db_session, redis_stub)
+
+    producer = AsyncMock()
+    producer.start = AsyncMock()
+    producer.stop = AsyncMock()
+    producer.send_and_wait = AsyncMock()
+
+    try:
+        with patch("aiokafka.AIOKafkaProducer", return_value=producer):
+            async with AsyncClient(
+                transport=ASGITransport(app=app, raise_app_exceptions=False),
+                base_url="http://test",
+            ) as ac:
+                token = await _token(
+                    db_session, default_tenant.id, [Scope.CHAOS_INVOKE.value]
+                )
+                payload = _content(
+                    await _call(
+                        ac,
+                        token,
+                        "poison_message",
+                        {"topic": "job.submitted", "payload": {}},
+                    )
+                )
+        assert payload["accepted"] is True
+        assert payload["dlq_job_id"] is not None
+        row = (
+            await db_session.execute(
+                _select(Job).where(
+                    Job.id == uuid.UUID(payload["dlq_job_id"])
+                )
+            )
+        ).scalar_one()
+        assert row.status == "dead_letter"
+        assert row.remediation_hint == RemediationHint.REPLAY_SAFE.value
+        assert row.tenant_id == default_tenant.id
+    finally:
+        teardown()
+
+
 # ---------------------------------------------------------------------------
 # Scope enforcement — one representative check per tool is overkill;
 # ADR-0007's dispatch layer already covers this. Do it once against
@@ -412,5 +466,55 @@ async def test_saturate_redis_missing_chaos_scope_is_forbidden(
                 {"num_keys": 5, "value_bytes": 32},
             )
         assert body["error"]["code"] == protocol.MCP_FORBIDDEN
+    finally:
+        teardown()
+
+
+# ---------------------------------------------------------------------------
+# create_bad_data_job — the persistent-bug chaos hook (v0.4.0)
+# ---------------------------------------------------------------------------
+
+
+async def test_create_bad_data_job_inserts_human_required_dlq_entry(
+    db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
+) -> None:
+    """The synthetic DLQ row lands with `remediation_hint=human_required`
+    so `replay_dlq_by_category` refuses to touch it — that's exactly the
+    branch the agent's escalate-not-replay path exercises."""
+    from app.models.enums import RemediationHint
+    from app.models.job import Job
+    from sqlalchemy import select as _select
+
+    redis_stub = _RedisStub()
+    app, teardown = _mcp_app_with_chaos_enabled(db_session, redis_stub)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app, raise_app_exceptions=False),
+            base_url="http://test",
+        ) as ac:
+            token = await _token(
+                db_session, default_tenant.id, [Scope.CHAOS_INVOKE.value]
+            )
+            payload = _content(
+                await _call(
+                    ac, token, "create_bad_data_job", {}
+                )
+            )
+        assert payload["accepted"] is True
+        assert (
+            payload["remediation_hint"]
+            == RemediationHint.HUMAN_REQUIRED.value
+        )
+        rows = (
+            await db_session.execute(
+                _select(Job).where(Job.id == uuid.UUID(payload["job_id"]))
+            )
+        ).scalars().all()
+        assert rows
+        job = rows[0]
+        assert job.status == "dead_letter"
+        assert (
+            job.remediation_hint == RemediationHint.HUMAN_REQUIRED.value
+        )
     finally:
         teardown()

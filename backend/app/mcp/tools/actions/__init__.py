@@ -12,7 +12,10 @@ reference — those live in a sibling package.
 
 from app.mcp.tools.actions import (  # noqa: F401
     invalidate_cache_key,
+    mark_dlq_permanent,
     pause_dag,
+    replay_dlq_by_category,
+    replay_dlq_by_ids,
     replay_dlq_messages,
     restart_consumer_group,
 )

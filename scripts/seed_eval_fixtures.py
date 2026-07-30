@@ -59,7 +59,12 @@ from app.models.audit import (  # noqa: E402
     AuditLog,
 )
 from app.models.deploy_marker import DeployMarker  # noqa: E402
-from app.models.enums import JobStatus, JobType, UserRole  # noqa: E402
+from app.models.enums import (  # noqa: E402
+    JobStatus,
+    JobType,
+    RemediationHint,
+    UserRole,
+)
 from app.models.job import Job  # noqa: E402
 from app.models.job_dependency import JobDependency  # noqa: E402
 from app.models.tenant import Tenant  # noqa: E402
@@ -245,15 +250,48 @@ def _alert_rows(tenant_id: uuid.UUID) -> list[dict[str, object]]:
 
 
 def _dlq_specs() -> list[dict[str, object]]:
-    """Each spec becomes one Job + one JobTriage row. Job types map to
-    the platform's real enum values but error_message names the real
-    intended service (send_email, process_payment) so the agent's LLM
-    reads a realistic string."""
+    """Each spec becomes one Job + one JobTriage row. Each maps to one
+    of the three `remediation_hint` categories the agent branches on:
+
+      * schema-violation  → replay_safe        (fix consumer, replay)
+      * SMTP / stripe     → wait_and_replay    (dep down, retry later)
+      * csv bad-data      → human_required     (persistent bug, escalate)
+
+    Job types use the platform's real enum values but error strings
+    name the intended service (send_email, process_payment) so the
+    agent's LLM reads a realistic string."""
     return [
+        {
+            "job_id": stable("dlq-job-schema-violation"),
+            "triage_id": stable("dlq-triage-schema-violation"),
+            "type": JobType.BULK_API_SYNC.value,
+            "remediation_hint": RemediationHint.REPLAY_SAFE.value,
+            "error_message": (
+                "SchemaValidationError: payload missing required field "
+                "'user_id' (received keys: ['tenant_id', 'action', 'ts'])"
+            ),
+            "retry_count": 3,
+            "created_offset": timedelta(minutes=8),
+            "triage": {
+                "root_cause_category": "schema_violation",
+                "summary": (
+                    "Producer sent a payload missing user_id — schema "
+                    "rejected it three times."
+                ),
+                "suggested_fix": (
+                    "Fix the producer to include user_id, then replay the "
+                    "DLQ entry. Backwards-compatible producer fix + replay "
+                    "is the standard remediation."
+                ),
+                "is_retryable": True,
+                "confidence": 0.91,
+            },
+        },
         {
             "job_id": stable("dlq-job-send-email"),
             "triage_id": stable("dlq-triage-send-email"),
             "type": JobType.BULK_API_SYNC.value,
+            "remediation_hint": RemediationHint.WAIT_AND_REPLAY.value,
             "error_message": (
                 "send_email downstream call failed: "
                 "ConnectionRefusedError('smtp.mailer.internal:587')"
@@ -266,7 +304,8 @@ def _dlq_specs() -> list[dict[str, object]]:
                 "suggested_fix": (
                     "Check smtp.mailer.internal ECS task health; recent "
                     "billing hotfix (v0.4.2) may have changed VPC egress "
-                    "rules — cross-reference `get_deploy_history`."
+                    "rules — cross-reference `get_deploy_history`. Replay "
+                    "once the dependency recovers."
                 ),
                 "is_retryable": True,
                 "confidence": 0.82,
@@ -276,6 +315,7 @@ def _dlq_specs() -> list[dict[str, object]]:
             "job_id": stable("dlq-job-process-payment"),
             "triage_id": stable("dlq-triage-process-payment"),
             "type": JobType.BULK_API_SYNC.value,
+            "remediation_hint": RemediationHint.WAIT_AND_REPLAY.value,
             "error_message": (
                 "process_payment call timed out after 30s: "
                 "TimeoutError('stripe.api')"
@@ -298,6 +338,7 @@ def _dlq_specs() -> list[dict[str, object]]:
             "job_id": stable("dlq-job-csv-parse"),
             "triage_id": stable("dlq-triage-csv-parse"),
             "type": JobType.CSV_UPLOAD.value,
+            "remediation_hint": RemediationHint.HUMAN_REQUIRED.value,
             "error_message": (
                 "ValueError: invalid literal for int() with base 10: "
                 "'not-a-number' at row 15,382"
@@ -433,6 +474,7 @@ async def _seed_dlq(session: AsyncSession, tenant: Tenant, user: User) -> None:
                 payload={"eval_fixture": True},
                 retry_count=spec["retry_count"],
                 error_message=spec["error_message"],
+                remediation_hint=spec.get("remediation_hint"),
                 trace_id=str(stable(f"dlq-trace-{spec['job_id']}")),
                 created_at=created_at,
                 updated_at=created_at,
@@ -670,7 +712,11 @@ def collect_pins() -> dict[str, object]:
             for spec in _alert_rows(uuid.uuid4())
         ],
         "dlq_jobs": [
-            {"id": str(spec["job_id"]), "type": spec["type"]}
+            {
+                "id": str(spec["job_id"]),
+                "type": spec["type"],
+                "remediation_hint": spec.get("remediation_hint"),
+            }
             for spec in _dlq_specs()
         ],
         "failed_traces": [

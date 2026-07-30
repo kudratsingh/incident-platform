@@ -30,6 +30,12 @@ class ListDlqMessagesInput(BaseModel):
         default=None,
         description="Filter to one job type (e.g. `csv_upload`, `report_gen`).",
     )
+    remediation_hint: str | None = Field(
+        default=None,
+        description="Filter to entries the agent should treat one way. "
+        "Values: `replay_safe`, `wait_and_replay`, `human_required`. "
+        "Omit for all categories (including uncategorized).",
+    )
     limit: int = Field(default=50, ge=1, le=200)
 
 
@@ -46,6 +52,13 @@ class DlqEntry(BaseModel):
     type: str
     error_message: str | None = None
     retry_count: int
+    remediation_hint: str | None = Field(
+        default=None,
+        description="Coarse category set by triage / seed / chaos. See "
+        "`RemediationHint` for the fixed value set. `null` means the "
+        "platform hasn't categorized this entry yet — agent should "
+        "treat as unknown, not as replay-safe.",
+    )
     created_at: datetime
     updated_at: datetime | None = None
     trace_id: str | None = None
@@ -62,9 +75,12 @@ class ListDlqMessagesOutput(BaseModel):
     "list_dlq_messages",
     description=(
         "List jobs currently in the dead-letter state, most recent first. "
-        "Includes the LLM triage row for each job when the platform has "
-        "one, so the agent can build on the first-pass analysis instead of "
-        "starting from raw error strings."
+        "Each entry carries `remediation_hint` (`replay_safe`, "
+        "`wait_and_replay`, `human_required`, or null) so the agent can "
+        "pick a strategy without re-reasoning about the error string. "
+        "Filter by `remediation_hint=<value>` to isolate one category — "
+        "e.g. pass `replay_safe` before calling `replay_dlq_by_category`. "
+        "Also includes the LLM triage row when present."
     ),
     input_model=ListDlqMessagesInput,
     output_model=ListDlqMessagesOutput,
@@ -82,6 +98,7 @@ async def list_dlq_messages(
         limit=inp.limit,
         status=JobStatus.DEAD_LETTER.value,
         job_type=inp.job_type,
+        remediation_hint=inp.remediation_hint,
     )
 
     items: list[DlqEntry] = []
@@ -102,6 +119,7 @@ async def list_dlq_messages(
                 type=job.type,
                 error_message=job.error_message,
                 retry_count=job.retry_count,
+                remediation_hint=job.remediation_hint,
                 created_at=job.created_at,
                 updated_at=job.updated_at,
                 trace_id=job.trace_id,

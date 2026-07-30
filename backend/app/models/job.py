@@ -45,6 +45,15 @@ class Job(TimestampMixin, Base):
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     retry_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     max_retries: Mapped[int] = mapped_column(Integer, default=3, nullable=False)
+    # Coarse categorization the agent uses to decide DLQ remediation:
+    #   `replay_safe`      — transient / poison; replay after fix
+    #   `wait_and_replay`  — external dep down; retry after recovery
+    #   `human_required`   — persistent bug; do NOT replay
+    # Set by the LLM triage service (Phase 10) and by the seed script /
+    # chaos hooks. Nullable — only DLQ entries carry a value today.
+    # Kept as a plain string (no CHECK constraint) so new categories can
+    # be added without a schema change.
+    remediation_hint: Mapped[str | None] = mapped_column(String(32), nullable=True)
     # Higher number = higher priority in the queue
     priority: Mapped[int] = mapped_column(Integer, default=0, nullable=False, index=True)
     # Correlation ID from the originating HTTP request, for end-to-end tracing

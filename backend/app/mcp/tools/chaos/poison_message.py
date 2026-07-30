@@ -1,15 +1,21 @@
 """
-`poison_message` — publish a schema-invalid payload to a Kafka topic.
+`poison_message` — publish a schema-invalid payload to a Kafka topic
+AND drop a matching `replay_safe` DLQ entry.
 
-Real effect: the target consumer's `_process_one` catches
-`SchemaValidationError`, logs, commits, and moves on. The metric the
-agent should watch is the corresponding structured-log warning and any
-per-tenant DLQ movement that results.
+Two effects (both observable via `list_dlq_messages` +
+`get_consumer_lag`):
 
-Bypasses the normal `publish_raw` path — that path validates the
-payload and would reject the poison payload before it reached the
-broker. Uses a short-lived aiokafka producer inline so we don't
-touch the shared platform producer's send buffer.
+1. **Kafka side.** Sends a schema-invalid payload; the target
+   consumer's `_process_one` catches `SchemaValidationError`, logs,
+   commits, and moves on. Bypasses `publish_raw` (which validates)
+   using an inline short-lived aiokafka producer.
+
+2. **DLQ side.** Writes a synthetic `jobs` row with
+   `status=dead_letter`, `remediation_hint=replay_safe`, and a
+   realistic error string. That's how the agent's remediation loop
+   sees the poisoning — the platform's real consumers don't route
+   schema errors to DLQ (they log-and-drop), so without this
+   synthetic row the agent would see no downstream effect.
 
 Requires `chaos:invoke`. Registered only when `CHAOS_ENABLED=true`.
 """
@@ -20,7 +26,11 @@ from app.config import get_settings
 from app.core.logging import get_logger
 from app.mcp.chaos import BlastRadius, chaos_tool
 from app.mcp.registry import ToolContext
+from app.models.enums import JobStatus, JobType, RemediationHint
+from app.models.job import Job
+from app.models.user import User
 from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import select
 
 logger = get_logger(__name__)
 
@@ -55,20 +65,27 @@ class PoisonMessageOutput(BaseModel):
     payload_bytes: int
     partition_key: str | None = None
     accepted: bool = Field(
-        description="Whether the send succeeded from the platform's "
-        "perspective. Doesn't guarantee the consumer has processed it — "
-        "the resulting DLQ movement (if any) is observable via "
-        "`list_dlq_messages`."
+        description="Kafka send succeeded from the platform's "
+        "perspective. The paired synthetic DLQ entry is guaranteed."
+    )
+    dlq_job_id: str | None = Field(
+        default=None,
+        description="ID of the synthetic DLQ entry the hook wrote "
+        "(remediation_hint=replay_safe). Observable via "
+        "`list_dlq_messages`. `null` only when no user exists in the "
+        "caller's tenant to attach the job to (defensive)."
     )
 
 
 @chaos_tool(
     "poison_message",
     description=(
-        "Publish a schema-invalid payload to one Kafka topic, bypassing "
-        "the platform's producer-side schema validation. The target "
-        "consumer will parse-fail, log, commit, and move on — this "
-        "exercises the error path without corrupting real messages."
+        "Publish a schema-invalid payload to one Kafka topic AND "
+        "drop a synthetic `replay_safe` DLQ entry the agent's "
+        "remediation loop can act on. Bypasses producer-side "
+        "validation; real consumers log-and-drop schema errors "
+        "rather than routing to DLQ, so the synthetic row makes "
+        "the effect observable through `list_dlq_messages`."
     ),
     input_model=PoisonMessageInput,
     output_model=PoisonMessageOutput,
@@ -94,12 +111,42 @@ async def poison_message(
     finally:
         await producer.stop()
 
+    # Synthetic DLQ entry — the observable effect the agent's
+    # remediation loop keys off. Real consumers log+commit schema
+    # errors rather than routing to DLQ, so without this row the
+    # agent has nothing to hypothesize about.
+    dlq_job_id: str | None = None
+    user = (
+        await ctx.db.execute(
+            select(User).where(User.tenant_id == ctx.principal.tenant_id).limit(1)
+        )
+    ).scalar_one_or_none()
+    if user is not None:
+        error_msg = (
+            f"SchemaValidationError: payload missing required field on "
+            f"topic '{inp.topic}' (chaos poison_message)"
+        )
+        job = Job(
+            tenant_id=ctx.principal.tenant_id,
+            user_id=user.id,
+            type=JobType.BULK_API_SYNC.value,
+            status=JobStatus.DEAD_LETTER.value,
+            payload={"chaos_fixture": "poison_message", "topic": inp.topic},
+            retry_count=3,
+            error_message=error_msg,
+            remediation_hint=RemediationHint.REPLAY_SAFE.value,
+        )
+        ctx.db.add(job)
+        await ctx.db.flush()
+        dlq_job_id = str(job.id)
+
     logger.warning(
         "chaos poison_message sent",
         extra={
             "topic": inp.topic,
             "bytes": len(body),
             "key": inp.partition_key,
+            "dlq_job_id": dlq_job_id,
         },
     )
     return PoisonMessageOutput(
@@ -107,4 +154,5 @@ async def poison_message(
         payload_bytes=len(body),
         partition_key=inp.partition_key,
         accepted=True,
+        dlq_job_id=dlq_job_id,
     )

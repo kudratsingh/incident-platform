@@ -44,6 +44,7 @@ class JobRepository(BaseRepository[Job]):
         created_before: Any = None,
         retry_count_min: int | None = None,
         retry_count_max: int | None = None,
+        remediation_hint: str | None = None,
     ) -> tuple[list[Job], int]:
         filters: list[Any] = [Job.tenant_id == tenant_id]
         if user_id is not None:
@@ -62,6 +63,8 @@ class JobRepository(BaseRepository[Job]):
             filters.append(Job.retry_count >= retry_count_min)
         if retry_count_max is not None:
             filters.append(Job.retry_count <= retry_count_max)
+        if remediation_hint is not None:
+            filters.append(Job.remediation_hint == remediation_hint)
 
         where = and_(*filters)
         total = await self._count(where)
