@@ -10,6 +10,8 @@ Public surface: exactly one route, `POST /mcp`. Everything the agent
 needs is a JSON-RPC method on that endpoint.
 """
 
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 from typing import Any
 
 from app.config import assert_chaos_gate
@@ -32,6 +34,21 @@ from sqlalchemy.ext.asyncio import AsyncSession
 logger = get_logger(__name__)
 
 
+@asynccontextmanager
+async def _mcp_lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
+    """MCP-side startup — schema drift check only. The MCP process
+    doesn't run the worker loop or Kafka producer; it just serves
+    JSON-RPC. But it does hit the DB on every tool call, so a schema
+    behind the code is fatal — see the v0.4.1 postmortem for why we
+    fail loud instead of allowing 500s per call.
+    """
+    from app.core.migration_check import assert_migrations_current
+    from app.dependencies import get_session_factory
+
+    await assert_migrations_current(get_session_factory())
+    yield
+
+
 def create_mcp_app() -> FastAPI:
     """FastAPI factory for the MCP process. Kept as a factory so tests
     can build fresh instances with dependency overrides without touching
@@ -46,6 +63,7 @@ def create_mcp_app() -> FastAPI:
         version=handlers.SERVER_VERSION,
         docs_url=None,
         redoc_url=None,
+        lifespan=_mcp_lifespan,
     )
     app.add_middleware(RequestContextMiddleware)
 

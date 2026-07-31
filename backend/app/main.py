@@ -35,6 +35,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     )
 
     # Import here to avoid circular imports at module load time
+    from app.core.migration_check import assert_migrations_current
     from app.dependencies import get_session_factory
     from app.workers.dispatcher import worker_loop
     from app.workers.kafka_producer import start_producer, stop_producer
@@ -47,6 +48,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # current table but the alembic_version row still pointed at the
     # initial revision, so the next alembic run would find tables already
     # existing and refuse to advance. Removed.
+
+    # Fail fast if the DB is behind the code's alembic head. The v0.4.1
+    # postmortem: `docker compose restart` didn't rerun the migrate
+    # one-shot, so `jobs.remediation_hint` was missing and every DLQ
+    # tool 500'd for hours before an operator spotted it in the logs.
+    # A loud boot failure is strictly better than the silent run.
+    _session_factory = get_session_factory()
+    await assert_migrations_current(_session_factory)
 
     # Live-eval fixtures — opt-in via SEED_EVAL_FIXTURES=true. Runs the
     # same script the operator would invoke via `make seed-eval-fixtures`,
@@ -94,7 +103,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         logger.error("kafka producer failed to start", extra={"error": str(exc)})
 
     redis = get_redis_client()
-    session_factory = get_session_factory()
+    session_factory = _session_factory
     worker_task = asyncio.create_task(worker_loop(session_factory, redis))
 
     yield
