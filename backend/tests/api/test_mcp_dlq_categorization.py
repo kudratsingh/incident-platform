@@ -34,8 +34,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 
 class _RedisStub:
+    """In-memory stand-in that supports the KV + ZSET ops the DLQ
+    tools touch (`get/set/delete` for idempotency; `zadd/zrangebyscore`
+    for scheduled replays). Extend as new op families show up."""
+
     def __init__(self) -> None:
         self._store: dict[str, bytes | str] = {}
+        self._zsets: dict[str, dict[str, float]] = {}
 
     async def get(self, key: str) -> bytes | str | None:
         return self._store.get(key)
@@ -53,6 +58,58 @@ class _RedisStub:
                 del self._store[k]
                 removed += 1
         return removed
+
+    async def zadd(self, key: str, mapping: dict[str, float]) -> int:
+        zset = self._zsets.setdefault(key, {})
+        added = 0
+        for member, score in mapping.items():
+            if member not in zset:
+                added += 1
+            zset[member] = score
+        return added
+
+    async def zrangebyscore(
+        self,
+        key: str,
+        min_score: float | str,
+        max_score: float | str,
+        withscores: bool = False,
+    ) -> list[Any]:
+        zset = self._zsets.get(key, {})
+        lo = float("-inf") if min_score == "-inf" else float(min_score)
+        hi = float("inf") if max_score == "inf" else float(max_score)
+        picked = sorted(
+            [(m, s) for m, s in zset.items() if lo <= s <= hi],
+            key=lambda x: x[1],
+        )
+        return picked if withscores else [m for m, _ in picked]
+
+    def pipeline(self) -> _ZsetPipe:
+        return _ZsetPipe(self._zsets)
+
+    async def zcard(self, key: str) -> int:
+        return len(self._zsets.get(key, {}))
+
+
+class _ZsetPipe:
+    def __init__(self, zsets: dict[str, dict[str, float]]) -> None:
+        self._zsets = zsets
+        self._ops: list[tuple[str, str, str]] = []  # (op, key, member)
+
+    def zrem(self, key: str, member: str) -> _ZsetPipe:
+        self._ops.append(("zrem", key, member))
+        return self
+
+    async def execute(self) -> list[int]:
+        results: list[int] = []
+        for op, key, member in self._ops:
+            zset = self._zsets.get(key, {})
+            if op == "zrem" and member in zset:
+                del zset[member]
+                results.append(1)
+            else:
+                results.append(0)
+        return results
 
 
 @pytest_asyncio.fixture
@@ -398,3 +455,168 @@ async def test_mark_dlq_permanent_refuses_non_dlq(
     )
     assert body["error"]["code"] == protocol.MCP_TOOL_ERROR
     assert body["error"]["data"]["error_code"] == "not_found"
+
+
+# ---------------------------------------------------------------------------
+# delay_seconds — scheduled DLQ replay (wait_and_replay category)
+# ---------------------------------------------------------------------------
+
+
+async def _redis_stub_from_mcp_client(mcp_client) -> _RedisStub:  # type: ignore[no-untyped-def]
+    """Recover the `_RedisStub` the fixture yielded so we can assert
+    ZSET side-effects directly. The fixture's dependency override
+    generator holds it as its bound `redis_stub` closure — we roundtrip
+    through the app to reach it."""
+    app = mcp_client._transport.app  # type: ignore[attr-defined]
+    override = app.dependency_overrides[get_redis]
+    gen = override()
+    stub = await gen.__anext__()
+    return stub  # type: ignore[no-any-return]
+
+
+async def test_replay_dlq_by_ids_immediate_behavior_unchanged_without_delay(
+    mcp_client, db_session, default_tenant, test_user  # type: ignore[no-untyped-def]
+) -> None:
+    """delay_seconds=None (omitted) — same behavior as before v0.4.1."""
+    ids = await _seed_categorized_dlq(db_session, default_tenant, test_user)
+    token = await _token(
+        db_session, default_tenant.id, [Scope.ACTIONS_EXECUTE.value]
+    )
+    payload = _content(
+        await _call(
+            mcp_client,
+            token,
+            "replay_dlq_by_ids",
+            {
+                "job_ids": [str(ids[RemediationHint.REPLAY_SAFE.value])],
+                "idempotency_key": "immediate-no-delay",
+            },
+        )
+    )
+    assert payload["replayed"] == 1
+    assert payload["scheduled"] == 0
+    assert payload["results"][0]["scheduled"] is False
+    assert payload["results"][0]["execute_at"] is None
+
+
+async def test_replay_dlq_by_ids_with_delay_schedules_rather_than_replays(
+    mcp_client, db_session, default_tenant, test_user  # type: ignore[no-untyped-def]
+) -> None:
+    """delay_seconds=N — pushes onto the ZSET, writes a
+    `job.replay_scheduled` audit row, doesn't touch job status."""
+    ids = await _seed_categorized_dlq(db_session, default_tenant, test_user)
+    job_id = ids[RemediationHint.WAIT_AND_REPLAY.value]
+    token = await _token(
+        db_session, default_tenant.id, [Scope.ACTIONS_EXECUTE.value]
+    )
+    payload = _content(
+        await _call(
+            mcp_client,
+            token,
+            "replay_dlq_by_ids",
+            {
+                "job_ids": [str(job_id)],
+                "delay_seconds": 60,
+                "idempotency_key": "delay-60-0001",
+            },
+        )
+    )
+    assert payload["replayed"] == 0
+    assert payload["scheduled"] == 1
+    result = payload["results"][0]
+    assert result["ok"] is True
+    assert result["scheduled"] is True
+    assert result["execute_at"] is not None
+
+    # ZSET has an entry
+    stub = await _redis_stub_from_mcp_client(mcp_client)
+    assert (
+        len(stub._zsets.get("jobs:dlq_replay_delayed", {})) == 1
+    ), "expected one scheduled replay in the ZSET"
+
+    # Job is still in dead_letter — the scheduled path does NOT flip
+    # status; only the eventual promote-loop replay does.
+    still = (
+        await db_session.execute(select(Job).where(Job.id == job_id))
+    ).scalar_one()
+    assert still.status == JobStatus.DEAD_LETTER.value
+
+    # Audit row was written with the delay + execute_at.
+    audit_rows = (
+        await db_session.execute(
+            select(AuditLog).where(AuditLog.action == "job.replay_scheduled")
+        )
+    ).scalars().all()
+    assert list(audit_rows)
+    row = audit_rows[-1]
+    assert row.extra_data is not None
+    assert row.extra_data["delay_seconds"] == 60
+    assert row.extra_data["execute_at"] == result["execute_at"]
+
+
+async def test_replay_dlq_by_ids_delay_seconds_upper_bound_rejected(
+    mcp_client, db_session, default_tenant, test_user  # type: ignore[no-untyped-def]
+) -> None:
+    """delay_seconds > 3600 → Pydantic validation error at the RPC
+    layer (invalid tool arguments), not a tool error."""
+    ids = await _seed_categorized_dlq(db_session, default_tenant, test_user)
+    token = await _token(
+        db_session, default_tenant.id, [Scope.ACTIONS_EXECUTE.value]
+    )
+    body = await _call(
+        mcp_client,
+        token,
+        "replay_dlq_by_ids",
+        {
+            "job_ids": [str(ids[RemediationHint.WAIT_AND_REPLAY.value])],
+            "delay_seconds": 7200,
+            "idempotency_key": "delay-too-big",
+        },
+    )
+    assert "error" in body
+    assert body["error"]["code"] == protocol.JSONRPC_INVALID_PARAMS
+
+
+async def test_replay_dlq_by_category_with_delay_schedules_all_matched(
+    mcp_client, db_session, default_tenant, test_user  # type: ignore[no-untyped-def]
+) -> None:
+    """Bulk category replay + delay — every matched job is scheduled,
+    none are replayed immediately."""
+    # Two wait_and_replay jobs
+    for i in range(2):
+        db_session.add(
+            Job(
+                tenant_id=default_tenant.id,
+                user_id=test_user.id,
+                type=JobType.BULK_API_SYNC.value,
+                status=JobStatus.DEAD_LETTER.value,
+                error_message=f"transient {i}",
+                retry_count=3,
+                remediation_hint=RemediationHint.WAIT_AND_REPLAY.value,
+            )
+        )
+    await db_session.flush()
+
+    token = await _token(
+        db_session, default_tenant.id, [Scope.ACTIONS_EXECUTE.value]
+    )
+    payload = _content(
+        await _call(
+            mcp_client,
+            token,
+            "replay_dlq_by_category",
+            {
+                "category": RemediationHint.WAIT_AND_REPLAY.value,
+                "delay_seconds": 120,
+                "idempotency_key": "cat-delay-0001",
+            },
+        )
+    )
+    assert payload["matched"] == 2
+    assert payload["replayed"] == 0
+    assert payload["scheduled"] == 2
+    assert payload["execute_at"] is not None
+    assert len(payload["job_ids"]) == 2
+
+    stub = await _redis_stub_from_mcp_client(mcp_client)
+    assert len(stub._zsets.get("jobs:dlq_replay_delayed", {})) == 2

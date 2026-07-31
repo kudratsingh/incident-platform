@@ -36,6 +36,7 @@ from app.services import retry_policy
 from app.workers import (
     async_tasks,
     cpu_processors,
+    dlq_replay_scheduler,
     kafka_producer,
     queue,
     thread_adapters,
@@ -571,6 +572,80 @@ async def _promote_delayed_loop(
         await asyncio.sleep(POLL_INTERVAL)
 
 
+async def _promote_dlq_replay_loop(
+    session_factory: async_sessionmaker[AsyncSession],
+    redis: Any,
+) -> None:
+    """
+    Fire operator-scheduled DLQ replays whose delay window has elapsed.
+
+    Distinct from `_promote_delayed_loop` (which handles the retry-cycle
+    ZSET `jobs:delayed`). This one drains
+    `jobs:dlq_replay_delayed` — entries the agent's Tier-1 tools
+    scheduled via `replay_dlq_by_ids(delay_seconds=…)` or
+    `replay_dlq_by_category(delay_seconds=…)`.
+
+    Each due entry hits `JobService.replay_job`, which writes the
+    canonical `job.replayed` audit row and republishes via the outbox
+    — so the eventual execution is indistinguishable from an
+    immediate replay, aside from the paired `job.replay_scheduled`
+    row written at scheduling time.
+    """
+    # Local imports keep the module-level graph flat and match the
+    # style of other supporting loops in this file.
+    from app.repositories.job_dependency import JobDependencyRepository
+    from app.services.job import JobService
+
+    while True:
+        try:
+            ready = await dlq_replay_scheduler.pop_ready(redis)
+            for tenant_id, principal_id, job_id in ready:
+                try:
+                    async with session_factory() as session:
+                        async with session.begin():
+                            service = JobService(
+                                JobRepository(session),
+                                AuditRepository(session),
+                                OutboxRepository(session),
+                                redis,
+                                dep_repo=JobDependencyRepository(session),
+                            )
+                            await service.replay_job(
+                                job_id=job_id,
+                                requesting_user_id=principal_id,
+                                tenant_id=tenant_id,
+                            )
+                    logger.info(
+                        "dlq replay scheduled fired",
+                        extra={
+                            "job_id": str(job_id),
+                            "tenant_id": str(tenant_id),
+                        },
+                    )
+                except Exception as exc:
+                    # Don't re-enqueue on failure — the operator can
+                    # see the missed replay in the audit trail (the
+                    # scheduled row is there, no matching replayed row)
+                    # and re-issue. Auto-retrying could mask a
+                    # permanent problem like "job was deleted."
+                    logger.error(
+                        "dlq replay scheduled fire failed",
+                        extra={
+                            "job_id": str(job_id),
+                            "tenant_id": str(tenant_id),
+                            "error": str(exc),
+                        },
+                    )
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            logger.error(
+                "dlq replay promote loop error", extra={"error": str(exc)}
+            )
+
+        await asyncio.sleep(POLL_INTERVAL)
+
+
 OUTBOX_RELAY_INTERVAL = 1.0  # seconds between outbox polls
 OUTBOX_RELAY_BATCH = 100
 
@@ -709,10 +784,11 @@ async def worker_loop(
         8. triage.run()           — Phase 10: LLM classification of dead-lettered jobs.
 
       Background loops:
-        1. _promote_delayed_loop  — re-publishes delayed retries via the outbox.
-        2. _outbox_relay_loop     — publishes outbox rows to Kafka.
-        3. _metrics_loop          — emits queue/in-flight/lag gauges + cached lag for backpressure.
-        4. _digest_loop           — Phase 10: per-tenant LLM incident summaries (off by default).
+        1. _promote_delayed_loop     — re-publishes delayed retries via outbox.
+        2. _promote_dlq_replay_loop  — fires operator-scheduled DLQ replays.
+        3. _outbox_relay_loop        — publishes outbox rows to Kafka.
+        4. _metrics_loop             — emits gauges + cached lag for backpressure.
+        5. _digest_loop              — Phase 10: per-tenant LLM digests (opt-in).
 
     Cancel signal: cancel all, wait for in-flight jobs, stop all consumers.
     """
@@ -759,6 +835,7 @@ async def worker_loop(
     tasks.extend(
         [
             asyncio.create_task(_promote_delayed_loop(session_factory, redis)),
+            asyncio.create_task(_promote_dlq_replay_loop(session_factory, redis)),
             asyncio.create_task(_outbox_relay_loop(session_factory)),
             asyncio.create_task(_metrics_loop(redis, dispatcher)),
             asyncio.create_task(_digest_loop(session_factory)),
