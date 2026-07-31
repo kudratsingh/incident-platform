@@ -229,7 +229,9 @@ async def test_replay_failed_job() -> None:
     job_repo.get_for_tenant.return_value = failed_job
     job_repo.update_status.return_value = replayed_job
 
-    result = await svc.replay_job(failed_job.id, uuid.uuid4(), tenant_id)
+    result = await svc.replay_job(
+        failed_job.id, tenant_id, requesting_user_id=uuid.uuid4()
+    )
 
     job_repo.update_status.assert_awaited_once()
     audit_repo.log.assert_awaited_once()
@@ -251,7 +253,7 @@ async def test_replay_resets_retry_count_and_error() -> None:
     job_repo.get_for_tenant.return_value = dead_job
     job_repo.update_status.return_value = dead_job
 
-    await svc.replay_job(dead_job.id, uuid.uuid4(), tenant_id)
+    await svc.replay_job(dead_job.id, tenant_id, requesting_user_id=uuid.uuid4())
 
     extra = job_repo.update_status.await_args.kwargs["extra"]
     assert extra["retry_count"] == 0
@@ -270,4 +272,35 @@ async def test_replay_non_failed_job_raises() -> None:
     job_repo.get_for_tenant.return_value = running_job
 
     with pytest.raises(JobError, match="replayed"):
-        await svc.replay_job(running_job.id, uuid.uuid4(), tenant_id)
+        await svc.replay_job(
+            running_job.id, tenant_id, requesting_user_id=uuid.uuid4()
+        )
+
+
+async def test_replay_from_service_account_writes_audit_with_null_user_id() -> None:
+    """Regression: the SA path used to pass the service_account.id as
+    requesting_user_id, which then went into audit_logs.user_id and
+    violated the users FK. Fixed by routing the SA id to principal_id
+    and NULL'ing user_id when principal_type != 'user'. The MCP tools
+    (replay_dlq_by_ids, replay_dlq_by_category, replay_dlq_messages)
+    plus the DLQ-replay promote loop all hit this path."""
+    svc, job_repo, audit_repo, _ = _make_service()
+    tenant_id = uuid.uuid4()
+    sa_id = uuid.uuid4()
+    dead_job = _make_job(status=JobStatus.DEAD_LETTER, tenant_id=tenant_id)
+    job_repo.get_for_tenant.return_value = dead_job
+    job_repo.update_status.return_value = dead_job
+
+    await svc.replay_job(
+        dead_job.id,
+        tenant_id,
+        principal_type="service_account",
+        principal_id=sa_id,
+    )
+
+    kwargs = audit_repo.log.await_args.kwargs
+    assert kwargs["user_id"] is None, (
+        "SA replay must NULL user_id — else the users FK trips"
+    )
+    assert kwargs["principal_type"] == "service_account"
+    assert kwargs["principal_id"] == sa_id

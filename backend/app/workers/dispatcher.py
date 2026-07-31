@@ -610,10 +610,15 @@ async def _promote_dlq_replay_loop(
                                 redis,
                                 dep_repo=JobDependencyRepository(session),
                             )
+                            # Scheduled DLQ replays only come from SA
+                            # callers today (Tier-1 tools). If we grow a
+                            # human path we'd carry principal_type in
+                            # the ZSET member; for now, assume SA.
                             await service.replay_job(
                                 job_id=job_id,
-                                requesting_user_id=principal_id,
                                 tenant_id=tenant_id,
+                                principal_type="service_account",
+                                principal_id=principal_id,
                             )
                     logger.info(
                         "dlq replay scheduled fired",

@@ -237,8 +237,22 @@ class JobService:
         )
 
     async def replay_job(
-        self, job_id: uuid.UUID, requesting_user_id: uuid.UUID, tenant_id: uuid.UUID
+        self,
+        job_id: uuid.UUID,
+        tenant_id: uuid.UUID,
+        *,
+        requesting_user_id: uuid.UUID | None = None,
+        principal_type: str = "user",
+        principal_id: uuid.UUID | None = None,
     ) -> Job:
+        """Replay a failed/dead-letter job.
+
+        Callers pass either a `requesting_user_id` (human path, existing
+        admin endpoint) or an explicit `principal_type='service_account'`
+        + `principal_id=<sa_id>` (machine path, MCP tools). Writing the
+        SA id into `audit_logs.user_id` violates the users FK — that was
+        the bug PR #70 fixes.
+        """
         job = await self.job_repo.get_for_tenant(job_id, tenant_id)
         if not job:
             raise NotFoundError(f"Job {job_id} not found")
@@ -254,10 +268,19 @@ class JobService:
             JobStatus.PENDING,
             extra={"retry_count": 0, "error_message": None, "result": None},
         )
+        audit_user_id: uuid.UUID | None
+        if principal_type == "user":
+            audit_user_id = requesting_user_id
+        else:
+            # SA path — user_id must be NULL (FK to users), machine id
+            # goes in principal_id where it doesn't have a FK.
+            audit_user_id = None
         await self.audit_repo.log(
             "job.replayed",
             tenant_id=job.tenant_id,
-            user_id=requesting_user_id,
+            user_id=audit_user_id,
+            principal_type=principal_type,
+            principal_id=principal_id if principal_id is not None else requesting_user_id,
             job_id=job_id,
             resource_type="job",
             resource_id=str(job_id),
@@ -289,7 +312,10 @@ class JobService:
                 "job_id": str(job_id),
                 "previous_status": job.status,
                 "retry_count": job.retry_count,
-                "replayed_by": str(requesting_user_id),
+                "replayed_by": str(
+                    principal_id if principal_id is not None else requesting_user_id
+                ),
+                "principal_type": principal_type,
             },
         )
         assert updated is not None
