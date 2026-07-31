@@ -172,6 +172,14 @@ services:
       DEBUG: "true"
       OTLP_ENDPOINT: http://jaeger:4318
       PYTHONPATH: /app/backend
+      # poison_message is the only MCP tool that opens a direct Kafka
+      # connection (every other tool routes through the outbox). The
+      # config default is localhost:9092, which inside a container
+      # resolves to the container itself and returns
+      # KafkaConnectionError. Missing this env var on the mcp service
+      # was the reason poison_message returned -32603 in v0.4.0 →
+      # v0.4.2.
+      KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
       # Chaos framework — must match the `app` service's setting.
       # The @chaos_tool decorators evaluate this at MCP process import
       # time, so with CHAOS_ENABLED=true the 5 chaos tools register

@@ -23,6 +23,7 @@ Requires `chaos:invoke`. Registered only when `CHAOS_ENABLED=true`.
 import json
 
 from app.config import get_settings
+from app.core.exceptions import AppError
 from app.core.logging import get_logger
 from app.mcp.chaos import BlastRadius, chaos_tool
 from app.mcp.registry import ToolContext
@@ -31,6 +32,16 @@ from app.models.job import Job
 from app.models.user import User
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
+
+
+class PoisonMessageBrokerUnavailableError(AppError):
+    """Kafka broker isn't reachable from the MCP process. The tool
+    can't drop the poisoned message so the DLQ side-effect also
+    doesn't fire. Returned instead of a generic -32603 so the caller
+    sees a specific, actionable error."""
+
+    status_code = 503
+    error_code = "kafka_unavailable"
 
 logger = get_logger(__name__)
 
@@ -102,14 +113,31 @@ async def poison_message(
     body = json.dumps(inp.payload).encode()
     key_bytes = inp.partition_key.encode() if inp.partition_key else None
 
+    # aiokafka's error class is behind the inline import, so catch
+    # broadly and surface a clean AppError. `start()` is inside the
+    # try so a bootstrap failure still hits `stop()` — otherwise the
+    # producer object leaks with an "Unclosed AIOKafkaProducer"
+    # warning.
     producer = AIOKafkaProducer(
         bootstrap_servers=settings.kafka_bootstrap_servers,
     )
-    await producer.start()
     try:
+        try:
+            await producer.start()
+        except Exception as exc:
+            raise PoisonMessageBrokerUnavailableError(
+                f"Kafka broker not reachable at "
+                f"{settings.kafka_bootstrap_servers}: {exc}"
+            ) from exc
         await producer.send_and_wait(inp.topic, value=body, key=key_bytes)
     finally:
-        await producer.stop()
+        try:
+            await producer.stop()
+        except Exception as exc:  # pragma: no cover — defensive
+            logger.warning(
+                "aiokafka producer stop failed",
+                extra={"error": str(exc)},
+            )
 
     # Synthetic DLQ entry — the observable effect the agent's
     # remediation loop keys off. Real consumers log+commit schema

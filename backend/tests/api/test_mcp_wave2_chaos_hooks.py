@@ -438,6 +438,46 @@ async def test_poison_message_also_writes_replay_safe_dlq_entry(
         teardown()
 
 
+async def test_poison_message_kafka_unreachable_returns_clean_error(
+    db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
+) -> None:
+    """If Kafka is unreachable the tool must return a specific
+    `kafka_unavailable` error, not the generic -32603 mask. And it
+    must not leak the producer object (the `stop()` path always
+    runs). This is the regression class that broke the mcp compose
+    service in v0.4.0 → v0.4.2 when KAFKA_BOOTSTRAP_SERVERS was
+    unset."""
+    redis_stub = _RedisStub()
+    app, teardown = _mcp_app_with_chaos_enabled(db_session, redis_stub)
+
+    producer = AsyncMock()
+    producer.start = AsyncMock(side_effect=OSError("broker down"))
+    producer.stop = AsyncMock()
+    producer.send_and_wait = AsyncMock()
+
+    try:
+        with patch("aiokafka.AIOKafkaProducer", return_value=producer):
+            async with AsyncClient(
+                transport=ASGITransport(app=app, raise_app_exceptions=False),
+                base_url="http://test",
+            ) as ac:
+                token = await _token(
+                    db_session, default_tenant.id, [Scope.CHAOS_INVOKE.value]
+                )
+                body = await _call(
+                    ac,
+                    token,
+                    "poison_message",
+                    {"topic": "job.submitted", "payload": {}},
+                )
+        assert body["error"]["code"] == protocol.MCP_TOOL_ERROR
+        assert body["error"]["data"]["error_code"] == "kafka_unavailable"
+        # Cleanup path ran despite start() raising
+        producer.stop.assert_awaited()
+    finally:
+        teardown()
+
+
 # ---------------------------------------------------------------------------
 # Scope enforcement — one representative check per tool is overkill;
 # ADR-0007's dispatch layer already covers this. Do it once against
