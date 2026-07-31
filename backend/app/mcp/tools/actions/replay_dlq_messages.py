@@ -95,8 +95,9 @@ async def replay_dlq_messages(
         try:
             updated = await service.replay_job(
                 job_id=job.id,
-                requesting_user_id=ctx.principal.id,
                 tenant_id=ctx.principal.tenant_id,
+                principal_type=ctx.principal.kind,
+                principal_id=ctx.principal.id,
             )
             replayed.append(ReplayedJob(id=str(updated.id), type=updated.type))
         except AppError as exc:
