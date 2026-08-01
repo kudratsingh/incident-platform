@@ -109,6 +109,16 @@ _LAG_KEY_PREFIX = "kafka:consumer_lag:"
 # Long TTL so evals don't decay mid-run. Fresh runs re-seed anyway.
 _LAG_TTL_SECONDS = 24 * 3600
 
+# The `remediate_stale_cache_success` eval scenario expects this Redis
+# key to exist with recognisably-stale contents, then invalidates it via
+# `invalidate_cache_key` and observes the delete. Without the seed the
+# scenario can't run live — that gap was FIX_PLAN #19. Reset re-populates
+# it so consecutive scenarios each start from the stale-cache condition.
+_HOT_SET_KEY = "cache:jobs:worker-dispatcher:hot_set"
+# Value is a JSON array of stable job IDs; anyone inspecting it sees
+# obviously-fake "hot" state rather than mistaking it for real cache.
+_HOT_SET_TTL_SECONDS = 24 * 3600
+
 # ---------------------------------------------------------------------------
 # Fixture data — spec matches the incident-commander readiness brief
 # ---------------------------------------------------------------------------
@@ -428,6 +438,61 @@ async def _seed_consumer_lag(redis: aioredis.Redis) -> None:
         )
 
 
+async def _seed_hot_set(redis: aioredis.Redis) -> None:
+    """Populate the `remediate_stale_cache_success` scenario's fixture
+    (FIX_PLAN #19). Value is stable + recognisably fake so an operator
+    inspecting Redis doesn't confuse it with production cache."""
+    import json as _json
+
+    payload = _json.dumps(
+        [
+            str(stable("dlq-job-schema-violation")),
+            str(stable("dlq-job-smtp-transient")),
+            str(stable("dlq-job-csv-baddata")),
+        ]
+    )
+    await redis.set(_HOT_SET_KEY, payload, ex=_HOT_SET_TTL_SECONDS)
+
+
+async def _reset_dlq_state(session: AsyncSession) -> int:
+    """Re-baseline stable() DLQ jobs to their advertised state.
+
+    Live eval scenarios mutate these rows (status → RUNNING/REPLAYED,
+    retry_count reset to 0 on replay, remediation_hint occasionally
+    cleared). Without this reset, the second run of a scenario sees a
+    row in the wrong state and mis-grades — that was FIX_PLAN #7. Only
+    touches the stable() IDs from `_dlq_specs()`; leaves any non-fixture
+    jobs alone.
+
+    Returns the number of rows reset (0 = fixtures already baseline)."""
+    now = datetime.now(UTC)
+    reset_count = 0
+    for spec in _dlq_specs():
+        job_id = spec["job_id"]
+        existing = (
+            await session.execute(select(Job).where(Job.id == job_id))
+        ).scalar_one_or_none()
+        if existing is None:
+            continue  # never seeded; nothing to reset
+        needs_reset = (
+            existing.status != JobStatus.DEAD_LETTER.value
+            or existing.retry_count != spec["retry_count"]
+            or existing.remediation_hint != spec.get("remediation_hint")
+            or existing.error_message != spec["error_message"]
+        )
+        if not needs_reset:
+            continue
+        existing.status = JobStatus.DEAD_LETTER.value
+        existing.retry_count = cast("int", spec["retry_count"])
+        existing.remediation_hint = cast(
+            "str | None", spec.get("remediation_hint")
+        )
+        existing.error_message = cast("str", spec["error_message"])
+        existing.updated_at = now
+        reset_count += 1
+    return reset_count
+
+
 async def _seed_deploys(
     session: AsyncSession, tenant_id: uuid.UUID | None
 ) -> None:
@@ -661,12 +726,26 @@ async def seed(
     database_url: str = _DB_URL,
     redis_url: str = _REDIS_URL,
     tenant_slug: str = _TENANT_SLUG,
-) -> None:
+    reset: bool = False,
+) -> dict[str, int]:
     """Programmatic entry point — usable from tests and the app
-    lifespan's `SEED_EVAL_FIXTURES=true` path. No stdout output."""
+    lifespan's `SEED_EVAL_FIXTURES=true` path. No stdout output.
+
+    `reset=True` re-baselines mutable fixture state that scenarios
+    drift over the course of a live eval run (FIX_PLAN #7):
+      * stable() DLQ jobs get status/retry_count/hint/error_message
+        restored to their spec.
+      * Kafka consumer-lag keys re-written (a scenario that consumed
+        or drove up lag has its cached value replaced).
+      * `cache:jobs:worker-dispatcher:hot_set` re-populated (FIX_PLAN
+        #19 — required for `remediate_stale_cache_success`).
+
+    Returns a small summary dict {'dlq_reset': N} for the caller to
+    log / include in a reset-protocol audit trail."""
     engine = create_async_engine(database_url, echo=False)
     factory = async_sessionmaker(engine, expire_on_commit=False)
     redis = aioredis.from_url(redis_url, decode_responses=True)
+    dlq_reset = 0
 
     try:
         async with factory() as session:
@@ -678,11 +757,16 @@ async def seed(
                 await _seed_dlq(session, tenant, user)
                 await _seed_failed_traces(session, tenant, user)
                 await _seed_dag(session, tenant, user)
+                if reset:
+                    dlq_reset = await _reset_dlq_state(session)
 
         await _seed_consumer_lag(redis)
+        await _seed_hot_set(redis)
     finally:
         await redis.aclose()
         await engine.dispose()
+
+    return {"dlq_reset": dlq_reset}
 
 
 def collect_pins() -> dict[str, object]:
@@ -744,13 +828,36 @@ def write_pins_json(path: str = "/app/eval-fixtures-pins.json") -> str:
 
 
 async def main() -> None:
-    await seed()
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Seed the platform with realistic eval fixtures. "
+            "Idempotent by default; --reset also restores mutable state "
+            "that live scenarios drift (FIX_PLAN #7, #19)."
+        )
+    )
+    parser.add_argument(
+        "--reset",
+        action="store_true",
+        help=(
+            "Re-baseline mutable fixture state: DLQ job status / "
+            "retry_count / remediation_hint; consumer-lag Redis keys; "
+            "the cache:jobs:worker-dispatcher:hot_set key. Safe to run "
+            "against a fresh compose stack (no-op) or between scenarios."
+        ),
+    )
+    args = parser.parse_args()
+
+    summary = await seed(reset=args.reset)
     try:
         pins_path = write_pins_json()
     except OSError as exc:
         pins_path = f"(could not write pins file: {exc})"
     _print_pins()
     print(f"pins manifest: {pins_path}")
+    if args.reset:
+        print(f"reset summary: dlq_reset={summary['dlq_reset']}")
     print("Done. All fixtures are idempotent — re-runs are safe.")
 
 
