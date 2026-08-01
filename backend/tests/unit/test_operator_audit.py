@@ -3,7 +3,7 @@
 the audit-row identity fields."""
 
 import uuid
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 from app.dependencies import Principal
 from app.models.audit import (
@@ -18,6 +18,16 @@ from app.services.operator_audit import (
     TOOL_INVOKED_ACTION,
     record_tool_invocation,
 )
+
+
+def _mock_audit_repo() -> AsyncMock:
+    """AuditRepository double whose `.session.begin_nested()` behaves as an
+    async context manager. `AsyncMock` alone doesn't — sync methods that
+    return an async CM need MagicMock (which auto-implements `__aenter__` /
+    `__aexit__` since 3.8)."""
+    mock = AsyncMock()
+    mock.session = MagicMock()
+    return mock
 
 
 def _sa_principal() -> Principal:
@@ -44,7 +54,7 @@ def _user_principal() -> Principal:
 
 
 async def test_records_success_row_for_service_account() -> None:
-    repo = AsyncMock()
+    repo = _mock_audit_repo()
     principal = _sa_principal()
     await record_tool_invocation(
         repo,
@@ -76,7 +86,7 @@ async def test_records_success_row_for_service_account() -> None:
 
 
 async def test_records_error_row_carries_message() -> None:
-    repo = AsyncMock()
+    repo = _mock_audit_repo()
     await record_tool_invocation(
         repo,
         principal=_sa_principal(),
@@ -94,7 +104,7 @@ async def test_records_error_row_carries_message() -> None:
 
 async def test_records_row_for_human_principal_when_present() -> None:
     """The helper accepts either principal shape — humans get user path."""
-    repo = AsyncMock()
+    repo = _mock_audit_repo()
     principal = _user_principal()
     await record_tool_invocation(
         repo,
@@ -117,7 +127,7 @@ async def test_none_scope_serialized_verbatim() -> None:
     """Some tools (e.g. tools/list) run without a scope requirement — the
     audit row records that as an explicit null rather than dropping the
     field."""
-    repo = AsyncMock()
+    repo = _mock_audit_repo()
     await record_tool_invocation(
         repo,
         principal=_sa_principal(),
@@ -129,3 +139,23 @@ async def test_none_scope_serialized_verbatim() -> None:
     )
     extra = repo.log.call_args.kwargs["extra_data"]
     assert extra["scope_used"] is None
+
+
+async def test_failing_audit_insert_does_not_propagate() -> None:
+    """SAVEPOINT contract (#6): a failing audit insert (FK drift, constraint
+    bug — the replay_job/#70 class) must not surface to the caller. The
+    tool's own success response has to survive an audit-side crash."""
+    repo = _mock_audit_repo()
+    repo.log.side_effect = RuntimeError("audit table constraint violation")
+    # Must not raise — the caller depends on record_tool_invocation being
+    # a best-effort side effect, per the module docstring's contract.
+    await record_tool_invocation(
+        repo,
+        principal=_sa_principal(),
+        tool_name="get_consumer_lag",
+        arguments={"group": "worker-dispatcher"},
+        scope_used="telemetry:read",
+        latency_ms=1.0,
+        outcome=OUTCOME_SUCCESS,
+    )
+    repo.log.assert_awaited_once()

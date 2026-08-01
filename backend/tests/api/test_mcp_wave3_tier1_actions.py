@@ -27,7 +27,7 @@ from app.repositories.service_account import (
     ServiceAccountTokenRepository,
 )
 from app.services.service_account import ServiceAccountService
-from app.workers.kafka_consumer import kill_key_for
+from app.workers.kafka_consumer import kill_key_for, latency_key_for
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -222,6 +222,7 @@ async def test_restart_consumer_group_clears_kill_key(
 ) -> None:
     ac, redis_stub = mcp_client
     redis_stub._store[kill_key_for("worker-dispatcher")] = "killed"
+    redis_stub._store[latency_key_for("worker-dispatcher")] = "2000"
     token = await _token(
         db_session, default_tenant.id, [Scope.ACTIONS_EXECUTE.value]
     )
@@ -237,7 +238,36 @@ async def test_restart_consumer_group_clears_kill_key(
         )
     )
     assert payload["kill_key_cleared"] is True
+    assert payload["latency_key_cleared"] is True
     assert kill_key_for("worker-dispatcher") not in redis_stub._store
+    assert latency_key_for("worker-dispatcher") not in redis_stub._store
+
+
+async def test_restart_consumer_group_clears_injected_latency_without_kill(
+    mcp_client, db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
+) -> None:
+    """inject_latency (no kill) must be remediable by restart alone —
+    the doc-code contract the chaos help text promises (`restart clears
+    the latency by dropping the consumer's Redis state`)."""
+    ac, redis_stub = mcp_client
+    redis_stub._store[latency_key_for("worker-dispatcher")] = "2000"
+    token = await _token(
+        db_session, default_tenant.id, [Scope.ACTIONS_EXECUTE.value]
+    )
+    payload = _content(
+        await _call(
+            ac,
+            token,
+            "restart_consumer_group",
+            {
+                "consumer_group": "worker-dispatcher",
+                "idempotency_key": "restart-latency-key-1",
+            },
+        )
+    )
+    assert payload["kill_key_cleared"] is False  # nothing was killed
+    assert payload["latency_key_cleared"] is True
+    assert latency_key_for("worker-dispatcher") not in redis_stub._store
 
 
 async def test_replay_dlq_messages_replays_dead_letter_jobs(

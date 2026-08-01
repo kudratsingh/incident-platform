@@ -16,12 +16,15 @@ is different.
 
 from typing import Any
 
+from app.core.logging import get_logger
 from app.dependencies import Principal
 from app.models.audit import (
     PRINCIPAL_TYPE_SERVICE_ACCOUNT,
     PRINCIPAL_TYPE_USER,
 )
 from app.repositories.audit import AuditRepository
+
+logger = get_logger(__name__)
 
 TOOL_INVOKED_ACTION = "agent.tool_invoked"
 # Chaos tool activity is a separate audit stream so operators can filter
@@ -95,15 +98,26 @@ async def record_tool_invocation(
     else:
         action = TOOL_INVOKED_ACTION
 
-    await audit_repo.log(
-        action,
-        tenant_id=principal.tenant_id,
-        resource_type="mcp_tool",
-        resource_id=tool_name,
-        request_id=request_id,
-        extra_data=extra,
-        **_principal_kwargs(principal),
-    )
+    try:
+        # SAVEPOINT: a failing audit insert (FK drift, constraint bug —
+        # the replay_job/#70 class) rolls back only the audit row. The
+        # tool's own writes and the caller's response are unaffected,
+        # which is what the "never raises" contract above requires.
+        async with audit_repo.session.begin_nested():
+            await audit_repo.log(
+                action,
+                tenant_id=principal.tenant_id,
+                resource_type="mcp_tool",
+                resource_id=tool_name,
+                request_id=request_id,
+                extra_data=extra,
+                **_principal_kwargs(principal),
+            )
+    except Exception:
+        logger.exception(
+            "audit write failed; dropping tool-invocation row",
+            extra={"tool_name": tool_name, "outcome": outcome},
+        )
 
 
 __all__ = [

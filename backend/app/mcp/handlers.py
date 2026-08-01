@@ -14,6 +14,7 @@ Error mapping to JSON-RPC codes:
 """
 
 import time
+from datetime import timedelta
 from typing import Any
 
 from app.core.exceptions import (
@@ -41,6 +42,11 @@ from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
 logger = get_logger(__name__)
+
+# Cached Tier-1 responses outlive any plausible retry window at 24h but
+# stop pinning the platform to a response forever — a leftover record with
+# no TTL is why repeat operator restores replayed stale results.
+_IDEMPOTENCY_TTL = timedelta(hours=24)
 
 SERVER_NAME = "incident-platform-mcp"
 SERVER_VERSION = "0.1.0"
@@ -379,6 +385,7 @@ async def handle_tools_call(
             idempotency_key=idempotency_key,
             arguments=call_params.arguments,
             response=output.model_dump(mode="json"),
+            ttl=_IDEMPOTENCY_TTL,
         )
 
     # Emit the tool result as a single text content block whose body is
