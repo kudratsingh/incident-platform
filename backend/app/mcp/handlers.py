@@ -347,6 +347,16 @@ async def handle_tools_call(
     except Exception as exc:
         latency_ms = (time.perf_counter() - start) * 1000
         logger.exception("mcp tool crashed", extra={"tool": tool_def.name})
+        # Discard any partial writes the tool staged before it crashed
+        # (#5). Without this rollback, the outer get_db() cleanup would
+        # commit those writes behind our "internal tool error" response
+        # — the client sees failure while the DB kept the half-executed
+        # effect. The audit below is savepoint-wrapped (#6); if it fails
+        # against the rolled-back session it drops silently to the log.
+        try:
+            await ctx.db.rollback()
+        except Exception:
+            logger.exception("mcp handler rollback after tool crash failed")
         await record_tool_invocation(
             audit_repo,
             principal=ctx.principal,
@@ -387,6 +397,15 @@ async def handle_tools_call(
             response=output.model_dump(mode="json"),
             ttl=_IDEMPOTENCY_TTL,
         )
+
+    # Force the session to send pending SQL so any deferred DB error
+    # (constraint violation, FK drift — the class that sank #70) surfaces
+    # here as an exception rather than silently at the outer commit. That
+    # way a success response only goes out if the writes actually
+    # reached the DB successfully; a failure at flush lands in the
+    # `except Exception` handler above and the whole tx is rolled back.
+    # See ADR 0010's commit-before-response section.
+    await ctx.db.flush()
 
     # Emit the tool result as a single text content block whose body is
     # the JSON-serialized output model. Structured content is the norm
