@@ -44,7 +44,7 @@ from app.workers import (
 from app.workers.audit_consumer import AuditConsumer
 from app.workers.dependency_resolver import DependencyResolver
 from app.workers.event_log_consumer import EventLogConsumer
-from app.workers.kafka_consumer import BaseKafkaConsumer
+from app.workers.kafka_consumer import BaseKafkaConsumer, _check_chaos_kill
 from app.workers.read_model import ReadModelProjector
 from app.workers.saga_coordinator import SagaCoordinator
 from app.workers.sse_consumer import SseConsumer
@@ -768,6 +768,83 @@ async def _metrics_loop(redis: Any, consumer: JobDispatcherConsumer) -> None:
             logger.error("metrics loop error", extra={"error": str(exc)})
 
 
+_SUPERVISOR_POLL_SECONDS = 2.0
+_SUPERVISOR_MAX_BACKOFF_SECONDS = 30.0
+
+
+async def _restart_consumer(consumer: BaseKafkaConsumer) -> None:
+    """stop()+start() with capped exponential backoff until it sticks."""
+    backoff = 1.0
+    while True:
+        try:
+            await consumer.stop()
+            await consumer.start()
+            logger.warning(
+                "supervisor restarted consumer",
+                extra={"group_id": consumer.group_id},
+            )
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error(
+                "consumer restart failed; retrying",
+                extra={"group_id": consumer.group_id, "error": str(exc)},
+            )
+            await asyncio.sleep(min(backoff, _SUPERVISOR_MAX_BACKOFF_SECONDS))
+            backoff *= 2
+
+
+async def _supervise_consumer(consumer: BaseKafkaConsumer) -> None:
+    """Keep one consumer's run() loop alive across chaos kills and crashes.
+
+    Fills the gap three docstrings referenced but nothing implemented:
+    `kill_consumer` makes run() exit and `restart_consumer_group` only
+    deletes the Redis kill key — without a supervisor, a killed consumer
+    stayed dead until the worker process restarted, so live remediation
+    evals could never observe recovery.
+
+    run() outcomes:
+      * raises                 -> log, backoff, stop/start, re-enter.
+      * returns, chaos_killed  -> poll until the kill key clears
+        (restart_consumer_group or TTL expiry), then stop/start for a
+        fresh AIOKafkaConsumer and re-enter run().
+      * returns otherwise      -> stop() was called (orderly shutdown) or
+        run() swallowed a cancellation during teardown; supervision ends.
+    """
+    while True:
+        try:
+            await consumer.run()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error(
+                "consumer run() crashed; supervisor restarting",
+                extra={"group_id": consumer.group_id, "error": str(exc)},
+            )
+            await asyncio.sleep(_SUPERVISOR_POLL_SECONDS)
+            await _restart_consumer(consumer)
+            continue
+
+        if consumer.chaos_killed:
+            logger.warning(
+                "consumer killed by chaos; supervisor waiting for kill key",
+                extra={"group_id": consumer.group_id},
+            )
+            while await _check_chaos_kill(consumer.group_id):
+                await asyncio.sleep(_SUPERVISOR_POLL_SECONDS)
+            await _restart_consumer(consumer)
+            continue
+
+        if consumer.is_running:
+            logger.info(
+                "consumer run() returned without stop/chaos "
+                "(cancelled during shutdown?); supervisor exiting",
+                extra={"group_id": consumer.group_id},
+            )
+        return
+
+
 async def worker_loop(
     session_factory: async_sessionmaker[AsyncSession],
     redis: Any,
@@ -836,7 +913,7 @@ async def worker_loop(
     logger.info(
         "worker loop started", extra={"consumers": [c.group_id for c in started]}
     )
-    tasks = [asyncio.create_task(c.run()) for c in started]
+    tasks = [asyncio.create_task(_supervise_consumer(c)) for c in started]
     tasks.extend(
         [
             asyncio.create_task(_promote_delayed_loop(session_factory, redis)),

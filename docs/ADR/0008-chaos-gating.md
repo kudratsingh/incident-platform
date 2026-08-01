@@ -113,9 +113,20 @@ Removing the framework entirely is deletion of `backend/app/mcp/chaos_tools/`, d
 - Terraform test: `terraform plan` with `chaos_enabled=true, environment=production` fails with the validation message.
 - Integration test: MCP process in a chaos-enabled test env exposes `kill_consumer` via `tools/list`; process in a chaos-disabled env does not list it.
 
+## Amendment (v0.4.5) — Compensating-action requirement
+
+Every chaos hook must **name its compensating action and link the test proving the pair round-trips**. The requirement was implicit in Wave 1 and got violated twice — `kill_consumer` had no working restart until [ADR 0009](0009-consumer-lifecycle-and-supervision.md), and `inject_latency` had no matching key-clear until the same release. Both gaps looked fine at the docstring level and only surfaced during live eval runs, where a permanently-dead consumer compounded across scenarios.
+
+New rule for reviewers: a PR that adds or modifies a chaos hook must, in the same PR, either
+
+1. Point to an existing Tier-1 action that undoes the fault, and link the contract test that proves the round-trip, or
+2. Add the compensating action alongside the chaos hook, with the round-trip test.
+
+Docstrings on both sides — the chaos hook and its compensator — must name each other. Silent asymmetry is the failure mode this rule exists to prevent.
+
 ## Pointers
 
 - `backend/app/config.py` — the boot-time assertion (to be added in Wave 1 PR #4)
 - `infra/variables.tf` — the Terraform validation
 - `backend/app/mcp/chaos_tools/` — the tool implementations (to be created in Wave 1 PR #4)
-- Related ADRs: [0006 — MCP server standalone process](0006-mcp-server-standalone-process.md), [0007 — Machine-principal scope model](0007-machine-principal-scope-model.md)
+- Related ADRs: [0006 — MCP server standalone process](0006-mcp-server-standalone-process.md), [0007 — Machine-principal scope model](0007-machine-principal-scope-model.md), [0009 — Consumer lifecycle and supervision](0009-consumer-lifecycle-and-supervision.md)

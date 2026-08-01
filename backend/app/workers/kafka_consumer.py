@@ -89,6 +89,7 @@ class BaseKafkaConsumer(ABC):
         self.group_id = group_id
         self._consumer: AIOKafkaConsumer | None = None
         self._running = False
+        self._chaos_killed = False
 
     async def start(self) -> None:
         settings = get_settings()
@@ -106,6 +107,7 @@ class BaseKafkaConsumer(ABC):
         )
         await self._consumer.start()
         self._running = True
+        self._chaos_killed = False
         logger.info(
             "kafka consumer started",
             extra={"group_id": self.group_id, "topics": self.topics},
@@ -117,6 +119,16 @@ class BaseKafkaConsumer(ABC):
             await self._consumer.stop()
             self._consumer = None
         logger.info("kafka consumer stopped", extra={"group_id": self.group_id})
+
+    @property
+    def is_running(self) -> bool:
+        """True between start() and stop()."""
+        return self._running
+
+    @property
+    def chaos_killed(self) -> bool:
+        """True when run() exited because the chaos kill key appeared."""
+        return self._chaos_killed
 
     async def run(self) -> None:
         """
@@ -134,6 +146,7 @@ class BaseKafkaConsumer(ABC):
             # otherwise the check short-circuits without a Redis call.
             if get_settings().chaos_enabled:
                 if await _check_chaos_kill(self.group_id):
+                    self._chaos_killed = True
                     logger.warning(
                         "kafka consumer stopped by chaos kill_consumer",
                         extra={"group_id": self.group_id},
