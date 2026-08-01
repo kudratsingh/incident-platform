@@ -15,12 +15,13 @@ blast radius label.
 """
 
 
+import uuid
+
 from app.core.logging import get_logger
 from app.mcp.chaos import BlastRadius, chaos_tool
 from app.mcp.registry import ToolContext
-from app.models.enums import JobStatus, JobType, RemediationHint
+from app.models.enums import JobStatus, JobType, RemediationHint, UserRole
 from app.models.job import Job
-from app.models.tenant import DEFAULT_TENANT_ID
 from app.models.user import User
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
@@ -72,30 +73,22 @@ async def create_bad_data_job(
     inp: CreateBadDataJobInput, ctx: ToolContext
 ) -> CreateBadDataJobOutput:
     logger = get_logger(__name__)
-
-    # Grab any active user in the caller's tenant to satisfy the Job
-    # FK. Falls back to the default tenant's first user for local
-    # dev where a tenant may only have the seed accounts.
     tenant_id = ctx.principal.tenant_id
+
+    # Prefer any real user in the caller's tenant to satisfy the Job
+    # FK. When the tenant is unseeded (common in local dev / fresh
+    # eval env), lazy-create a chaos-owned user in the SAME tenant.
+    # The pre-v0.4.6 shape fell back to a user from DEFAULT_TENANT_ID,
+    # violating the tenant-isolation invariant (jobs.tenant_id and
+    # users.tenant_id ended up pointing at different tenants). See
+    # ADR 0003 (RLS as defense-in-depth).
     user = (
         await ctx.db.execute(
             select(User).where(User.tenant_id == tenant_id).limit(1)
         )
     ).scalar_one_or_none()
-    if user is None and tenant_id != DEFAULT_TENANT_ID:
-        user = (
-            await ctx.db.execute(
-                select(User).where(User.tenant_id == DEFAULT_TENANT_ID).limit(1)
-            )
-        ).scalar_one_or_none()
-
     if user is None:
-        # No user to attach the job to — chaos degrades gracefully.
-        return CreateBadDataJobOutput(
-            job_id="",
-            remediation_hint=RemediationHint.HUMAN_REQUIRED.value,
-            accepted=False,
-        )
+        user = await _ensure_chaos_owner(ctx, tenant_id)
 
     job = Job(
         tenant_id=tenant_id,
@@ -123,3 +116,34 @@ async def create_bad_data_job(
         remediation_hint=RemediationHint.HUMAN_REQUIRED.value,
         accepted=True,
     )
+
+
+# Chaos-created users use a deterministic email + a well-known unusable
+# password so a login attempt against them fails cleanly (bcrypt refuses
+# to parse "!") and cleanup scripts can grep them by prefix. `is_active`
+# is False so any endpoint that filters active users doesn't surface
+# them in operator-facing lists.
+_CHAOS_OWNER_EMAIL_PREFIX = "chaos-owner"
+_CHAOS_UNUSABLE_PASSWORD = "!chaos-owner-no-login"
+
+
+async def _ensure_chaos_owner(ctx: ToolContext, tenant_id: uuid.UUID) -> User:
+    """Get-or-create a chaos-owned user in `tenant_id`. Idempotent —
+    the tenant-scoped email means repeat calls in the same tenant
+    return the same row."""
+    email = f"{_CHAOS_OWNER_EMAIL_PREFIX}+{tenant_id}@chaos.local"
+    existing = (
+        await ctx.db.execute(select(User).where(User.email == email))
+    ).scalar_one_or_none()
+    if existing is not None:
+        return existing
+    user = User(
+        tenant_id=tenant_id,
+        email=email,
+        hashed_password=_CHAOS_UNUSABLE_PASSWORD,
+        role=UserRole.USER.value,
+        is_active=False,
+    )
+    ctx.db.add(user)
+    await ctx.db.flush()
+    return user
