@@ -33,6 +33,8 @@ This file (`CLAUDE.md`) is the high-signal index. Treat it as the entry point �
   - [0006 — MCP server as a standalone process from the platform codebase](docs/ADR/0006-mcp-server-standalone-process.md)
   - [0007 — Machine principals with a scope model separate from human roles](docs/ADR/0007-machine-principal-scope-model.md)
   - [0008 — Chaos framework is triple-gated and never in production](docs/ADR/0008-chaos-gating.md)
+  - [0010 — Idempotency record lifecycle](docs/ADR/0010-idempotency-record-lifecycle.md)
+- [`docs/postmortems/`](docs/postmortems/) — one file per incident (backfilled or written at the time). Format: Impact / Timeline / Root cause / Detection gap / Fix / Prevention rule adopted.
 - [`docs/ROADMAP.md`](docs/ROADMAP.md) — open extension ideas, sized + categorized
 - [`runbooks/`](runbooks/) — machine-readable on-call playbooks for every CloudWatch alarm + SLO
 
