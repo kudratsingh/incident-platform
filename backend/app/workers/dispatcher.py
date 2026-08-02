@@ -490,19 +490,31 @@ class JobDispatcherConsumer(BaseKafkaConsumer):
                     extra_data={"error": error, "reason": "dispatcher_escape"},
                 )
 
-    async def consumer_lag(self) -> int:
+    async def consumer_lag(self) -> int | None:
         """Sum of (log_end_offset - committed_offset) across all assigned partitions.
 
-        Returns 0 if the consumer hasn't joined the group yet or has no
-        assignments — caller treats "unknown" as "not backed up."
+        Returns `None` for genuinely-unknown states (consumer not started,
+        no assignment yet, Kafka query failed) — never 0. The pre-v0.4.6
+        shape returned 0 for these paths, which downstream readers
+        (backpressure, `get_consumer_lag` MCP tool) couldn't distinguish
+        from "lag is really 0 = healthy". A dead consumer looked identical
+        to a healthy one, which was one of the noise sources compounding
+        the seven-run debug loop. Practice 9: unknown is not healthy.
+
+        `None` propagates: `_metrics_loop` skips the Redis cache write
+        (letting the TTL drop the last-known value) and skips the
+        CloudWatch gauge emission (an absent metric is more accurate
+        than a fabricated 0). `check_backpressure` treats a missing
+        cache entry as fail-open — the same behaviour as pre-fix, so no
+        regression on the API side.
         """
         consumer = self._consumer
         if consumer is None:
-            return 0
+            return None
         try:
             assignment = consumer.assignment()
             if not assignment:
-                return 0
+                return None
             end_offsets = await consumer.end_offsets(list(assignment))
             lag = 0
             for tp in assignment:
@@ -516,7 +528,7 @@ class JobDispatcherConsumer(BaseKafkaConsumer):
             return lag
         except Exception as exc:
             logger.warning("consumer_lag query failed", extra={"error": str(exc)})
-            return 0
+            return None
 
 
 async def _promote_delayed_loop(
@@ -760,8 +772,16 @@ async def _metrics_loop(redis: Any, consumer: JobDispatcherConsumer) -> None:
             lag = await consumer.consumer_lag()
             await metrics.emit_gauge("QueueDepth", float(delayed))
             await metrics.emit_gauge("InFlightJobs", float(len(consumer.in_flight)))
-            await metrics.emit_gauge("ConsumerLag", float(lag))
-            await redis.set(BACKPRESSURE_LAG_KEY, lag, ex=BACKPRESSURE_LAG_TTL)
+            # `lag is None` means the consumer is in an unknown state
+            # (not started, no assignment, or Kafka query errored). Do
+            # NOT emit a fabricated 0 — the reader (`check_backpressure`
+            # and `get_consumer_lag`) would treat that as "healthy" and
+            # mask a real problem. The previous cache entry TTLs out and
+            # backpressure fails open on absence. See ADR-referenced
+            # discussion of "unknown is not healthy" (Practice 9).
+            if lag is not None:
+                await metrics.emit_gauge("ConsumerLag", float(lag))
+                await redis.set(BACKPRESSURE_LAG_KEY, lag, ex=BACKPRESSURE_LAG_TTL)
         except asyncio.CancelledError:
             break
         except Exception as exc:
