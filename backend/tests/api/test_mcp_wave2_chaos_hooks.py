@@ -558,3 +558,91 @@ async def test_create_bad_data_job_inserts_human_required_dlq_entry(
         )
     finally:
         teardown()
+
+
+async def test_create_bad_data_job_lazy_creates_chaos_owner_in_caller_tenant(
+    db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
+) -> None:
+    """FIX_PLAN #8: when the caller's tenant has no users, chaos must
+    lazy-create a user IN THE CALLER'S TENANT — never fall back to a
+    user from another tenant (violates ADR 0003 isolation). Verified
+    by creating a fresh tenant with zero users and asserting the job's
+    user_id ends up in that same tenant."""
+    from app.models.job import Job
+    from app.models.tenant import Tenant
+    from app.models.user import User
+    from sqlalchemy import select as _select
+
+    fresh_tenant = Tenant(
+        slug=f"chaos-t-{uuid.uuid4().hex[:8]}",
+        name="Chaos-only tenant",
+        is_active=True,
+    )
+    db_session.add(fresh_tenant)
+    await db_session.flush()
+    assert fresh_tenant.id != default_tenant.id
+    # Pre-condition: no users in this tenant.
+    pre_users = (
+        await db_session.execute(
+            _select(User).where(User.tenant_id == fresh_tenant.id)
+        )
+    ).scalars().all()
+    assert pre_users == []
+
+    redis_stub = _RedisStub()
+    app, teardown = _mcp_app_with_chaos_enabled(db_session, redis_stub)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app, raise_app_exceptions=False),
+            base_url="http://test",
+        ) as ac:
+            token = await _token(
+                db_session, fresh_tenant.id, [Scope.CHAOS_INVOKE.value]
+            )
+            payload = _content(
+                await _call(ac, token, "create_bad_data_job", {})
+            )
+        assert payload["accepted"] is True
+        job = (
+            await db_session.execute(
+                _select(Job).where(Job.id == uuid.UUID(payload["job_id"]))
+            )
+        ).scalar_one()
+        # The load-bearing invariant: job.tenant_id and the owning
+        # user.tenant_id must match. Pre-v0.4.6 this would have been
+        # violated (job goes to fresh_tenant, user pulled from default).
+        assert job.tenant_id == fresh_tenant.id
+        owner = (
+            await db_session.execute(
+                _select(User).where(User.id == job.user_id)
+            )
+        ).scalar_one()
+        assert owner.tenant_id == fresh_tenant.id
+        # Chaos user is marked inactive so it doesn't show up in
+        # operator-facing user lists.
+        assert owner.is_active is False
+        assert owner.email.startswith("chaos-owner")
+
+        # Second call in the same tenant reuses the same chaos user
+        # (idempotent) — no proliferation of chaos-owner rows.
+        async with AsyncClient(
+            transport=ASGITransport(app=app, raise_app_exceptions=False),
+            base_url="http://test",
+        ) as ac:
+            second = _content(
+                await _call(ac, token, "create_bad_data_job", {})
+            )
+        second_job = (
+            await db_session.execute(
+                _select(Job).where(Job.id == uuid.UUID(second["job_id"]))
+            )
+        ).scalar_one()
+        assert second_job.user_id == owner.id
+        chaos_owners = (
+            await db_session.execute(
+                _select(User).where(User.tenant_id == fresh_tenant.id)
+            )
+        ).scalars().all()
+        assert len(chaos_owners) == 1
+    finally:
+        teardown()
