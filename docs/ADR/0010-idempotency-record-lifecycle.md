@@ -27,13 +27,55 @@ Lookups treat expired records as absent — the caller re-executes and stores fr
 
 ### 2. Arguments-hash contract (cross-repo)
 
-The `_hash_arguments` function is a **published contract**, consumed by the commander. The shape is:
+The `_hash_arguments` function (`backend/app/services/idempotency.py`) is a **published contract** — its output feeds the platform's own `IdempotencyRecord.arguments_hash` column and (since v0.4.6 finalization) is also pinned from the commander side. The commander uses matching normalization to build a locally-computed reference hash inside its cross-repo contract-snapshot test, so any drift on either side fails CI at the version-sync PR that caused it — the same job that already catches [ADR 0009](0009-consumer-lifecycle-and-supervision.md)-shaped tool schema drift.
 
-- **Input**: the exact `dict[str, Any]` passed as the tool's `arguments` — the raw wire payload the JSON-RPC handler received, with any Pydantic-filled defaults already materialized. The platform hashes what it *actually executes*, not what the wire carried before defaulting.
-- **Hash**: SHA-256 of the canonical-JSON serialization: `json.dumps(arguments, sort_keys=True, separators=(",", ":"), default=str)`. Sorted keys, tight separators, `default=str` for datetime/UUID/other non-JSON-native types.
-- **Contract stability**: any change to this shape (different serializer, different `default=`, different key handling) is a **breaking change to the commander**. Retry dedup silently breaks — a network-retry that should hit the cache instead executes the effect a second time.
+The rest of this section is the **exact normalization spec**, derived from code, so both repos pin the same reference.
 
-Enforcement: a cross-repo contract test (backlog item #26) pins the hash of a fixed argument dict on both sides. Any drift fails CI in the repo that changed. Until that test lands, changes to `_hash_arguments` require a manual note on the PR and a coordinated commander-side change.
+#### What is hashed
+
+`call_params.arguments` — the raw JSON-object dict as it arrives on the JSON-RPC wire, before any Pydantic parsing. The platform does *not* run the tool's input model over the dict before hashing it (see `backend/app/mcp/handlers.py::handle_tools_call` — the call to `idempotency_service.lookup(...)` / `.store(...)` passes `call_params.arguments`, not `parsed_input`).
+
+Consequence: the bytes on the wire *are* the hash input. If the commander's serialization changes what those bytes look like — even for a semantically-equivalent request — the hash changes and an in-flight retry with the same `Idempotency-Key` starts 409ing.
+
+In particular, the commander produces the wire dict via `model_validate(...).model_dump(mode="json")`, which by default materializes Pydantic defaults into explicit fields. Changing that to `exclude_unset=True` (or any equivalent) is a **breaking change to in-flight idempotency records** on the same day it's deployed. Same-day changes must go through a coordinated version-sync (see "Coordination rule" below).
+
+#### Normalization
+
+```python
+body = json.dumps(arguments, sort_keys=True, separators=(",", ":"), default=str).encode()
+sha256(body).hexdigest()
+```
+
+Point-by-point, so the commander's local reference computation can match byte-for-byte:
+
+| Aspect | Behaviour | Notes |
+|---|---|---|
+| **Algorithm** | SHA-256, lowercase hex digest | `hashlib.sha256(...).hexdigest()` |
+| **Serializer** | Python stdlib `json.dumps` | Not `orjson`, not `simplejson` — the commander must not swap in a different encoder without a version-sync. |
+| **Object key order** | Sorted (recursive) | `sort_keys=True`. Insertion order at the caller is not significant, at any nesting depth. |
+| **Whitespace** | None between tokens | `separators=(",", ":")`. `{"a":1,"b":2}`, not `{"a": 1, "b": 2}`. |
+| **`default=str`** | Non-JSON-native values stringify via `str()` | Not exercised by the wire path — the wire dict is already JSON — but a future path that hashes Python-native dicts (e.g. UUIDs, datetimes) would rely on it. Change to `default=` is by definition breaking. |
+| **`idempotency_key` field** | **Included in the hash** | The platform hashes the whole `arguments` dict; it does not strip `idempotency_key`. Doesn't affect same-key-different-args semantics (the key always matches when we reach the hash comparison), but the commander's local hash must include it. |
+| **JSON array element order** | Significant | Arrays are ordered by JSON spec. `{"tags":["a","b"]}` and `{"tags":["b","a"]}` are different hashes. Intentional — lists aren't sets. |
+| **Numeric type** | Significant | `1` and `1.0` are distinct at the Python and JSON levels and produce different bytes. A commander that switches a field's declared type between calls will 409. |
+| **String encoding** | UTF-8 | `.encode()` default. Non-ASCII characters must round-trip cleanly on both sides. |
+| **Null vs. absent** | Significant | `{"x": null}` and `{}` are different keys → different bytes → different hashes. Commanders using `exclude_none=True` produce a different hash than those emitting explicit `null`. |
+
+#### Enforcement (post-v0.4.6)
+
+- **Provider self-verification (platform)** — `backend/tests/unit/test_idempotency_service.py` locks the canonical-JSON invariance, expiry semantics, and same-key-different-args 409 shape. `backend/tests/api/test_mcp_wave3_tier1_actions.py` covers the end-to-end replay path. No new platform-side test is added for #26 — the provider already tests its own contract.
+- **Consumer verification (commander)** — `contracts/platform-tools.snapshot.json` gets a perturbation matrix section: a fixed set of representative argument dicts (with variations for nested-key order, list-vs-null-vs-absent, default fields present/omitted) is pinned to their expected hashes, computed once against the digest-pinned platform image. That block sits in the same CI job that already verifies input/output schemas per PR #55, so a change to `_hash_arguments` on either side fails at the version-sync PR that introduced it.
+- **What the commander does NOT do**: import the platform's `_hash_arguments` function to re-compute locally. That would (a) invert the ADR 0001 dependency arrow — the commander is an external client, and a provider importing its client's normalizer breaks the moment a second client exists; (b) verify whatever platform checkout is on disk, not the digest-pinned artifact live evals actually hit — the same failure class as [FIX_PLAN #25](../../CLAUDE.md); (c) freeze internal platform refactors by making the private helper de-facto public API.
+
+#### Coordination rule
+
+Any change to what feeds `_hash_arguments` (the caller's dict shape) OR how it hashes (sort behaviour, separators, `default=`, algorithm) is a **conscious spec change**, not a refactor. Coordinated cross-repo sequence:
+
+1. Platform revises the normalization table above in this ADR and lands the code change in the same PR.
+2. Platform release tags a new version, referencing the ADR change in the tag message.
+3. Commander pin-bump PR regenerates the perturbation matrix against the new pinned image and updates its own snapshot in the same PR.
+
+If the commander's matrix disagrees with this ADR at any pin bump, one of them is a bug — not a compatibility issue to work around. In particular, if the matrix ever reveals that platform-observed key order *is* significant (i.e. `sort_keys=True` isn't holding), treat that as a **conscious platform-side spec change** (formalize sorted-key canonical JSON here, add the fix, commander updates matrix next sync). Neither agent silently patches around a mismatch.
 
 ### 3. Same-key-different-args = 409
 
@@ -59,11 +101,26 @@ Rejected for v0.4.5: adds one lever per tool and forces the commander to know th
 
 Rejected: the platform is the system of record for its own idempotency behavior. A client that requested 72h retention would still expect Stripe-shape 409s on same-key-different-args at t=72h, which is the exact incident this ADR exists to prevent. The platform sets the policy.
 
-### Hash the wire bytes instead of the parsed dict
+### Hash the parsed Pydantic model instead of the wire dict
 
-Skip Pydantic-materialization and hash the raw JSON body.
+Run `tool.input_model.model_validate(arguments)` first, then hash the parsed model's serialization. Two callers that omit an optional field vs. explicitly send its default would then hash the same way.
 
-Rejected: two commanders that omit an optional field vs. explicitly send its default would hash differently and be treated as different arguments, even though the platform executes the same effect. Hashing the parsed dict means "what the platform will actually do" is what determines idempotency.
+Rejected: it moves the source-of-truth from "what the caller sent" to "what the platform inferred". A commander PR that changes a field's default (or adds a new one) silently changes every in-flight hash on deployment, without any wire-level indication. Hashing the wire dict makes the contract precisely observable — the bytes on the wire *are* the hash input, and neither side can accidentally change it without a coordinated version-sync (see the coordination rule in section 2). Fixed the corresponding text in the earlier version of this ADR that mis-stated this as the current implementation.
+
+### Cross-repo hash contract via shared normalizer package or provider-import
+
+Two variants of the same idea, both rejected. Provider (platform) exports its `_hash_arguments` function; consumer (commander) imports and re-computes locally to compare.
+
+Rejected because:
+- **Inverts the dependency arrow.** [ADR 0001](0001-outbox-vs-cdc.md) and the agent-facing surface docs frame the commander as an external client. A provider that imports its own client's helpers breaks the moment a second client shows up — the provider now has to satisfy two clients' schemas.
+- **Verifies the wrong artifact.** A test importing `app.services.idempotency` runs against whatever platform checkout is on disk, not the digest-pinned container the live evals actually hit. FIX_PLAN #25 already taught this lesson — the exact reason we're pinning by image digest is that in-repo checkout state and shipped-artifact state can diverge.
+- **Freezes internal refactors.** `_hash_arguments` becomes de-facto public API and can't be renamed / restructured / inlined without a commander-visible change.
+
+### Cross-repo shared contract package (third repo)
+
+Publish an `incident-platform-contract` package with the normalization spec + reference implementation; both platform and commander pip-install it.
+
+Rejected at current scale. Right answer at N-consumers × M-providers where a shared package amortises the versioning + release burden; overkill at 1×1 for the sake of one hash function. The lightweight part of this idea worth keeping — a **written spec that lives with the provider** — is what section 2 of this ADR now is.
 
 ## Consequences
 
@@ -77,7 +134,7 @@ Rejected: two commanders that omit an optional field vs. explicitly send its def
 
 - **No reaper means expired records accumulate.** Rows accumulate at ~10²–10³/tenant/day and are read-cheap (indexed lookup ignores expired rows). A partial-index + nightly cleanup follow-up is filed when write rate justifies it. Not urgent.
 - **24h is a global constant, not a per-tool policy.** If a legitimate need arises for a shorter or longer window for a specific tool, this ADR's decision has to be revisited. Cheap to revisit — the constant is one place — but the mental model shifts from "always 24h" to "per-tool", which is a review-time cost.
-- **The contract-test gap is real until #26 lands.** Right now, `_hash_arguments` drift caught by manual review only. Item #26 in FIX_PLAN_v2 tracks the cross-repo test that makes drift a CI failure.
+- **Cross-repo hash coordination lives in two places** (the spec here + the commander's perturbation matrix) and both must move together on any change to `_hash_arguments`. That coupling is intentional — the alternative is silent drift — but any future change to the normalization is a two-repo PR sequence, not a one-repo refactor.
 
 ### Commit-before-response (resolved v0.4.6)
 

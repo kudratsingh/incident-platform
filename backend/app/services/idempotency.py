@@ -46,7 +46,16 @@ class CacheHit:
 def _hash_arguments(arguments: dict[str, Any]) -> str:
     """Canonical-JSON SHA-256. Sorted keys + tight separators so the
     same dict hashes the same regardless of insertion order or
-    whitespace."""
+    whitespace.
+
+    Published cross-repo contract — the commander's contract snapshot
+    matrix pins these bytes. Any change to what this function hashes
+    (input dict shape) or how (sort_keys, separators, default=,
+    algorithm) is a coordinated version-sync, not a refactor. Full
+    normalization table + coordination rule in
+    docs/ADR/0010-idempotency-record-lifecycle.md § "Arguments-hash
+    contract (cross-repo)".
+    """
     body = json.dumps(
         arguments, sort_keys=True, separators=(",", ":"), default=str
     ).encode()
