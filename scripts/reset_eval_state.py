@@ -118,6 +118,38 @@ async def _purge_idempotency_records(session_factory: Any) -> int:
             return int(result.rowcount or 0)
 
 
+async def _delete_chaos_owner_users(session_factory: Any) -> int:
+    """DELETE users lazy-created by `create_bad_data_job` when a
+    tenant had no real users (see PR #83 / FIX_PLAN #8). Recognisable
+    by the `chaos-owner+` email prefix + `is_active=false`.
+
+    Owned chaos jobs are removed first so the FK holds. Only touches
+    jobs where the user_id is one we're about to delete — real jobs
+    that happen to share tenant are unaffected.
+
+    Returns the number of users deleted."""
+    async with session_factory() as session:
+        async with session.begin():
+            # Delete chaos jobs first (FK dependency).
+            await session.execute(
+                text(
+                    "DELETE FROM jobs WHERE user_id IN ("
+                    "  SELECT id FROM users "
+                    "  WHERE email LIKE 'chaos-owner+%@chaos.local' "
+                    "  AND is_active = false"
+                    ")"
+                )
+            )
+            result = await session.execute(
+                text(
+                    "DELETE FROM users "
+                    "WHERE email LIKE 'chaos-owner+%@chaos.local' "
+                    "AND is_active = false"
+                )
+            )
+            return int(result.rowcount or 0)
+
+
 def _refuse_in_production() -> None:
     """Loud failure if invoked against a production platform. Backed by
     ADR 0008's environment gate — this is the belt on top of the braces."""
@@ -155,6 +187,11 @@ async def reset(
             redis_url=redis_url,
             reset=True,
         )
+        # Delete chaos-owner users from any tenant that had
+        # `create_bad_data_job` run against it. Runs unconditionally
+        # (unlike the idempotency purge, which is opt-in) — these rows
+        # are chaos-specific and shouldn't survive a reset.
+        chaos_owners_deleted = await _delete_chaos_owner_users(factory)
         idempotency_purged = 0
         if purge_idempotency:
             idempotency_purged = await _purge_idempotency_records(factory)
@@ -164,6 +201,7 @@ async def reset(
 
     return {
         "chaos_keys_cleared": chaos_cleared,
+        "chaos_owners_deleted": chaos_owners_deleted,
         "dlq_reset": seed_summary["dlq_reset"],
         "idempotency_purged": idempotency_purged,
     }

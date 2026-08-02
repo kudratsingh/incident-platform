@@ -235,3 +235,83 @@ def test_refuse_in_production_allows_non_production(
         reset._refuse_in_production()
     finally:
         get_settings.cache_clear()
+
+
+# ---------------------------------------------------------------------------
+# _delete_chaos_owner_users — follow-up to PR #83's tenant-fallback fix
+# ---------------------------------------------------------------------------
+
+
+async def test_delete_chaos_owner_users_removes_users_and_their_jobs(
+    db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
+) -> None:
+    """The chaos-owner user + any chaos jobs it owns are removed. Real
+    users' jobs (owned by non-chaos users) survive."""
+    reset = _reset_module()
+    from contextlib import asynccontextmanager
+
+    from app.models.user import User
+    from sqlalchemy import select as _select
+
+    # Chaos user + one owned chaos job.
+    chaos_user = User(
+        tenant_id=default_tenant.id,
+        email=f"chaos-owner+{default_tenant.id}@chaos.local",
+        hashed_password="!chaos-owner-no-login",
+        role="user",
+        is_active=False,
+    )
+    db_session.add(chaos_user)
+    await db_session.flush()
+    chaos_job = Job(
+        tenant_id=default_tenant.id,
+        user_id=chaos_user.id,
+        type=JobType.CSV_UPLOAD.value,
+        status=JobStatus.DEAD_LETTER.value,
+        payload={"chaos_fixture": "bad_data_job"},
+        retry_count=3,
+    )
+    db_session.add(chaos_job)
+    # Real user + real job — must survive.
+    real_job = Job(
+        tenant_id=default_tenant.id,
+        user_id=test_user.id,
+        type=JobType.CSV_UPLOAD.value,
+        status=JobStatus.PENDING.value,
+    )
+    db_session.add(real_job)
+    await db_session.flush()
+
+    # Fake session factory that yields the test session with a no-op
+    # begin() (the outer test fixture already owns the transaction).
+    @asynccontextmanager
+    async def _noop_begin():  # type: ignore[no-untyped-def]
+        yield
+
+    class _FakeFactoryCtx:
+        async def __aenter__(self):  # type: ignore[no-untyped-def]
+            db_session.begin = _noop_begin  # type: ignore[assignment]
+            return db_session
+
+        async def __aexit__(self, *_a):  # type: ignore[no-untyped-def]
+            return None
+
+    class _FakeFactory:
+        def __call__(self):  # type: ignore[no-untyped-def]
+            return _FakeFactoryCtx()
+
+    deleted = await reset._delete_chaos_owner_users(_FakeFactory())
+    assert deleted == 1
+
+    # Chaos user gone; chaos job gone (deleted first for FK); real job intact.
+    assert (
+        await db_session.execute(
+            _select(User).where(User.id == chaos_user.id)
+        )
+    ).scalar_one_or_none() is None
+    assert (
+        await db_session.execute(_select(Job).where(Job.id == chaos_job.id))
+    ).scalar_one_or_none() is None
+    assert (
+        await db_session.execute(_select(Job).where(Job.id == real_job.id))
+    ).scalar_one_or_none() is not None
