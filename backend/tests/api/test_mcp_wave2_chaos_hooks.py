@@ -47,6 +47,18 @@ class _RedisStub:
         self._store[key] = value
         return True
 
+    async def delete(self, *keys: str) -> int:
+        # Match redis-py semantics — returns the count of keys that
+        # actually existed and were removed. Needed by
+        # invalidate_cache_key (round-trip compensator for
+        # create_stale_cache).
+        removed = 0
+        for k in keys:
+            if k in self._store:
+                del self._store[k]
+                removed += 1
+        return removed
+
     def pipeline(self) -> _RedisPipeline:
         return _RedisPipeline(self)
 
@@ -85,11 +97,28 @@ def _mcp_app_with_chaos_enabled(db_session: AsyncSession, redis_stub: _RedisStub
         importlib.reload(chaos_pkg.inject_latency)  # type: ignore[attr-defined]
         importlib.reload(chaos_pkg.bad_deploy)  # type: ignore[attr-defined]
         importlib.reload(chaos_pkg.create_bad_data_job)  # type: ignore[attr-defined]
+        importlib.reload(chaos_pkg.create_stale_cache)  # type: ignore[attr-defined]
         from app.mcp.tools import consumer_lag as _cl
         from app.mcp.tools import list_active_alerts as _laa
 
         importlib.reload(_cl)
         importlib.reload(_laa)
+
+        # Action tools aren't chaos-gated but the snapshot wipe above
+        # cleared them. Re-import so round-trip tests (create_stale_cache
+        # → invalidate_cache_key) can invoke the compensator.
+        from app.mcp.tools import actions as _actions_pkg
+
+        for _mod in (
+            _actions_pkg.invalidate_cache_key,  # type: ignore[attr-defined]
+            _actions_pkg.restart_consumer_group,  # type: ignore[attr-defined]
+            _actions_pkg.pause_dag,  # type: ignore[attr-defined]
+            _actions_pkg.mark_dlq_permanent,  # type: ignore[attr-defined]
+            _actions_pkg.replay_dlq_messages,  # type: ignore[attr-defined]
+            _actions_pkg.replay_dlq_by_ids,  # type: ignore[attr-defined]
+            _actions_pkg.replay_dlq_by_category,  # type: ignore[attr-defined]
+        ):
+            importlib.reload(_mod)
 
         from app.mcp.standalone import create_mcp_app
 
@@ -644,5 +673,149 @@ async def test_create_bad_data_job_lazy_creates_chaos_owner_in_caller_tenant(
             )
         ).scalars().all()
         assert len(chaos_owners) == 1
+    finally:
+        teardown()
+
+
+# ---------------------------------------------------------------------------
+# create_stale_cache — hot_set chaos hook (v0.4.7 / FIX_PLAN #24 item 2)
+# ---------------------------------------------------------------------------
+
+
+async def test_create_stale_cache_not_registered_when_chaos_disabled(
+    db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
+) -> None:
+    """Same gating story as saturate_redis — chaos-only tool must not
+    appear in the registry when CHAOS_ENABLED=false."""
+    from app.mcp.standalone import create_mcp_app
+
+    redis_stub = _RedisStub()
+    app = create_mcp_app()
+
+    async def _override_db():
+        yield db_session
+
+    async def _override_redis():
+        yield redis_stub
+
+    app.dependency_overrides[get_db] = _override_db
+    app.dependency_overrides[get_redis] = _override_redis
+    async with AsyncClient(
+        transport=ASGITransport(app=app, raise_app_exceptions=False),
+        base_url="http://test",
+    ) as ac:
+        token = await _token(
+            db_session, default_tenant.id, [Scope.CHAOS_INVOKE.value]
+        )
+        body = await _call(ac, token, "create_stale_cache", {})
+    assert body["error"]["code"] == protocol.MCP_TOOL_NOT_FOUND
+
+
+async def test_create_stale_cache_populates_default_hot_set_key(
+    db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
+) -> None:
+    """Default key is the hot_set the `remediate_stale_cache_success`
+    scenario reads, value is a JSON array of fabricated IDs, TTL
+    passed to Redis."""
+    redis_stub = _RedisStub()
+    app, teardown = _mcp_app_with_chaos_enabled(db_session, redis_stub)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app, raise_app_exceptions=False),
+            base_url="http://test",
+        ) as ac:
+            token = await _token(
+                db_session, default_tenant.id, [Scope.CHAOS_INVOKE.value]
+            )
+            payload = _content(
+                await _call(ac, token, "create_stale_cache", {})
+            )
+        assert payload["accepted"] is True
+        assert payload["key"] == "cache:jobs:worker-dispatcher:hot_set"
+        assert payload["ttl_seconds"] == 600
+        # The stub captured the write — value is JSON array with 3 fake IDs.
+        raw = redis_stub._store["cache:jobs:worker-dispatcher:hot_set"]
+        stale = json.loads(raw if isinstance(raw, str) else raw.decode())
+        assert isinstance(stale, list)
+        assert len(stale) == 3
+        assert all(s.startswith("stale-fixture-") for s in stale)
+    finally:
+        teardown()
+
+
+async def test_create_stale_cache_refuses_key_outside_allowlist(
+    db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
+) -> None:
+    """Key must be under a prefix that `invalidate_cache_key` accepts —
+    otherwise the compensator would refuse to clear it and the
+    round-trip is broken."""
+    redis_stub = _RedisStub()
+    app, teardown = _mcp_app_with_chaos_enabled(db_session, redis_stub)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app, raise_app_exceptions=False),
+            base_url="http://test",
+        ) as ac:
+            token = await _token(
+                db_session, default_tenant.id, [Scope.CHAOS_INVOKE.value]
+            )
+            body = await _call(
+                ac,
+                token,
+                "create_stale_cache",
+                {"key": "arbitrary:foo:bar"},
+            )
+        assert body["error"]["code"] == protocol.MCP_TOOL_ERROR
+        assert body["error"]["data"]["error_code"] == "stale_cache_key_forbidden"
+    finally:
+        teardown()
+
+
+async def test_create_stale_cache_round_trip_with_invalidate_cache_key(
+    db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
+) -> None:
+    """The load-bearing contract test per ADR 0008 amendment: every
+    chaos hook must name a compensator + link a round-trip test.
+    Sequence:
+      1. create_stale_cache populates the hot_set key.
+      2. invalidate_cache_key clears it.
+      3. Redis stub confirms the key is gone.
+    If this fails, the `remediate_stale_cache_success` scenario is
+    unwinnable — the compensator can't undo what the chaos hook did."""
+    redis_stub = _RedisStub()
+    app, teardown = _mcp_app_with_chaos_enabled(db_session, redis_stub)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app, raise_app_exceptions=False),
+            base_url="http://test",
+        ) as ac:
+            # Step 1: chaos scope populates the key.
+            chaos_token = await _token(
+                db_session, default_tenant.id, [Scope.CHAOS_INVOKE.value]
+            )
+            create = _content(
+                await _call(
+                    ac, chaos_token, "create_stale_cache", {}
+                )
+            )
+            assert create["accepted"] is True
+            key = create["key"]
+            assert key in redis_stub._store  # actually there
+
+            # Step 2: actions scope invalidates it — same key.
+            actions_token = await _token(
+                db_session, default_tenant.id, [Scope.ACTIONS_EXECUTE.value]
+            )
+            invalidate = _content(
+                await _call(
+                    ac,
+                    actions_token,
+                    "invalidate_cache_key",
+                    {"key": key, "idempotency_key": "stale-round-trip-1"},
+                )
+            )
+            # Step 3: compensator observed + cleared the key.
+            assert invalidate["deleted"] is True
+            assert key not in redis_stub._store
     finally:
         teardown()

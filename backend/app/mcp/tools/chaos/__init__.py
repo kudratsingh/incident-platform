@@ -10,6 +10,7 @@ Add new chaos tools by importing their module below.
 from app.mcp.tools.chaos import (  # noqa: F401
     bad_deploy,
     create_bad_data_job,
+    create_stale_cache,
     inject_latency,
     kill_consumer,
     poison_message,
