@@ -759,6 +759,47 @@ async def _digest_loop(session_factory: async_sessionmaker[AsyncSession]) -> Non
             logger.error("digest loop error", extra={"error": str(exc)})
 
 
+_IDEMPOTENCY_REAPER_INTERVAL_SECONDS = 3600.0  # 1h — matches the TTL cadence
+
+
+async def _idempotency_reaper_loop(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Delete expired idempotency records every hour.
+
+    Closes the "no reaper means expired records accumulate" negative
+    consequence in [ADR 0010](docs/ADR/0010-idempotency-record-lifecycle.md).
+    Lookups already treat expired records as absent so this is a
+    housekeeping loop, not a correctness one — but at ~10²–10³
+    records/tenant/day the table would grow without bound and every
+    lookup would scan more rows than necessary.
+
+    The interval mirrors the record TTL cadence (24h). Running hourly
+    means a record expires at t+24h, gets reaped no later than t+25h.
+    That's a bounded 1h window of "expired but still in the table",
+    which lookups handle via the `expires_at < now()` check.
+    """
+    from app.repositories.idempotency import IdempotencyRepository
+
+    while True:
+        try:
+            await asyncio.sleep(_IDEMPOTENCY_REAPER_INTERVAL_SECONDS)
+            async with session_factory() as session:
+                async with session.begin():
+                    reaped = await IdempotencyRepository(session).delete_expired()
+            if reaped:
+                logger.info(
+                    "idempotency reaper deleted expired records",
+                    extra={"count": reaped},
+                )
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            logger.error(
+                "idempotency reaper loop error", extra={"error": str(exc)}
+            )
+
+
 async def _metrics_loop(redis: Any, consumer: JobDispatcherConsumer) -> None:
     """Emit queue/in-flight/consumer-lag gauges every ~60s.
 
@@ -886,11 +927,13 @@ async def worker_loop(
         8. triage.run()           — Phase 10: LLM classification of dead-lettered jobs.
 
       Background loops:
-        1. _promote_delayed_loop     — re-publishes delayed retries via outbox.
-        2. _promote_dlq_replay_loop  — fires operator-scheduled DLQ replays.
-        3. _outbox_relay_loop        — publishes outbox rows to Kafka.
-        4. _metrics_loop             — emits gauges + cached lag for backpressure.
-        5. _digest_loop              — Phase 10: per-tenant LLM digests (opt-in).
+        1. _promote_delayed_loop      — re-publishes delayed retries via outbox.
+        2. _promote_dlq_replay_loop   — fires operator-scheduled DLQ replays.
+        3. _outbox_relay_loop         — publishes outbox rows to Kafka.
+        4. _metrics_loop              — emits gauges + cached lag for backpressure.
+        5. _digest_loop               — Phase 10: per-tenant LLM digests (opt-in).
+        6. _idempotency_reaper_loop   — hourly DELETE of expired idempotency records
+                                        (ADR 0010's "no reaper" follow-up).
 
     Cancel signal: cancel all, wait for in-flight jobs, stop all consumers.
     """
@@ -941,6 +984,7 @@ async def worker_loop(
             asyncio.create_task(_outbox_relay_loop(session_factory)),
             asyncio.create_task(_metrics_loop(redis, dispatcher)),
             asyncio.create_task(_digest_loop(session_factory)),
+            asyncio.create_task(_idempotency_reaper_loop(session_factory)),
         ]
     )
 

@@ -191,3 +191,80 @@ async def test_store_persists_hash_and_response() -> None:
     assert kwargs["arguments_hash"] == _hash_arguments(args)
     assert kwargs["response_json"] == resp
     assert kwargs["expires_at"] is not None
+
+
+# ---------------------------------------------------------------------------
+# Reaper — ADR 0010 follow-up (v0.4.8)
+# ---------------------------------------------------------------------------
+
+
+async def test_delete_expired_removes_only_records_past_expires_at(
+    db_session,  # type: ignore[no-untyped-def]
+) -> None:
+    """Reaper query bounds: rows with expires_at in the past go away;
+    rows with expires_at in the future stay; rows with expires_at IS
+    NULL (no TTL — legacy or hypothetical future) are never touched."""
+    from app.repositories.idempotency import IdempotencyRepository
+
+    now = datetime.now(UTC)
+    tenant_id = uuid.uuid4()
+    principal_id = uuid.uuid4()
+
+    def _rec(*, key: str, expires_at: datetime | None) -> IdempotencyRecord:
+        return IdempotencyRecord(
+            id=uuid.uuid4(),
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            tool_name="restart_consumer_group",
+            idempotency_key=key,
+            arguments_hash=_hash_arguments({"consumer_group": key}),
+            response_json={"ok": True},
+            expires_at=expires_at,
+        )
+
+    fresh = _rec(key="fresh", expires_at=now + timedelta(hours=1))
+    expired = _rec(key="expired", expires_at=now - timedelta(hours=1))
+    no_ttl = _rec(key="no-ttl", expires_at=None)
+    for row in (fresh, expired, no_ttl):
+        db_session.add(row)
+    await db_session.flush()
+
+    reaped = await IdempotencyRepository(db_session).delete_expired(now=now)
+    assert reaped == 1  # only `expired`
+
+    from sqlalchemy import select as _select
+
+    remaining_keys = {
+        r.idempotency_key
+        for r in (
+            await db_session.execute(_select(IdempotencyRecord))
+        ).scalars().all()
+    }
+    assert remaining_keys == {"fresh", "no-ttl"}
+
+
+async def test_delete_expired_noop_when_nothing_expired(
+    db_session,  # type: ignore[no-untyped-def]
+) -> None:
+    """No expired rows → no rows deleted → returns 0. Reaper loop
+    skips its log line on this path so we don't spam operators with
+    'reaped 0' every hour."""
+    from app.repositories.idempotency import IdempotencyRepository
+
+    now = datetime.now(UTC)
+    db_session.add(
+        IdempotencyRecord(
+            id=uuid.uuid4(),
+            tenant_id=uuid.uuid4(),
+            principal_id=uuid.uuid4(),
+            tool_name="pause_dag",
+            idempotency_key="k1",
+            arguments_hash="deadbeef",
+            response_json={},
+            expires_at=now + timedelta(hours=12),
+        )
+    )
+    await db_session.flush()
+
+    reaped = await IdempotencyRepository(db_session).delete_expired(now=now)
+    assert reaped == 0

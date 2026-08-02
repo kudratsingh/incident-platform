@@ -141,3 +141,112 @@ async def test_metrics_loop_skips_cache_write_when_lag_is_none() -> None:
     assert "QueueDepth" in emitted
     # Redis cache never written on the unknown path.
     redis.set.assert_not_awaited()
+
+
+async def test_idempotency_reaper_loop_deletes_expired_records() -> None:
+    """The reaper loop calls delete_expired() every hour and logs the
+    count when non-zero. Scaffolding follows the metrics_loop pattern:
+    patch asyncio.sleep to break out after one iteration."""
+    import asyncio as _asyncio
+    from unittest.mock import MagicMock
+
+    from app.workers.dispatcher import _idempotency_reaper_loop
+
+    call_count = {"n": 0}
+
+    async def _sleep_once(_):  # type: ignore[no-untyped-def]
+        call_count["n"] += 1
+        if call_count["n"] >= 2:
+            raise _asyncio.CancelledError
+
+    # Fake session_factory + repo — the loop opens a session, begins a
+    # tx, calls delete_expired, returns.
+    from contextlib import asynccontextmanager
+
+    fake_session = AsyncMock()
+
+    @asynccontextmanager
+    async def _tx():  # type: ignore[no-untyped-def]
+        yield
+
+    fake_session.begin = _tx
+
+    class _FactoryCtx:
+        async def __aenter__(self):  # type: ignore[no-untyped-def]
+            return fake_session
+
+        async def __aexit__(self, *_a):  # type: ignore[no-untyped-def]
+            return None
+
+    def _factory():  # type: ignore[no-untyped-def]
+        return _FactoryCtx()
+
+    repo_instance = MagicMock()
+    repo_instance.delete_expired = AsyncMock(return_value=5)  # 5 expired rows
+
+    with (
+        patch("app.workers.dispatcher.asyncio.sleep", _sleep_once),
+        patch(
+            "app.repositories.idempotency.IdempotencyRepository",
+            return_value=repo_instance,
+        ),
+    ):
+        await _idempotency_reaper_loop(_factory)  # type: ignore[arg-type]
+
+    repo_instance.delete_expired.assert_awaited_once()
+
+
+async def test_idempotency_reaper_loop_survives_repo_error() -> None:
+    """A raised exception from delete_expired must not crash the loop
+    — it's a housekeeping task, correctness doesn't depend on it, and
+    the worker process must not die because a cleanup query failed."""
+    import asyncio as _asyncio
+    from contextlib import asynccontextmanager
+    from unittest.mock import MagicMock
+
+    from app.workers.dispatcher import _idempotency_reaper_loop
+
+    call_count = {"n": 0}
+
+    async def _sleep_thrice(_):  # type: ignore[no-untyped-def]
+        call_count["n"] += 1
+        # Iteration 1: raise. Iteration 2: cancel to exit.
+        if call_count["n"] >= 3:
+            raise _asyncio.CancelledError
+
+    fake_session = AsyncMock()
+
+    @asynccontextmanager
+    async def _tx():  # type: ignore[no-untyped-def]
+        yield
+
+    fake_session.begin = _tx
+
+    class _FactoryCtx:
+        async def __aenter__(self):  # type: ignore[no-untyped-def]
+            return fake_session
+
+        async def __aexit__(self, *_a):  # type: ignore[no-untyped-def]
+            return None
+
+    def _factory():  # type: ignore[no-untyped-def]
+        return _FactoryCtx()
+
+    repo_instance = MagicMock()
+    repo_instance.delete_expired = AsyncMock(
+        side_effect=RuntimeError("db temporarily unavailable")
+    )
+
+    with (
+        patch("app.workers.dispatcher.asyncio.sleep", _sleep_thrice),
+        patch(
+            "app.repositories.idempotency.IdempotencyRepository",
+            return_value=repo_instance,
+        ),
+    ):
+        # Must not raise — loop's except handler swallows + logs.
+        await _idempotency_reaper_loop(_factory)  # type: ignore[arg-type]
+
+    # Called at least once (iteration 1 tried, raised; iteration 2 tried
+    # again and raised again; then iteration 3 cancelled).
+    assert repo_instance.delete_expired.await_count >= 1
