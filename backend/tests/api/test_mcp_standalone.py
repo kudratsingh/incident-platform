@@ -164,6 +164,50 @@ async def test_tools_list_with_auth_returns_registered_tools(
     assert "get_consumer_lag" in names
 
 
+async def test_tools_list_includes_output_schema_per_tool(
+    mcp_client,  # type: ignore[no-untyped-def]
+    db_session: AsyncSession,
+    default_tenant,
+) -> None:
+    """v0.4.8 extension (FIX_PLAN #25 optional): every tool advertises
+    its outputSchema alongside inputSchema so the commander's
+    contract-snapshot job can diff live-platform-advertised output
+    shapes without relying on its local registry as the source of
+    truth. Extension field — MCP-compliant clients that don't know
+    about it will ignore it."""
+    ac, _ = mcp_client
+    token = await _mint_token(
+        db_session, default_tenant, [Scope.TELEMETRY_READ.value]
+    )
+    resp = await ac.post(
+        "/mcp",
+        json=_rpc("tools/list"),
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    body = resp.json()
+    assert "result" in body
+    tools = body["result"]["tools"]
+    assert tools, "expected at least one tool registered"
+
+    # Every advertised tool must include outputSchema as a JSON Schema
+    # object. Empty {} is not acceptable — every tool has a declared
+    # output model, so the schema must be populated.
+    for tool in tools:
+        assert "outputSchema" in tool, f"{tool['name']} missing outputSchema"
+        assert isinstance(tool["outputSchema"], dict), tool["name"]
+        assert tool["outputSchema"].get("type") == "object", (
+            f"{tool['name']} outputSchema not a JSON object schema"
+        )
+
+    # Spot-check: get_consumer_lag advertises the same shape its output
+    # model declares — lag: int | None + consumer_group + cache_key.
+    lag_tool = next(t for t in tools if t["name"] == "get_consumer_lag")
+    props = lag_tool["outputSchema"]["properties"]
+    assert "consumer_group" in props
+    assert "lag" in props
+    assert "cache_key" in props
+
+
 # ---------------------------------------------------------------------------
 # tools/call
 # ---------------------------------------------------------------------------

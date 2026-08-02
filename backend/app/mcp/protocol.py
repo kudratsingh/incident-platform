@@ -95,11 +95,25 @@ class InitializeResult(BaseModel):
 class ToolInfo(BaseModel):
     """One entry in `tools/list`. `inputSchema` is a JSON Schema object;
     we generate it from each tool's Pydantic input model at registration
-    time (see `registry.py`)."""
+    time (see `registry.py`).
+
+    `outputSchema` is a platform extension (v0.4.8) not standardized by
+    the MCP spec: it's the JSON Schema of each tool's declared output
+    model. Clients that don't know about it will ignore it; clients that
+    do (the commander's contract-snapshot job) can diff the actual
+    platform-advertised output shape against their pinned snapshot
+    without treating the local registry as a source-of-truth proxy."""
 
     name: str
     description: str
     inputSchema: dict[str, Any]  # noqa: N815 (MCP spec)
+    outputSchema: dict[str, Any] = Field(  # noqa: N815 (platform extension)
+        default_factory=dict,
+        description=(
+            "JSON Schema of the tool's declared output model. Platform "
+            "extension — not in the MCP spec proper."
+        ),
+    )
 
 
 class ToolsListResult(BaseModel):

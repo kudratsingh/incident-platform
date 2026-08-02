@@ -107,6 +107,7 @@ def handle_tools_list(request_id: str | int | None) -> p.JsonRpcResponse:
             name=t.name,
             description=t.description,
             inputSchema=t.input_json_schema(),
+            outputSchema=t.output_json_schema(),
         )
         for t in list_tools()
     ]

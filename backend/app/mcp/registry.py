@@ -63,6 +63,16 @@ class ToolDefinition:
         clients get the same schema Pydantic uses for validation."""
         return self.input_model.model_json_schema()
 
+    def output_json_schema(self) -> dict[str, Any]:
+        """JSON Schema for the output model, emitted verbatim in
+        `tools/list` alongside `inputSchema` since v0.4.8. Not
+        standardized by the MCP spec — extension field — but clients
+        that ignore unknown keys (the commander's contract-snapshot
+        job among them) can now diff live-platform-outputs against
+        their pinned snapshot without needing the registry as a
+        source-of-truth proxy. Closes the loop FIX_PLAN #25 opened."""
+        return self.output_model.model_json_schema()
+
 
 _REGISTRY: dict[str, ToolDefinition] = {}
 
