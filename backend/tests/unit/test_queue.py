@@ -5,18 +5,13 @@ removed in the queue-leak fix — Kafka took over primary dispatch in Phase 7.
 """
 
 import time
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 from app.workers import queue
 
 
 def _mock_redis() -> AsyncMock:
-    r = AsyncMock()
-    pipe = AsyncMock()
-    pipe.execute = AsyncMock(return_value=[1, 1, 1, 1])
-    # pipeline() is a sync call that returns a pipeline object (not a coroutine)
-    r.pipeline = MagicMock(return_value=pipe)
-    return r
+    return AsyncMock()
 
 
 async def test_push_delayed_uses_future_timestamp() -> None:
@@ -30,23 +25,38 @@ async def test_push_delayed_uses_future_timestamp() -> None:
     assert before + 9 < score < after + 11
 
 
-async def test_pop_ready_delayed_returns_and_removes_ready_ids() -> None:
+async def test_pop_ready_delayed_returns_ids_atomically_via_lua() -> None:
+    """FIX_PLAN #9: pop is a single Lua EVAL, not a
+    zrangebyscore-then-pipeline-zrem. Verifies the returned ids match
+    what the script returned AND that the read-then-remove race no
+    longer requires multiple round-trips."""
     redis = _mock_redis()
-    redis.zrangebyscore.return_value = [("job-x", 100.0), ("job-y", 200.0)]
-    pipe = redis.pipeline.return_value
+    redis.eval = AsyncMock(return_value=[b"job-x", b"job-y"])
 
     ready = await queue.pop_ready_delayed(redis)
 
     assert ready == ["job-x", "job-y"]
-    # One zrem per ready id; pipeline.execute awaited once.
-    assert pipe.zrem.call_count == 2
-    pipe.execute.assert_awaited_once()
+    redis.eval.assert_awaited_once()
+    # Script gets the DELAYED_KEY, current time (as string).
+    args = redis.eval.await_args.args
+    assert args[1] == 1  # numkeys
+    assert args[2] == queue.DELAYED_KEY
+    # No pipeline path exercised — the old race is gone.
+    redis.pipeline.assert_not_called()
 
 
-async def test_pop_ready_delayed_returns_empty_when_none_ready() -> None:
+async def test_pop_ready_delayed_returns_empty_when_lua_returns_empty() -> None:
     redis = _mock_redis()
-    redis.zrangebyscore.return_value = []
+    redis.eval = AsyncMock(return_value=[])
     assert await queue.pop_ready_delayed(redis) == []
+
+
+async def test_atomic_pop_ready_decodes_str_and_bytes() -> None:
+    """decode_responses varies per-deployment; the helper accepts both."""
+    redis = _mock_redis()
+    redis.eval = AsyncMock(return_value=["already-str", b"bytes-form"])
+    result = await queue._atomic_pop_ready(redis, "someset", 100.0)
+    assert result == ["already-str", "bytes-form"]
 
 
 async def test_delayed_length_returns_zcard() -> None:

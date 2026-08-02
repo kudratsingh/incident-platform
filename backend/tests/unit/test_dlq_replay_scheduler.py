@@ -7,17 +7,13 @@ identical Redis semantics.
 
 import time
 import uuid
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 from app.workers import dlq_replay_scheduler
 
 
 def _mock_redis() -> AsyncMock:
-    r = AsyncMock()
-    pipe = AsyncMock()
-    pipe.execute = AsyncMock(return_value=[1, 1])
-    r.pipeline = MagicMock(return_value=pipe)
-    return r
+    return AsyncMock()
 
 
 async def test_schedule_replay_uses_future_timestamp() -> None:
@@ -47,16 +43,21 @@ async def test_schedule_replay_uses_future_timestamp() -> None:
     assert execute_at == score
 
 
-async def test_pop_ready_parses_and_removes_members() -> None:
+async def test_pop_ready_parses_and_returns_members_via_atomic_eval() -> None:
+    """FIX_PLAN #9: pop goes through the shared Lua-atomic helper,
+    which returns just member strings. Members parse back to their
+    tenant/principal/job triple."""
     redis = _mock_redis()
     tenant_id = uuid.uuid4()
     principal_id = uuid.uuid4()
     job_a = uuid.uuid4()
     job_b = uuid.uuid4()
-    redis.zrangebyscore.return_value = [
-        (f"{tenant_id}:{principal_id}:{job_a}", 100.0),
-        (f"{tenant_id}:{principal_id}:{job_b}", 200.0),
-    ]
+    redis.eval = AsyncMock(
+        return_value=[
+            f"{tenant_id}:{principal_id}:{job_a}".encode(),
+            f"{tenant_id}:{principal_id}:{job_b}".encode(),
+        ]
+    )
 
     ready = await dlq_replay_scheduler.pop_ready(redis)
 
@@ -64,27 +65,23 @@ async def test_pop_ready_parses_and_removes_members() -> None:
         (tenant_id, principal_id, job_a),
         (tenant_id, principal_id, job_b),
     ]
-    pipe = redis.pipeline.return_value
-    assert pipe.zrem.call_count == 2
-    pipe.execute.assert_awaited_once()
+    # Single atomic call — no pipeline path.
+    redis.pipeline.assert_not_called()
 
 
 async def test_pop_ready_returns_empty_when_none_due() -> None:
     redis = _mock_redis()
-    redis.zrangebyscore.return_value = []
+    redis.eval = AsyncMock(return_value=[])
     assert await dlq_replay_scheduler.pop_ready(redis) == []
 
 
 async def test_pop_ready_skips_malformed_members() -> None:
-    """A malformed member (from a bad manual write, say) is removed
-    but not returned — the promote loop won't blow up on it."""
+    """A malformed member (from a bad manual write, say) is dropped
+    by the atomic pop but its parse fails and it's skipped in the
+    returned list. The promote loop won't blow up on it."""
     redis = _mock_redis()
-    redis.zrangebyscore.return_value = [
-        ("not-a-triple", 100.0),
-    ]
+    redis.eval = AsyncMock(return_value=[b"not-a-triple"])
     assert await dlq_replay_scheduler.pop_ready(redis) == []
-    pipe = redis.pipeline.return_value
-    pipe.zrem.assert_called()  # still purged
 
 
 async def test_scheduled_length_returns_zcard() -> None:

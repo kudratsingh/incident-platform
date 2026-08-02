@@ -16,8 +16,8 @@ this is only reached when the caller varies the delay.
 
 import time
 import uuid
-from typing import cast
 
+from app.workers.queue import _atomic_pop_ready
 from redis.asyncio import Redis
 
 SCHEDULED_KEY = "jobs:dlq_replay_delayed"
@@ -55,20 +55,15 @@ async def pop_ready(
     """Atomically remove and return every scheduled replay whose
     `execute_at` has passed. Malformed members (shouldn't happen but
     survive a bad manual write) are dropped from the set and skipped.
-    """
-    now = time.time()
-    raw = await redis.zrangebyscore(SCHEDULED_KEY, "-inf", now, withscores=True)
-    ready = cast(list[tuple[str, float]], raw)
-    if not ready:
-        return []
 
-    pipe = redis.pipeline()
-    for member, _score in ready:
-        pipe.zrem(SCHEDULED_KEY, member)
-    await pipe.execute()
-
+    Uses the shared Lua-backed atomic pop from `queue._atomic_pop_ready`
+    so two concurrent readers can't process the same member twice —
+    the previous read-then-pipeline-zrem shape had a real race that
+    became a correctness bug the moment the worker scaled horizontally
+    (FIX_PLAN #9)."""
+    members = await _atomic_pop_ready(redis, SCHEDULED_KEY, time.time())
     parsed: list[tuple[uuid.UUID, uuid.UUID, uuid.UUID]] = []
-    for member, _score in ready:
+    for member in members:
         try:
             parsed.append(_parse(member))
         except (ValueError, AttributeError):

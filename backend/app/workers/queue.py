@@ -20,11 +20,48 @@ the ready entries, and republishes them via the outbox → `job.submitted`.
 """
 
 import time
-from typing import cast
 
 from redis.asyncio import Redis
 
 DELAYED_KEY = "jobs:delayed"
+
+# Atomic ZRANGEBYSCORE + ZREM via Lua (FIX_PLAN #9).
+#
+# The pre-v0.4.6 shape was two separate round-trips: read the ready set,
+# then pipeline a per-member ZREM. Between those two, a second reader on
+# the same key would see the same members and process them a second
+# time. Naturally deduped downstream by the DLQ status filter for
+# delayed retries, but the race exists and becomes a real correctness
+# bug the moment the worker horizontally scales (Phase 8). Making the
+# pop atomic converts a "theoretical, will bite later" into
+# "impossible-by-construction".
+#
+# Script contract:
+#   KEYS[1] : sorted-set key
+#   ARGV[1] : max score (as string; Redis parses it)
+#   returns : list of member strings ready to process. Empty list when
+#             nothing is due — caller need not test emptiness before
+#             looping.
+_POP_READY_LUA = """
+local due = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1])
+if #due > 0 then
+    redis.call('ZREM', KEYS[1], unpack(due))
+end
+return due
+"""
+
+
+async def _atomic_pop_ready(redis: Redis, key: str, max_score: float) -> list[str]:
+    """Atomically ZRANGEBYSCORE(-inf, max_score) + ZREM the same members
+    in a single Redis round-trip. Returns the member strings that were
+    both ready AND successfully removed by this call — no other client
+    can pop the same members concurrently."""
+    raw = await redis.eval(_POP_READY_LUA, 1, key, str(max_score))
+    # decode_responses is True in production; keep byte-safety for tests
+    # that pass raw bytes back.
+    return [
+        item.decode() if isinstance(item, bytes) else str(item) for item in raw
+    ]
 
 
 async def push_delayed(redis: Redis, job_id: str, delay_seconds: float) -> None:
@@ -34,22 +71,10 @@ async def push_delayed(redis: Redis, job_id: str, delay_seconds: float) -> None:
 
 
 async def pop_ready_delayed(redis: Redis) -> list[str]:
-    """Atomically remove and return all delayed jobs whose run_at has passed.
-
-    Used by the dispatcher's `_promote_delayed_loop` to republish ready
-    retries to the `job.submitted` Kafka topic (via the outbox).
-    """
-    now = time.time()
-    raw = await redis.zrangebyscore(DELAYED_KEY, "-inf", now, withscores=True)
-    ready = cast(list[tuple[str, float]], raw)
-    if not ready:
-        return []
-
-    pipe = redis.pipeline()
-    for job_id, _score in ready:
-        pipe.zrem(DELAYED_KEY, job_id)
-    await pipe.execute()
-    return [job_id for job_id, _score in ready]
+    """Atomically remove and return all delayed jobs whose run_at has
+    passed. Used by the dispatcher's `_promote_delayed_loop` to
+    republish ready retries to `job.submitted` (via the outbox)."""
+    return await _atomic_pop_ready(redis, DELAYED_KEY, time.time())
 
 
 async def delayed_length(redis: Redis) -> int:
