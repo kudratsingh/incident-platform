@@ -74,11 +74,12 @@ What's actually shipped (as of the most recent merge):
   6. `dependency-resolver` — promotes `WAITING` jobs to `PENDING` when their parents complete
   7. `saga-coordinator` — drives saga-level state and compensation on failure
   8. `llm-triage` (Phase 10) — calls Claude on every `job.dlq` to write a `JobTriage` row
-- **Four background loops** also running in the same process:
+- **Five background loops** also running in the same process:
   - **Outbox relay** — polls `outbox_events` every second and publishes to Kafka
   - **Delayed-retry promote** — moves exponentially-backed-off retries from a Redis sorted-set back into Kafka via the outbox
   - **Metrics loop** — emits CloudWatch gauges (`QueueDepth`, `InFlightJobs`, `ConsumerLag`) and caches the lag in Redis for the backpressure check
   - **Digest loop** (Phase 10) — every `LLM_DIGEST_INTERVAL_HOURS` (default 24), generates a per-tenant incident summary via Claude and persists it to `incident_summaries`
+  - **Idempotency reaper** — hourly DELETE of expired `idempotency_records` rows (closes ADR 0010's "no reaper" follow-up)
 
 See [`docs/KAFKA.md`](docs/KAFKA.md) for the full consumer-group catalog (failure isolation, partition strategy, schema-evolution rules) and [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#per-task-responsibilities) for the worker-loop responsibilities table.
 

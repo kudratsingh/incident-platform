@@ -23,7 +23,7 @@ Every idempotency record carries `expires_at = now() + 24h`. Rationale for the n
 - **Lower bound: multi-hop retry windows.** The commander's transport layer retries with exponential backoff up to ~5 minutes; the outer agent loop can retry a plan across ~30 minutes; a human operator resurrecting yesterday's session is at most a working day away. 24h absorbs all of these.
 - **Chosen number** falls comfortably above the operational retry window and below "same key means something different now" territory.
 
-Lookups treat expired records as absent — the caller re-executes and stores fresh. A background reaper is unnecessary at current volumes (10²–10³ Tier-1 calls/day per tenant); if the table grows, a partial index on `expires_at < now()` and a nightly `DELETE` job handle it. Deferred until the write rate justifies the operational surface.
+Lookups treat expired records as absent — the caller re-executes and stores fresh. Background cleanup runs hourly via `_idempotency_reaper_loop` in the worker process (v0.4.8) — `DELETE FROM idempotency_records WHERE expires_at IS NOT NULL AND expires_at < now()`. Interval matches the TTL cadence: a record expires at t+24h, gets reaped no later than t+25h. That bounded 1h window of "expired but still in the table" is invisible to callers because the lookup's own `expires_at < now()` check treats them as absent.
 
 ### 2. Arguments-hash contract (cross-repo)
 
@@ -132,7 +132,7 @@ Rejected at current scale. Right answer at N-consumers × M-providers where a sh
 
 ### Negative
 
-- **No reaper means expired records accumulate.** Rows accumulate at ~10²–10³/tenant/day and are read-cheap (indexed lookup ignores expired rows). A partial-index + nightly cleanup follow-up is filed when write rate justifies it. Not urgent.
+- **Hourly reaper interval is a compromise.** Every hour is short enough that the table stays bounded at ~24× the daily write rate but long enough that a burst of expired records isn't held for weeks. If write volume rises significantly, drop to 15min or add a partial index on `(expires_at) WHERE expires_at IS NOT NULL` for cheaper deletes.
 - **24h is a global constant, not a per-tool policy.** If a legitimate need arises for a shorter or longer window for a specific tool, this ADR's decision has to be revisited. Cheap to revisit — the constant is one place — but the mental model shifts from "always 24h" to "per-tool", which is a review-time cost.
 - **Cross-repo hash coordination lives in two places** (the spec here + the commander's perturbation matrix) and both must move together on any change to `_hash_arguments`. That coupling is intentional — the alternative is silent drift — but any future change to the normalization is a two-repo PR sequence, not a one-repo refactor.
 
