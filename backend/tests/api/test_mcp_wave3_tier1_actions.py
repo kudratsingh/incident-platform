@@ -408,3 +408,81 @@ async def test_invalidate_cache_key_idempotent_on_missing_key(
     second = _content(await _call(ac, token, "invalidate_cache_key", args))
     assert first["deleted"] is False
     assert second == first
+
+
+# ---------------------------------------------------------------------------
+# Commit-before-response — SAVEPOINT-per-item contract (#5)
+# ---------------------------------------------------------------------------
+
+
+async def test_replay_dlq_messages_mid_loop_crash_isolates_via_savepoint(
+    mcp_client, db_session: AsyncSession, default_tenant, test_user, monkeypatch  # type: ignore[no-untyped-def]
+) -> None:
+    """Contract lock for #5: a non-AppError raised on job N of a batch
+    must roll back only that item's writes (savepoint), keep the batch
+    going, and return a success shape with `failed=N` — not surface as
+    the tool's `except Exception` handler committing a partial replay
+    behind an 'internal tool error' response."""
+    # Three DLQ jobs. Middle one will trigger the injected crash; the
+    # other two should complete via savepoint-committed replays.
+    jobs = []
+    for i in range(3):
+        job = Job(
+            tenant_id=default_tenant.id,
+            user_id=test_user.id,
+            type=JobType.CSV_UPLOAD.value,
+            status=JobStatus.DEAD_LETTER.value,
+            retry_count=3,
+            error_message=f"stuck-{i}",
+        )
+        db_session.add(job)
+        jobs.append(job)
+    await db_session.flush()
+    doomed_id = jobs[1].id
+
+    # Wrap the real replay_job so the second job raises a non-AppError
+    # (SQLAlchemy-flavored to mirror a plausible constraint violation).
+    from app.services.job import JobService
+
+    real_replay = JobService.replay_job
+
+    async def _boom_on_middle(
+        self, job_id, tenant_id, **kwargs  # type: ignore[no-untyped-def]
+    ):
+        if job_id == doomed_id:
+            raise RuntimeError("simulated mid-loop constraint violation")
+        return await real_replay(self, job_id, tenant_id, **kwargs)
+
+    monkeypatch.setattr(JobService, "replay_job", _boom_on_middle)
+
+    ac, _ = mcp_client
+    token = await _token(
+        db_session, default_tenant.id, [Scope.ACTIONS_EXECUTE.value]
+    )
+    body = await _call(
+        ac,
+        token,
+        "replay_dlq_messages",
+        {"idempotency_key": "midloop-crash-k-1", "limit": 10},
+    )
+    # Success shape, not internal_error — the savepoint contained the
+    # per-item crash and let the batch complete.
+    assert "error" not in body, body
+    payload = _content(body)
+    assert payload["requested"] == 3
+    assert payload["replayed"] == 2
+    assert payload["failed"] == 1
+    replayed_ids = {j["id"] for j in payload["jobs"]}
+    assert str(doomed_id) not in replayed_ids
+
+    # And the DB state matches the response: doomed job still DEAD_LETTER,
+    # other two flipped to PENDING (savepoint-committed).
+    for job in jobs:
+        await db_session.refresh(job)
+    doomed = next(j for j in jobs if j.id == doomed_id)
+    assert doomed.status == JobStatus.DEAD_LETTER.value
+    assert doomed.retry_count == 3  # unchanged
+    for j in jobs:
+        if j.id != doomed_id:
+            assert j.status == JobStatus.PENDING.value
+            assert j.retry_count == 0

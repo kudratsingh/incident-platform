@@ -92,19 +92,36 @@ async def replay_dlq_messages(
     replayed: list[ReplayedJob] = []
     failed = 0
     for job in jobs:
+        # SAVEPOINT per item (#5): a mid-loop exception (AppError OR any
+        # other) rolls back only this iteration. Without this, a non-
+        # AppError raised on job N would propagate up to
+        # handle_tools_call, be caught as "internal tool error", but the
+        # session would still commit the writes staged for jobs 1..N-1 —
+        # the caller sees an error while the effect landed. The
+        # savepoint bounds each item's writes to that item's success.
         try:
-            updated = await service.replay_job(
-                job_id=job.id,
-                tenant_id=ctx.principal.tenant_id,
-                principal_type=ctx.principal.kind,
-                principal_id=ctx.principal.id,
-            )
+            async with ctx.db.begin_nested():
+                updated = await service.replay_job(
+                    job_id=job.id,
+                    tenant_id=ctx.principal.tenant_id,
+                    principal_type=ctx.principal.kind,
+                    principal_id=ctx.principal.id,
+                )
             replayed.append(ReplayedJob(id=str(updated.id), type=updated.type))
         except AppError as exc:
             failed += 1
             logger.warning(
                 "replay_dlq_messages replay failed",
                 extra={"job_id": str(job.id), "error": exc.message},
+            )
+        except Exception as exc:
+            # Non-AppError (SQLAlchemy error, unexpected bug, etc.) —
+            # count as failed but keep the batch going. The savepoint
+            # already rolled back this item; the loop is safe to continue.
+            failed += 1
+            logger.exception(
+                "replay_dlq_messages replay crashed",
+                extra={"job_id": str(job.id), "error": str(exc)},
             )
 
     return ReplayDlqMessagesOutput(

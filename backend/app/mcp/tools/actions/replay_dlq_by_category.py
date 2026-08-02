@@ -138,19 +138,29 @@ async def replay_dlq_by_category(
 
     for job in jobs:
         if inp.delay_seconds is None:
+            # SAVEPOINT per item (#5) — same rationale as
+            # replay_dlq_messages: bound a mid-loop non-AppError so it
+            # can't commit a partial batch behind an error response.
             try:
-                await service.replay_job(
-                    job_id=job.id,
-                    tenant_id=ctx.principal.tenant_id,
-                    principal_type=ctx.principal.kind,
-                    principal_id=ctx.principal.id,
-                )
+                async with ctx.db.begin_nested():
+                    await service.replay_job(
+                        job_id=job.id,
+                        tenant_id=ctx.principal.tenant_id,
+                        principal_type=ctx.principal.kind,
+                        principal_id=ctx.principal.id,
+                    )
                 replayed_ids.append(str(job.id))
             except AppError as exc:
                 failed += 1
                 logger.warning(
                     "replay_dlq_by_category per-job failure",
                     extra={"job_id": str(job.id), "error": exc.message},
+                )
+            except Exception as exc:
+                failed += 1
+                logger.exception(
+                    "replay_dlq_by_category per-job crashed",
+                    extra={"job_id": str(job.id), "error": str(exc)},
                 )
             continue
 

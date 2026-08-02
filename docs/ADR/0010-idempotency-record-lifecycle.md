@@ -79,9 +79,27 @@ Rejected: two commanders that omit an optional field vs. explicitly send its def
 - **24h is a global constant, not a per-tool policy.** If a legitimate need arises for a shorter or longer window for a specific tool, this ADR's decision has to be revisited. Cheap to revisit — the constant is one place — but the mental model shifts from "always 24h" to "per-tool", which is a review-time cost.
 - **The contract-test gap is real until #26 lands.** Right now, `_hash_arguments` drift caught by manual review only. Item #26 in FIX_PLAN_v2 tracks the cross-repo test that makes drift a CI failure.
 
+### Commit-before-response (resolved v0.4.6)
+
+Two-part fix. The pre-v0.4.6 shape had `IdempotencyService.store()` executing in the same request transaction as the tool's writes, with the transaction committing at request exit via the `get_db()` dependency. Two failure modes:
+
+**(a) Mid-loop non-AppError in a replay tool.** `replay_dlq_messages` and its siblings iterate over DLQ jobs, calling `service.replay_job` per item. The `try/except` only caught `AppError`; a `RuntimeError` (SQLAlchemy constraint violation, unexpected bug, dependency error) raised on job N propagated up to `handle_tools_call`, which caught it as `except Exception`, recorded an error audit, and returned "internal tool error" — while the outer `get_db()` cleanup then **committed** the writes staged for jobs 1..N-1. Caller saw failure; DB kept the partial effect.
+
+**(b) Deferred SQL errors surfaced only at outer commit.** A constraint violation ORM-detected only at flush/commit time would have already left `handle_tools_call` past the response-build point when it raised — mid-response, hard to correlate.
+
+Fix:
+
+- **SAVEPOINT per item.** Each per-item call in `replay_dlq_messages`, `replay_dlq_by_ids`, and `replay_dlq_by_category` is wrapped in `async with ctx.db.begin_nested():`. Both `AppError` and non-`AppError` exceptions per item are caught, counted as `failed`, and logged. The savepoint rolls back only that item; the batch continues. Success shape (`replayed=N failed=M`) accurately reflects reality.
+- **Explicit rollback in the `except Exception` handler.** When something raises outside the per-item savepoints (or a tool that doesn't use them at all), `handle_tools_call` now `await ctx.db.rollback()`s before recording the error audit — so the outer cleanup doesn't commit half-executed writes behind the error response. The audit itself is savepoint-wrapped ([#6](../postmortems/0002-phantom-supervisor.md)) so a rollback-broken session can still log without propagating.
+- **`await ctx.db.flush()` before response build.** Success-path only. Sends pending SQL to the DB so deferred errors (FK drift, constraint violations — the class that sank [PR #70](https://github.com/kudratsingh/incident-platform/pull/70)) surface here as exceptions rather than silently at the outer commit. A flush failure lands in the `except Exception` above and the whole tx rolls back.
+
+Together these give: **a success response means the DB has the pending writes, and the writes will commit as a unit; an error response means nothing committed for that call.** The per-item semantics for replay tools are additive: partial success is a first-class outcome, distinguishable from partial failure.
+
+Contract test: `test_replay_dlq_messages_mid_loop_crash_isolates_via_savepoint` in `tests/api/test_mcp_wave3_tier1_actions.py` injects a `RuntimeError` on the 2nd of 3 jobs and asserts `replayed=2 failed=1` + the second job's status unchanged.
+
 ### Reservations
 
-**Commit-before-response** (FIX_PLAN item #5) is unresolved and will amend this ADR when it lands. Today's shape: `store()` executes inside the same DB transaction as the tool's own writes, which the caller's response is serialized from. If the request handler crashes between "tool did its work" and "idempotency record was inserted", the retry executes the effect a second time — the exact scenario idempotency exists to prevent. Item #5 tightens the transactional boundary so a successful response guarantees a durable idempotency record. A follow-up section here will document the mechanism once that PR lands.
+Nothing outstanding at v0.4.6.
 
 ## Verification
 

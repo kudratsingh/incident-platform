@@ -119,13 +119,19 @@ async def replay_dlq_by_ids(
 
     for job_id in inp.job_ids:
         if inp.delay_seconds is None:
+            # SAVEPOINT per item (#5) — same rationale as the sibling
+            # replay tools. Immediate replay writes go through the
+            # session; without a nested transaction, a mid-loop
+            # non-AppError commits the earlier ids' writes behind an
+            # error response.
             try:
-                await service.replay_job(
-                    job_id=job_id,
-                    tenant_id=ctx.principal.tenant_id,
-                    principal_type=ctx.principal.kind,
-                    principal_id=ctx.principal.id,
-                )
+                async with ctx.db.begin_nested():
+                    await service.replay_job(
+                        job_id=job_id,
+                        tenant_id=ctx.principal.tenant_id,
+                        principal_type=ctx.principal.kind,
+                        principal_id=ctx.principal.id,
+                    )
                 results.append(ReplayResult(id=str(job_id), ok=True))
                 replayed += 1
             except AppError as exc:
@@ -138,6 +144,17 @@ async def replay_dlq_by_ids(
                 logger.warning(
                     "replay_dlq_by_ids per-id failure",
                     extra={"job_id": str(job_id), "error": exc.message},
+                )
+            except Exception as exc:
+                failed += 1
+                results.append(
+                    ReplayResult(
+                        id=str(job_id), ok=False, error=str(exc)
+                    )
+                )
+                logger.exception(
+                    "replay_dlq_by_ids per-id crashed",
+                    extra={"job_id": str(job_id), "error": str(exc)},
                 )
             continue
 
