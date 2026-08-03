@@ -14,7 +14,13 @@ What gets cleared/reset:
      which restores DLQ job status/retry_count/hint, re-populates the
      consumer-lag keys, and seeds the `hot_set` fixture (FIX_PLAN #7,
      #19).
-  3. **Idempotency records** — with `--purge-idempotency`, `DELETE`s
+  3. **Non-fixture DLQ rows** — any `dead_letter` job outside the
+     `_dlq_specs()` stable-ID set is moved to `cancelled`, so the DLQ
+     a scenario sees is exactly the fixture set it was graded against.
+     Catches chaos jobs attached to a real user, which the
+     chaos-owner-user cleanup below can't reach. Also de-noises the
+     planner on non-DLQ scenarios, which read the same surface.
+  4. **Idempotency records** — with `--purge-idempotency`, `DELETE`s
      every `idempotency_records` row for the seeded incident-commander
      service account. Off by default; the 24h TTL from [ADR 0010]
      handles the common case, but opt-in purge is useful when a
@@ -150,6 +156,56 @@ async def _delete_chaos_owner_users(session_factory: Any) -> int:
             return int(result.rowcount or 0)
 
 
+async def _sweep_nonfixture_dlq(session_factory: Any) -> int:
+    """Move every `dead_letter` job that isn't a seeded fixture to a
+    terminal status, so the DLQ a scenario observes contains exactly
+    the fixtures it was graded against.
+
+    `_delete_chaos_owner_users` above only reaches chaos jobs owned by
+    a lazy-created `chaos-owner+*` user. When the target tenant already
+    had a real user, `create_bad_data_job` attaches the job to *that*
+    user instead — so the row survives every reset and accumulates.
+    That is how a `bad_data_job` row from 2026-07-31, owned by
+    `agent-demo@example.com`, was still sitting in the DLQ days later.
+
+    The cost isn't just a dirty DLQ tab. Stale entries widen the
+    surface the agent's planner reads, which pulled it into extra
+    probes on scenarios that never mentioned the DLQ — consumer_lag
+    included. Sweeping is therefore a de-noising step for the whole
+    remediation loop, not just the DLQ scenarios.
+
+    `cancelled` rather than DELETE: these rows are real history for a
+    real user, the eval only cares that they're out of `dead_letter`,
+    and a status flip stays auditable. Fixtures are identified by the
+    stable() ID set — the `eval_fixture` payload marker agrees today,
+    but the IDs are what `_reset_dlq_state` re-baselines against, so
+    they're the authoritative definition.
+
+    Blast radius is deliberately environment-wide rather than scoped to
+    the seeded tenant: a stray `dead_letter` row in *any* tenant is
+    visible to a platform-admin-scoped agent and lands in the same
+    planner surface. Safe because this whole script is gated by
+    `_refuse_in_production()`.
+
+    Returns the number of rows swept."""
+    from scripts import seed_eval_fixtures  # type: ignore[import-not-found]
+
+    fixture_ids = [
+        str(spec["job_id"]) for spec in seed_eval_fixtures._dlq_specs()
+    ]
+    async with session_factory() as session:
+        async with session.begin():
+            result = await session.execute(
+                text(
+                    "UPDATE jobs SET status = 'cancelled', updated_at = now() "
+                    "WHERE status = 'dead_letter' "
+                    "AND id <> ALL(CAST(:fixture_ids AS uuid[]))"
+                ),
+                {"fixture_ids": fixture_ids},
+            )
+            return int(result.rowcount or 0)
+
+
 def _refuse_in_production() -> None:
     """Loud failure if invoked against a production platform. Backed by
     ADR 0008's environment gate — this is the belt on top of the braces."""
@@ -192,6 +248,11 @@ async def reset(
         # (unlike the idempotency purge, which is opt-in) — these rows
         # are chaos-specific and shouldn't survive a reset.
         chaos_owners_deleted = await _delete_chaos_owner_users(factory)
+        # Runs after the seed/reset above, which restores replayed
+        # fixtures to `dead_letter`. Sweeping first would be harmless
+        # but pointless — the restore would repopulate the DLQ after
+        # the sweep had already looked at it.
+        dlq_swept = await _sweep_nonfixture_dlq(factory)
         idempotency_purged = 0
         if purge_idempotency:
             idempotency_purged = await _purge_idempotency_records(factory)
@@ -203,6 +264,7 @@ async def reset(
         "chaos_keys_cleared": chaos_cleared,
         "chaos_owners_deleted": chaos_owners_deleted,
         "dlq_reset": seed_summary["dlq_reset"],
+        "dlq_swept": dlq_swept,
         "idempotency_purged": idempotency_purged,
     }
 
