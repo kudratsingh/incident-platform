@@ -98,7 +98,9 @@ async def _list_incidents_query(
         "List incidents (alerts) scoped to the caller's tenant. Defaults "
         "to unresolved; pass `include_resolved=true` to see history. "
         "Superset of `list_active_alerts` — that tool is the cheap "
-        "poll path when you know you want unresolved only."
+        "poll path when you know you want unresolved only.\n"
+        "FRESHNESS: live read from Postgres — reflects the moment of "
+        "the call, no cache."
     ),
     input_model=ListIncidentsInput,
     output_model=ListIncidentsOutput,

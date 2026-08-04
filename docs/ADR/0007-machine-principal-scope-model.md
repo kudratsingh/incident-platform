@@ -33,7 +33,9 @@ Introduce two new concepts:
 | `actions:execute` | Execute an approved proposal (Tier 1 idempotent, Tier 2 requires approval reference). |
 | `chaos:invoke` | Invoke chaos framework tools. Gated additionally by `CHAOS_ENABLED` — see [ADR 0008](0008-chaos-gating.md). |
 
-The seed principal `incident-commander` gets `telemetry:read + incidents:read` and nothing else. Wave 3 introduces `actions:propose` and `actions:execute` behind the approvals subsystem.
+The seed principal `incident-commander` starts at `telemetry:read + incidents:read` and nothing else. Wave 3 introduces `actions:propose` and `actions:execute` behind the approvals subsystem.
+
+**Update (v0.4.9):** the live seed grant has since widened to four scopes — `telemetry:read`, `incidents:read`, `actions:execute`, `chaos:invoke`. `actions:execute` landed with Wave 3 Tier-1 actions; `chaos:invoke` landed when scenarios began self-seeding their own faults. `actions:propose` is still ungranted because the approvals subsystem it gates doesn't exist yet — Tier-1 executes directly under an `Idempotency-Key`. This paragraph documented the Step 0 intent for long enough that it read as current state; the authority is `SELECT name, scopes FROM service_accounts`.
 
 ### Why scopes, not new roles
 

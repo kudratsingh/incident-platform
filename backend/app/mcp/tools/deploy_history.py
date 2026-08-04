@@ -87,7 +87,11 @@ class GetDeployHistoryOutput(BaseModel):
         "snapshot when unseeded. Useful for correlating incidents "
         "with a recent deploy — the seed script annotates one row "
         "with a `notes` string for exactly this hypothesis-testing "
-        "use case."
+        "use case.\n"
+        "FRESHNESS: live read from Postgres, no cache. Deploy markers "
+        "are written by the release pipeline, so a very recent deploy "
+        "may not have a row yet — absence of a marker is weak evidence "
+        "that no deploy happened."
     ),
     input_model=GetDeployHistoryInput,
     output_model=GetDeployHistoryOutput,

@@ -92,7 +92,14 @@ class ReplayDlqByIdsOutput(BaseModel):
         "`wait_and_replay` category — the platform schedules on a "
         "Redis ZSET and a worker loop fires the replay when the "
         "delay elapses. Returns per-id outcome so a partial replay "
-        "is observable. Idempotent."
+        "is observable. Idempotent.\n"
+        "VERIFYING A DELAYED REPLAY: a scheduled entry is not replayed "
+        "yet. It stays in status `dead_letter` and keeps appearing in "
+        "list_dlq_messages until `execute_at` passes — an unchanged "
+        "DLQ is the expected state, not a failure. Verify with the "
+        "`scheduled` outcomes in this response and the "
+        "`job.replay_scheduled` audit events, not with DLQ shrink. "
+        "Re-check DLQ size only after `execute_at`."
     ),
     input_model=ReplayDlqByIdsInput,
     output_model=ReplayDlqByIdsOutput,

@@ -29,10 +29,13 @@ from app.core import metrics
 from app.core.logging import get_logger, job_id_var, trace_id_var
 from app.core.tracing import extract_context, get_tracer
 from app.models.enums import JobStatus, JobType
+from app.models.job import Job
 from app.repositories.audit import AuditRepository
 from app.repositories.job import JobRepository
+from app.repositories.job_dependency import JobDependencyRepository
 from app.repositories.outbox import OutboxRepository
 from app.services import retry_policy
+from app.utils.dag_pause import find_blocking_pause
 from app.workers import (
     async_tasks,
     cpu_processors,
@@ -51,12 +54,20 @@ from app.workers.sse_consumer import SseConsumer
 from app.workers.triage_consumer import LlmTriageConsumer
 from opentelemetry import trace
 from opentelemetry.trace import SpanKind
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 logger = get_logger(__name__)
 tracer = get_tracer(__name__)
 
 POLL_INTERVAL = 0.5  # seconds between queue checks
+
+# Resume sweep: slower than the retry loops on purpose. It only exists
+# to catch children whose promotion event has already passed (held by a
+# DAG pause, or a missed job.completed), so seconds of latency after a
+# pause lifts is fine and the DB scan stays cheap.
+_RESUME_SWEEP_INTERVAL = 10  # seconds
+_RESUME_SWEEP_LIMIT = 200  # WAITING rows examined per pass
 MAX_CONCURRENT_JOBS = 10  # cap on simultaneously running jobs
 
 # Strategy map: job type → processor coroutine
@@ -584,6 +595,83 @@ async def _promote_delayed_loop(
         await asyncio.sleep(POLL_INTERVAL)
 
 
+async def _resume_unblocked_waiting_loop(
+    session_factory: async_sessionmaker[AsyncSession],
+    redis: Any,
+) -> None:
+    """Promote WAITING jobs whose parents are all done and whose DAG is
+    no longer paused.
+
+    The DependencyResolver only reacts to `job.completed`. Once
+    `pause_dag` became enforcing, a child held during a pause had no
+    second chance: the parent's completion event was already consumed,
+    so lifting the pause (or letting its TTL expire) would strand the
+    child in WAITING forever. This loop is what makes the pause
+    *temporary* rather than terminal, and it doubles as a backstop for
+    any child whose promotion event was missed.
+
+    Cross-tenant by design — it's a platform-level scheduler, not a
+    request path, so it deliberately doesn't go through the
+    tenant-scoped `JobRepository.list_jobs`.
+    """
+    settings = get_settings()
+    while True:
+        try:
+            async with session_factory() as session:
+                async with session.begin():
+                    dep_repo = JobDependencyRepository(session)
+                    job_repo = JobRepository(session)
+                    outbox_repo = OutboxRepository(session)
+
+                    rows = (
+                        await session.execute(
+                            select(Job)
+                            .where(Job.status == JobStatus.WAITING)
+                            .limit(_RESUME_SWEEP_LIMIT)
+                        )
+                    ).scalars()
+
+                    for child in rows:
+                        if await dep_repo.unmet_count(child.id) > 0:
+                            continue
+                        if (
+                            await find_blocking_pause(redis, dep_repo, child.id)
+                            is not None
+                        ):
+                            continue
+
+                        await job_repo.update_status(
+                            child.id,
+                            JobStatus.PENDING,
+                            extra={"error_message": None},
+                        )
+                        await outbox_repo.add(
+                            tenant_id=child.tenant_id,
+                            topic=settings.kafka_topic_job_submitted,
+                            key=f"{child.tenant_id}:{child.user_id}",
+                            payload={
+                                "event": "job.submitted",
+                                "tenant_id": str(child.tenant_id),
+                                "job_id": str(child.id),
+                                "user_id": str(child.user_id),
+                                "job_type": child.type,
+                                "payload": dict(child.payload or {}),
+                                "priority": child.priority,
+                                "trace_id": child.trace_id,
+                            },
+                        )
+                        logger.info(
+                            "resume sweep promoted child",
+                            extra={"child_id": str(child.id)},
+                        )
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            logger.error("resume sweep error", extra={"error": str(exc)})
+
+        await asyncio.sleep(_RESUME_SWEEP_INTERVAL)
+
+
 async def _promote_dlq_replay_loop(
     session_factory: async_sessionmaker[AsyncSession],
     redis: Any,
@@ -913,7 +1001,7 @@ async def worker_loop(
     """
     Start the Kafka consumers and the supporting background loops.
 
-    Concurrent tasks that make up the worker — 8 Kafka consumers + 4 loops:
+    Concurrent tasks that make up the worker — 8 Kafka consumers + 7 loops:
 
       Kafka consumers (each its own group, so failure of one doesn't
       affect the others):
@@ -922,17 +1010,20 @@ async def worker_loop(
         3. sse.run()              — consumes lifecycle events, bridges to Redis pub/sub.
         4. event_log.run()        — appends every lifecycle event to `job_events`.
         5. read_model.run()       — projects per-tenant/per-user status sets in Redis.
-        6. dep_resolver.run()     — promotes WAITING children to PENDING on parent completion.
+        6. dep_resolver.run()     — promotes WAITING children to PENDING on parent completion,
+                                    unless the child or an ancestor carries a `dag:paused:*` flag.
         7. saga.run()             — settles sagas; enqueues compensation on DLQ.
         8. triage.run()           — Phase 10: LLM classification of dead-lettered jobs.
 
       Background loops:
         1. _promote_delayed_loop      — re-publishes delayed retries via outbox.
         2. _promote_dlq_replay_loop   — fires operator-scheduled DLQ replays.
-        3. _outbox_relay_loop         — publishes outbox rows to Kafka.
-        4. _metrics_loop              — emits gauges + cached lag for backpressure.
-        5. _digest_loop               — Phase 10: per-tenant LLM digests (opt-in).
-        6. _idempotency_reaper_loop   — hourly DELETE of expired idempotency records
+        3. _resume_unblocked_waiting_loop — promotes WAITING children once their DAG
+                                        pause lifts; backstops missed promotions.
+        4. _outbox_relay_loop         — publishes outbox rows to Kafka.
+        5. _metrics_loop              — emits gauges + cached lag for backpressure.
+        6. _digest_loop               — Phase 10: per-tenant LLM digests (opt-in).
+        7. _idempotency_reaper_loop   — hourly DELETE of expired idempotency records
                                         (ADR 0010's "no reaper" follow-up).
 
     Cancel signal: cancel all, wait for in-flight jobs, stop all consumers.
@@ -942,7 +1033,7 @@ async def worker_loop(
     sse = SseConsumer(redis)
     event_log = EventLogConsumer(session_factory)
     read_model = ReadModelProjector(redis)
-    dep_resolver = DependencyResolver(session_factory)
+    dep_resolver = DependencyResolver(session_factory, redis)
     saga = SagaCoordinator(session_factory)
     triage = LlmTriageConsumer(session_factory)
     consumers: list[BaseKafkaConsumer] = [
@@ -981,6 +1072,9 @@ async def worker_loop(
         [
             asyncio.create_task(_promote_delayed_loop(session_factory, redis)),
             asyncio.create_task(_promote_dlq_replay_loop(session_factory, redis)),
+            asyncio.create_task(
+                _resume_unblocked_waiting_loop(session_factory, redis)
+            ),
             asyncio.create_task(_outbox_relay_loop(session_factory)),
             asyncio.create_task(_metrics_loop(redis, dispatcher)),
             asyncio.create_task(_digest_loop(session_factory)),

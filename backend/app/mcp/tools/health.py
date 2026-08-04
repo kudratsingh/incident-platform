@@ -41,7 +41,10 @@ class RedisHealthOutput(BaseModel):
     "get_redis_health",
     description=(
         "Ping Redis and read a short list of stats from INFO. Never "
-        "raises — an `ok=false` result *is* the interesting signal."
+        "raises — an `ok=false` result *is* the interesting signal.\n"
+        "FRESHNESS: live probe, measured at call time. Reports "
+        "aggregate server stats only — it does not enumerate keys, so "
+        "it cannot tell you which keys exist or who wrote them."
     ),
     input_model=_EmptyIn,
     output_model=RedisHealthOutput,
@@ -89,7 +92,8 @@ class PostgresHealthOutput(BaseModel):
     description=(
         "Ping the primary database and read a small set of activity "
         "stats. Falls back cleanly on non-Postgres backends (SQLite in "
-        "tests) — the `dialect` field tells the agent what it looked at."
+        "tests) — the `dialect` field tells the agent what it looked at.\n"
+        "FRESHNESS: live probe, measured at call time."
     ),
     input_model=_EmptyIn,
     output_model=PostgresHealthOutput,

@@ -34,31 +34,43 @@ class RestartConsumerGroupInput(BaseModel):
         min_length=8,
         max_length=255,
         description="Caller-supplied token. Repeat calls with the same "
-        "value + same arguments return the same result without "
-        "re-executing.",
+        "value + same arguments return the cached result WITHOUT "
+        "re-executing — including `accepted: true`. Reusing a key from "
+        "an earlier incident therefore looks like a success and does "
+        "nothing. Use a fresh key per distinct intent; only reuse one "
+        "to retry the very same call after a transport failure.",
     )
 
 
 class RestartConsumerGroupOutput(BaseModel):
     consumer_group: str
+    # v0.4.9: the `kill_key` / `latency_key` string fields are gone.
+    # They spelled out `chaos:kill:*` / `chaos:latency:*` in the
+    # response of a tool that only requires `actions:execute` — so an
+    # agent with no chaos scope still learned the test rig existed, and
+    # at least one investigation chased the harness instead of the
+    # fault. The booleans carry the whole operational outcome; the key
+    # names were never actionable, only revealing.
     kill_key_cleared: bool
-    kill_key: str
-    # v0.4.5: restart also reports the injected-latency flag it cleared.
-    # Additive — the agent's output model ignores unknown fields, so
-    # older commanders keep parsing this response unchanged.
     latency_key_cleared: bool
-    latency_key: str
     accepted: bool
 
 
 @tool(
     "restart_consumer_group",
     description=(
-        "Clear the chaos kill flag AND any injected latency on a Kafka "
-        "consumer group so its supervisor restarts it at full speed. "
-        "Compensating counterpart to both `kill_consumer` and "
-        "`inject_latency`; use this to end a chaos run cleanly. "
-        "Idempotent — repeat calls with the same idempotency_key are safe."
+        "Restart a stalled Kafka consumer group and clear any "
+        "throttling applied to it, so its supervisor brings it back at "
+        "full speed. `kill_key_cleared` / `latency_key_cleared` report "
+        "whether each condition was actually present. Idempotent — "
+        "repeat calls with the same idempotency_key are safe.\n"
+        "VERIFYING: a real restart brings the consumer back within a "
+        "few seconds (measured ~2s). Confirm via group membership and "
+        "draining lag — not via get_consumer_lag alone, whose cached "
+        "value keeps reading the pre-restart high for ~30s after a "
+        "genuine recovery. `kill_key_cleared: false` with an unchanged "
+        "consumer is the signature of a reused idempotency_key "
+        "replaying an old success rather than acting."
     ),
     input_model=RestartConsumerGroupInput,
     output_model=RestartConsumerGroupOutput,
@@ -83,8 +95,6 @@ async def restart_consumer_group(
     return RestartConsumerGroupOutput(
         consumer_group=inp.consumer_group,
         kill_key_cleared=kill_cleared,
-        kill_key=kill_key,
         latency_key_cleared=latency_cleared,
-        latency_key=latency_key,
         accepted=True,
     )

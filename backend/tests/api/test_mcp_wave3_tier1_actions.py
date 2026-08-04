@@ -242,6 +242,14 @@ async def test_restart_consumer_group_clears_kill_key(
     assert kill_key_for("worker-dispatcher") not in redis_stub._store
     assert latency_key_for("worker-dispatcher") not in redis_stub._store
 
+    # v0.4.9 leak guard: this tool only requires `actions:execute`, so
+    # its response must not name the chaos rig. Spelling out
+    # `chaos:kill:*` / `chaos:latency:*` here once sent an agent
+    # investigating the harness instead of the fault.
+    assert "kill_key" not in payload
+    assert "latency_key" not in payload
+    assert "chaos" not in json.dumps(payload)
+
 
 async def test_restart_consumer_group_clears_injected_latency_without_kill(
     mcp_client, db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]

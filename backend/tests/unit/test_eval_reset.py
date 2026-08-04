@@ -197,6 +197,45 @@ async def test_clear_chaos_keys_scans_and_deletes_matching_patterns() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Tier-1 action residue — delayed replay timers + DAG pauses
+# ---------------------------------------------------------------------------
+
+
+async def test_clear_scheduled_replays_drops_pending_timers() -> None:
+    """A 5-minute replay scheduled by one scenario used to survive the
+    reset and fire during the next one."""
+    reset = _reset_module()
+    redis = AsyncMock()
+    redis.zcard.return_value = 3
+
+    cleared = await reset._clear_scheduled_replays(redis)
+
+    assert cleared == 3
+    redis.delete.assert_awaited_once_with("jobs:dlq_replay_delayed")
+
+
+async def test_clear_scheduled_replays_noop_when_empty() -> None:
+    reset = _reset_module()
+    redis = AsyncMock()
+    redis.zcard.return_value = 0
+
+    assert await reset._clear_scheduled_replays(redis) == 0
+    redis.delete.assert_not_awaited()
+
+
+async def test_clear_dag_pauses_removes_pause_flags() -> None:
+    """Harmless before the resolver enforced pauses; since ADR 0011 a
+    leftover flag holds the next scenario's DAG in WAITING."""
+    reset = _reset_module()
+    redis = AsyncMock()
+    scan_results = iter([(0, [b"dag:paused:abc", b"dag:paused:def"])])
+    redis.scan.side_effect = lambda **_: next(scan_results)
+    redis.delete = AsyncMock(return_value=2)
+
+    assert await reset._clear_dag_pauses(redis) == 2
+
+
+# ---------------------------------------------------------------------------
 # _refuse_in_production — FIX_PLAN #79 guardrail
 # ---------------------------------------------------------------------------
 

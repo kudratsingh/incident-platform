@@ -14,13 +14,19 @@ What gets cleared/reset:
      which restores DLQ job status/retry_count/hint, re-populates the
      consumer-lag keys, and seeds the `hot_set` fixture (FIX_PLAN #7,
      #19).
-  3. **Non-fixture DLQ rows** — any `dead_letter` job outside the
+  3. **Tier-1 action residue** — pending delayed-replay timers on the
+     `jobs:dlq_replay_delayed` ZSET, and any `dag:paused:*` flag. Both
+     are effects the *agent* left behind rather than chaos state, and
+     both bleed into the next scenario: a timer fires mid-run and
+     shrinks the DLQ unprompted, a stale pause holds the next DAG in
+     WAITING (enforced since ADR 0011).
+  4. **Non-fixture DLQ rows** — any `dead_letter` job outside the
      `_dlq_specs()` stable-ID set is moved to `cancelled`, so the DLQ
      a scenario sees is exactly the fixture set it was graded against.
      Catches chaos jobs attached to a real user, which the
      chaos-owner-user cleanup below can't reach. Also de-noises the
      planner on non-DLQ scenarios, which read the same surface.
-  4. **Idempotency records** — with `--purge-idempotency`, `DELETE`s
+  5. **Idempotency records** — with `--purge-idempotency`, `DELETE`s
      every `idempotency_records` row for the seeded incident-commander
      service account. Off by default; the 24h TTL from [ADR 0010]
      handles the common case, but opt-in purge is useful when a
@@ -80,6 +86,13 @@ _CHAOS_KEY_PATTERNS = (
     "kafka:consumer:*:latency_ms",  # latency_key_for()
 )
 
+# Tier-1 *action* residue, as opposed to chaos residue above. These are
+# effects the agent itself creates during a scenario; left in place they
+# fire or apply during the next one. Mirrors
+# `dlq_replay_scheduler.SCHEDULED_KEY` — kept as a literal so this
+# script has no import dependency on the worker package.
+_SCHEDULED_REPLAY_KEY = "jobs:dlq_replay_delayed"
+
 
 async def _clear_chaos_keys(redis: aioredis.Redis) -> int:
     """Scan + delete every key matching a chaos pattern. Uses SCAN over
@@ -93,6 +106,46 @@ async def _clear_chaos_keys(redis: aioredis.Redis) -> int:
                 deleted += await redis.delete(*batch)
             if cursor == 0:
                 break
+    return deleted
+
+
+async def _clear_scheduled_replays(redis: aioredis.Redis) -> int:
+    """Drop every pending delayed-DLQ-replay timer.
+
+    `replay_dlq_by_ids/-by_category(delay_seconds=...)` pushes onto the
+    `jobs:dlq_replay_delayed` ZSET and a worker loop fires it when the
+    delay elapses. Nothing cancelled those on reset, so a scenario that
+    scheduled a 5-minute replay left a live timer behind: it fires
+    mid-*next*-scenario, replays a DLQ entry nobody asked about, and
+    the DLQ shrinks under the next agent's feet.
+
+    Returns the number of timers removed."""
+    pending = int(await redis.zcard(_SCHEDULED_REPLAY_KEY) or 0)
+    if pending:
+        await redis.delete(_SCHEDULED_REPLAY_KEY)
+    return pending
+
+
+async def _clear_dag_pauses(redis: aioredis.Redis) -> int:
+    """Delete every `dag:paused:*` flag.
+
+    Harmless before v0.4.9, when the flag was written and never read.
+    Now that the DependencyResolver enforces it (ADR 0011), a pause
+    left over from one scenario holds the next scenario's DAG in
+    WAITING — the same class of cross-scenario bleed as the replay
+    timers above.
+
+    Returns the number of pause flags removed."""
+    deleted = 0
+    cursor = 0
+    while True:
+        cursor, batch = await redis.scan(
+            cursor=cursor, match="dag:paused:*", count=100
+        )
+        if batch:
+            deleted += await redis.delete(*batch)
+        if cursor == 0:
+            break
     return deleted
 
 
@@ -238,6 +291,8 @@ async def reset(
 
     try:
         chaos_cleared = await _clear_chaos_keys(redis)
+        timers_cleared = await _clear_scheduled_replays(redis)
+        pauses_cleared = await _clear_dag_pauses(redis)
         seed_summary = await seed_eval_fixtures.seed(
             database_url=database_url,
             redis_url=redis_url,
@@ -263,9 +318,11 @@ async def reset(
     return {
         "chaos_keys_cleared": chaos_cleared,
         "chaos_owners_deleted": chaos_owners_deleted,
+        "dag_pauses_cleared": pauses_cleared,
         "dlq_reset": seed_summary["dlq_reset"],
         "dlq_swept": dlq_swept,
         "idempotency_purged": idempotency_purged,
+        "timers_cleared": timers_cleared,
     }
 
 

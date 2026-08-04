@@ -80,7 +80,11 @@ class ListDlqMessagesOutput(BaseModel):
         "pick a strategy without re-reasoning about the error string. "
         "Filter by `remediation_hint=<value>` to isolate one category — "
         "e.g. pass `replay_safe` before calling `replay_dlq_by_category`. "
-        "Also includes the LLM triage row when present."
+        "Also includes the LLM triage row when present.\n"
+        "FRESHNESS: live read from Postgres — reflects the moment of "
+        "the call, no cache. Note that entries scheduled for a delayed "
+        "replay still appear here until their `execute_at` passes, so "
+        "an unchanged list right after a delayed replay is expected."
     ),
     input_model=ListDlqMessagesInput,
     output_model=ListDlqMessagesOutput,
