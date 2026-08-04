@@ -6,7 +6,9 @@
 >
 > **Rule 1 (non-chaos tools never name chaos internals)** shipped in v0.4.9. It was a correctness fix on a live leak.
 >
-> **Rule 2 (scenario-owned DLQ fixtures)** is accepted on the merits and **deferred until after the clean-baseline rerun** — operator decision. It is an eval-architecture improvement, not a correctness fix, and landing it now would force another platform version cycle plus an agent-side contract sync immediately before the run it is meant to improve. The standing fixture pool remains the baseline until then. Implementation is drafted and parked; see the sequencing section.
+> **Rule 2 (scenario-owned DLQ fixtures)** is accepted on the merits and **deferred until after the clean-baseline rerun** — operator decision. It is an eval-architecture improvement, not a correctness fix, and landing it now would force another platform version cycle plus an agent-side contract sync immediately before the run it is meant to improve. The standing fixture pool remains the baseline until then.
+>
+> **Correction (post-merge).** The rule-2 implementation is **on `master`**, not parked on a branch. PR #92 merged shortly before the docs PR that carried this ADR, so the docs branch picked it up. Deliberately left in place rather than reverted — see "What the deferral now means" below. The deferral still holds, but the constraint that enforces it changed from *don't merge* to **don't cut a tag before the rerun**.
 
 ## Context
 
@@ -52,14 +54,24 @@ The baseline flip is a breaking change for every `dlq_*` scenario written agains
 
 So it lands in three steps, **after the rerun**, and **`EVAL_EMPTY_DLQ_BASELINE` is opt-in, never a default flip in the same change**:
 
-0. **(Now.)** Nothing. The standing pool remains the baseline through the clean-baseline rerun. Rule 2 changes no behaviour until step 1.
+0. **(Now.)** Code is on `master` but inert — see below. The standing pool remains the baseline through the clean-baseline rerun.
 1. **Platform.** Ship `seed_dlq_messages` + the opt-in flag. Default behaviour unchanged — the standing pool still exists, existing scenarios keep passing.
 2. **Commander.** Migrate `dlq_*` scenarios to declare their fixtures via the hook; run with `EVAL_EMPTY_DLQ_BASELINE=1`.
 3. **Platform.** Flip the default, retire `_dlq_specs()` and `_reset_dlq_state`, simplify the sweep to an unconditional clear.
 
 At no point is either side broken by the other's merge. Step 3 is a small follow-up, not a rewrite — the sweep already exists and only loses a condition.
 
-**Why step 0 exists.** The implementation was built and verified before the deferral decision (both modes exercised against a live stack; the mode proved reversible, with `_reset_dlq_state` restoring the pool when the flag is cleared). It is parked on a branch rather than discarded, so step 1 is a rebase and a re-run of the gate rather than a rewrite. The deferral is about *when the version cycle lands*, not about doubt over the design.
+**Why step 0 exists.** The implementation was built and verified before the deferral decision (both modes exercised against a live stack; the mode proved reversible, with `_reset_dlq_state` restoring the pool when the flag is cleared). The deferral is about *when the version cycle lands*, not about doubt over the design.
+
+### What the deferral now means, given the code is on `master`
+
+The rule-2 implementation merged to `master` ahead of the deferral being recorded. It was left in place rather than reverted, because a revert plus a later un-revert buys nothing the release boundary already provides. What matters is which artifact the rerun consumes:
+
+- **The pinned `v0.4.9` image does not contain it.** Verified: that image ships 8 chaos tools, no `seed_dlq_messages`. The rerun runs against the pinned digest, so it sees exactly the surface the agent's contract snapshot was taken against.
+- **Behaviour on `master` is unchanged.** `EVAL_EMPTY_DLQ_BASELINE` defaults off, so the standing pool is still the baseline. Verified post-merge: `empty_dlq_baseline: false`, `dlq_swept: 0`, 4 DLQ rows.
+- **`master`'s tool surface has drifted by one** — 27 tools instead of 26, because `seed_dlq_messages` registers when `CHAOS_ENABLED=true`. A run against a *dev* stack built from `master` would fail the contract snapshot on that extra tool. A run against the pinned image would not.
+
+So the operative constraint is now: **do not cut a tag before the rerun.** Tagging would build an image containing the new tool, and the commander's pin bump would drag in the contract change the deferral exists to avoid. Merging was never the risk; releasing is.
 
 ## Consequences
 
