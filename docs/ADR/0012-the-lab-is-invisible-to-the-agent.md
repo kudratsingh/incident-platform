@@ -1,6 +1,12 @@
 # ADR 0012 — The lab is invisible to the agent
 
-**Status:** Accepted (v0.4.9 / v0.4.10) · **Date:** 2026 Q3 · **Owner:** Platform
+**Status:** Rule 1 accepted + shipped (v0.4.9) · Rule 2 **accepted-deferred, target: post-rerun** · **Date:** 2026 Q3 · **Owner:** Platform
+
+> **Split status, deliberately.** The two rules below share a root cause but not a timeline.
+>
+> **Rule 1 (non-chaos tools never name chaos internals)** shipped in v0.4.9. It was a correctness fix on a live leak.
+>
+> **Rule 2 (scenario-owned DLQ fixtures)** is accepted on the merits and **deferred until after the clean-baseline rerun** — operator decision. It is an eval-architecture improvement, not a correctness fix, and landing it now would force another platform version cycle plus an agent-side contract sync immediately before the run it is meant to improve. The standing fixture pool remains the baseline until then. Implementation is drafted and parked; see the sequencing section.
 
 ## Context
 
@@ -30,9 +36,11 @@ Note the leak was *not* in `get_redis_health`, which was the initial suspect. Th
 
 ### 2. Scenarios declare their own fixtures; the baseline is empty
 
+*(Accepted; implementation deferred to post-rerun — see status note above.)*
+
 Accepting commander ADR 0010. The inter-scenario baseline becomes an empty DLQ. A scenario that needs DLQ content declares it — the same principle PR #54 already established for chaos faults, applied to fixtures.
 
-Platform half:
+Platform half, when it lands:
 
 - **`seed_dlq_messages`** — a chaos-gated hook creating N rows with declared `remediation_hint`, `job_type`, `count`, and error string. Chaos-gated rather than a plain seed helper because it writes `dead_letter` rows into a live database; that is fault injection whatever it is named, and it inherits [ADR 0008](0008-chaos-gating.md)'s triple gate so it can never fire in production.
 - **`EVAL_EMPTY_DLQ_BASELINE`** — when set, the reset sweep drops its fixture-ID exclusion and clears every `dead_letter` row.
@@ -42,13 +50,16 @@ Platform half:
 
 The baseline flip is a breaking change for every `dlq_*` scenario written against the standing pool, and the two repos deploy independently. Flipping the default in the same change that ships the hook would break the commander's evals in the window between the two merges.
 
-So it lands in three steps, and **`EVAL_EMPTY_DLQ_BASELINE` is opt-in, not default**:
+So it lands in three steps, **after the rerun**, and **`EVAL_EMPTY_DLQ_BASELINE` is opt-in, never a default flip in the same change**:
 
-1. **Platform (this ADR, v0.4.10).** Ship `seed_dlq_messages` + the opt-in flag. Default behaviour unchanged — the standing pool still exists, existing scenarios keep passing.
+0. **(Now.)** Nothing. The standing pool remains the baseline through the clean-baseline rerun. Rule 2 changes no behaviour until step 1.
+1. **Platform.** Ship `seed_dlq_messages` + the opt-in flag. Default behaviour unchanged — the standing pool still exists, existing scenarios keep passing.
 2. **Commander.** Migrate `dlq_*` scenarios to declare their fixtures via the hook; run with `EVAL_EMPTY_DLQ_BASELINE=1`.
 3. **Platform.** Flip the default, retire `_dlq_specs()` and `_reset_dlq_state`, simplify the sweep to an unconditional clear.
 
 At no point is either side broken by the other's merge. Step 3 is a small follow-up, not a rewrite — the sweep already exists and only loses a condition.
+
+**Why step 0 exists.** The implementation was built and verified before the deferral decision (both modes exercised against a live stack; the mode proved reversible, with `_reset_dlq_state` restoring the pool when the flag is cleared). It is parked on a branch rather than discarded, so step 1 is a rebase and a re-run of the gate rather than a rewrite. The deferral is about *when the version cycle lands*, not about doubt over the design.
 
 ## Consequences
 
