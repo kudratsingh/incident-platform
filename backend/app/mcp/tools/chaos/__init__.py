@@ -15,6 +15,7 @@ from app.mcp.tools.chaos import (  # noqa: F401
     kill_consumer,
     poison_message,
     saturate_redis,
+    seed_dlq_messages,
 )
 
 __all__: list[str] = []

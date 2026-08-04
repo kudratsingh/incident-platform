@@ -34,6 +34,8 @@ This file (`CLAUDE.md`) is the high-signal index. Treat it as the entry point �
   - [0007 — Machine principals with a scope model separate from human roles](docs/ADR/0007-machine-principal-scope-model.md)
   - [0008 — Chaos framework is triple-gated and never in production](docs/ADR/0008-chaos-gating.md)
   - [0010 — Idempotency record lifecycle](docs/ADR/0010-idempotency-record-lifecycle.md)
+  - [0011 — DAG pause is enforced by the resolver, not just recorded](docs/ADR/0011-dag-pause-enforcement.md)
+  - [0012 — The lab is invisible to the agent](docs/ADR/0012-the-lab-is-invisible-to-the-agent.md)
 - [`docs/postmortems/`](docs/postmortems/) — one file per incident (backfilled or written at the time). Format: Impact / Timeline / Root cause / Detection gap / Fix / Prevention rule adopted.
   - [0009 — Consumer lifecycle and supervision](docs/ADR/0009-consumer-lifecycle-and-supervision.md)
 - [`docs/ROADMAP.md`](docs/ROADMAP.md) — open extension ideas, sized + categorized
