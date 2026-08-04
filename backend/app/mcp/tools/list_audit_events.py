@@ -77,7 +77,11 @@ class ListAuditEventsOutput(BaseModel):
         "reconcile state after a restart or to check what an "
         "operator did before the current incident. Filter by "
         "`action`, `action_prefix` (e.g. `agent.`), or "
-        "`principal_type` (`user` vs `service_account`)."
+        "`principal_type` (`user` vs `service_account`).\n"
+        "FRESHNESS: live read from Postgres. Rows written directly by "
+        "an action appear immediately; rows produced by the Kafka "
+        "audit consumer land within a second or two of the event, so "
+        "allow a moment before concluding an event is missing."
     ),
     input_model=ListAuditEventsInput,
     output_model=ListAuditEventsOutput,

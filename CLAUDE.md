@@ -145,7 +145,9 @@ Same mental model as Sentry / GitHub / Stripe / Linear: the MCP server ships ins
 | `actions:execute` | Execute an approved proposal (Tier 1 idempotent, Tier 2 requires an approval reference). |
 | `chaos:invoke` | Invoke chaos framework tools. Additionally gated by `CHAOS_ENABLED`. |
 
-The seed principal `incident-commander` gets `telemetry:read + incidents:read` and nothing else.
+The seed principal `incident-commander` currently holds four scopes: `telemetry:read`, `incidents:read`, `actions:execute`, `chaos:invoke`. It was read-only at Step 0; `actions:execute` arrived with the Wave 3 Tier-1 actions and `chaos:invoke` with the self-seeding chaos scenarios, so live remediation evals can break the platform and fix it without an operator in the loop.
+
+Notably **not** granted: `actions:propose`. Tier-2 actions and the approvals subsystem are still unbuilt, so nothing needs it yet — the agent executes Tier-1 directly under an `Idempotency-Key`. Verify the live grant with `SELECT name, scopes FROM service_accounts` rather than trusting this list; it drifted once already.
 
 **Audit events** — same `<resource>.<verb>` snake-case shape as existing events. Every machine-principal action carries `principal_type='service_account'` on the audit row:
 

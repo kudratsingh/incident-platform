@@ -54,7 +54,9 @@ class ListActiveAlertsOutput(BaseModel):
         "List unresolved alerts scoped to the caller's tenant. Alerts "
         "come from platform sources (SLO breach, DLQ threshold, chaos "
         "runs, etc.). Prefer receiving the HMAC-signed webhook if you "
-        "can — this endpoint is a poll fallback."
+        "can — this endpoint is a poll fallback.\n"
+        "FRESHNESS: live read from Postgres — reflects the moment of "
+        "the call, no cache."
     ),
     input_model=ListActiveAlertsInput,
     output_model=ListActiveAlertsOutput,

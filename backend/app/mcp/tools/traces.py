@@ -66,7 +66,10 @@ class GetTraceOutput(BaseModel):
         "Fetch every artifact carrying a given trace_id — job rows plus "
         "audit-log rows if `include_audit=true`. Useful for building a "
         "cold-start context around one incident: the trace is the "
-        "correlation key that stitches the browser → API → worker → DB path."
+        "correlation key that stitches the browser → API → worker → DB path.\n"
+        "FRESHNESS: live read from Postgres (jobs + audit rows), no "
+        "cache and no dependency on the tracing backend — results are "
+        "unaffected by whether an OTel collector is running."
     ),
     input_model=GetTraceInput,
     output_model=GetTraceOutput,

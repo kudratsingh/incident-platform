@@ -41,10 +41,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 class _RedisStub:
     """Enough of the async Redis surface for the tools we exercise:
-    `get`, `set`, `ping`, `info`."""
+    `get`, `set`, `mget`, `ttl`, `ping`, `info`.
+
+    `mget`/`ttl` back the DAG pause reads in `get_dag_state`. They have
+    to be real here: `app.utils.dag_pause` fails open on any exception,
+    so a missing stub method would silently report "not paused" and the
+    pause assertions below would pass without testing anything."""
 
     def __init__(self, info: dict[str, Any] | None = None) -> None:
         self._store: dict[str, bytes | str] = {}
+        self._ttls: dict[str, int] = {}
         self._info = info or {
             "connected_clients": 3,
             "used_memory": 12_500_000,
@@ -58,7 +64,18 @@ class _RedisStub:
 
     async def set(self, key: str, value: bytes | str, ex: int | None = None) -> bool:
         self._store[key] = value
+        if ex is not None:
+            self._ttls[key] = ex
         return True
+
+    async def mget(self, keys: list[str]) -> list[bytes | str | None]:
+        return [self._store.get(k) for k in keys]
+
+    async def ttl(self, key: str) -> int:
+        # redis-py convention: -2 missing, -1 present with no expiry.
+        if key not in self._store:
+            return -2
+        return self._ttls.get(key, -1)
 
     async def ping(self) -> bool:
         return True
@@ -304,6 +321,96 @@ async def test_get_dag_state_returns_parents_and_children(
     assert ids == {str(parent.id), str(seed.id), str(child.id)}
     # Two edges: seed -> parent (upward) and child -> seed (downward).
     assert len(payload["edges"]) == 2
+
+
+async def test_get_dag_state_reports_unpaused_by_default(
+    mcp_client, db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
+) -> None:
+    """The pause fields are part of the output contract even when no
+    pause exists — the agent branches on them unconditionally."""
+    ac, _ = mcp_client
+    seed = Job(
+        tenant_id=default_tenant.id,
+        user_id=test_user.id,
+        type=JobType.REPORT_GEN.value,
+        status=JobStatus.WAITING.value,
+    )
+    db_session.add(seed)
+    await db_session.flush()
+
+    token = await _token(
+        db_session, default_tenant.id, [Scope.INCIDENTS_READ.value]
+    )
+    payload = _content(
+        await _call(ac, token, "get_dag_state", {"job_id": str(seed.id)})
+    )
+    assert payload["paused"] is False
+    assert payload["paused_by"] is None
+    assert payload["paused_expires_in_seconds"] is None
+
+
+async def test_get_dag_state_reports_pause_and_expiry(
+    mcp_client, db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
+) -> None:
+    """This is the verification surface runaway_saga needs: after
+    pause_dag, the seed reads back paused with a countdown."""
+    ac, redis_stub = mcp_client
+    seed = Job(
+        tenant_id=default_tenant.id,
+        user_id=test_user.id,
+        type=JobType.REPORT_GEN.value,
+        status=JobStatus.WAITING.value,
+    )
+    db_session.add(seed)
+    await db_session.flush()
+
+    await redis_stub.set(f"dag:paused:{seed.id}", "paused", ex=600)
+
+    token = await _token(
+        db_session, default_tenant.id, [Scope.INCIDENTS_READ.value]
+    )
+    payload = _content(
+        await _call(ac, token, "get_dag_state", {"job_id": str(seed.id)})
+    )
+    assert payload["paused"] is True
+    assert payload["paused_expires_in_seconds"] == 600
+    assert payload["paused_by"] == str(seed.id)
+
+
+async def test_get_dag_state_attributes_pause_to_ancestor(
+    mcp_client, db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
+) -> None:
+    """A child paused via its root reports paused=False (no flag of its
+    own) but paused_by=<root> — the distinction that tells the agent
+    where to aim a resume."""
+    ac, redis_stub = mcp_client
+    root = Job(
+        tenant_id=default_tenant.id,
+        user_id=test_user.id,
+        type=JobType.CSV_UPLOAD.value,
+        status=JobStatus.COMPLETED.value,
+    )
+    child = Job(
+        tenant_id=default_tenant.id,
+        user_id=test_user.id,
+        type=JobType.BULK_API_SYNC.value,
+        status=JobStatus.WAITING.value,
+    )
+    db_session.add_all([root, child])
+    await db_session.flush()
+    db_session.add(JobDependency(job_id=child.id, depends_on_job_id=root.id))
+    await db_session.flush()
+
+    await redis_stub.set(f"dag:paused:{root.id}", "paused", ex=300)
+
+    token = await _token(
+        db_session, default_tenant.id, [Scope.INCIDENTS_READ.value]
+    )
+    payload = _content(
+        await _call(ac, token, "get_dag_state", {"job_id": str(child.id)})
+    )
+    assert payload["paused"] is False
+    assert payload["paused_by"] == str(root.id)
 
 
 async def test_get_dag_state_unknown_job_404(

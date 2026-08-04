@@ -6,8 +6,9 @@ DependencyResolver consumer checks the key before promoting a
 `WAITING` child; if any ancestor (or the child itself) is paused,
 the child stays waiting.
 
-Real effect self-cleans on TTL. Companion to (future)
-`resume_dag`; for now the effect ends when the TTL expires.
+Real effect self-cleans on TTL: `_resume_unblocked_waiting_loop`
+promotes any child left behind once the flag is gone, so a pause is
+temporary rather than terminal. Verify with `get_dag_state.paused`.
 
 `actions:execute` + idempotent.
 """
@@ -19,15 +20,12 @@ from app.core.logging import get_logger
 from app.core.scopes import Scope
 from app.mcp.registry import ToolContext, tool
 from app.repositories.job import JobRepository
+from app.utils.dag_pause import pause_key_for
 from pydantic import BaseModel, ConfigDict, Field
 
 logger = get_logger(__name__)
 
-
-def pause_key_for(root_id: uuid.UUID) -> str:
-    """Redis key the pause_dag tool sets. Consumers checking whether
-    to promote a WAITING child probe this key on each ancestor id."""
-    return f"dag:paused:{root_id}"
+__all__ = ["pause_dag", "pause_key_for"]
 
 
 class PauseDagInput(BaseModel):
@@ -58,9 +56,13 @@ class PauseDagOutput(BaseModel):
     "pause_dag",
     description=(
         "Pause promotion of WAITING children in the DAG rooted at "
-        "`root_job_id`. The DependencyResolver consumer checks the "
-        "pause key before promoting; while set, no child promotes. "
-        "Effect self-cleans on TTL (default 10 minutes). Idempotent."
+        "`root_job_id`. Observable effect: `get_dag_state(root_job_id)` "
+        "returns `paused=true` with `paused_expires_in_seconds`, "
+        "children stay in status `waiting`, and no new promotions "
+        "occur while the flag is set. Already-RUNNING jobs are not "
+        "cancelled — pause stops promotion, it does not stop work in "
+        "flight. Self-cleans on TTL (default 10 minutes), after which "
+        "held children promote automatically. Idempotent."
     ),
     input_model=PauseDagInput,
     output_model=PauseDagOutput,

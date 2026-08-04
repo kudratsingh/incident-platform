@@ -6,6 +6,11 @@ children, one hop each direction — enough to explain "why is this
 stuck?"). Nodes carry status so the agent can immediately see which
 upstream/downstream jobs are the interesting ones.
 
+Also reports DAG pause state, which is how `pause_dag` is verified:
+`paused` is the seed's own flag, `paused_by` names the ancestor whose
+flag is holding the seed back (they differ when a pause was applied
+further up the chain).
+
 Requires `incidents:read`. Tenant-scoped through `JobRepository`.
 """
 
@@ -17,6 +22,7 @@ from app.core.scopes import Scope
 from app.mcp.registry import ToolContext, tool
 from app.repositories.job import JobRepository
 from app.repositories.job_dependency import JobDependencyRepository
+from app.utils.dag_pause import find_blocking_pause, pause_state
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -50,6 +56,22 @@ class GetDagStateOutput(BaseModel):
     seed_id: str
     nodes: list[DagNode]
     edges: list[DagEdge]
+    paused: bool = Field(
+        description="True when this job carries its own pause flag — the "
+        "direct result of pause_dag(root_job_id=this job)."
+    )
+    paused_expires_in_seconds: int | None = Field(
+        default=None,
+        description="Seconds until this job's own pause flag expires, and "
+        "held children resume automatically. Null when not paused (or "
+        "when the flag carries no expiry).",
+    )
+    paused_by: str | None = Field(
+        default=None,
+        description="Job id whose pause flag is holding this job back — "
+        "itself, or an ancestor when the pause was applied further up "
+        "the chain. Null when nothing in the ancestry is paused.",
+    )
 
 
 @tool(
@@ -57,7 +79,14 @@ class GetDagStateOutput(BaseModel):
     description=(
         "Fetch the immediate dependency graph around one job — direct "
         "parents and direct children with statuses. Use to answer "
-        "'why is this job waiting?' or 'what will unblock if I replay?'"
+        "'why is this job waiting?' or 'what will unblock if I replay?' "
+        "Also reports pause state: `paused` is this job's own flag, "
+        "`paused_by` names the ancestor holding it back, and "
+        "`paused_expires_in_seconds` counts down to automatic resume. "
+        "This is the verification surface for pause_dag — a successful "
+        "pause reads as paused=true with children still in `waiting`. "
+        "Live read: graph and statuses come from Postgres, pause flags "
+        "from Redis; both reflect the moment of the call."
     ),
     input_model=GetDagStateInput,
     output_model=GetDagStateOutput,
@@ -105,8 +134,14 @@ async def get_dag_state(
     for cid in child_ids:
         edges.append(DagEdge(from_id=str(cid), to_id=str(seed.id)))
 
+    paused, expires_in = await pause_state(ctx.redis, seed.id)
+    blocking = await find_blocking_pause(ctx.redis, dep_repo, seed.id)
+
     return GetDagStateOutput(
         seed_id=str(seed.id),
         nodes=list(nodes.values()),
         edges=edges,
+        paused=paused,
+        paused_expires_in_seconds=expires_in,
+        paused_by=str(blocking) if blocking is not None else None,
     )

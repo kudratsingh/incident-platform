@@ -12,6 +12,12 @@ the same child. The promotion is guarded by a status check (we only flip
 WAITING → PENDING), so the worst case is a redundant job.submitted in the
 outbox. Combined with the dispatcher's per-job idempotency, the worker
 still processes the child only once.
+
+Pause: a child is held in WAITING while it or any ancestor carries a
+`dag:paused:*` flag (set by the `pause_dag` tool). Before this check
+existed the flag was written and never read, so `pause_dag` reported
+`accepted: true` and promoted children anyway. Redis failures fail open
+— see `app.utils.dag_pause`.
 """
 
 import uuid
@@ -23,6 +29,7 @@ from app.models.enums import JobStatus
 from app.repositories.job import JobRepository
 from app.repositories.job_dependency import JobDependencyRepository
 from app.repositories.outbox import OutboxRepository
+from app.utils.dag_pause import find_blocking_pause
 from app.workers.kafka_consumer import BaseKafkaConsumer
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -30,13 +37,21 @@ logger = get_logger(__name__)
 
 
 class DependencyResolver(BaseKafkaConsumer):
-    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+    def __init__(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        redis: Any = None,
+    ) -> None:
         settings = get_settings()
         super().__init__(
             topics=[settings.kafka_topic_job_completed],
             group_id=settings.kafka_consumer_group_dependency,
         )
         self.session_factory = session_factory
+        # Optional so existing tests that construct the resolver without
+        # Redis keep working — a resolver with no client simply never
+        # sees a pause, which is the pre-change behaviour.
+        self.redis = redis
 
     async def handle_message(
         self,
@@ -71,6 +86,24 @@ class DependencyResolver(BaseKafkaConsumer):
                     unmet = await dep_repo.unmet_count(child_id)
                     if unmet > 0:
                         continue
+
+                    if self.redis is not None:
+                        paused_by = await find_blocking_pause(
+                            self.redis, dep_repo, child_id
+                        )
+                        if paused_by is not None:
+                            # Stays WAITING. No outbox row, so nothing to
+                            # undo when the pause lifts — the next
+                            # job.completed redelivery (or the parent's
+                            # own event on retry) re-evaluates it.
+                            logger.info(
+                                "dependency-resolver held child (dag paused)",
+                                extra={
+                                    "child_id": str(child.id),
+                                    "paused_by": str(paused_by),
+                                },
+                            )
+                            continue
 
                     await job_repo.update_status(
                         child_id, JobStatus.PENDING, extra={"error_message": None}

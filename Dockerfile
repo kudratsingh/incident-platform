@@ -30,6 +30,12 @@ COPY --from=builder /install /usr/local
 COPY backend/ ./backend/
 COPY alembic.ini ./
 COPY backend/alembic/ ./backend/alembic/
+# Whole scripts/ dir, not just the entrypoint: `make eval-reset` shells
+# into this container to run scripts/reset_eval_state.py (which imports
+# scripts/seed_eval_fixtures.py). Copying only the entrypoint meant the
+# pinned image couldn't self-serve a reset, so eval runs were pegged to
+# a bind-mounted dev stack. This supersedes the single-file COPY.
+COPY scripts/ ./scripts/
 COPY scripts/entrypoint.sh ./entrypoint.sh
 
 # Non-root user for security

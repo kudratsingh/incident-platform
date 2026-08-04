@@ -96,7 +96,15 @@ class ReplayDlqByCategoryOutput(BaseModel):
         "Bulk-replay every DLQ entry in one remediation category "
         "(`replay_safe` or `wait_and_replay`). Refuses "
         "`human_required` — those must go through a human review "
-        "path. Bounded by `max_replays` (default 20). Idempotent."
+        "path. Bounded by `max_replays` (default 20). Idempotent.\n"
+        "VERIFYING A DELAYED REPLAY: when `delay_seconds` is set, "
+        "nothing is enqueued yet. The matched entries stay in status "
+        "`dead_letter` and remain visible in list_dlq_messages until "
+        "`execute_at` passes — a DLQ that has not shrunk is the "
+        "expected state, not a failed replay. Verify with the "
+        "`scheduled` count in this response and the "
+        "`job.replay_scheduled` audit events, not with DLQ size. "
+        "Re-check DLQ size only after `execute_at`."
     ),
     input_model=ReplayDlqByCategoryInput,
     output_model=ReplayDlqByCategoryOutput,
