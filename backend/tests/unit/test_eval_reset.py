@@ -236,6 +236,104 @@ async def test_clear_dag_pauses_removes_pause_flags() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Empty-DLQ baseline mode — commander ADR 0010 / platform ADR 0012
+# ---------------------------------------------------------------------------
+
+
+def test_empty_dlq_baseline_defaults_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Opt-in on purpose: flipping the baseline is breaking for every
+    dlq_* scenario written against the standing pool, so the platform
+    ships the capability before the commander migrates."""
+    reset = _reset_module()
+    monkeypatch.delenv("EVAL_EMPTY_DLQ_BASELINE", raising=False)
+    assert reset._empty_dlq_baseline() is False
+
+
+@pytest.mark.parametrize("raw", ["1", "true", "TRUE", "yes"])
+def test_empty_dlq_baseline_accepts_truthy_spellings(
+    monkeypatch: pytest.MonkeyPatch, raw: str
+) -> None:
+    reset = _reset_module()
+    monkeypatch.setenv("EVAL_EMPTY_DLQ_BASELINE", raw)
+    assert reset._empty_dlq_baseline() is True
+
+
+@pytest.mark.parametrize("raw", ["0", "false", "", "no"])
+def test_empty_dlq_baseline_rejects_falsy_spellings(
+    monkeypatch: pytest.MonkeyPatch, raw: str
+) -> None:
+    reset = _reset_module()
+    monkeypatch.setenv("EVAL_EMPTY_DLQ_BASELINE", raw)
+    assert reset._empty_dlq_baseline() is False
+
+
+async def test_delete_seeded_dlq_fixtures_removes_declared_rows(
+    db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
+) -> None:
+    """Scenario-declared scaffolding is DELETEd, not cancelled — it
+    isn't a real user's history and cancelling would accumulate dead
+    rows across every eval run."""
+    reset = _reset_module()
+
+    seeded = Job(
+        tenant_id=default_tenant.id,
+        user_id=test_user.id,
+        type=JobType.BULK_API_SYNC.value,
+        status=JobStatus.DEAD_LETTER.value,
+        payload={"seeded_fixture": True},
+        retry_count=3,
+    )
+    ordinary = Job(
+        tenant_id=default_tenant.id,
+        user_id=test_user.id,
+        type=JobType.CSV_UPLOAD.value,
+        status=JobStatus.DEAD_LETTER.value,
+        payload={"real": True},
+        retry_count=3,
+    )
+    db_session.add_all([seeded, ordinary])
+    await db_session.flush()
+
+    # The fixture session already has a transaction open, so the
+    # function's own `session.begin()` would raise. Wrap it so `begin()`
+    # is a no-op while every statement still hits the real DB.
+    class _NullTx:
+        async def __aenter__(self):  # type: ignore[no-untyped-def]
+            return None
+
+        async def __aexit__(self, *_a):  # type: ignore[no-untyped-def]
+            return False
+
+    class _SessionProxy:
+        def __init__(self, s):  # type: ignore[no-untyped-def]
+            self._s = s
+
+        def begin(self):  # type: ignore[no-untyped-def]
+            return _NullTx()
+
+        def __getattr__(self, name):  # type: ignore[no-untyped-def]
+            return getattr(self._s, name)
+
+        async def __aenter__(self):  # type: ignore[no-untyped-def]
+            return self
+
+        async def __aexit__(self, *_a):  # type: ignore[no-untyped-def]
+            return False
+
+    deleted = await reset._delete_seeded_dlq_fixtures(
+        lambda: _SessionProxy(db_session)
+    )
+
+    assert deleted == 1
+    remaining = (
+        await db_session.execute(select(Job.id).where(Job.id == ordinary.id))
+    ).scalars().all()
+    assert remaining, "non-seeded DLQ row must survive"
+
+
+# ---------------------------------------------------------------------------
 # _refuse_in_production — FIX_PLAN #79 guardrail
 # ---------------------------------------------------------------------------
 

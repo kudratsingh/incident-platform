@@ -59,7 +59,17 @@ import sys
 from typing import Any
 
 # Allow running from project root without installing the package.
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "backend"))
+#   * `../backend` so `import app...` resolves.
+#   * `..` (the repo/app root) so `from scripts import seed_eval_fixtures`
+#     resolves. Without it the script only ran under an explicit
+#     `-e PYTHONPATH=/app:/app/backend` override, which is the workaround
+#     the commander's `make eval-reset` was carrying. Setting both here
+#     makes the shipped image self-sufficient: `docker compose exec app
+#     python /app/scripts/reset_eval_state.py` now works unadorned.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+for _path in (os.path.join(_HERE, "..", "backend"), os.path.join(_HERE, "..")):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
 
 import redis.asyncio as aioredis  # noqa: E402
 from app.config import get_settings  # noqa: E402
@@ -92,6 +102,18 @@ _CHAOS_KEY_PATTERNS = (
 # `dlq_replay_scheduler.SCHEDULED_KEY` — kept as a literal so this
 # script has no import dependency on the worker package.
 _SCHEDULED_REPLAY_KEY = "jobs:dlq_replay_delayed"
+
+
+def _empty_dlq_baseline() -> bool:
+    """Whether the inter-scenario baseline is an empty DLQ.
+
+    Read at call time, not import time, so a single process can be
+    exercised both ways in tests."""
+    return os.getenv("EVAL_EMPTY_DLQ_BASELINE", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
 
 
 async def _clear_chaos_keys(redis: aioredis.Redis) -> int:
@@ -209,6 +231,27 @@ async def _delete_chaos_owner_users(session_factory: Any) -> int:
             return int(result.rowcount or 0)
 
 
+async def _delete_seeded_dlq_fixtures(session_factory: Any) -> int:
+    """DELETE rows created by the `seed_dlq_messages` chaos hook.
+
+    Deleted rather than cancelled (the disposal `_sweep_nonfixture_dlq`
+    applies to everything else) because these are scaffolding a
+    scenario declared for itself, not history belonging to a real user.
+    Cancelling them would leave thousands of dead rows behind across
+    eval runs.
+
+    Returns the number of rows deleted."""
+    async with session_factory() as session:
+        async with session.begin():
+            result = await session.execute(
+                text(
+                    "DELETE FROM jobs "
+                    "WHERE CAST(payload AS text) LIKE '%\"seeded_fixture\"%'"
+                )
+            )
+            return int(result.rowcount or 0)
+
+
 async def _sweep_nonfixture_dlq(session_factory: Any) -> int:
     """Move every `dead_letter` job that isn't a seeded fixture to a
     terminal status, so the DLQ a scenario observes contains exactly
@@ -240,12 +283,27 @@ async def _sweep_nonfixture_dlq(session_factory: Any) -> int:
     planner surface. Safe because this whole script is gated by
     `_refuse_in_production()`.
 
-    Returns the number of rows swept."""
-    from scripts import seed_eval_fixtures  # type: ignore[import-not-found]
+    **Empty-DLQ mode** (`EVAL_EMPTY_DLQ_BASELINE=1`, commander ADR
+    0010): the fixture exclusion is dropped and *every* `dead_letter`
+    row is swept, so a scenario inherits nothing and declares whatever
+    DLQ content it needs via `seed_dlq_messages`.
 
-    fixture_ids = [
-        str(spec["job_id"]) for spec in seed_eval_fixtures._dlq_specs()
-    ]
+    Opt-in rather than default on purpose. Flipping the baseline to
+    empty is a breaking change for every `dlq_*` scenario currently
+    written against the standing 4-row pool. Making it a mode lets the
+    platform ship first, the commander migrate its scenarios, and the
+    default flip land third — at no point is either side broken. See
+    the sequencing note in ADR 0012.
+
+    Returns the number of rows swept."""
+    if _empty_dlq_baseline():
+        fixture_ids: list[str] = []
+    else:
+        from scripts import seed_eval_fixtures  # type: ignore[import-not-found]
+
+        fixture_ids = [
+            str(spec["job_id"]) for spec in seed_eval_fixtures._dlq_specs()
+        ]
     async with session_factory() as session:
         async with session.begin():
             result = await session.execute(
@@ -307,6 +365,9 @@ async def reset(
         # fixtures to `dead_letter`. Sweeping first would be harmless
         # but pointless — the restore would repopulate the DLQ after
         # the sweep had already looked at it.
+        # Delete scenario-declared fixtures before the sweep so they're
+        # removed outright rather than left as `cancelled` rows.
+        seeded_dlq_deleted = await _delete_seeded_dlq_fixtures(factory)
         dlq_swept = await _sweep_nonfixture_dlq(factory)
         idempotency_purged = 0
         if purge_idempotency:
@@ -321,6 +382,8 @@ async def reset(
         "dag_pauses_cleared": pauses_cleared,
         "dlq_reset": seed_summary["dlq_reset"],
         "dlq_swept": dlq_swept,
+        "empty_dlq_baseline": _empty_dlq_baseline(),
+        "seeded_dlq_deleted": seeded_dlq_deleted,
         "idempotency_purged": idempotency_purged,
         "timers_cleared": timers_cleared,
     }

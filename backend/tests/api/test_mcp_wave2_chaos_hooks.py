@@ -98,6 +98,7 @@ def _mcp_app_with_chaos_enabled(db_session: AsyncSession, redis_stub: _RedisStub
         importlib.reload(chaos_pkg.bad_deploy)  # type: ignore[attr-defined]
         importlib.reload(chaos_pkg.create_bad_data_job)  # type: ignore[attr-defined]
         importlib.reload(chaos_pkg.create_stale_cache)  # type: ignore[attr-defined]
+        importlib.reload(chaos_pkg.seed_dlq_messages)  # type: ignore[attr-defined]
         from app.mcp.tools import consumer_lag as _cl
         from app.mcp.tools import list_active_alerts as _laa
 
@@ -585,6 +586,86 @@ async def test_create_bad_data_job_inserts_human_required_dlq_entry(
         assert (
             job.remediation_hint == RemediationHint.HUMAN_REQUIRED.value
         )
+    finally:
+        teardown()
+
+
+async def test_seed_dlq_messages_creates_declared_rows(
+    db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
+) -> None:
+    """Platform half of commander ADR 0010: a scenario declares the DLQ
+    content it is graded against instead of inheriting a standing pool."""
+    from app.models.enums import RemediationHint
+    from app.models.job import Job
+    from sqlalchemy import select as _select
+
+    redis_stub = _RedisStub()
+    app, teardown = _mcp_app_with_chaos_enabled(db_session, redis_stub)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app, raise_app_exceptions=False),
+            base_url="http://test",
+        ) as ac:
+            token = await _token(
+                db_session, default_tenant.id, [Scope.CHAOS_INVOKE.value]
+            )
+            payload = _content(
+                await _call(
+                    ac,
+                    token,
+                    "seed_dlq_messages",
+                    {
+                        "remediation_hint": RemediationHint.WAIT_AND_REPLAY.value,
+                        "count": 3,
+                        "job_type": "bulk_api_sync",
+                    },
+                )
+            )
+        assert payload["accepted"] is True
+        assert payload["count"] == 3
+        assert len(payload["job_ids"]) == 3
+
+        rows = (
+            await db_session.execute(
+                _select(Job).where(
+                    Job.id.in_([uuid.UUID(i) for i in payload["job_ids"]])
+                )
+            )
+        ).scalars().all()
+        assert len(rows) == 3
+        for job in rows:
+            assert job.status == "dead_letter"
+            assert (
+                job.remediation_hint == RemediationHint.WAIT_AND_REPLAY.value
+            )
+            # Tagged so the reset deletes rather than cancels them.
+            assert job.payload.get("seeded_fixture") is True
+    finally:
+        teardown()
+
+
+async def test_seed_dlq_messages_rejects_unknown_hint(
+    db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
+) -> None:
+    """An unrecognised hint must fail loudly — a row with a bogus hint
+    would silently never match the agent's category filters."""
+    redis_stub = _RedisStub()
+    app, teardown = _mcp_app_with_chaos_enabled(db_session, redis_stub)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app, raise_app_exceptions=False),
+            base_url="http://test",
+        ) as ac:
+            token = await _token(
+                db_session, default_tenant.id, [Scope.CHAOS_INVOKE.value]
+            )
+            body = await _call(
+                ac,
+                token,
+                "seed_dlq_messages",
+                {"remediation_hint": "definitely_not_a_hint"},
+            )
+        assert "error" in body
     finally:
         teardown()
 
