@@ -23,6 +23,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "backend"))
 
 from app.core.security import hash_password  # noqa: E402
 from app.models.enums import UserRole  # noqa: E402
+from app.models.tenant import DEFAULT_TENANT_ID  # noqa: E402
 from app.models.user import User  # noqa: E402
 from sqlalchemy import select  # noqa: E402
 from sqlalchemy.ext.asyncio import (  # noqa: E402
@@ -71,6 +72,12 @@ async def _upsert_users(session: AsyncSession) -> None:
             print(f"  already exists: {spec['email']}")
             continue
         user = User(
+            # Phase 12 made users.tenant_id NOT NULL; this script predates
+            # it and inserted NULL, so every run died on a
+            # NotNullViolationError. Seeded into the default tenant to
+            # match every other bootstrap path (`DEFAULT_TENANT_ID` is the
+            # mixed-hex UUID chosen for SQLite compatibility).
+            tenant_id=DEFAULT_TENANT_ID,
             email=spec["email"],
             hashed_password=hash_password(spec["password"]),
             role=spec["role"],
