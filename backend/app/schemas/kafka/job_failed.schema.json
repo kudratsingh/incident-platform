@@ -13,6 +13,9 @@
     "error": { "type": "string" },
     "message": { "type": "string" },
     "retry_count": { "type": "integer", "minimum": 0 },
+    "max_retries": { "type": "integer", "minimum": 0 },
+    "payload": { "type": ["object", "null"] },
+    "trace_id": { "type": ["string", "null"] },
     "dead_lettered": { "type": "boolean" }
   },
   "additionalProperties": true

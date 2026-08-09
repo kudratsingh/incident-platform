@@ -16,9 +16,21 @@ Topic names come from `Settings.kafka_topic_*` so they're configurable; the tabl
 | `job.progress` | `kafka_producer.publish_job_progress` (direct, from `_run_job`) | `JobProgress` schema | 1 day | 12 / 48 |
 | `job.completed` | Outbox relay (from `_run_job` success path) | `JobCompleted` schema | 7 days | 12 / 48 |
 | `job.failed` | Outbox relay (from `_run_job` failure path, both retry and DLQ) | `JobFailed` schema | 7 days | 12 / 48 |
-| `job.dlq` | Outbox relay (from `_run_job` exhaustion or LLM-forced dead-letter) | `JobFailed` schema with `dead_lettered: true` | 30 days | 12 / 48 |
+| `job.dlq` | Outbox relay (from `_run_job` exhaustion, LLM-forced dead-letter, or an unregistered job type) | `JobFailed` schema with `dead_lettered: true`, plus the triage context fields below | 30 days | 12 / 48 |
 
 Schemas live in `backend/app/schemas/kafka/*.schema.json` and are validated on both producer and consumer paths. See [ADR 0002](ADR/0002-json-schema-vs-protobuf.md) for the why.
+
+### `job.dlq` triage context
+
+`job.dlq` events carry three fields on top of the `JobFailed` core. They are **optional in the schema** because the same `JobFailed` schema backs the retry-path `job.failed` topic, which carries none of them — making them required would fail producer-side validation in `publish_raw` and silently drop every retry event.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `max_retries` | integer ≥ 0 | The job's retry budget. Absent it, `LlmTriageConsumer` fell back to `0` and asked the model to explain "retry 3 of 0". |
+| `payload` | object or null | The job payload as executed, with the `__traceparent` OTel carrier already popped. Bounded: if it serializes to more than `dispatcher.DLQ_PAYLOAD_MAX_BYTES` (4 KB) it is replaced by `{"_truncated": true, "_original_bytes": n}`, and it is `null` if the payload wasn't serializable. The bound exists because this event fans out to four consumer groups and is appended verbatim to `job_events`. |
+| `trace_id` | string or null | The job's `trace_id` column — the raw value, not the `trace_id_var` fallback (which substitutes the job id when the column is NULL). |
+
+The producer's full key set is `dispatcher.DLQ_EVENT_KEYS`; `tests/unit/test_triage_consumer.py` asserts it stays a superset of every key the triage consumer reads, so producer/consumer drift fails a test instead of degrading triage in silence.
 
 ### Why these topics, not one mega-topic
 
