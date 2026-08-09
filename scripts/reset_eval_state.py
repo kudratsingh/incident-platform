@@ -42,9 +42,27 @@ What gets cleared/reset:
 
 ## Guardrails
 
-- **Refuses to run in production.** Explicit `Settings.environment !=
-  "production"` check at the top of `main()`. Same belt-and-braces
-  reasoning as ADR 0008: two independent gates on the same invariant.
+- **Refuses to run in production.** `_assert_not_production()` is the
+  single check, and it is enforced on *both* entry points: `main()`
+  turns it into a stderr message + `exit(1)`, and `reset()` re-raises it
+  as a `RuntimeError` before any engine or Redis client is constructed.
+  Gating only the CLI was the bug (D-08) — `reset()` is exported, takes
+  arbitrary DB/Redis URLs, and is what the eval harness imports. Same
+  belt-and-braces reasoning as ADR 0008: two independent gates on the
+  same invariant.
+- **Audit rows are ground truth and this script never touches them.**
+  No statement here reads, writes, updates or deletes `audit_logs`. The
+  job and user DELETEs it does perform (`_delete_seeded_dlq_fixtures`,
+  `_delete_chaos_owner_users`) have one documented side effect: the FKs are
+  `ON DELETE SET NULL`, so `audit_logs.job_id` / `audit_logs.user_id` go
+  NULL for rows referencing deleted scaffolding (and `job_triages`
+  CASCADE-deletes with its job). The audit row itself, its `action`,
+  its `extra_data` and its **`resource_id`** all survive intact — which
+  is why `resource_id` (a string, written as `str(job_id)` by every
+  Tier-1 audit writer) is the durable join key for any audit-based
+  grading or forensics. Never join on the FK columns. See the "reset
+  disposal vs audit ground truth" amendment in
+  [ADR 0012](../docs/ADR/0012-the-lab-is-invisible-to-the-agent.md).
 - **Idempotent.** Second run against the same post-reset state is a
   no-op summary.
 
@@ -94,15 +112,17 @@ _DB_URL = os.getenv(
 )
 _REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
-# Every Redis key namespace the chaos framework writes into. Anything
-# added by a new chaos hook has to land here (or the reset will leak
-# state across scenarios). Kept as a set so `SCAN`-style clearing is
-# straightforward.
-_CHAOS_KEY_PATTERNS = (
-    "chaos:*",
-    "kafka:consumer:*:killed",  # kill_key_for()
-    "kafka:consumer:*:latency_ms",  # latency_key_for()
-)
+# Every Redis key namespace the chaos framework writes into.
+#
+# One pattern, because every chaos key helper MUST live under `chaos:*`:
+# `kafka_consumer.kill_key_for()` yields `chaos:kill:{group}` and
+# `kafka_consumer.latency_key_for()` yields `chaos:latency:{group}`.
+# A new chaos hook adds no pattern here — it keeps its keys inside the
+# namespace, and `test_every_chaos_key_helper_lives_under_the_chaos_namespace`
+# fails if one ever escapes. (Two `kafka:consumer:*` entries used to sit
+# here claiming to mirror those helpers; they matched no key any code
+# has ever written — D-13.)
+_CHAOS_KEY_PATTERNS = ("chaos:*",)
 
 # Tier-1 *action* residue, as opposed to chaos residue above. These are
 # effects the agent itself creates during a scenario; left in place they
@@ -288,17 +308,59 @@ async def _delete_seeded_dlq_fixtures(session_factory: Any) -> int:
     applies to everything else) because these are scaffolding a
     scenario declared for itself, not history belonging to a real user.
     Cancelling them would leave thousands of dead rows behind across
-    eval runs.
+    eval runs. See ADR 0012 rule 2.
+
+    **The marker contract.** `seed_dlq_messages` writes exactly
+    `payload = {SEEDED_FIXTURE_MARKER: True}` — a *top-level* key holding
+    boolean `true` (`app/mcp/tools/chaos/seed_dlq_messages.py`). The
+    predicate matches that structure and nothing else. It used to be
+    `CAST(payload AS text) LIKE '%"seeded_fixture"%'`, which is a
+    substring test against the serialized payload: it also matched the
+    marker as a *value* (`{"tag": "seeded_fixture"}`), at any nesting
+    depth, and with any value at all — including `false`. That is a hard
+    DELETE, in any tenant, CASCADE-ing `job_triages` and nulling the
+    audit FKs, on a row that merely mentioned the word (S-02).
+
+    Dialect-branched because the predicate has no portable spelling:
+
+      * postgresql — `payload @> '{"seeded_fixture": true}'::jsonb`.
+        `PortableJSON` renders as JSONB on PG (`app/models/base.py`), so
+        containment is available, and it matches a top-level key with
+        boolean true only. Deliberately *not*
+        `(payload ->> 'seeded_fixture')::boolean`: a hostile value like
+        `{"seeded_fixture": "banana"}` makes that cast raise and aborts
+        the whole reset transaction. Containment just returns false.
+      * sqlite (the unit harness) — `json_extract(payload,
+        '$.seeded_fixture') = 1`, SQLite's spelling of the same test.
+
+    Deliberately **not** scoped by status: a seeded row the agent
+    replayed out of `dead_letter` is still declared scaffolding, and
+    leaving it behind accumulates exactly the litter ADR 0012's
+    delete-don't-cancel rule exists to prevent. Deliberately **not**
+    scoped by tenant either: the reset is environment-wide by design
+    (see `_sweep_nonfixture_dlq`). Residual risk after the tightening is
+    a user who deliberately writes the exact top-level
+    `{"seeded_fixture": true}` marker into a real job's payload — that
+    row is indistinguishable from scaffolding and will be deleted.
+
+    Audit rows referencing a deleted job are never touched; their
+    `resource_id` still carries the job's UUID (module docstring).
 
     Returns the number of rows deleted."""
     async with session_factory() as session:
         async with session.begin():
-            result = await session.execute(
-                text(
-                    "DELETE FROM jobs "
-                    "WHERE CAST(payload AS text) LIKE '%\"seeded_fixture\"%'"
+            if session.bind.dialect.name == "postgresql":
+                statement = text(
+                    "DELETE FROM jobs WHERE payload @> CAST(:marker AS jsonb)"
                 )
-            )
+                params: dict[str, Any] = {"marker": '{"seeded_fixture": true}'}
+            else:
+                statement = text(
+                    "DELETE FROM jobs "
+                    "WHERE json_extract(payload, '$.seeded_fixture') = 1"
+                )
+                params = {}
+            result = await session.execute(statement, params)
             return int(result.rowcount or 0)
 
 
@@ -330,8 +392,11 @@ async def _sweep_nonfixture_dlq(session_factory: Any) -> int:
     Blast radius is deliberately environment-wide rather than scoped to
     the seeded tenant: a stray `dead_letter` row in *any* tenant is
     visible to a platform-admin-scoped agent and lands in the same
-    planner surface. Safe because this whole script is gated by
-    `_refuse_in_production()`.
+    planner surface. Safe because `_assert_not_production()` runs first
+    on *both* entry points — inside `reset()` for library callers and in
+    `main()` for the CLI. (That claim used to name `_refuse_in_production()`
+    and "this whole script", which was false: the check ran only in
+    `main()`, so an importer of `reset()` reached this statement ungated.)
 
     **Empty-DLQ mode** (`EVAL_EMPTY_DLQ_BASELINE=1`, commander ADR
     0010): the fixture exclusion is dropped and *every* `dead_letter`
@@ -367,17 +432,32 @@ async def _sweep_nonfixture_dlq(session_factory: Any) -> int:
             return int(result.rowcount or 0)
 
 
-def _refuse_in_production() -> None:
-    """Loud failure if invoked against a production platform. Backed by
-    ADR 0008's environment gate — this is the belt on top of the braces."""
+def _assert_not_production() -> None:
+    """Raise if invoked against a production platform. Backed by ADR
+    0008's environment gate — this is the belt on top of the braces.
+
+    The single gate, shared by both entry points: `reset()` lets the
+    `RuntimeError` propagate to its (library) caller, `main()` turns it
+    into a stderr message and `exit(1)` for the CLI. There is
+    deliberately no `allow_production` parameter — overriding
+    `ENVIRONMENT` is the one documented escape hatch, and one lever is
+    enough."""
     env = get_settings().environment
     if env == "production":
-        print(
-            "ERROR: reset_eval_state.py refuses to run in production "
+        raise RuntimeError(
+            "reset_eval_state.py refuses to run in production "
             f"(ENVIRONMENT={env!r}). If this is a real production-parity "
-            "eval env, override ENVIRONMENT before invoking.",
-            file=sys.stderr,
+            "eval env, override ENVIRONMENT before invoking."
         )
+
+
+def _refuse_in_production() -> None:
+    """CLI wrapper around `_assert_not_production()`: loud message on
+    stderr, exit code 1."""
+    try:
+        _assert_not_production()
+    except RuntimeError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
         sys.exit(1)
 
 
@@ -388,7 +468,13 @@ async def reset(
     purge_idempotency: bool = False,
 ) -> dict[str, Any]:
     """Programmatic entry point. Returns a summary dict suitable for
-    JSON encoding by the CLI or the eval harness."""
+    JSON encoding by the CLI or the eval harness.
+
+    Raises `RuntimeError` when `ENVIRONMENT=production`, before anything
+    is imported, connected or created — this coroutine accepts arbitrary
+    DB/Redis URLs, so the CLI's gate protected nothing here (D-08)."""
+    _assert_not_production()
+
     # Local import so the seed script's heavy DB imports are only paid
     # by scenarios that actually run this reset.
     from scripts import seed_eval_fixtures  # type: ignore[import-not-found]

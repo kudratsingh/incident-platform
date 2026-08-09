@@ -6,14 +6,24 @@
     rows back to baseline without touching non-fixture data.
   * `reset_eval_state._clear_chaos_keys` finds and deletes every key
     matching the chaos patterns.
-  * `reset_eval_state` refuses to run against ENVIRONMENT=production.
+  * `reset_eval_state` refuses to run against ENVIRONMENT=production —
+    from `main()` (SystemExit) *and* from the programmatic `reset()`
+    entry point (RuntimeError, raised before anything is connected).
+  * `reset_eval_state._delete_seeded_dlq_fixtures` keys off the
+    structured top-level marker, not a substring of the serialized
+    payload.
+  * `reset_eval_state` never reads or writes `audit_logs` (ADR 0012's
+    "reset disposal vs audit ground truth" amendment).
 
 Import-guarded so the seed script's heavy DB imports (SQLAlchemy engine,
 alembic wiring) don't fire until the test needs them."""
 
 from __future__ import annotations
 
+import ast
+import fnmatch
 import importlib
+import inspect
 import json
 import os
 import sys
@@ -39,6 +49,49 @@ def _seed_module():  # type: ignore[no-untyped-def]
 
 def _reset_module():  # type: ignore[no-untyped-def]
     return importlib.import_module("reset_eval_state")
+
+
+# ---------------------------------------------------------------------------
+# Shared session harness
+#
+# Every destructive helper in reset_eval_state opens its own
+# `async with session.begin()`, but the `db_session` fixture already owns
+# the transaction — so `begin()` has to be a no-op while each statement
+# still hits the real DB. Hoisted to module level because four tests
+# need it (it was copy-pasted into two of them before).
+# ---------------------------------------------------------------------------
+
+
+class _NullTx:
+    async def __aenter__(self):  # type: ignore[no-untyped-def]
+        return None
+
+    async def __aexit__(self, *_a):  # type: ignore[no-untyped-def]
+        return False
+
+
+class _SessionProxy:
+    def __init__(self, s):  # type: ignore[no-untyped-def]
+        self._s = s
+
+    def begin(self):  # type: ignore[no-untyped-def]
+        return _NullTx()
+
+    def __getattr__(self, name):  # type: ignore[no-untyped-def]
+        # Forwards `bind` too, which is what the dialect branch in
+        # `_delete_seeded_dlq_fixtures` reads.
+        return getattr(self._s, name)
+
+    async def __aenter__(self):  # type: ignore[no-untyped-def]
+        return self
+
+    async def __aexit__(self, *_a):  # type: ignore[no-untyped-def]
+        return False
+
+
+def _factory(session):  # type: ignore[no-untyped-def]
+    """A `session_factory`-shaped callable over an existing session."""
+    return lambda: _SessionProxy(session)
 
 
 # ---------------------------------------------------------------------------
@@ -179,26 +232,54 @@ async def test_reset_dlq_state_leaves_non_fixture_rows_untouched(
 # ---------------------------------------------------------------------------
 
 
-async def test_clear_chaos_keys_scans_and_deletes_matching_patterns() -> None:
-    reset = _reset_module()
-    redis = AsyncMock()
+def test_every_chaos_key_helper_lives_under_the_chaos_namespace() -> None:
+    """`_CHAOS_KEY_PATTERNS` is only complete because every chaos key a
+    helper can produce is under `chaos:*`. A future helper that escapes
+    the namespace escapes the reset silently — so assert the property
+    statically rather than trusting a hand-typed pattern list."""
+    from app.workers.kafka_consumer import kill_key_for, latency_key_for
 
-    # Simulate SCAN returning two batches (one match) for the first
-    # pattern, no matches for the rest. Real Redis returns (cursor,
-    # keys) tuples and terminates on cursor=0.
-    scan_results = iter(
-        [
-            (0, [b"chaos:killed:worker-dispatcher", b"chaos:latency:audit-writer"]),
-            (0, [b"kafka:consumer:worker-dispatcher:killed"]),
-            (0, []),
-        ]
-    )
-    redis.scan.side_effect = lambda **_: next(scan_results)
-    redis.delete = AsyncMock(side_effect=[2, 1])
+    for helper in (kill_key_for, latency_key_for):
+        assert fnmatch.fnmatch(helper("any-group"), "chaos:*"), (
+            f"{helper.__name__} produces a key outside chaos:* — either move "
+            "it back under that namespace or add a pattern for it"
+        )
+
+
+async def test_clear_chaos_keys_scans_and_deletes_matching_patterns() -> None:
+    """The SCAN inputs are the REAL key shapes the helpers emit.
+
+    The previous version fed `kafka:consumer:<group>:killed`, a shape no
+    code has ever written — the tuple carried two patterns matching
+    nothing (D-13), and the test cemented the fiction.
+    """
+    reset = _reset_module()
+    from app.workers.kafka_consumer import kill_key_for, latency_key_for
+
+    redis = AsyncMock()
+    matched = [
+        kill_key_for("worker-dispatcher").encode(),
+        latency_key_for("audit-writer").encode(),
+        b"chaos:bad_deploy",
+    ]
+    # Real Redis returns (cursor, keys) tuples and terminates on cursor=0.
+    scan_results = iter([(0, matched)])
+    scanned_patterns: list[str] = []
+
+    def _scan(**kwargs):  # type: ignore[no-untyped-def]
+        scanned_patterns.append(kwargs["match"])
+        return next(scan_results)
+
+    redis.scan.side_effect = _scan
+    redis.delete = AsyncMock(return_value=3)
 
     deleted = await reset._clear_chaos_keys(redis)
+
     assert deleted == 3
-    assert redis.delete.await_count == 2
+    assert redis.delete.await_count == 1
+    # Exactly one SCAN, because exactly one pattern is live.
+    assert scanned_patterns == ["chaos:*"]
+    assert reset._CHAOS_KEY_PATTERNS == ("chaos:*",)
 
 
 # ---------------------------------------------------------------------------
@@ -279,63 +360,56 @@ async def test_delete_seeded_dlq_fixtures_removes_declared_rows(
 ) -> None:
     """Scenario-declared scaffolding is DELETEd, not cancelled — it
     isn't a real user's history and cancelling would accumulate dead
-    rows across every eval run."""
+    rows across every eval run.
+
+    The predicate is the *structured* top-level marker
+    (`seed_dlq_messages.SEEDED_FIXTURE_MARKER` writes
+    `payload={"seeded_fixture": True}`), so the three adversarial
+    payloads below survive. HEAD's `CAST(payload AS text) LIKE
+    '%"seeded_fixture"%'` deleted all four (S-02): a substring match
+    against the serialized payload hits the marker as a *value*, at any
+    nesting depth, and with any value including `false` — a hard DELETE
+    with CASCADE onto `job_triages` and SET NULL onto the audit FKs.
+    """
     reset = _reset_module()
+    from app.mcp.tools.chaos.seed_dlq_messages import SEEDED_FIXTURE_MARKER
 
-    seeded = Job(
-        tenant_id=default_tenant.id,
-        user_id=test_user.id,
-        type=JobType.BULK_API_SYNC.value,
-        status=JobStatus.DEAD_LETTER.value,
-        payload={"seeded_fixture": True},
-        retry_count=3,
-    )
-    ordinary = Job(
-        tenant_id=default_tenant.id,
-        user_id=test_user.id,
-        type=JobType.CSV_UPLOAD.value,
-        status=JobStatus.DEAD_LETTER.value,
-        payload={"real": True},
-        retry_count=3,
-    )
-    db_session.add_all([seeded, ordinary])
+    def _job(payload: dict[str, object]) -> Job:
+        return Job(
+            tenant_id=default_tenant.id,
+            user_id=test_user.id,
+            type=JobType.BULK_API_SYNC.value,
+            status=JobStatus.DEAD_LETTER.value,
+            payload=payload,
+            retry_count=3,
+        )
+
+    # The one row the chaos hook actually writes.
+    seeded = _job({SEEDED_FIXTURE_MARKER: True})
+    ordinary = _job({"real": True})
+    # Adversarial: marker as a VALUE, marker nested under another key,
+    # marker present but false. None of these is declared scaffolding.
+    marker_as_value = _job({"tag": SEEDED_FIXTURE_MARKER})
+    marker_nested = _job({"nested": {SEEDED_FIXTURE_MARKER: True}})
+    marker_false = _job({SEEDED_FIXTURE_MARKER: False})
+    survivors = [ordinary, marker_as_value, marker_nested, marker_false]
+    db_session.add_all([seeded, *survivors])
     await db_session.flush()
+    survivor_ids = {job.id for job in survivors}
 
-    # The fixture session already has a transaction open, so the
-    # function's own `session.begin()` would raise. Wrap it so `begin()`
-    # is a no-op while every statement still hits the real DB.
-    class _NullTx:
-        async def __aenter__(self):  # type: ignore[no-untyped-def]
-            return None
-
-        async def __aexit__(self, *_a):  # type: ignore[no-untyped-def]
-            return False
-
-    class _SessionProxy:
-        def __init__(self, s):  # type: ignore[no-untyped-def]
-            self._s = s
-
-        def begin(self):  # type: ignore[no-untyped-def]
-            return _NullTx()
-
-        def __getattr__(self, name):  # type: ignore[no-untyped-def]
-            return getattr(self._s, name)
-
-        async def __aenter__(self):  # type: ignore[no-untyped-def]
-            return self
-
-        async def __aexit__(self, *_a):  # type: ignore[no-untyped-def]
-            return False
-
-    deleted = await reset._delete_seeded_dlq_fixtures(
-        lambda: _SessionProxy(db_session)
-    )
+    deleted = await reset._delete_seeded_dlq_fixtures(_factory(db_session))
 
     assert deleted == 1
-    remaining = (
-        await db_session.execute(select(Job.id).where(Job.id == ordinary.id))
-    ).scalars().all()
-    assert remaining, "non-seeded DLQ row must survive"
+    remaining = set(
+        (
+            await db_session.execute(
+                select(Job.id).where(Job.id.in_(survivor_ids | {seeded.id}))
+            )
+        ).scalars()
+    )
+    assert remaining == survivor_ids, (
+        "only the top-level boolean-true marker row may be deleted"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -387,37 +461,11 @@ async def test_resolve_chaos_alerts_clears_bad_deploy_residue(
     db_session.add_all([chaos_active, kafka_active, chaos_resolved])
     await db_session.flush()
 
-    # Same wrapper as `_delete_seeded_dlq_fixtures` above: the fixture
-    # session already owns a transaction, so `session.begin()` has to be
-    # a no-op while every statement still hits the real DB.
-    class _NullTx:
-        async def __aenter__(self):  # type: ignore[no-untyped-def]
-            return None
-
-        async def __aexit__(self, *_a):  # type: ignore[no-untyped-def]
-            return False
-
-    class _SessionProxy:
-        def __init__(self, s):  # type: ignore[no-untyped-def]
-            self._s = s
-
-        def begin(self):  # type: ignore[no-untyped-def]
-            return _NullTx()
-
-        def __getattr__(self, name):  # type: ignore[no-untyped-def]
-            return getattr(self._s, name)
-
-        async def __aenter__(self):  # type: ignore[no-untyped-def]
-            return self
-
-        async def __aexit__(self, *_a):  # type: ignore[no-untyped-def]
-            return False
-
     chaos_active_id = chaos_active.id
     kafka_active_id = kafka_active.id
     chaos_resolved_id = chaos_resolved.id
 
-    resolved = await reset._resolve_chaos_alerts(lambda: _SessionProxy(db_session))
+    resolved = await reset._resolve_chaos_alerts(_factory(db_session))
 
     # Only the ACTIVE chaos alert is touched — the already-resolved one
     # must not have its resolved_at re-stamped (idempotent second run).
@@ -486,6 +534,164 @@ def test_refuse_in_production_allows_non_production(
         reset._refuse_in_production()
     finally:
         get_settings.cache_clear()
+
+
+async def test_reset_refuses_production_before_creating_anything(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The programmatic entry point is gated too (D-08).
+
+    `_refuse_in_production()` ran only in `main()`, so `reset()` — which
+    is exported, takes arbitrary DB/Redis URLs, and is what the eval
+    harness imports — executed every destructive step against a
+    production platform while its own docstring claimed the script was
+    gated. The guard now raises `RuntimeError` as `reset()`'s first
+    statement: a library caller gets an exception, the CLI keeps
+    `SystemExit` (asserted above), and nothing is connected first.
+    """
+    reset = _reset_module()
+    from app.config import get_settings
+
+    def _no_engine(*_a, **_k):  # type: ignore[no-untyped-def]
+        raise AssertionError(
+            "reset() must refuse before creating an engine — the gate has to "
+            "precede create_async_engine, not follow it"
+        )
+
+    monkeypatch.setattr(reset, "create_async_engine", _no_engine)
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    # The Settings validator refuses the default `change-me-...` key under
+    # ENVIRONMENT=production; feed it a long-enough one so the guardrail
+    # path is what we actually reach.
+    monkeypatch.setenv("SECRET_KEY", "a" * 48)
+    get_settings.cache_clear()
+    try:
+        with pytest.raises(RuntimeError, match="refuses to run in production"):
+            await reset.reset(
+                database_url="sqlite+aiosqlite://",
+                redis_url="redis://nowhere",
+            )
+    finally:
+        get_settings.cache_clear()
+
+
+# ---------------------------------------------------------------------------
+# Audit ground truth — D-10 / ADR 0012 amendment
+# ---------------------------------------------------------------------------
+
+
+def _sql_literals(module) -> list[str]:  # type: ignore[no-untyped-def]
+    """Every string handed to a `text(...)` call in the module's source.
+
+    Parsed rather than grepped so prose (docstrings, comments — which
+    *do* discuss audit_logs, deliberately) can't satisfy or trip the
+    assertion. Non-literal arguments are unparsed back to source so a
+    future f-string SQL builder is still screened."""
+    literals: list[str] = []
+    for node in ast.walk(ast.parse(inspect.getsource(module))):
+        if not isinstance(node, ast.Call):
+            continue
+        if getattr(node.func, "id", None) != "text":
+            continue
+        for arg in node.args:
+            if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                literals.append(arg.value)
+            else:
+                literals.append(ast.unparse(arg))
+    return literals
+
+
+def test_reset_sql_never_names_audit_logs() -> None:
+    """Static tripwire: audit rows are immutable to the reset.
+
+    The commander grades against `audit_logs` (invariant 6), so the reset
+    must never write, update or delete one. Today it doesn't — this pins
+    that, and fails loudly the moment someone "tidies up" audit rows
+    alongside the jobs and users the reset legitimately deletes."""
+    reset = _reset_module()
+    statements = _sql_literals(reset)
+    assert statements, "expected the reset to issue raw SQL; parser found none"
+    offenders = [sql for sql in statements if "audit_logs" in sql]
+    assert offenders == [], (
+        "reset_eval_state must not touch audit_logs — the deleted rows' "
+        "identity survives on audit_logs.resource_id (ADR 0012 amendment)"
+    )
+
+
+async def test_reset_deletes_leave_audit_rows_byte_identical(
+    db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
+) -> None:
+    """Behavioural half of the same contract.
+
+    Both hard-DELETE helpers run over a job that a pre-existing audit row
+    references. The audit row must survive with its action, `resource_id`
+    and `extra_data` untouched — `resource_id` is the durable join key
+    any grader or forensic query must use, because the FK columns are
+    nulled by design (`ON DELETE SET NULL`; asserted on the Postgres
+    harness, where FK actions actually fire)."""
+    reset = _reset_module()
+    from app.mcp.tools.chaos.seed_dlq_messages import SEEDED_FIXTURE_MARKER
+    from app.models.audit import AuditLog
+    from app.models.user import User
+
+    chaos_user = User(
+        tenant_id=default_tenant.id,
+        email=f"chaos-owner+{default_tenant.id}@chaos.local",
+        hashed_password="!chaos-owner-no-login",
+        role="user",
+        is_active=False,
+    )
+    db_session.add(chaos_user)
+    await db_session.flush()
+    chaos_job = Job(
+        tenant_id=default_tenant.id,
+        user_id=chaos_user.id,
+        type=JobType.CSV_UPLOAD.value,
+        status=JobStatus.DEAD_LETTER.value,
+        payload={"chaos_fixture": "bad_data_job"},
+        retry_count=3,
+    )
+    seeded_job = Job(
+        tenant_id=default_tenant.id,
+        user_id=test_user.id,
+        type=JobType.BULK_API_SYNC.value,
+        status=JobStatus.DEAD_LETTER.value,
+        payload={SEEDED_FIXTURE_MARKER: True},
+        retry_count=3,
+    )
+    db_session.add_all([chaos_job, seeded_job])
+    await db_session.flush()
+
+    extra_data = {"previous_status": "dead_letter", "previous_retry_count": 3}
+    audits = [
+        AuditLog(
+            tenant_id=default_tenant.id,
+            job_id=job.id,
+            action="job.replayed",
+            resource_type="job",
+            resource_id=str(job.id),
+            extra_data=extra_data,
+        )
+        for job in (chaos_job, seeded_job)
+    ]
+    db_session.add_all(audits)
+    await db_session.flush()
+    audit_ids = [row.id for row in audits]
+    expected_resource_ids = {str(chaos_job.id), str(seeded_job.id)}
+
+    assert await reset._delete_chaos_owner_users(_factory(db_session)) == 1
+    assert await reset._delete_seeded_dlq_fixtures(_factory(db_session)) == 1
+
+    db_session.expire_all()
+    surviving = (
+        await db_session.execute(
+            select(AuditLog).where(AuditLog.id.in_(audit_ids))
+        )
+    ).scalars().all()
+    assert len(surviving) == 2, "the reset must never delete an audit row"
+    assert {row.action for row in surviving} == {"job.replayed"}
+    assert {row.resource_id for row in surviving} == expected_resource_ids
+    assert [row.extra_data for row in surviving] == [extra_data, extra_data]
 
 
 # ---------------------------------------------------------------------------
