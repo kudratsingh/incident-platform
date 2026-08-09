@@ -44,13 +44,18 @@ resource "aws_ecs_task_definition" "backend" {
       ]
 
       environment = [
-        { name = "ENVIRONMENT", value = "production" },
+        { name = "ENVIRONMENT", value = var.environment },
+        # ADR 0008 gate 1 — paired with ENVIRONMENT above: the variables.tf
+        # validation refuses true+production, and app-side assert_chaos_gate()
+        # re-checks the same pair at boot.
+        { name = "CHAOS_ENABLED", value = var.chaos_enabled ? "true" : "false" },
         { name = "DEBUG", value = "false" },
         { name = "REDIS_URL", value = local.redis_url },
         { name = "STORAGE_BUCKET", value = aws_s3_bucket.storage.bucket },
         { name = "AWS_DEFAULT_REGION", value = var.aws_region },
         # ALB DNS name so the backend allows cross-origin requests from the frontend.
         { name = "CORS_ORIGINS", value = "[\"http://${aws_lb.main.dns_name}\"]" },
+        { name = "ALERT_WEBHOOK_URL", value = var.alert_webhook_url },
       ]
 
       secrets = [
@@ -61,6 +66,10 @@ resource "aws_ecs_task_definition" "backend" {
         {
           name      = "SECRET_KEY"
           valueFrom = aws_secretsmanager_secret.secret_key.arn
+        },
+        {
+          name      = "ALERT_WEBHOOK_SECRET"
+          valueFrom = aws_secretsmanager_secret.alert_webhook_secret.arn
         },
       ]
 

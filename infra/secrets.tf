@@ -36,3 +36,16 @@ resource "aws_secretsmanager_secret_version" "secret_key" {
   secret_id     = aws_secretsmanager_secret.secret_key.id
   secret_string = random_password.secret_key.result
 }
+
+# ── ALERT_WEBHOOK_SECRET ──────────────────────────────────────────────────────
+
+resource "aws_secretsmanager_secret" "alert_webhook_secret" {
+  name                    = "${var.app_name}/alert-webhook-secret"
+  description             = "HMAC-SHA256 shared secret for signing outbound alert webhook bodies"
+  recovery_window_in_days = 7
+}
+
+resource "aws_secretsmanager_secret_version" "alert_webhook_secret" {
+  secret_id     = aws_secretsmanager_secret.alert_webhook_secret.id
+  secret_string = var.alert_webhook_secret
+}

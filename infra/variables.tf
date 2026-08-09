@@ -51,10 +51,14 @@ variable "alarm_email" {
 # Chaos framework — see ADR 0008.
 #
 # `chaos_enabled=true` MUST NOT be permitted in the production
-# workspace. The validation below is the load-bearing check; even if
-# someone manually sets the variable, `terraform apply` refuses to
-# proceed. The app-side `assert_chaos_gate()` catches the case where
-# an operator somehow bypasses Terraform entirely.
+# workspace. The validation below is the load-bearing check: plan and
+# apply refuse the chaos_enabled=true + environment="production"
+# combination, while any non-production workspace may enable chaos
+# freely. The value is wired into the backend task definition as
+# CHAOS_ENABLED (ecs.tf); the app-side `assert_chaos_gate()` re-checks
+# the same pair at boot and catches the case where an operator somehow
+# bypasses Terraform entirely. The `infra` CI job proves the refusal
+# with a credential-free negative plan on every push.
 # ------------------------------------------------------------------
 variable "chaos_enabled" {
   description = "Enable the chaos framework in this workspace. Must be false when environment = production."
@@ -62,8 +66,8 @@ variable "chaos_enabled" {
   default     = false
 
   validation {
-    condition     = !(var.chaos_enabled)
-    error_message = "Chaos is disabled by default in every workspace. To enable in a non-production workspace, comment out this validation block and set chaos_enabled=true. Never enable in production — the app also refuses to boot with CHAOS_ENABLED=true when ENVIRONMENT=production."
+    condition     = !(var.chaos_enabled && var.environment == "production")
+    error_message = "chaos_enabled=true is refused in the production workspace (ADR 0008): the chaos framework must never be deployable to production. Chaos may be enabled in any other workspace by setting environment to a value other than \"production\". The app enforces the same invariant at boot — assert_chaos_gate() refuses CHAOS_ENABLED=true when ENVIRONMENT=production."
   }
 }
 

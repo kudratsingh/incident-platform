@@ -1,7 +1,7 @@
 locals {
-  azs             = ["${var.aws_region}a", "${var.aws_region}b"]
-  public_cidrs    = ["10.0.0.0/24", "10.0.1.0/24"]
-  private_cidrs   = ["10.0.2.0/24", "10.0.3.0/24"]
+  azs           = ["${var.aws_region}a", "${var.aws_region}b"]
+  public_cidrs  = ["10.0.0.0/24", "10.0.1.0/24"]
+  private_cidrs = ["10.0.2.0/24", "10.0.3.0/24"]
 }
 
 # ── VPC ───────────────────────────────────────────────────────────────────────
