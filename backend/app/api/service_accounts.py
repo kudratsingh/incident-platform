@@ -1,9 +1,16 @@
 """
 Admin endpoints for machine principals — service accounts + their tokens.
 
-Tenant admins manage their own tenant's service accounts. Platform admins
-can cross tenants via `?tenant_id=`; the resolver enforces this the same
-way the other admin endpoints do.
+Service-account management is a platform-operator workflow: every endpoint
+here requires `is_platform_admin` (X-01 hop 2 — a tenant admin must not be
+able to mint machine credentials). Platform admins can cross tenants via
+`?tenant_id=`; the resolver enforces this the same way the other admin
+endpoints do.
+
+`chaos:invoke` is additionally refused as a grantable scope at this API
+boundary while the chaos gate is closed (X-01 hop 3) — see
+`assert_api_grantable`. The operator seed script provisions it through the
+service layer and is unaffected.
 
 Everything under this router is human-facing (creating and revoking machine
 credentials is an operator workflow). The scope-guarded endpoints that
@@ -14,13 +21,14 @@ first).
 import uuid
 from datetime import timedelta
 
-from app.core.exceptions import NotFoundError
+from app.config import get_settings
+from app.core.exceptions import AuthorizationError, NotFoundError
+from app.core.scopes import assert_api_grantable
 from app.dependencies import (
     get_db,
-    require_role,
+    require_platform_admin,
     resolve_admin_tenant,
 )
-from app.models.enums import UserRole
 from app.models.user import User
 from app.repositories.audit import AuditRepository
 from app.repositories.service_account import (
@@ -42,7 +50,25 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 router = APIRouter(prefix="/admin/service-accounts", tags=["service-accounts"])
 
-_require_admin = require_role(UserRole.ADMIN)
+# Platform admin, not tenant admin: machine credentials are cross-cutting
+# operator material, and `resolve_admin_tenant`'s `?tenant_id=` override
+# already only honors platform admins.
+_require_admin = require_platform_admin
+
+
+def _assert_api_grantable(scopes: list[str] | None) -> None:
+    """Endpoint-boundary gate on scope grants (create / PATCH / mint).
+
+    Maps the ValueError from `assert_api_grantable` to 403 exactly as the
+    service maps `validate_scopes`. Lives at the API layer ONLY — the
+    seed script's service-layer provisioning path must stay open.
+    """
+    try:
+        assert_api_grantable(
+            scopes, chaos_enabled=get_settings().chaos_enabled
+        )
+    except ValueError as exc:
+        raise AuthorizationError(str(exc)) from exc
 
 
 def _service(db: AsyncSession) -> ServiceAccountService:
@@ -64,6 +90,7 @@ async def create_service_account(
     current_user: User = Depends(_require_admin),
     db: AsyncSession = Depends(get_db),
 ) -> ServiceAccountResponse:
+    _assert_api_grantable(payload.scopes)
     effective_tenant = await resolve_admin_tenant(current_user, db, tenant_id)
     sa = await _service(db).create_service_account(
         tenant_id=effective_tenant,
@@ -114,14 +141,16 @@ async def update_service_account_scopes(
     (POST /{id}/tokens) pick up the new set. Common use:
 
       1. `PATCH /admin/service-accounts/{id}` with the wider scope
-         list (e.g. add `chaos:invoke` + `actions:execute` when the
-         agent moves into Phase 6 remediation)
+         list (e.g. add `actions:execute` when the agent moves into
+         Phase 6 remediation; `chaos:invoke` can only be added this
+         way on a chaos-enabled stack — see `assert_api_grantable`)
       2. `POST /admin/service-accounts/{id}/tokens` to mint a fresh
          token that carries the new scopes
       3. Point the agent's PLATFORM_TOKEN at the new value
 
     Idempotent — a call that changes nothing skips the audit row.
     """
+    _assert_api_grantable(payload.scopes)
     effective_tenant = await resolve_admin_tenant(current_user, db, tenant_id)
     sa = await ServiceAccountRepository(db).get_by_id(sa_id)
     if sa is None or sa.tenant_id != effective_tenant:
@@ -146,6 +175,11 @@ async def mint_token(
     current_user: User = Depends(_require_admin),
     db: AsyncSession = Depends(get_db),
 ) -> TokenMintResponse:
+    # Explicitly requested scopes are gated here; a `scopes: null` mint
+    # inherits the account's set, which is fine — the account can only
+    # hold chaos:invoke if the operator path (or a chaos-enabled admin)
+    # legitimately put it there, and the service enforces the subset rule.
+    _assert_api_grantable(payload.scopes)
     effective_tenant = await resolve_admin_tenant(current_user, db, tenant_id)
     sa = await ServiceAccountRepository(db).get_by_id(sa_id)
     if sa is None or sa.tenant_id != effective_tenant:

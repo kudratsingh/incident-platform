@@ -33,11 +33,15 @@ class AuthService:
         self,
         email: str,
         password: str,
-        role: str = "user",
         tenant_slug: str = DEFAULT_TENANT_SLUG,
         new_tenant_name: str | None = None,
         ip_address: str | None = None,
     ) -> User:
+        # Registration never takes a caller-supplied role (X-01 / F1-04).
+        # Everyone starts as a plain user; the single, bounded exception is
+        # the founder branch below, which is decided here — not by the
+        # request — when a brand-new tenant is created.
+        role = "user"
         existing = await self.user_repo.get_by_email(email)
         if existing:
             raise ConflictError(f"Email already registered: {email}")

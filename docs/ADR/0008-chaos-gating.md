@@ -124,9 +124,41 @@ New rule for reviewers: a PR that adds or modifies a chaos hook must, in the sam
 
 Docstrings on both sides — the chaos hook and its compensator — must name each other. Silent asymmetry is the failure mode this rule exists to prevent.
 
+## Amendment (v0.5.0) — The grant path is gated, not just the invoke path
+
+The three gates above all sit at *invoke* time. The X-01 audit finding showed
+the *grant* path was open: any tenant admin — a station reachable from
+unauthenticated `POST /auth/register` before v0.5.0 — could put `chaos:invoke`
+on a service account and mint a token through the human admin API. Gate 2 is
+only as strong as the controls on who can mint the scope.
+
+The grant path is now controlled too:
+
+1. **Only platform admins reach the grant machinery at all.** Every endpoint
+   under `/admin/service-accounts` requires `is_platform_admin` (see the
+   [ADR 0007 amendment](0007-machine-principal-scope-model.md)).
+2. **With the chaos gate closed (`CHAOS_ENABLED=false`), the human API refuses
+   to grant `chaos:invoke` outright** — create, PATCH-widen, and explicit
+   mint requests carrying it return 403 (`assert_api_grantable`, called at
+   the API endpoint boundary only). Since production forces
+   `CHAOS_ENABLED=false` (Terraform validation + boot assert above), no API
+   path can place `chaos:invoke` on a principal in production.
+3. **The two legitimate provisioning paths remain.** The operator seed script
+   (`scripts/seed_incident_commander.py`) provisions through the service
+   layer, which is deliberately not gated, in any environment. And on a
+   chaos-enabled stack — the platform's own docker-compose sets
+   `CHAOS_ENABLED=true`, which is what the incident-commander
+   `make bootstrap-token` flow targets — a platform admin may grant
+   `chaos:invoke` through the API.
+
+Net effect: in production the scope cannot be granted at all; elsewhere it is
+granted only by a platform operator who is deliberately standing on a
+chaos-enabled stack. The three invoke-time gates are unchanged.
+
 ## Pointers
 
 - `backend/app/config.py` — the boot-time assertion (to be added in Wave 1 PR #4)
 - `infra/variables.tf` — the Terraform validation
 - `backend/app/mcp/chaos_tools/` — the tool implementations (to be created in Wave 1 PR #4)
+- `backend/app/core/scopes.py` — `assert_api_grantable`, the grant-path gate (v0.5.0)
 - Related ADRs: [0006 — MCP server standalone process](0006-mcp-server-standalone-process.md), [0007 — Machine-principal scope model](0007-machine-principal-scope-model.md), [0009 — Consumer lifecycle and supervision](0009-consumer-lifecycle-and-supervision.md)
