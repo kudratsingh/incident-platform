@@ -164,7 +164,14 @@ Append-only log of every meaningful action (job creation, replay, incident resol
 | `request_id` | String(255) | The HTTP request that triggered the action. Used to correlate audit events across services. |
 | `ip_address` | String(50) | |
 | `extra_data` | JSONB NULLABLE | Per-event freeform. e.g. `{retry_count: 5, error: "..."}` for `job.dead_letter`. |
+| `kafka_topic` | String(128) NULLABLE | Set only on consumer-written `event.*` rows; NULL for inline application writes. |
+| `kafka_partition` | Integer NULLABLE | Same. |
+| `kafka_offset` | BigInt NULLABLE | Same. |
 | `created_at` | DateTime | When the action happened. |
+
+### Constraints
+
+- **`uq_audit_logs_kafka_coord` — UNIQUE (kafka_topic, kafka_partition, kafka_offset)** — same dedup primitive as `job_events`: without it, Kafka redelivery would append duplicate `event.*` rows to the immutable trail; the `AuditConsumer` swallows the `IntegrityError` and commits the offset. NULLs are distinct under UNIQUE, so inline rows (all-NULL coords) never collide.
 
 ### Why audit logs are written by *both* the application and the audit consumer
 

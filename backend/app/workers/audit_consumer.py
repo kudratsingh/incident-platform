@@ -7,6 +7,13 @@ state change). This consumer writes a second class of rows tagged
 `event.<name>` to demonstrate Kafka-driven consumer-group fan-out and to
 provide a self-contained event-sourced view of job lifecycle. In a later
 phase the inline writes can be removed once Kafka delivery is trusted.
+
+Idempotency under at-least-once delivery: every event.* row carries its
+Kafka coordinates, and audit_logs has UNIQUE (kafka_topic, kafka_partition,
+kafka_offset). On redelivery the INSERT fails the constraint, we swallow
+the IntegrityError, and the offset commits — same pattern as
+EventLogConsumer. Inline audit writers leave the coords NULL and are
+unaffected (NULLs never collide under UNIQUE).
 """
 
 import uuid
@@ -16,6 +23,7 @@ from app.config import get_settings
 from app.core.logging import get_logger
 from app.repositories.audit import AuditRepository
 from app.workers.kafka_consumer import BaseKafkaConsumer
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 logger = get_logger(__name__)
@@ -47,7 +55,9 @@ class AuditConsumer(BaseKafkaConsumer):
         topic: str,
         key: str | None,
         value: dict[str, Any],
-        **_kafka_meta: Any,
+        *,
+        partition: int = 0,
+        offset: int = 0,
     ) -> None:
         event_name = value.get("event") if isinstance(value, dict) else None
         if not event_name:
@@ -86,17 +96,31 @@ class AuditConsumer(BaseKafkaConsumer):
             if k not in ("event", "tenant_id", "job_id", "user_id")
         }
 
-        async with self.session_factory() as session:
-            async with session.begin():
-                await AuditRepository(session).log(
-                    action,
-                    tenant_id=tenant_id,
-                    user_id=user_id,
-                    job_id=job_id,
-                    resource_type="job",
-                    resource_id=str(job_id) if job_id else None,
-                    extra_data=extra_data,
-                )
+        # The IntegrityError from uq_audit_logs_kafka_coord surfaces on the
+        # transaction exit (commit), not on the .log() await — the except
+        # must wrap both context managers.
+        try:
+            async with self.session_factory() as session:
+                async with session.begin():
+                    await AuditRepository(session).log(
+                        action,
+                        tenant_id=tenant_id,
+                        user_id=user_id,
+                        job_id=job_id,
+                        resource_type="job",
+                        resource_id=str(job_id) if job_id else None,
+                        extra_data=extra_data,
+                        kafka_topic=topic,
+                        kafka_partition=partition,
+                        kafka_offset=offset,
+                    )
+        except IntegrityError:
+            # Redelivery — row already exists. Not an error; returning
+            # normally lets the offset commit.
+            logger.debug(
+                "audit dedup skipped duplicate",
+                extra={"topic": topic, "partition": partition, "offset": offset},
+            )
 
 
 def _parse_uuid(value: Any) -> uuid.UUID | None:

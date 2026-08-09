@@ -4,6 +4,7 @@ import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.workers.audit_consumer import AuditConsumer
+from sqlalchemy.exc import IntegrityError
 
 
 def _factory_with_audit() -> tuple[MagicMock, AsyncMock]:
@@ -118,3 +119,61 @@ async def test_audit_consumer_skips_malformed_event() -> None:
         )
 
     audit_repo.log.assert_not_awaited()
+
+
+async def test_kafka_coords_passed_to_log() -> None:
+    """The consumer must thread the Kafka coordinates into the audit row —
+    they are the dedup key under at-least-once redelivery. HEAD discarded
+    them via **_kafka_meta."""
+    factory, audit_repo = _factory_with_audit()
+    consumer = AuditConsumer(factory)
+
+    with patch("app.workers.audit_consumer.AuditRepository", return_value=audit_repo):
+        await consumer.handle_message(
+            topic="job.completed",
+            key="u",
+            value={
+                "event": "job.completed",
+                "tenant_id": str(uuid.uuid4()),
+                "job_id": str(uuid.uuid4()),
+                "user_id": str(uuid.uuid4()),
+            },
+            partition=2,
+            offset=42,
+        )
+
+    audit_repo.log.assert_awaited_once()
+    kwargs = audit_repo.log.await_args.kwargs
+    assert kwargs["kafka_topic"] == "job.completed"
+    assert kwargs["kafka_partition"] == 2
+    assert kwargs["kafka_offset"] == 42
+
+
+async def test_redelivery_integrity_error_is_swallowed() -> None:
+    """Kafka redelivery → uq_audit_logs_kafka_coord fires on commit → the
+    consumer must treat it as already-recorded and return normally so the
+    offset commits (mirrors EventLogConsumer)."""
+    factory, audit_repo = _factory_with_audit()
+    # The unique violation surfaces on the transaction context-manager exit
+    # (commit), not on the .log() await itself.
+    session = factory.return_value
+    begin_ctx = session.begin.return_value
+    begin_ctx.__aexit__ = AsyncMock(
+        side_effect=IntegrityError("uq violated", params=None, orig=Exception())
+    )
+
+    consumer = AuditConsumer(factory)
+    with patch("app.workers.audit_consumer.AuditRepository", return_value=audit_repo):
+        # Must not raise.
+        await consumer.handle_message(
+            topic="job.submitted",
+            key="u",
+            value={
+                "event": "job.submitted",
+                "tenant_id": str(uuid.uuid4()),
+                "job_id": str(uuid.uuid4()),
+                "user_id": str(uuid.uuid4()),
+            },
+            partition=0,
+            offset=7,
+        )

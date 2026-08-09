@@ -71,7 +71,8 @@ Every consumer in this codebase commits its Kafka offset **only after** `handle_
 
 - **Job idempotency keys** (`idempotency_key` UNIQUE constraint on `jobs`) — prevent double-execution when the dispatcher redelivers `job.submitted`
 - **Event log uniqueness** (`UNIQUE (kafka_topic, kafka_partition, kafka_offset)` on `job_events`) — `IntegrityError` is caught and swallowed in `EventLogConsumer.handle_message`, so redelivery is a no-op
-- **Idempotent set operations** in the read-model (`SADD` / `SREM` on Redis sets are no-ops for existing/missing members)
+- **Audit event uniqueness** (`uq_audit_logs_kafka_coord`, the same three-column UNIQUE on `audit_logs` — nullable, so inline application-written audit rows are exempt) — `IntegrityError` caught and swallowed in `AuditConsumer.handle_message`, so redelivery can't append duplicate `event.*` rows to the immutable trail
+- **Idempotent set operations** in the read-model (`SADD` / `SREM` on Redis sets are no-ops for existing/missing members), plus a terminal-state guard: non-terminal events are ignored for jobs already projected into a terminal set (`completed` / `dead_letter`), so a `job.progress` redelivered or reordered after `job.completed` can't demote the job; terminal→terminal transitions stay allowed for DLQ replay
 - **Triage `UNIQUE (job_id)`** — second triage call for the same job is a no-op
 
 The effect is **at-least-once delivery with effectively-once consumer effects**.

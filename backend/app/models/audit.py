@@ -3,7 +3,15 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from app.models.base import Base, PortableJSON
-from sqlalchemy import DateTime, ForeignKey, String, func
+from sqlalchemy import (
+    BigInteger,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    UniqueConstraint,
+    func,
+)
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -71,6 +79,15 @@ class AuditLog(Base):
     request_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     ip_address: Mapped[str | None] = mapped_column(String(50), nullable=True)
     extra_data: Mapped[dict[str, Any] | None] = mapped_column(PortableJSON, nullable=True)
+    # Kafka coordinates — set ONLY by the AuditConsumer for event.* rows so
+    # redelivery dedups on the unique constraint below. Nullable is
+    # load-bearing: inline transactional audit writers (API routes, worker
+    # _run_job, saga coordinator) have no Kafka coords and leave all three
+    # NULL; both Postgres and SQLite treat NULLs as distinct under UNIQUE,
+    # so inline rows never collide.
+    kafka_topic: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    kafka_partition: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    kafka_offset: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -80,6 +97,15 @@ class AuditLog(Base):
     )
     job: Mapped["Job | None"] = relationship(
         "Job", back_populates="audit_logs", lazy="noload"
+    )
+
+    __table_args__ = (
+        # Kafka redelivery → second event.* write fails this constraint, the
+        # AuditConsumer treats the IntegrityError as "already recorded" and
+        # commits the offset. Mirrors uq_job_events_kafka_coord.
+        UniqueConstraint(
+            "kafka_topic", "kafka_partition", "kafka_offset", name="uq_audit_logs_kafka_coord"
+        ),
     )
 
     def __repr__(self) -> str:

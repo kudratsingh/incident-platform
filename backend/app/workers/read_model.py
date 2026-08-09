@@ -9,6 +9,17 @@ Why sets keyed by job_id rather than counters: at-least-once Kafka delivery
 means counters can over-count under redelivery. A set keyed by job_id is
 idempotent — re-adding the same id is a no-op. SCARD then gives the count.
 
+Set-idempotency only covers redelivery of the SAME event. Cross-event
+reordering or redelivery (a job.progress consumed after that job's
+job.completed) would demote a terminal job back to 'running' — permanently,
+because no further event arrives to correct it. handle_message therefore
+guards: non-terminal transitions are ignored for any job already projected
+into a terminal set (completed / dead_letter). Terminal→terminal
+transitions are exempt so a DLQ replay's eventual job.completed still
+applies. Replay tradeoff: after an admin/agent replays a dead-lettered
+job, the projection holds it in dead_letter (the replay's live 'running'
+phase is ignored) until the next terminal event lands, then self-corrects.
+
 Keys:
   jobs:tenant:{tenant_id}:status:{status} — per-tenant set of job_ids with that status
   jobs:user:{user_id}:status:{status}     — per-user set of job_ids with that status
@@ -35,6 +46,12 @@ logger = get_logger(__name__)
 # Statuses we track in the projection. Strings rather than the enum so the
 # projector doesn't need to import the SQLAlchemy enum module.
 _TRACKED_STATUSES = ("running", "completed", "failed", "dead_letter")
+
+# Statuses that end a job's lifecycle. Once a job sits in one of these sets,
+# only another terminal event may move it (see the handle_message guard).
+# 'failed' is NOT terminal — the retry cycle legitimately moves failed jobs
+# back to running.
+_TERMINAL_STATUSES = ("completed", "dead_letter")
 
 # Map Kafka event → new status. job.submitted intentionally doesn't change a
 # status set: the dispatcher creates the row in PENDING, and the next event
@@ -106,6 +123,26 @@ class ReadModelProjector(BaseKafkaConsumer):
             if mapped is None:
                 return
             new_status = mapped
+
+        # Terminal-state guard (cross-event reordering / redelivery): once a
+        # job is projected into a terminal set, a late or redelivered
+        # non-terminal event must not drag it back. Terminal→terminal stays
+        # allowed so a DLQ replay's job.completed still lands. Checking the
+        # tenant keys alone suffices — tenant and user sets are always
+        # written together in _move.
+        if new_status not in _TERMINAL_STATUSES:
+            tid = str(tenant_id)
+            jid = str(job_id)
+            if await self.redis.sismember(  # type: ignore[misc,unused-ignore]
+                _tenant_key(tid, "completed"), jid
+            ) or await self.redis.sismember(  # type: ignore[misc,unused-ignore]
+                _tenant_key(tid, "dead_letter"), jid
+            ):
+                logger.debug(
+                    "read-model ignoring non-terminal event for terminal job",
+                    extra={"event": event_name, "job_id": jid, "tenant_id": tid},
+                )
+                return
 
         await _move(
             self.redis, str(tenant_id), str(user_id), str(job_id), new_status
