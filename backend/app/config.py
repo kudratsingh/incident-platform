@@ -1,9 +1,38 @@
 from functools import lru_cache
 
-from pydantic import RedisDsn, field_validator
+from pydantic import RedisDsn, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _INSECURE_DEFAULT_KEY = "change-me-in-production-please-use-a-long-random-string"
+
+# (field name, insecure literal, refusal message) — table-shaped so the next
+# secret-with-a-default (e.g. database_url's postgres:postgres) is a one-line
+# addition, not a redesign. Checked by _refuse_insecure_production_secrets.
+_INSECURE_PRODUCTION_SECRETS: tuple[tuple[str, str, str], ...] = (
+    (
+        "secret_key",
+        _INSECURE_DEFAULT_KEY,
+        "SECRET_KEY must be set to a strong random value in production. "
+        "Generate one with: "
+        'python -c "import secrets; print(secrets.token_hex(32))"',
+    ),
+    (
+        "storage_access_key",
+        "minioadmin",
+        "STORAGE_ACCESS_KEY is the weak default MinIO credential and must "
+        "never reach production. Production S3 access uses the ECS task IAM "
+        "role (see infra/iam.tf); infra injects only STORAGE_BUCKET "
+        "(infra/ecs.tf:50).",
+    ),
+    (
+        "storage_secret_key",
+        "minioadmin",
+        "STORAGE_SECRET_KEY is the weak default MinIO credential and must "
+        "never reach production. Production S3 access uses the ECS task IAM "
+        "role (see infra/iam.tf); infra injects only STORAGE_BUCKET "
+        "(infra/ecs.tf:50).",
+    ),
+)
 
 
 class Settings(BaseSettings):
@@ -33,26 +62,18 @@ class Settings(BaseSettings):
 
     # JWT
     secret_key: str = _INSECURE_DEFAULT_KEY
-
-    @field_validator("secret_key")
-    @classmethod
-    def secret_key_must_be_set(cls, v: str, info: object) -> str:
-        # Delay the import to avoid circular dependency at module load time
-        import os
-        if os.getenv("ENVIRONMENT", "development") == "production" and v == _INSECURE_DEFAULT_KEY:
-            raise ValueError(
-                "SECRET_KEY must be set to a strong random value in production. "
-                "Generate one with: python -c \"import secrets; print(secrets.token_hex(32))\""
-            )
-        return v
     algorithm: str = "HS256"
     access_token_expire_minutes: int = 30
     refresh_token_expire_days: int = 7
 
     # Object storage (MinIO locally)
+    # No usable credential defaults ship (finding E2-07). Local MinIO users
+    # set these via .env; in production the ECS task IAM role provides S3
+    # access. The Phase-14 storage client must treat None as "use ambient
+    # IAM credentials" and must not invent a fallback literal.
     storage_endpoint: str = "http://localhost:9000"
-    storage_access_key: str = "minioadmin"
-    storage_secret_key: str = "minioadmin"
+    storage_access_key: str | None = None
+    storage_secret_key: str | None = None
     storage_bucket: str = "incident-platform"
 
     # Workers
@@ -155,6 +176,26 @@ class Settings(BaseSettings):
     # Logging
     log_level: str = "INFO"
     log_file: str | None = None  # e.g. "logs/app.log" — if set, JSON logs are also written here
+
+    @model_validator(mode="after")
+    def _refuse_insecure_production_secrets(self) -> "Settings":
+        """Fail closed at boot: no secret-with-a-default may reach production.
+
+        Validates against the *parsed* ``self.environment`` — the effective
+        value regardless of config source (init kwarg, process env var, or
+        the ``.env`` file). The previous field_validator read
+        ``os.getenv("ENVIRONMENT")`` and was bypassed whenever production
+        was declared only via the ``.env`` file (finding E2-08).
+
+        Fires at Settings() construction, i.e. exactly at boot in
+        production (get_settings is lru_cached; main.py builds settings at
+        import time).
+        """
+        if self.environment == "production":
+            for field, insecure_literal, message in _INSECURE_PRODUCTION_SECRETS:
+                if getattr(self, field) == insecure_literal:
+                    raise ValueError(message)
+        return self
 
 
 @lru_cache

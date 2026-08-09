@@ -45,7 +45,7 @@ These namespaces are written by the incident-commander MCP tools and the eval to
 
 Sliding-window counters. Two scopes:
 
-- **Per-client (IP + endpoint)** — defends against a single noisy client. Defined in `app/utils/rate_limit.py`. Used as a FastAPI dependency on every mutating endpoint (login, register, job create, etc.).
+- **Per-client (IP + endpoint)** — defends against a single noisy client. Defined in `app/utils/rate_limit.py`. Used as a FastAPI dependency on every mutating endpoint (login, register, job create, etc.). The client identity is the rightmost `X-Forwarded-For` hop — the one the trusted ALB appends — so rotating the caller-supplied part of the header cannot mint fresh buckets.
 - **Per-tenant** — defends against a noisy *tenant* (multiple users / multiple processes from the same customer). Defined in `app/utils/quota.py` as `_check_tenant_rate`. Checked at the top of `POST /jobs` after the per-client check.
 
 Both fail open if Redis is unreachable: `logger.warning` and let the request through. The rationale: a Redis outage is bad enough; turning it into a 100% outage by blocking all traffic makes it worse.

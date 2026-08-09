@@ -8,7 +8,14 @@ from app.config import Settings, assert_chaos_gate
 
 def test_gate_allows_chaos_disabled_in_production() -> None:
     """Baseline — production without chaos is fine."""
-    settings = Settings(environment="production", chaos_enabled=False)
+    # secret_key: production Settings refuse the insecure default at
+    # construction (WO-P6-01); _env_file=None keeps the test hermetic.
+    settings = Settings(
+        _env_file=None,
+        environment="production",
+        secret_key="x" * 48,
+        chaos_enabled=False,
+    )
     assert_chaos_gate(settings)  # no raise
 
 
@@ -20,7 +27,12 @@ def test_gate_allows_chaos_enabled_in_staging() -> None:
 
 def test_gate_refuses_chaos_enabled_in_production() -> None:
     """The load-bearing check — the whole ADR 0008 argument."""
-    settings = Settings(environment="production", chaos_enabled=True)
+    settings = Settings(
+        _env_file=None,
+        environment="production",
+        secret_key="x" * 48,
+        chaos_enabled=True,
+    )
     with pytest.raises(RuntimeError, match="Chaos tools must never"):
         assert_chaos_gate(settings)
 
