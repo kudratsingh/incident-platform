@@ -22,6 +22,17 @@ The chaos framework is **triple-gated**. All three gates must be open, independe
 
 If gate 1 is closed, the chaos tools are not registered on the MCP server at startup — they don't appear in the `tools/list` response for that environment. If gate 1 is open but gate 2 is closed, the call returns 403 with `error_code: scope_required`. If gates 1 and 2 are open but gate 3 refuses the tool, the call returns 403 with `error_code: blast_radius_exceeded`.
 
+> **Implementation status (2026-08-09): gate 3 above is specified but NOT implemented.** The audit
+> found `CHAOS_MAX_BLAST_RADIUS` and `blast_radius_exceeded` only in this ADR; `chaos.py` prepends
+> the blast-radius label to the description and treats it as informational. In code the framework is
+> **double**-gated: the environment flag and the `chaos:invoke` scope. Production safety does not
+> depend on gate 3 — gate 1 leaves the tools unregistered in production entirely, and the 2026-08
+> campaign additionally made the Terraform validation real and removed `chaos:invoke` from the
+> API-grantable scopes. Implementation is deferred past the eval restart with its reasoning and a
+> full implementation sketch in [ADR 0016](0016-defer-principal-scoped-tools-list.md); that ADR's
+> backlog item replaces this note when gate 3 lands. Recorded rather than quietly left to drift —
+> the decision text above stands as the target design.
+
 ### Why three gates and not one strict one
 
 Any single gate is one accident away from failure:

@@ -97,6 +97,7 @@ These are sized at "phase" level in the milestone plan. Not repeated here, but r
 | Login attempt rate limiting + lockout | S | Already have rate limiting on the login route. Add a "5 failures = 15min lockout" policy. |
 | Field-level encryption for payloads | M | The `result` and `payload` columns may contain sensitive data. Encrypt with a per-tenant key derived from the master KMS key. |
 | Cross-tenant access logging | S | When a platform admin uses `?tenant_id=X` to view another tenant, log it prominently. The audit row should make the cross-tenant access visible. |
+| **Principal-scoped `tools/list` + blast-radius gate 3** | M | **First item after the eval restart.** Scope-filter `tools/list`, mask chaos scope-denials as tool-not-found (chaos tools ONLY — non-chaos denials must keep `-32002`/`scope`, both repos' read-only guards depend on it), then implement ADR 0008 gate 3. Deferred deliberately, not forgotten: constraints, ordering, and the commander-side snapshot-guard precondition are in [ADR 0016](ADR/0016-defer-principal-scoped-tools-list.md). Findings D-05, D-06. |
 
 ---
 
