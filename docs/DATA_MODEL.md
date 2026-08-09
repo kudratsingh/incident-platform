@@ -30,6 +30,8 @@ For the Kafka side (event log, lifecycle topics), see [`docs/KAFKA.md`](KAFKA.md
 
 Every domain table carries `tenant_id` as a FK to `tenants` so tenancy is enforced at the constraint layer (combined with RLS — see [ADR 0003](ADR/0003-rls-as-defense-in-depth.md)).
 
+**RLS coverage** (migrations `c4f8e9a52340` + `a7e3d9c41f28`): all 11 tenant-scoped tables — `jobs`, `audit_logs`, `outbox_events`, `job_events`, `sagas`, `job_triages`, `incident_summaries`, `service_accounts`, `alerts`, `idempotency_records`, `deploy_markers` — carry the `tenant_isolation` policy **and `FORCE ROW LEVEL SECURITY`**, so the policies bind the table owner too (the RDS master the app connects as). The `deploy_markers` policy additionally admits `tenant_id IS NULL` rows (platform-wide deploys stay visible under tenant-scoped sessions). `users` is the single deliberate exclusion — auth reads it before `app.tenant_id` is set (ADR 0003 bootstrap). `audit_logs` also carries RESTRICTIVE deny policies for UPDATE/DELETE, making it immutable at the DB layer while the `ON DELETE SET NULL` FKs keep working (referential-integrity actions bypass RLS). See [ADR 0015](ADR/0015-force-rls-and-nonowner-app-role.md). The unit gate `backend/tests/unit/test_rls_coverage.py` fails CI if a future `tenant_id` table ships without a policy.
+
 ---
 
 ## `tenants` — the multi-tenancy root
@@ -151,7 +153,7 @@ A saga is a container; the actual steps live in `jobs` with `saga_id` set. Step 
 
 ## `audit_logs` — what happened, when, by whom
 
-Append-only log of every meaningful action (job creation, replay, incident resolved, saga created, login, user registration, tenant created, etc.).
+Append-only log of every meaningful action (job creation, replay, incident resolved, saga created, login, user registration, tenant created, etc.). Append-only is enforced at the DB layer: RESTRICTIVE RLS policies deny UPDATE and DELETE for every non-superuser session, owner included (migration `a7e3d9c41f28`; [ADR 0015](ADR/0015-force-rls-and-nonowner-app-role.md)). The `ON DELETE SET NULL` FKs below still fire — referential-integrity actions bypass row security.
 
 | Column | Type | Notes |
 |---|---|---|
