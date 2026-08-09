@@ -37,6 +37,12 @@ COPY backend/alembic/ ./backend/alembic/
 # a bind-mounted dev stack. This supersedes the single-file COPY.
 COPY scripts/ ./scripts/
 COPY scripts/entrypoint.sh ./entrypoint.sh
+# Runbook YAMLs: services/runbooks.py resolves <app root>/runbooks once
+# at import time and caches the result for the process lifetime. An
+# image without this directory serves an empty runbooks API forever —
+# GET /admin/runbooks was [] and /admin/runbooks/{id} 404'd in every
+# released image (finding E2-03).
+COPY runbooks/ ./runbooks/
 
 # Non-root user for security
 RUN addgroup --system appgroup && adduser --system --ingroup appgroup appuser \
