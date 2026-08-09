@@ -17,7 +17,7 @@ For the broader architectural context, see [`docs/ARCHITECTURE.md`](ARCHITECTURE
 | `job:progress:{job_id}` | Pub/Sub channel (no persisted key) | `progress.py` `publish` | `streaming.py` SSE endpoint via `subscribe` | N/A (Pub/Sub is fire-and-forget) | No — listeners must be connected |
 | `jobs:tenant:{tenant_id}:status:{status}` | set of job_ids | `read_model.py` `_move` | `admin.py` `system_stats` via `read_global_stats` | None | No — read model goes stale |
 | `jobs:user:{user_id}:status:{status}` | set of job_ids | `read_model.py` `_move` | `admin.py` `user_stats` via `read_user_stats` | None | No — read model goes stale |
-| `job:{tenant_id}:{job_id}` | JSON string | `cache.py` `JobCache.set` | `cache.py` `JobCache.get` | 10s | Yes — cache miss = DB read |
+| `cache:job:{tenant_id}:{job_id}` | JSON string | `cache.py` `JobCache.set` | `cache.py` `JobCache.get` | 10s | Yes — cache miss = DB read |
 | `kafka:consumer_lag:worker-dispatcher` | string (int) | `dispatcher.py` `_metrics_loop` | `backpressure.py` `check_backpressure` | 90s | Yes — falls back to "no backpressure" |
 | `priority_queue` (sorted set) | sorted set of job_ids by priority score | `queue.py` `push` | `queue.py` `pop` | None | Critical — see below |
 | `delayed_queue` (sorted set) | sorted set of job_ids by ready-at timestamp | `queue.py` `push_delayed` | `queue.py` `pop_ready_delayed` | None | Critical — see below |
@@ -81,9 +81,13 @@ This is the most operationally fragile thing about the current Redis usage. Docu
 
 The tenant scoping landed in Phase 12 PR D — before that, the sets were keyed only by status (`jobs:status:running`) and one tenant's overview counted sibling tenants' jobs. See the PR description on #38.
 
-### Job cache (`job:{tenant_id}:{job_id}`)
+### Job cache (`cache:job:{tenant_id}:{job_id}`)
 
 Read-through cache for `GET /jobs/{id}`. JSON serialization of the `JobResponse` schema. TTL 10s. Cache invalidated explicitly on replay and incident-resolve (`JobCache.delete`) so admins re-hitting after a Replay see the fresh state immediately.
+
+The invalidation site is the **service layer** — `JobService.replay_job` and `JobService.resolve_incident` (`app/services/job.py`) — not the REST handlers. That is what makes every write path coherent: `POST /admin/jobs/{id}/replay`, the MCP replay tools (`replay_dlq_messages` / `replay_dlq_by_ids` / `replay_dlq_by_category`), and the scheduled DLQ-replay loop in `app/workers/dispatcher.py` all funnel through `JobService` (E2-02 — previously only the REST wrappers invalidated, so an agent-driven replay left `GET /jobs/{id}` stale for a full TTL).
+
+The `cache:` namespace also makes this key reachable by the `invalidate_cache_key` MCP action, whose allowlist covers `cache:` — an agent can force-refresh a single job read without any change to that tool's contract.
 
 The key embeds the tenant (E2-01): a caller from another tenant computes a different key, structurally misses, and falls through to the tenant-scoped DB query. Isolation lives in the key, so the cached `JobResponse` payload never needs to carry `tenant_id`.
 
@@ -163,10 +167,10 @@ Manual today; future PR (Phase 8 platform work) makes it an admin endpoint. The 
 
 ### Clear the cache
 
-`FLUSHDB` is too blunt — wipes everything including the delayed queue. Better (job-cache keys live under `job:{tenant_id}:{job_id}`):
+`FLUSHDB` is too blunt — wipes everything including the delayed queue. Better (job-cache keys live under `cache:job:{tenant_id}:{job_id}`):
 
 ```bash
-SCAN 0 MATCH 'job:*' COUNT 100 | xargs DEL
+SCAN 0 MATCH 'cache:job:*' COUNT 100 | xargs DEL
 ```
 
 Cache misses are fine; they re-populate on next read.

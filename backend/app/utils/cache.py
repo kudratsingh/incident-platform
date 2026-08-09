@@ -33,15 +33,25 @@ _JOB_TTL = 10  # seconds — short TTL; jobs change status frequently
 class JobCache:
     """Cache layer for individual job objects.
 
-    Keys are tenant-scoped (``job:{tenant_id}:{job_id}``) so a cache hit can
-    never cross a tenant boundary: a caller from another tenant computes a
+    Keys are tenant-scoped (``cache:job:{tenant_id}:{job_id}``) so a cache hit
+    can never cross a tenant boundary: a caller from another tenant computes a
     different key, misses, and falls through to the tenant-scoped DB path
     (E2-01). The tenant therefore never needs to live in the cached payload.
     """
 
     @staticmethod
     def _key(job_id: uuid.UUID | str, tenant_id: uuid.UUID | str) -> str:
-        return f"job:{tenant_id}:{job_id}"
+        # The ``cache:`` namespace is load-bearing, not cosmetic (E2-02):
+        # it is the name docs/REDIS.md already catalogs, and it is what puts
+        # this key under an allowlisted prefix of the MCP `invalidate_cache_key`
+        # compensator — so an agent can force-refresh a stale job read without
+        # widening that tool's allowlist (which would drift its inputSchema
+        # against the pinned contract snapshot).
+        #
+        # Deploy-safe rename: the 10s TTL means keys orphaned under the old
+        # ``job:{tenant}:{id}`` name expire within one TTL of rollout. No
+        # migration, no backfill.
+        return f"cache:job:{tenant_id}:{job_id}"
 
     @classmethod
     async def get(

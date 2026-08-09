@@ -304,3 +304,41 @@ async def test_replay_from_service_account_writes_audit_with_null_user_id() -> N
     )
     assert kwargs["principal_type"] == "service_account"
     assert kwargs["principal_id"] == sa_id
+
+
+async def test_replay_invalidates_job_cache() -> None:
+    """E2-02: invalidation must live in the SERVICE layer, not only in the
+    REST admin wrapper — otherwise the three MCP replay tools and the
+    scheduled DLQ-replay loop leave `GET /jobs/{id}` serving stale status
+    for a whole TTL."""
+    svc, job_repo, _, _ = _make_service()
+    tenant_id = uuid.uuid4()
+    dead_job = _make_job(status=JobStatus.DEAD_LETTER, tenant_id=tenant_id)
+    job_repo.get_for_tenant.return_value = dead_job
+    job_repo.update_status.return_value = dead_job
+
+    await svc.replay_job(dead_job.id, tenant_id, requesting_user_id=uuid.uuid4())
+
+    svc.redis.delete.assert_awaited_once_with(  # type: ignore[attr-defined]
+        f"cache:job:{tenant_id}:{dead_job.id}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# resolve_incident
+# ---------------------------------------------------------------------------
+
+
+async def test_resolve_incident_invalidates_job_cache() -> None:
+    """Same invariant as replay: the service layer owns invalidation."""
+    svc, job_repo, _, _ = _make_service()
+    tenant_id = uuid.uuid4()
+    job = _make_job(status=JobStatus.FAILED, tenant_id=tenant_id)
+    job_repo.get_for_tenant.return_value = job
+    job_repo.update_status.return_value = job
+
+    await svc.resolve_incident(job.id, uuid.uuid4(), tenant_id)
+
+    svc.redis.delete.assert_awaited_once_with(  # type: ignore[attr-defined]
+        f"cache:job:{tenant_id}:{job.id}"
+    )

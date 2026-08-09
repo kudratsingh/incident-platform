@@ -27,7 +27,6 @@ from app.services.job import JobService
 from app.services.runbooks import get as get_runbook
 from app.services.runbooks import list_all as list_runbooks
 from app.services.slo import compute_all as compute_slos
-from app.utils.cache import JobCache
 from app.workers.read_model import read_global_stats, read_user_stats
 from fastapi import APIRouter, Depends
 from redis.asyncio import Redis
@@ -170,12 +169,12 @@ async def replay_job(
     redis: Redis = Depends(get_redis),
 ) -> JobResponse:
     svc = _job_service(db, redis)
+    # JobService owns cache invalidation (E2-02) — no delete here.
     job = await svc.replay_job(
         job_id=job_id,
         requesting_user_id=current_user.id,
         tenant_id=current_user.tenant_id,
     )
-    await JobCache.delete(redis, job_id, current_user.tenant_id)
     return JobResponse.model_validate(job)
 
 
@@ -584,12 +583,12 @@ async def resolve_incident(
     redis: Redis = Depends(get_redis),
 ) -> JobResponse:
     svc = _job_service(db, redis)
+    # JobService owns cache invalidation (E2-02) — no delete here.
     job = await svc.resolve_incident(
         job_id=job_id,
         requesting_user_id=current_user.id,
         tenant_id=current_user.tenant_id,
     )
-    await JobCache.delete(redis, job_id, current_user.tenant_id)
     return JobResponse.model_validate(job)
 
 

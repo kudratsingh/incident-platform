@@ -280,7 +280,7 @@ async def test_cache_hit_does_not_leak_cross_tenant_job(
 ) -> None:
     """E2-01 regression: a cached tenant-B job must never be served to a
     privileged tenant-A caller. The cache key is tenant-scoped, so tenant A's
-    lookup misses (`job:{A}:{id}`) and falls through to the tenant-scoped DB
+    lookup misses (`cache:job:{A}:{id}`) and falls through to the tenant-scoped DB
     path, which 404s."""
     job = Job(
         tenant_id=other_tenant.id,
@@ -301,12 +301,16 @@ async def test_cache_hit_does_not_leak_cross_tenant_job(
     )
 
     # Simulate "tenant B's job sits in the Redis cache": serve the payload
-    # for the tenant-B-scoped key (what fixed code writes) and for the
-    # legacy global key (what unfixed code wrote — this is what makes the
-    # test red at HEAD), but NEVER for a key scoped to any other tenant.
-    # A naive mock answering every key could not tell a tenant-scoped
-    # lookup from a global one and would mask the fix.
-    tenant_b_keys = {f"job:{job.id}", f"job:{other_tenant.id}:{job.id}"}
+    # for the tenant-B-scoped key (what current code writes) and for both
+    # historical key names (the pre-E2-01 global key and the pre-E2-02
+    # un-namespaced tenant key), but NEVER for a key scoped to any other
+    # tenant. A naive mock answering every key could not tell a
+    # tenant-scoped lookup from a global one and would mask the fix.
+    tenant_b_keys = {
+        f"cache:job:{other_tenant.id}:{job.id}",
+        f"job:{other_tenant.id}:{job.id}",
+        f"job:{job.id}",
+    }
 
     async def _tenant_aware_get(key: str) -> str | None:
         return cached_payload if key in tenant_b_keys else None
@@ -322,7 +326,7 @@ async def test_cache_hit_does_not_leak_cross_tenant_job(
     # Privileged (ADMIN) caller in tenant A asks for tenant B's job.
     resp = await client.get(f"/api/v1/jobs/{job.id}", headers=admin_headers)
 
-    # Cache miss on job:{A}:{id} -> DB path -> get_for_tenant(A) -> 404.
+    # Cache miss on cache:job:{A}:{id} -> DB path -> get_for_tenant(A) -> 404.
     assert resp.status_code == 404
     assert "tenant B secret failure detail" not in json.dumps(resp.json())
 
