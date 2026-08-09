@@ -37,6 +37,7 @@ This file (`CLAUDE.md`) is the high-signal index. Treat it as the entry point �
   - [0011 — DAG pause is enforced by the resolver, not just recorded](docs/ADR/0011-dag-pause-enforcement.md)
   - [0012 — The lab is invisible to the agent](docs/ADR/0012-the-lab-is-invisible-to-the-agent.md) — rule 1 shipped v0.4.9; rule 2 deferred to post-rerun
   - [0018 — Production Kafka is not provisioned](docs/ADR/0018-production-kafka-posture.md) — no broker in `infra/`, ECS deploy gated off, `KAFKA_BOOTSTRAP_SERVERS` omitted unless set
+  - [0019 — Stale-RUNNING recovery sweep dead-letters, never re-publishes](docs/ADR/0019-stale-running-recovery-sweep.md) — worker-crash orphans go to the DLQ, not back onto `job.submitted`; revisit once a job can prove it did not partially execute
 - [`docs/postmortems/`](docs/postmortems/) — one file per incident (backfilled or written at the time). Format: Impact / Timeline / Root cause / Detection gap / Fix / Prevention rule adopted.
   - [0009 — Consumer lifecycle and supervision](docs/ADR/0009-consumer-lifecycle-and-supervision.md)
 - [`docs/ROADMAP.md`](docs/ROADMAP.md) — open extension ideas, sized + categorized
@@ -77,9 +78,13 @@ What's actually shipped (as of the most recent merge):
   6. `dependency-resolver` — promotes `WAITING` jobs to `PENDING` when their parents complete
   7. `saga-coordinator` — drives saga-level state and compensation on failure
   8. `llm-triage` (Phase 10) — calls Claude on every `job.dlq` to write a `JobTriage` row
-- **Five background loops** also running in the same process:
+- **Nine background loops** also running in the same process:
   - **Outbox relay** — polls `outbox_events` every second and publishes to Kafka
   - **Delayed-retry promote** — moves exponentially-backed-off retries from a Redis sorted-set back into Kafka via the outbox
+  - **DLQ replay promote** — fires operator-scheduled DLQ replays whose delay window has elapsed
+  - **Resume-unblocked-waiting sweep** — promotes `WAITING` children once their DAG pause lifts; backstops missed promotions
+  - **Stale-PENDING backstop** — re-publishes `PENDING` jobs left with no `jobs:delayed` timer by a crash window
+  - **Stale-RUNNING sweep** — dead-letters `RUNNING` jobs orphaned by a hard worker crash, after `STALE_RUNNING_THRESHOLD_SECONDS` (default 900). Never re-publishes them ([ADR 0019](docs/ADR/0019-stale-running-recovery-sweep.md))
   - **Metrics loop** — emits CloudWatch gauges (`QueueDepth`, `InFlightJobs`, `ConsumerLag`) and caches the lag in Redis for the backpressure check
   - **Digest loop** (Phase 10) — every `LLM_DIGEST_INTERVAL_HOURS` (default 24), generates a per-tenant incident summary via Claude and persists it to `incident_summaries`
   - **Idempotency reaper** — hourly DELETE of expired `idempotency_records` rows (closes ADR 0010's "no reaper" follow-up)
@@ -248,11 +253,16 @@ The actual runtime topology after Phase 7:
            │     7. saga-coordinator    → compensation       │
            │     8. llm-triage          → job_triages rows   │
            │                                                 │
-           │   Four supporting loops:                        │
+           │   Nine supporting loops:                        │
            │     • outbox relay (DB → Kafka)                 │
            │     • delayed-retry promote (Redis → outbox)    │
+           │     • dlq replay promote (scheduled replays)    │
+           │     • resume-waiting sweep (pause lifted)       │
+           │     • stale-PENDING backstop (lost timers)      │
+           │     • stale-RUNNING sweep (crash orphans → DLQ) │
            │     • metrics loop (gauges + lag cache)         │
            │     • digest loop (per-tenant LLM summary)      │
+           │     • idempotency reaper (expired records)      │
            │                                                 │
            │   Three concurrency models:                     │
            │     • asyncio  → bulk_api_sync                  │
@@ -717,7 +727,7 @@ Deferred until the incident-commander agent is wired up and driving eval scenari
 │   │   │   └── incident_digest.py  # Phase 10 — periodic per-tenant digests
 │   │   │
 │   │   ├── workers/
-│   │   │   ├── dispatcher.py       # JobDispatcherConsumer + worker_loop (starts all 8 consumers + 4 loops)
+│   │   │   ├── dispatcher.py       # JobDispatcherConsumer + worker_loop (starts all 8 consumers + 9 loops)
 │   │   │   ├── async_tasks.py      # asyncio — bulk_api_sync
 │   │   │   ├── thread_adapters.py  # threading — csv_upload
 │   │   │   ├── cpu_processors.py   # multiprocessing — doc_analysis, report_gen

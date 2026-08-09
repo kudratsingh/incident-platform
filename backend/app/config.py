@@ -79,6 +79,16 @@ class Settings(BaseSettings):
     # Workers
     max_job_retries: int = 3
     job_retry_backoff_base: float = 2.0
+    # How long a job may sit in RUNNING before the crash-recovery sweep
+    # (`_stale_running_sweep_loop`) treats it as a worker-crash orphan and
+    # dead-letters it (E1-17, ADR 0019). Must comfortably exceed the longest
+    # legitimate processor runtime — including chaos-injected latency, whose
+    # `inject_latency` hook caps at 60s per poll — because the sweep cannot
+    # tell a slow job from an abandoned one. In a multi-replica deployment it
+    # is the ONLY protection for a sibling replica's long-running jobs: the
+    # in-process in-flight exclusion covers this process only, so a sibling's
+    # live job looks orphaned here and survives purely on this threshold.
+    stale_running_threshold_seconds: int = 900
 
     # Kafka / Redpanda
     kafka_bootstrap_servers: str = "localhost:9092"

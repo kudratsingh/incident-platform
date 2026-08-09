@@ -11,7 +11,7 @@ For per-component reference, see [`docs/DATA_MODEL.md`](DATA_MODEL.md), [`docs/K
 The platform runs as **three logical processes**:
 
 1. **API process** — FastAPI behind an ALB. Serves `/api/v1/*`. One ECS task with autoscaling target on CPU.
-2. **Worker process** — runs `worker_loop` from `app/workers/dispatcher.py`. Hosts eight Kafka consumer groups + eight background loops. One ECS task today (autoscaling on queue depth is a Phase 8 item).
+2. **Worker process** — runs `worker_loop` from `app/workers/dispatcher.py`. Hosts eight Kafka consumer groups + nine background loops. One ECS task today (autoscaling on queue depth is a Phase 8 item).
 3. **Frontend** — Nginx serving the React SPA. Same ALB, different listener rule.
 
 External dependencies, all managed:
@@ -66,11 +66,16 @@ The three processes share nothing in-process but coordinate via Postgres, Redis,
                 │   saga-coord     │
                 │   llm-triage     │
                 │                  │
-                │  4 loops:        │
+                │  9 loops:        │
                 │   outbox-relay   │
                 │   promote-delayed│
+                │   promote-replay │
+                │   resume-waiting │
+                │   stale-pending  │
+                │   stale-running  │
                 │   metrics-loop   │
                 │   digest-loop    │
+                │   idem-reaper    │
                 └──────────────────┘
                         │
                         ▼
@@ -269,7 +274,7 @@ The platform uses **all three Python concurrency models deliberately**, picked p
 The API process is fully asyncio. So is the entire worker process. Reasoning:
 
 - HTTP I/O dominates the API path (DB / Redis / Kafka / Anthropic).
-- The worker's eight Kafka consumers and four loops are all I/O-bound.
+- The worker's eight Kafka consumers and nine loops are all I/O-bound.
 - Switching between them on socket reads is what FastAPI + aiokafka were designed for.
 
 Within the worker, every consumer runs as a separate asyncio task (`asyncio.create_task(c.run())`). The `worker_loop` orchestrates startup, graceful shutdown (cancels all tasks, waits for in-flight messages), and per-task error isolation (one consumer's failure doesn't kill others).
@@ -332,9 +337,9 @@ Register the new processor in `_PROCESSORS` in `dispatcher.py`.
 
 1. Starts eight Kafka consumers (each with its own consumer group, started best-effort — one's failure doesn't kill the others).
 2. Validates the dispatcher consumer specifically — if that one fails to start, the worker exits since no jobs can run.
-3. Spawns the eight background loops as asyncio tasks.
+3. Spawns the nine background loops as asyncio tasks.
 
-The sixteen tasks run concurrently. They share:
+The seventeen tasks run concurrently. They share:
 
 - The same `session_factory` (so they share connection pool semantics; each task acquires/releases per transaction).
 - The same Redis client.
@@ -355,6 +360,7 @@ The sixteen tasks run concurrently. They share:
 | `_outbox_relay_loop` | `outbox_events` table | Kafka via `publish_raw` | Per-row — schema failures mark row failed, others retry next tick |
 | `_promote_delayed_loop` | Redis `delayed_queue` zset | outbox row | Per-item — a failed job is re-pushed onto the zset; the rest of the batch still promotes |
 | `_requeue_stale_pending_loop` | `jobs` rows `PENDING` for >300s with no `delayed_queue` timer | outbox row | Per-tick — exception logged, loop continues |
+| `_stale_running_sweep_loop` | `jobs` rows `RUNNING` for longer than `stale_running_threshold_seconds` and not in `dispatcher.in_flight_job_ids` | `dead_letter` status + `job.dead_letter` audit row + `job.dlq` outbox row ([ADR 0019](ADR/0019-stale-running-recovery-sweep.md)) | Per-job — each recovery is its own transaction; one failure leaves that row `RUNNING` for the next pass |
 | `_metrics_loop` | Dispatcher consumer + Redis | CloudWatch gauges | Per-tick — exception logged |
 | `_digest_loop` | DB + Anthropic API | `incident_summaries` rows | Per-tenant — one tenant's API failure doesn't stop the batch |
 
@@ -442,6 +448,7 @@ What happens when a component dies, in priority order.
 **Detection:** `backend-tasks-low` alarm (if ECS service replica count drops); queue-depth alarm climbs.
 **Recovery:** ECS auto-restarts the task. On restart it rebuilds consumer-group state and resumes from committed offsets.
 **Data loss:** in-flight jobs may double-execute if they had side effects before the crash. Mitigated by idempotency keys.
+**Stranded jobs:** offsets are committed at dispatch time, so jobs the dead worker was executing stay `RUNNING` with nothing left to redeliver them. Once a worker is back, `_stale_running_sweep_loop` dead-letters them within `stale_running_threshold_seconds` (default 900s) plus one 60s pass — they land in the DLQ with `reason: worker_crash_recovery` rather than being re-published, because a partially-executed job is unsafe to re-run ([ADR 0019](ADR/0019-stale-running-recovery-sweep.md)).
 **Runbook:** `runbooks/rb-ecs-tasks-low.yaml`.
 
 ### API process
