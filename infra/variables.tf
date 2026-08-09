@@ -90,3 +90,27 @@ variable "alert_webhook_secret" {
   default     = ""
   sensitive   = true
 }
+
+# ------------------------------------------------------------------
+# Kafka + tracing endpoints — see ADR 0018.
+#
+# There is no production broker in this stack: no MSK cluster, no
+# self-managed nodes, nothing. Both variables default to "" and the
+# ecs.tf task definition OMITS the corresponding environment entry when
+# empty, rather than passing "". That distinction is load-bearing —
+# `KAFKA_BOOTSTRAP_SERVERS=""` would override the app's own default
+# (localhost:9092) with a differently-broken value, changing the
+# failure mode without fixing anything. Omission leaves exactly one
+# documented behaviour.
+# ------------------------------------------------------------------
+variable "kafka_bootstrap_servers" {
+  description = "Kafka bootstrap servers for the deployed backend. REQUIRED for job execution: no broker is provisioned by this stack (ADR 0018), and while this is empty the env var is omitted, the app falls back to localhost:9092, and deployed workers accept jobs but never execute them. Set to an MSK, self-managed, or external broker before enabling the ECS deploy."
+  type        = string
+  default     = ""
+}
+
+variable "otlp_endpoint" {
+  description = "OTLP HTTP endpoint for trace export (e.g. an X-Ray/ADOT collector). Omitted from the task definition when empty, which leaves tracing disabled — see ADR 0018."
+  type        = string
+  default     = ""
+}

@@ -36,6 +36,7 @@ This file (`CLAUDE.md`) is the high-signal index. Treat it as the entry point �
   - [0010 — Idempotency record lifecycle](docs/ADR/0010-idempotency-record-lifecycle.md)
   - [0011 — DAG pause is enforced by the resolver, not just recorded](docs/ADR/0011-dag-pause-enforcement.md)
   - [0012 — The lab is invisible to the agent](docs/ADR/0012-the-lab-is-invisible-to-the-agent.md) — rule 1 shipped v0.4.9; rule 2 deferred to post-rerun
+  - [0018 — Production Kafka is not provisioned](docs/ADR/0018-production-kafka-posture.md) — no broker in `infra/`, ECS deploy gated off, `KAFKA_BOOTSTRAP_SERVERS` omitted unless set
 - [`docs/postmortems/`](docs/postmortems/) — one file per incident (backfilled or written at the time). Format: Impact / Timeline / Root cause / Detection gap / Fix / Prevention rule adopted.
   - [0009 — Consumer lifecycle and supervision](docs/ADR/0009-consumer-lifecycle-and-supervision.md)
 - [`docs/ROADMAP.md`](docs/ROADMAP.md) — open extension ideas, sized + categorized
@@ -174,7 +175,7 @@ Notably **not** granted: `actions:propose`. Tier-2 actions and the approvals sub
 - **Python 3.12+ / FastAPI** — async API gateway
 - **PostgreSQL** — system of record. Tables: `users`, `tenants`, `jobs`, `audit_logs`, `outbox_events`, `job_events`, `job_dependencies`, `sagas`, `job_triages`, `incident_summaries`. Full reference in [`docs/DATA_MODEL.md`](docs/DATA_MODEL.md).
 - **Redis** — cache, locks, rate limits, pub/sub progress events, CQRS read-model sets, cached backpressure lag value.
-- **Kafka** (Redpanda locally, Amazon MSK in production) — durable event log; decouples job submission from execution, powers event sourcing and fan-out. Topics: `job.submitted` / `job.progress` / `job.completed` / `job.failed` / `job.dlq`.
+- **Kafka** (Redpanda locally; production Kafka not yet provisioned — see [ADR 0018](docs/ADR/0018-production-kafka-posture.md)) — durable event log; decouples job submission from execution, powers event sourcing and fan-out. Topics: `job.submitted` / `job.progress` / `job.completed` / `job.failed` / `job.dlq`.
 - **JSON Schema** — every Kafka topic has a schema in `backend/app/schemas/kafka/`; producer and consumer validate on every message.
 - **Object storage** — S3 in production, MinIO locally — for uploaded files and artifacts.
 - **Worker layer** — asyncio tasks for I/O-heavy work, a threading adapter for blocking SDKs, a multiprocessing pool for CPU-heavy transforms.
@@ -187,9 +188,9 @@ Notably **not** granted: `actions:propose`. Tier-2 actions and the approvals sub
 
 ### Infrastructure
 - **Docker / Docker Compose** for local dev (Postgres + Redis + Redpanda + MinIO + backend + frontend).
-- **Terraform** for the full AWS stack in `infra/` — VPC, ECS Fargate, RDS, ElastiCache, ALB, ECR, IAM, Secrets Manager, S3, MSK, CloudWatch alarms with runbook URLs in their descriptions.
-- **CI/CD** — `.github/workflows/ci.yml`: frontend tsc + tests, ruff + mypy on backend, pytest with coverage gate, Docker build + push to ECR, ECS service update.
-- Cloud target: **AWS ECS/Fargate**; **Amazon MSK** for Kafka; **RDS Postgres**; **ElastiCache Redis**; **S3** for artifacts.
+- **Terraform** for the AWS stack in `infra/` — VPC, ECS Fargate, RDS, ElastiCache, ALB, ECR, IAM, Secrets Manager, S3, CloudWatch alarms with runbook URLs in their descriptions. No Kafka broker: see [ADR 0018](docs/ADR/0018-production-kafka-posture.md).
+- **CI/CD** — `.github/workflows/ci.yml`: frontend tsc + tests, ruff + mypy on backend, pytest with coverage gate, Terraform static checks, and a Docker build → ECR → ECS deploy job that is opt-in behind the `ENABLE_ECS_DEPLOY` repository variable (unset — the job skips; see [ADR 0018](docs/ADR/0018-production-kafka-posture.md)).
+- Cloud target: **AWS ECS/Fargate**; **RDS Postgres**; **ElastiCache Redis**; **S3** for artifacts. **Kafka has no production broker** — nothing in `infra/` provisions one ([ADR 0018](docs/ADR/0018-production-kafka-posture.md)).
 
 ### Testing
 - `pytest` with fixtures, parametrization, factories.
@@ -221,8 +222,8 @@ The actual runtime topology after Phase 7:
         ┌───────────────────┼───────────────────┐
         │                   │                   │
         ▼                   ▼                   ▼
-   PostgreSQL          Redis (cache,        Kafka (Redpanda / MSK)
-   ─────────────       pub/sub, sets,       ─────────────────────
+   PostgreSQL          Redis (cache,        Kafka (Redpanda)
+   ─────────────       pub/sub, sets,       ────────────────
    users               rate limits)         Topics:
    jobs                                       job.submitted
    audit_logs          Keys:                  job.progress
@@ -535,7 +536,7 @@ All four services use `client.messages.parse(..., output_format=SomePydanticMode
   - **Offset management**: explicit per-message per-partition commits (`{TopicPartition: offset + 1}`) only after `handle_message` returns successfully; on handler failure the consumer seeks back to the failed offset and the next poll redelivers (poison pills are committed past per-partition) — at-least-once. Combined with idempotency keys (jobs) and a unique constraint (event log) to avoid double effects.
   - **Dead-letter topic**: `job.dlq`. Admin UI inspects (with per-type breakdown) and replays. Replay resets `retry_count` (a bug we fixed in `#27`).
   - **Schema Registry** ✅ — file-based JSON Schema in `backend/app/schemas/kafka/`; format checker on (enforces `uuid` etc.); producer + consumer validate on every message.
-  - **Local dev**: Redpanda in `docker-compose.yml`; MSK in production via `infra/msk.tf`.
+  - **Local dev**: Redpanda in `docker-compose.yml`. **Production Kafka is not yet provisioned** — nothing in `infra/` creates a broker, `KAFKA_BOOTSTRAP_SERVERS` is omitted from the task definition unless `var.kafka_bootstrap_servers` is set, and the ECS deploy job is gated off. See [ADR 0018](docs/ADR/0018-production-kafka-posture.md).
   - **Testing** ✅ — Testcontainers-based integration test in `backend/tests/integration/test_kafka_e2e.py` spins up Redpanda on a pre-allocated host port and verifies producer ↔ consumer round-trip with schema validation on both ends. Skipped if Docker isn't available.
 - **Outbox pattern** ✅ — `outbox_events` table; written in same transaction as job state changes; `_outbox_relay_loop` polls every second and publishes. Partial index on `published_at IS NULL` for hot-path scan.
 - **CQRS** ✅ — `ReadModelProjector` maintains Redis sets per status (global + per-user); `GET /admin/stats` reads only those, no SQL aggregate on `jobs`. Sets keyed by `job_id` are idempotent under at-least-once delivery.
@@ -781,7 +782,6 @@ Deferred until the incident-commander agent is wired up and driving eval scenari
 │   ├── s3.tf
 │   ├── rds.tf
 │   ├── elasticache.tf
-│   ├── msk.tf                      # Amazon MSK + topics
 │   ├── alb.tf
 │   ├── ecs.tf                      # Cluster, task definitions, Fargate services
 │   └── cloudwatch.tf               # SNS topic + 7 alarms (5 baseline + 2 SLO fast-burn)
@@ -864,7 +864,7 @@ What degrades when a component dies. Full detail in [`docs/ARCHITECTURE.md`](doc
 |---|---|---|
 | Postgres | Nothing | All API requests 500 |
 | Redis | API, DB writes, workers | Rate limits / backpressure / cache / SSE updates fail open |
-| Kafka (MSK) | API accepts new jobs (outbox queues them) | New job execution stalls; SSE updates stop |
+| Kafka | API accepts new jobs (outbox queues them) | New job execution stalls; SSE updates stop |
 | Anthropic API | Everything | DLQ triages absent; retry policy → deterministic; NL queries return 503; digests stall |
 | Worker process | API accepts new jobs (outbox queues them) | No job execution; restart resumes from committed offsets |
 | API process | Worker, other replicas | New HTTP requests fail until replica restarts |

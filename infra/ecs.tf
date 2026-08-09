@@ -43,19 +43,34 @@ resource "aws_ecs_task_definition" "backend" {
         { containerPort = 8000, protocol = "tcp" }
       ]
 
-      environment = [
-        { name = "ENVIRONMENT", value = var.environment },
-        # ADR 0008 gate 1 — paired with ENVIRONMENT above: the variables.tf
-        # validation refuses true+production, and app-side assert_chaos_gate()
-        # re-checks the same pair at boot.
-        { name = "CHAOS_ENABLED", value = var.chaos_enabled ? "true" : "false" },
-        { name = "DEBUG", value = "false" },
-        { name = "STORAGE_BUCKET", value = aws_s3_bucket.storage.bucket },
-        { name = "AWS_DEFAULT_REGION", value = var.aws_region },
-        # ALB DNS name so the backend allows cross-origin requests from the frontend.
-        { name = "CORS_ORIGINS", value = "[\"http://${aws_lb.main.dns_name}\"]" },
-        { name = "ALERT_WEBHOOK_URL", value = var.alert_webhook_url },
-      ]
+      # ADR 0018: the optional tails are appended via concat() so that an unset
+      # variable OMITS its environment entry entirely. Passing an empty
+      # KAFKA_BOOTSTRAP_SERVERS would override the app's localhost:9092 default
+      # with a differently-broken value — a new failure mode, not a fix. No
+      # broker is provisioned by this stack; while kafka_bootstrap_servers is
+      # empty, deployed workers accept jobs and never execute them, which is
+      # why the ECS deploy job is gated off (vars.ENABLE_ECS_DEPLOY).
+      environment = concat(
+        [
+          { name = "ENVIRONMENT", value = var.environment },
+          # ADR 0008 gate 1 — paired with ENVIRONMENT above: the variables.tf
+          # validation refuses true+production, and app-side assert_chaos_gate()
+          # re-checks the same pair at boot.
+          { name = "CHAOS_ENABLED", value = var.chaos_enabled ? "true" : "false" },
+          { name = "DEBUG", value = "false" },
+          { name = "STORAGE_BUCKET", value = aws_s3_bucket.storage.bucket },
+          { name = "AWS_DEFAULT_REGION", value = var.aws_region },
+          # ALB DNS name so the backend allows cross-origin requests from the frontend.
+          { name = "CORS_ORIGINS", value = "[\"http://${aws_lb.main.dns_name}\"]" },
+          { name = "ALERT_WEBHOOK_URL", value = var.alert_webhook_url },
+        ],
+        var.kafka_bootstrap_servers == "" ? [] : [
+          { name = "KAFKA_BOOTSTRAP_SERVERS", value = var.kafka_bootstrap_servers },
+        ],
+        var.otlp_endpoint == "" ? [] : [
+          { name = "OTLP_ENDPOINT", value = var.otlp_endpoint },
+        ],
+      )
 
       # NOTE (WO-P2-03): the backend service has lifecycle
       # ignore_changes = [task_definition] — CI's deploy job re-renders

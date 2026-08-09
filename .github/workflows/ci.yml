@@ -143,6 +143,21 @@ jobs:
       - name: ElastiCache encryption flags present
         run: grep -q transit_encryption_enabled infra/elasticache.tf && grep -q at_rest_encryption_enabled infra/elasticache.tf
 
+      # F2-07 / ADR 0018: production Kafka is deliberately not provisioned, and
+      # the docs spent four files claiming otherwise by pointing at a Terraform
+      # file that never existed in any ref. Prose-only corrections decay — this
+      # finding is the proof — so the absence of that phantom filename is
+      # asserted mechanically. A hit here means the docs have drifted back.
+      - name: No references to a phantom Kafka Terraform module
+        run: |
+          set -euo pipefail
+          if grep -rn 'msk\.tf' CLAUDE.md README.md docs/; then
+            echo "ERROR: the lines above reference infra/msk.tf, which does not exist." >&2
+            echo "Production Kafka is not provisioned — see docs/ADR/0018-production-kafka-posture.md." >&2
+            exit 1
+          fi
+          echo "OK: no documentation references a phantom Kafka Terraform module."
+
       # ADR 0008: the production workspace must refuse chaos_enabled=true.
       # `terraform validate` cannot prove this — variable validations are only
       # evaluated by plan/apply with concrete values — so this is a negative
