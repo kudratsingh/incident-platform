@@ -13,6 +13,16 @@ it needs the deploy_markers table + a startup writer we haven't
 built. The tool description tells the caller as much so the agent's
 LLM doesn't over-index on this being a full outage.
 
+Compensating action (ADR 0008 v0.4.5 amendment): the eval-reset
+protocol — `scripts/reset_eval_state.py::_resolve_chaos_alerts` stamps
+`resolved_at` on every still-active `chaos:%` alert, which drops this
+one out of `list_active_alerts`; the Redis flag self-clears via its TTL
+(and is swept by `_clear_chaos_keys` on the same reset). Round-trip
+test: `backend/tests/unit/test_eval_reset.py::test_resolve_chaos_alerts_clears_bad_deploy_residue`.
+Nothing else on the platform resolves alerts — `AlertService` has only
+`create_alert` — so before the reset learned about the alerts table
+each invocation left one more permanently active critical alert behind.
+
 Requires `chaos:invoke`. Registered only when `CHAOS_ENABLED=true`.
 Blast radius: environment_wide (alerts propagate, flag is shared).
 """
