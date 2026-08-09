@@ -1,5 +1,7 @@
 # Convenience targets for local dev + agent-facing eval workflows.
-# All commands assume `docker compose up -d` has been run.
+# test/lint/typecheck run on the host venv (.venv), same as CI — no stack
+# needed. The container targets (up/down/logs/migrate/seed-*/mcp-probe)
+# assume `docker compose up -d` has been run.
 
 .PHONY: help up down logs test lint typecheck seed-incident-commander \
         seed-eval-fixtures mcp-probe migrate
@@ -16,14 +18,14 @@ down:  ## Stop the stack (preserves volumes)
 logs:  ## Tail backend logs (Ctrl-C to exit)
 	docker compose logs -f app
 
-test:  ## Run unit + API tests inside the app container
-	docker compose exec app pytest tests/unit tests/api --no-cov
+test:  ## Run unit + API tests via the host venv (fast, no coverage gate)
+	.venv/bin/python -m pytest backend/tests/unit backend/tests/api --no-cov
 
-lint:  ## Run ruff inside the container
-	docker compose exec app ruff check app/ tests/
+lint:  ## Run ruff via the host venv (same invocation as CI)
+	.venv/bin/ruff check backend/
 
-typecheck:  ## Run mypy strict inside the container
-	docker compose exec app mypy -p app
+typecheck:  ## Run mypy strict via the host venv (repo root; mypy_path=backend)
+	.venv/bin/mypy -p app
 
 migrate:  ## Apply any pending Alembic migrations (idempotent)
 	docker compose exec app alembic -c /app/alembic.ini upgrade head

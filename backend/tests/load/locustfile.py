@@ -25,17 +25,29 @@ Environment variables (optional overrides):
 from __future__ import annotations
 
 import os
+import pathlib
 import random
+import sys
 import uuid
 
 from locust import HttpUser, between, task
+
+# Make `app` importable no matter where locust is launched from: backend/ is
+# two parents up from tests/load/, so the __file__-relative insert keeps
+# `locust -f backend/tests/load/locustfile.py` working from any cwd.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
+
+from app.models.enums import JobType  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
 
 _DEFAULT_PAYLOAD = {"filename": "data.csv", "rows": 100}
-_JOB_TYPES = ["csv_upload", "report_generation", "bulk_sync", "document_analysis"]
+# Derived from the enum so the load suite cannot drift from the API contract
+# (a hardcoded copy once 422'd on three of the four types). Pinned by
+# backend/tests/unit/test_locustfile_job_types.py.
+_JOB_TYPES = [t.value for t in JobType]
 
 
 def _login(client, email: str, password: str) -> str | None:
