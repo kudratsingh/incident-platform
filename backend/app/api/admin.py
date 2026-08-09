@@ -1,6 +1,7 @@
 import uuid
 from typing import Any
 
+from app.core.logging import request_id_var
 from app.dependencies import (
     get_db,
     get_redis,
@@ -30,12 +31,33 @@ from app.services.slo import compute_all as compute_slos
 from app.workers.read_model import read_global_stats, read_user_stats
 from fastapi import APIRouter, Depends
 from redis.asyncio import Redis
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
 _require_support_or_admin = require_role(UserRole.SUPPORT, UserRole.ADMIN)
 _require_admin = require_role(UserRole.ADMIN)
+
+
+async def _set_rls_tenant(db: AsyncSession, tenant_id: uuid.UUID) -> None:
+    """Point this transaction's `app.tenant_id` at `tenant_id`.
+
+    Same statement `resolve_admin_tenant` issues for cross-tenant reads.
+    The tenant-management endpoints below need it for a WRITE: their audit
+    row belongs to the tenant being acted on, which for a platform admin is
+    usually NOT the tenant `get_current_user` put in the setting — and
+    `audit_logs` carries a WITH CHECK on `tenant_id` under FORCE row-level
+    security (migration a7e3d9c41f28, ADR 0015), so the INSERT would be
+    rejected. Retargeting the setting relaxes no policy: the row is written
+    under the very tenant it records, and only platform admins reach here.
+    No-op on SQLite (tests), which has no RLS.
+    """
+    if db.bind is not None and db.bind.dialect.name == "postgresql":
+        await db.execute(
+            text("SELECT set_config('app.tenant_id', :tid, true)"),
+            {"tid": str(tenant_id)},
+        )
 
 
 def _job_service(db: AsyncSession, redis: Redis) -> JobService:
@@ -403,6 +425,25 @@ async def admin_create_tenant(
     if await repo.get_by_slug(slug) is not None:
         raise ConflictError(f"Tenant slug already exists: {slug}")
     tenant = await repo.create(slug=slug, name=name, is_active=True)
+
+    # Creating a tenant is the most privileged operator action on the
+    # platform; it gets an audit row like every other admin mutation
+    # (F1-08). The row belongs to the NEW tenant, so retarget the RLS
+    # setting for the write and hand it back to the admin's own tenant
+    # afterwards — deliberately not in a `finally`, because a failed INSERT
+    # aborts the transaction and the restore would only mask the real error.
+    await _set_rls_tenant(db, tenant.id)
+    await AuditRepository(db).log(
+        "tenant.created",
+        tenant_id=tenant.id,
+        user_id=current_user.id,
+        resource_type="tenant",
+        resource_id=str(tenant.id),
+        request_id=request_id_var.get("") or None,
+        extra_data={"slug": tenant.slug, "name": tenant.name},
+    )
+    await _set_rls_tenant(db, current_user.tenant_id)
+
     return {
         "id": str(tenant.id),
         "slug": tenant.slug,
@@ -457,16 +498,33 @@ async def admin_update_tenant_limits(
     if tenant is None:
         raise NotFoundError(f"Tenant {tenant_id} not found")
 
-    changed = False
-    for field in ("rate_limit_per_minute", "quota_jobs_per_month"):
+    fields = ("rate_limit_per_minute", "quota_jobs_per_month")
+    before = {f: getattr(tenant, f) for f in fields}
+    for field in fields:
         if field in body:
             value = body[field]
             if not isinstance(value, int) or value < 0:
                 raise RequestValidationError(f"{field} must be a non-negative integer")
             setattr(tenant, field, value)
-            changed = True
+    after = {f: getattr(tenant, f) for f in fields}
+    changed = after != before
     if changed:
         await db.flush()
+        # Who loosened which limit, and from what (F1-08). Audited under the
+        # TARGET tenant — a platform admin usually isn't in it, and the
+        # audit_logs WITH CHECK is on the row's tenant_id (see
+        # `_set_rls_tenant`). A PATCH that changes nothing writes no row.
+        await _set_rls_tenant(db, tenant_id)
+        await AuditRepository(db).log(
+            "tenant.limits_updated",
+            tenant_id=tenant_id,
+            user_id=current_user.id,
+            resource_type="tenant",
+            resource_id=str(tenant_id),
+            request_id=request_id_var.get("") or None,
+            extra_data={"before": before, "after": after},
+        )
+        await _set_rls_tenant(db, current_user.tenant_id)
 
     return {
         "id": str(tenant.id),

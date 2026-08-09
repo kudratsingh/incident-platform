@@ -84,6 +84,96 @@ async def test_admin_creates_tenant(
     assert "acme" in slugs
 
 
+async def _audit_rows(db_session, action: str, resource_id: str):  # type: ignore[no-untyped-def]
+    """Audit rows for one action + resource, newest first."""
+    from app.models.audit import AuditLog
+    from sqlalchemy import select
+
+    result = await db_session.execute(
+        select(AuditLog).where(
+            AuditLog.action == action,
+            AuditLog.resource_id == resource_id,
+        )
+    )
+    return list(result.scalars().all())
+
+
+async def test_admin_create_tenant_writes_audit_row(
+    client: AsyncClient,
+    admin_user,  # type: ignore[no-untyped-def]
+    admin_headers: dict[str, str],
+    db_session,  # type: ignore[no-untyped-def]
+) -> None:
+    """Creating a tenant is the most privileged operator action there is —
+    it must leave an audit row like every other admin mutation (F1-08)."""
+    resp = await client.post(
+        "/api/v1/admin/tenants",
+        json={"slug": "audited", "name": "Audited Co."},
+        headers=admin_headers,
+    )
+    assert resp.status_code == 201
+    new_tenant_id = resp.json()["id"]
+
+    rows = await _audit_rows(db_session, "tenant.created", new_tenant_id)
+    assert len(rows) == 1
+    row = rows[0]
+    # The row belongs to the NEW tenant, and names the operator who made it.
+    assert str(row.tenant_id) == new_tenant_id
+    assert str(row.user_id) == str(admin_user.id)
+    assert str(row.principal_id) == str(admin_user.id)
+    assert row.principal_type == "user"
+    assert row.resource_type == "tenant"
+    assert row.extra_data == {"slug": "audited", "name": "Audited Co."}
+
+
+async def test_admin_update_tenant_limits_writes_audit_row(
+    client: AsyncClient,
+    admin_user,  # type: ignore[no-untyped-def]
+    admin_headers: dict[str, str],
+    db_session,  # type: ignore[no-untyped-def]
+) -> None:
+    """Rate-limit / quota changes are audited with their before + after
+    values, so an operator can reconstruct who loosened what (F1-08)."""
+    tenant_id = str(admin_user.tenant_id)
+    before_resp = await client.get(
+        f"/api/v1/admin/tenants/{tenant_id}", headers=admin_headers
+    )
+    before_quota = before_resp.json()["quota_jobs_per_month"]
+    assert before_quota != 4242
+
+    resp = await client.patch(
+        f"/api/v1/admin/tenants/{tenant_id}",
+        json={"quota_jobs_per_month": 4242},
+        headers=admin_headers,
+    )
+    assert resp.status_code == 200
+    assert resp.json()["quota_jobs_per_month"] == 4242
+
+    rows = await _audit_rows(db_session, "tenant.limits_updated", tenant_id)
+    assert len(rows) == 1
+    row = rows[0]
+    assert str(row.tenant_id) == tenant_id
+    assert str(row.user_id) == str(admin_user.id)
+    assert row.resource_type == "tenant"
+    assert row.extra_data["before"]["quota_jobs_per_month"] == before_quota
+    assert row.extra_data["after"]["quota_jobs_per_month"] == 4242
+    # Untouched field is reported unchanged, not dropped.
+    assert (
+        row.extra_data["before"]["rate_limit_per_minute"]
+        == row.extra_data["after"]["rate_limit_per_minute"]
+    )
+
+    # A PATCH that changes nothing writes no row — the trail records changes,
+    # not requests.
+    noop = await client.patch(
+        f"/api/v1/admin/tenants/{tenant_id}",
+        json={"quota_jobs_per_month": 4242},
+        headers=admin_headers,
+    )
+    assert noop.status_code == 200
+    assert len(await _audit_rows(db_session, "tenant.limits_updated", tenant_id)) == 1
+
+
 async def test_admin_create_tenant_duplicate_slug_returns_409(
     client: AsyncClient,
     admin_headers: dict[str, str],

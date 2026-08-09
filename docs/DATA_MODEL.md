@@ -161,7 +161,7 @@ Append-only log of every meaningful action (job creation, replay, incident resol
 | `tenant_id` | UUID NOT NULL FK → tenants.id | Indexed. |
 | `user_id` | UUID NULLABLE FK → users.id ON DELETE SET NULL | Nullable because some events have no user (e.g. system-emitted events). |
 | `job_id` | UUID NULLABLE FK → jobs.id ON DELETE SET NULL | Nullable because not every audit event is job-related. |
-| `action` | String(100) NOT NULL | Indexed. Snake_case verb, e.g. `job.created`, `job.replayed`, `saga.completed`, `tenant.created`. |
+| `action` | String(100) NOT NULL | Indexed. Snake_case verb, e.g. `job.created`, `job.replayed`, `saga.completed`, `tenant.created`, `tenant.limits_updated`. |
 | `resource_type`, `resource_id` | String(100), String(255) | Free-form. The convention is `resource_type=job, resource_id=<uuid>` etc. |
 | `request_id` | String(255) | The HTTP request that triggered the action. Used to correlate audit events across services. |
 | `ip_address` | String(50) | |

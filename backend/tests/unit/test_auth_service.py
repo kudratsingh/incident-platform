@@ -5,10 +5,14 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from app.core.exceptions import AuthenticationError, ConflictError
-from app.core.security import hash_password
+from app.core.security import hash_password, verify_password
 from app.models.enums import UserRole
 from app.models.user import User
 from app.services.auth import AuthService
+
+# The unusable-password sentinel chaos-created owners get
+# (app/mcp/tools/chaos/create_bad_data_job.py). Not a bcrypt string.
+CHAOS_OWNER_SENTINEL_HASH = "!chaos-owner-no-login"
 
 
 def _make_user(**kwargs: object) -> User:
@@ -103,3 +107,35 @@ async def test_login_inactive_user_raises() -> None:
 
     with pytest.raises(AuthenticationError, match="disabled"):
         await svc.login("test@example.com", "password123")
+
+
+async def test_login_against_unusable_password_hash_raises_auth_error() -> None:
+    """Chaos-lab owner accounts carry a sentinel hash bcrypt cannot parse.
+
+    `bcrypt.checkpw` raises ValueError('Invalid salt') on it, which used to
+    escape login() as a 500 — a 500-vs-401 oracle that fingerprints chaos
+    accounts (D-12). Verification must fail closed so the caller gets the
+    same 401 as any other bad credential.
+
+    Both `is_active` values are covered on purpose: the real chaos owner is
+    inactive, but login() verifies the password BEFORE the is_active check,
+    so an active account with an unparseable hash must fail cleanly too —
+    reordering the checks would not be a fix.
+    """
+    for is_active in (True, False):
+        svc, user_repo, _ = _make_service()
+        user_repo.get_by_email.return_value = _make_user(
+            email="chaos-owner+t@chaos.local",
+            hashed_password=CHAOS_OWNER_SENTINEL_HASH,
+            is_active=is_active,
+        )
+
+        with pytest.raises(AuthenticationError, match="Invalid email or password"):
+            await svc.login("chaos-owner+t@chaos.local", "anything")
+
+
+async def test_verify_password_rejects_non_bcrypt_hash() -> None:
+    """The same guard at its source: any hash bcrypt can't parse is False,
+    never an exception."""
+    assert verify_password("anything", CHAOS_OWNER_SENTINEL_HASH) is False
+    assert verify_password("anything", "") is False
