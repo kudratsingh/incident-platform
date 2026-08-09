@@ -32,7 +32,19 @@ class OutboxRepository(BaseRepository[OutboxEvent]):
         )
 
     async def fetch_unpublished(self, limit: int = 100) -> list[OutboxEvent]:
-        """Oldest unpublished events first, capped at `limit`."""
+        """Oldest unpublished events first, capped at `limit`.
+
+        No `.with_for_update(skip_locked=True)` here, on purpose. It looks
+        like the obvious guard against two relays draining the same batch,
+        and it would be — but only for a caller that keeps this
+        transaction open across the Kafka publishes. The relay's does not
+        (`_outbox_relay_tick`: fetch tx / publish / mark tx), so the row
+        locks would be released before the first publish and buy nothing
+        but the appearance of safety. What actually makes the relay a
+        single writer is the advisory-lock leader gate the caller holds
+        around the whole tick — see ADR 0020. If you ever collapse the
+        relay into one transaction, add the clause back and say so there.
+        """
         stmt = (
             select(OutboxEvent)
             .where(OutboxEvent.published_at.is_(None))

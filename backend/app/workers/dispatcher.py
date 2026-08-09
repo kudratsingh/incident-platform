@@ -23,11 +23,14 @@ Concurrency model selection (this is the core design decision):
 import asyncio
 import json
 import uuid
+from collections.abc import Callable
+from contextlib import AbstractAsyncContextManager
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from app.config import get_settings
 from app.core import metrics
+from app.core.leader_lock import OUTBOX_RELAY_LOCK_KEY, advisory_leader_lock
 from app.core.logging import get_logger, job_id_var, trace_id_var
 from app.core.tracing import extract_context, get_tracer
 from app.models.enums import JobStatus, JobType
@@ -885,6 +888,11 @@ async def _resume_unblocked_waiting_loop(
     Cross-tenant by design — it's a platform-level scheduler, not a
     request path, so it deliberately doesn't go through the
     tenant-scoped `JobRepository.list_jobs`.
+
+    Deliberately NOT leader-gated, unlike `_outbox_relay_loop` (ADR 0020):
+    `promote_waiting_to_pending` below is a CAS, so a second replica
+    sweeping the same child loses the compare-and-set and skips the outbox
+    add with it. Concurrent sweeps are wasted scans, not duplicate events.
     """
     settings = get_settings()
     while True:
@@ -975,6 +983,13 @@ async def _requeue_stale_pending_once(
     Kafka consumer lag exceeds the staleness window (the job.submitted is
     real, just not consumed yet), and the resulting second delivery loses
     `JobRepository.claim_for_running` and executes nothing.
+
+    That claim is also why this stays ungated while `_outbox_relay_loop`
+    is leader-gated (ADR 0020). Two replicas sweeping the same stale job
+    publish two `job.submitted`; exactly one of them wins the claim and
+    runs. A leader gate would suppress the redundant scan but not the
+    false-positive above, which no gate can see — the CAS is the stronger
+    guarantee and the one that must not be removed.
 
     Cross-tenant by design — same justification as
     `_resume_unblocked_waiting_loop`: a platform-level scheduler, not a
@@ -1351,61 +1366,97 @@ async def _promote_dlq_replay_loop(
 OUTBOX_RELAY_INTERVAL = 1.0  # seconds between outbox polls
 OUTBOX_RELAY_BATCH = 100
 
+#: Zero-argument factory returning the leader gate's async context
+#: manager. Injected by the tests — the SQLite tiers have no advisory
+#: locks, so the real gate is a no-op there and the interesting states
+#: (leader / not leader) can only be exercised by substitution.
+LeaderGate = Callable[[], AbstractAsyncContextManager[bool]]
 
-async def _outbox_relay_loop(
+
+async def _outbox_relay_tick(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     """
-    Transactional outbox relay.
+    One pass of the transactional outbox relay:
 
-    Each tick:
       1. Read up to OUTBOX_RELAY_BATCH unpublished rows in one transaction.
       2. For each row, attempt to publish to Kafka.
       3. Mark successfully-published rows in a second transaction.
       4. Rows whose publish failed remain unpublished and are retried next tick.
+
+    The caller holds the relay leader lock for the whole of this. That is
+    load-bearing and cannot be replaced by locking the rows in step 1:
+    step 1's transaction commits before a single publish happens, so any
+    `FOR UPDATE` taken there is already released by step 2 (ADR 0020).
     """
+    async with session_factory() as session:
+        async with session.begin():
+            repo = OutboxRepository(session)
+            events = await repo.fetch_unpublished(limit=OUTBOX_RELAY_BATCH)
+
+    if not events:
+        return
+
+    published_ids: list[uuid.UUID] = []
+    failed_ids: list[uuid.UUID] = []
+    for event in events:
+        try:
+            await kafka_producer.publish_raw(
+                topic=event.topic, key=event.key, payload=event.payload
+            )
+            published_ids.append(event.id)
+        except Exception as exc:
+            failed_ids.append(event.id)
+            logger.warning(
+                "outbox publish failed, will retry",
+                extra={
+                    "outbox_id": str(event.id),
+                    "topic": event.topic,
+                    "error": str(exc),
+                },
+            )
+
+    async with session_factory() as session:
+        async with session.begin():
+            repo = OutboxRepository(session)
+            await repo.mark_published(published_ids)
+            await repo.increment_attempts(failed_ids)
+
+    if published_ids:
+        logger.info(
+            "outbox batch published",
+            extra={"published": len(published_ids), "failed": len(failed_ids)},
+        )
+
+
+async def _outbox_relay_loop(
+    session_factory: async_sessionmaker[AsyncSession],
+    leader_gate: LeaderGate | None = None,
+) -> None:
+    """
+    Transactional outbox relay — single-writer across replicas (E1-15).
+
+    `worker_loop` runs in every API replica's lifespan, so without a gate
+    every rolling-deploy overlap publishes the entire unpublished backlog
+    twice: duplicate lifecycle events into audit, `job_events` and the SSE
+    bridge. Each tick therefore runs only if this process wins a Postgres
+    advisory lock; the loser sleeps the same interval and tries again, so
+    leadership follows whoever is up rather than being pinned to a task.
+
+    Second line of defense, not replaced by this: the `job_events` unique
+    constraint and WO-P4-03's atomic claim still dedupe on the consumer
+    side. See ADR 0020.
+    """
+    gate: LeaderGate = leader_gate or (
+        lambda: advisory_leader_lock(session_factory, OUTBOX_RELAY_LOCK_KEY)
+    )
     while True:
         try:
-            async with session_factory() as session:
-                async with session.begin():
-                    repo = OutboxRepository(session)
-                    events = await repo.fetch_unpublished(limit=OUTBOX_RELAY_BATCH)
-
-            if not events:
-                await asyncio.sleep(OUTBOX_RELAY_INTERVAL)
-                continue
-
-            published_ids: list[uuid.UUID] = []
-            failed_ids: list[uuid.UUID] = []
-            for event in events:
-                try:
-                    await kafka_producer.publish_raw(
-                        topic=event.topic, key=event.key, payload=event.payload
-                    )
-                    published_ids.append(event.id)
-                except Exception as exc:
-                    failed_ids.append(event.id)
-                    logger.warning(
-                        "outbox publish failed, will retry",
-                        extra={
-                            "outbox_id": str(event.id),
-                            "topic": event.topic,
-                            "error": str(exc),
-                        },
-                    )
-
-            async with session_factory() as session:
-                async with session.begin():
-                    repo = OutboxRepository(session)
-                    await repo.mark_published(published_ids)
-                    await repo.increment_attempts(failed_ids)
-
-            if published_ids:
-                logger.info(
-                    "outbox batch published",
-                    extra={"published": len(published_ids), "failed": len(failed_ids)},
-                )
-
+            async with gate() as is_leader:
+                if is_leader:
+                    await _outbox_relay_tick(session_factory)
+                else:
+                    logger.debug("outbox relay tick skipped — not the leader")
         except asyncio.CancelledError:
             break
         except Exception as exc:

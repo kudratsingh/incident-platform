@@ -146,6 +146,102 @@ async def test_relay_sleeps_when_outbox_is_empty() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Single-writer leader gate (E1-15 / ADR 0020)
+#
+# `worker_loop` runs in every API replica's lifespan, so two relays overlap
+# on every rolling deploy. The gate is what stops the second one from
+# republishing the whole backlog. SQLite has no advisory locks, so the real
+# gate is a no-op here and leadership is injected instead — mutual exclusion
+# itself is proved in tests/integration/test_outbox_relay_concurrency.py.
+# ---------------------------------------------------------------------------
+
+
+class _FakeGate:
+    """Leader gate stand-in that records acquire/release per tick."""
+
+    def __init__(self, is_leader: bool) -> None:
+        self.is_leader = is_leader
+        self.entered = 0
+        self.exited = 0
+
+    def __call__(self) -> "_FakeGate":
+        return self
+
+    async def __aenter__(self) -> bool:
+        self.entered += 1
+        return self.is_leader
+
+    async def __aexit__(self, *exc_info: object) -> bool:
+        self.exited += 1
+        return False
+
+
+async def test_relay_skips_the_whole_tick_when_not_leader() -> None:
+    """Not the leader: no fetch, no publish, no mark. Fetching anyway would
+    be harmless; publishing is what duplicates lifecycle events."""
+    factory, repo = _session_factory_with([_outbox_row(), _outbox_row()])
+    gate = _FakeGate(is_leader=False)
+    publish_mock = AsyncMock()
+
+    with patch("app.workers.dispatcher.OutboxRepository", return_value=repo), \
+         patch("app.workers.dispatcher.kafka_producer.publish_raw", new=publish_mock), \
+         patch(
+             "app.workers.dispatcher.asyncio.sleep",
+             side_effect=[None, StopAsyncIteration],
+         ):
+        with pytest.raises(StopAsyncIteration):
+            await dispatcher._outbox_relay_loop(factory, leader_gate=gate)
+
+    publish_mock.assert_not_awaited()
+    repo.fetch_unpublished.assert_not_awaited()
+    repo.mark_published.assert_not_awaited()
+    repo.increment_attempts.assert_not_awaited()
+    # Leadership is re-probed per tick, and the lock is given back each
+    # time — a relay that grabbed it and kept it would never let a
+    # surviving replica take over after a deploy.
+    assert (gate.entered, gate.exited) == (2, 2)
+
+
+async def test_relay_publishes_as_before_when_leader() -> None:
+    events = [_outbox_row(), _outbox_row()]
+    factory, repo = _session_factory_with(events)
+    gate = _FakeGate(is_leader=True)
+    publish_mock = AsyncMock()
+
+    with patch("app.workers.dispatcher.OutboxRepository", return_value=repo), \
+         patch("app.workers.dispatcher.kafka_producer.publish_raw", new=publish_mock), \
+         patch(
+             "app.workers.dispatcher.asyncio.sleep",
+             side_effect=[None, StopAsyncIteration],
+         ):
+        with pytest.raises(StopAsyncIteration):
+            await dispatcher._outbox_relay_loop(factory, leader_gate=gate)
+
+    assert publish_mock.await_count == 2
+    published_ids = repo.mark_published.await_args_list[0].args[0]
+    assert set(published_ids) == {e.id for e in events}
+    assert (gate.entered, gate.exited) == (2, 2)
+
+
+async def test_relay_releases_leadership_when_a_tick_raises() -> None:
+    """The lock must not survive a failed tick — otherwise one bad batch
+    parks the relay on a process that has stopped making progress."""
+    factory, repo = _session_factory_with([])
+    repo.fetch_unpublished.side_effect = RuntimeError("db down")
+    gate = _FakeGate(is_leader=True)
+
+    with patch("app.workers.dispatcher.OutboxRepository", return_value=repo), \
+         patch(
+             "app.workers.dispatcher.asyncio.sleep",
+             side_effect=[None, StopAsyncIteration],
+         ):
+        with pytest.raises(StopAsyncIteration):
+            await dispatcher._outbox_relay_loop(factory, leader_gate=gate)
+
+    assert gate.exited == gate.entered == 2
+
+
+# ---------------------------------------------------------------------------
 # JobService writes outbox row alongside the job row
 # ---------------------------------------------------------------------------
 
