@@ -345,6 +345,24 @@ The seventeen tasks run concurrently. They share:
 - The same Redis client.
 - The same producer (Kafka — module-level singleton).
 
+### More than one process runs this
+
+`worker_loop` is started from the API's own lifespan (`app/main.py`), so every API replica hosts a
+full set of these tasks — two of everything for the overlap window of every rolling deploy, and
+permanently more once Phase 8 scales the API out. Two loops are singular by nature and are guarded
+accordingly:
+
+- **`_outbox_relay_loop` is leader-gated.** Each tick runs only if the process wins
+  `pg_try_advisory_lock` on a constant key, held across the tick's three transactions on one pinned
+  connection; the loser skips and re-probes a second later. Ungated, every deploy republished the
+  whole unpublished backlog — duplicate lifecycle events into audit, `job_events`, and the SSE
+  bridge. See [ADR 0020](ADR/0020-outbox-relay-single-writer.md).
+- **The sweeps (`_resume_unblocked_waiting_loop`, `_requeue_stale_pending_loop`) are deliberately
+  ungated.** Both promote through a compare-and-set (`promote_waiting_to_pending`,
+  `claim_for_running`), so a second sweeper loses the CAS and emits nothing extra. Concurrent
+  sweeps are wasted scans, not duplicate work — and the CAS also holds against Kafka redelivery,
+  which no leader gate would see.
+
 ### Per-task responsibilities
 
 | Task | Source | Sink | Failure isolation |
@@ -357,7 +375,7 @@ The seventeen tasks run concurrently. They share:
 | `DependencyResolver` | `job.completed` | `jobs` updates + outbox rows | Per-promotion — failure to promote one child doesn't affect siblings |
 | `SagaCoordinator` | `job.completed`, `job.dlq` | `sagas` updates + outbox rows | Per-saga — one saga's failure doesn't affect others |
 | `LlmTriageConsumer` | `job.dlq` | `job_triages` rows | Per-job — LLM failure is logged and skipped |
-| `_outbox_relay_loop` | `outbox_events` table | Kafka via `publish_raw` | Per-row — schema failures mark row failed, others retry next tick |
+| `_outbox_relay_loop` | `outbox_events` table | Kafka via `publish_raw` | Per-row — schema failures mark row failed, others retry next tick. Leader-gated: only one process relays at a time ([ADR 0020](ADR/0020-outbox-relay-single-writer.md)) |
 | `_promote_delayed_loop` | Redis `delayed_queue` zset | outbox row | Per-item — a failed job is re-pushed onto the zset; the rest of the batch still promotes |
 | `_requeue_stale_pending_loop` | `jobs` rows `PENDING` for >300s with no `delayed_queue` timer | outbox row | Per-tick — exception logged, loop continues |
 | `_stale_running_sweep_loop` | `jobs` rows `RUNNING` for longer than `stale_running_threshold_seconds` and not in `dispatcher.in_flight_job_ids` | `dead_letter` status + `job.dead_letter` audit row + `job.dlq` outbox row ([ADR 0019](ADR/0019-stale-running-recovery-sweep.md)) | Per-job — each recovery is its own transaction; one failure leaves that row `RUNNING` for the next pass |
