@@ -17,7 +17,21 @@ def hash_password(password: str) -> str:
 
 
 def verify_password(plain: str, hashed: str) -> bool:
-    return bcrypt.checkpw(plain.encode(), hashed.encode())
+    """True only when `plain` matches a well-formed bcrypt `hashed`.
+
+    Fails closed on any hash bcrypt cannot parse instead of raising.
+    Chaos-lab owner accounts are stored with the unusable sentinel
+    `!chaos-owner-no-login` (app/mcp/tools/chaos/create_bad_data_job.py);
+    `checkpw` raises ValueError('Invalid salt') on it, which escaped
+    `AuthService.login` as a 500 and turned the status code into an oracle
+    for "this address is a chaos account" (D-12). A hash that cannot be
+    parsed is simply a credential nothing can match, so the caller gets the
+    same 401 as any other bad password.
+    """
+    try:
+        return bcrypt.checkpw(plain.encode(), hashed.encode())
+    except (ValueError, TypeError):
+        return False
 
 
 # ---------------------------------------------------------------------------

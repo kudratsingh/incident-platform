@@ -31,6 +31,10 @@ chain (including both RLS migrations), then proves:
  10. The boot posture probe (app.core.rls_check.assert_rls_posture)
      passes on a live incident_app engine and raises on a superuser
      engine under production settings.
+ 11. An audit INSERT for a FOREIGN tenant is refused by the WITH CHECK
+     and accepted once `app.tenant_id` is retargeted at that tenant —
+     the constraint the operator-audit writes in app/api/admin.py are
+     built around (F1-08).
 
 Since WO-P2-03 the non-superuser sessions here connect as the actual
 production runtime role: `incident_app`, created by the migration chain
@@ -414,6 +418,56 @@ async def test_audit_insert_with_matching_tenant_succeeds(rls_db: RlsDb) -> None
                 uuid.uuid4(), tenant,
             )
             assert tag == "INSERT 0 1", f"audit INSERT must succeed, got {tag!r}"
+    finally:
+        await app.close()
+
+
+async def test_foreign_tenant_audit_insert_needs_retargeted_setting(
+    rls_db: RlsDb,
+) -> None:
+    """The WITH CHECK that shapes the operator-audit writes in admin.py.
+
+    `POST /admin/tenants` and `PATCH /admin/tenants/{id}` write an audit
+    row belonging to the tenant being acted on, while the request's
+    `app.tenant_id` is the platform admin's OWN tenant. That INSERT is
+    refused (F1-08), which is why `app/api/admin.py::_set_rls_tenant`
+    retargets the setting at the subject tenant for the write — the same
+    `set_config` move `resolve_admin_tenant` makes for cross-tenant reads,
+    with no policy relaxed. Both halves are asserted here.
+    """
+    import asyncpg
+
+    sup = await asyncpg.connect(rls_db.superuser_dsn)
+    try:
+        admin_home = await _create_tenant(sup, "audit-xt-home")
+        subject = await _create_tenant(sup, "audit-xt-subject")
+    finally:
+        await sup.close()
+
+    app = await asyncpg.connect(rls_db.app_dsn)
+    try:
+        # Naive version: session scoped to the admin's home tenant.
+        async with app.transaction():
+            await app.execute(
+                "SELECT set_config('app.tenant_id', $1, true)", str(admin_home)
+            )
+            with pytest.raises(asyncpg.exceptions.InsufficientPrivilegeError):
+                await app.execute(
+                    "INSERT INTO audit_logs (id, tenant_id, action) "
+                    "VALUES ($1, $2, 'tenant.created')",
+                    uuid.uuid4(), subject,
+                )
+        # With the setting retargeted at the subject tenant, it lands.
+        async with app.transaction():
+            await app.execute(
+                "SELECT set_config('app.tenant_id', $1, true)", str(subject)
+            )
+            tag = await app.execute(
+                "INSERT INTO audit_logs (id, tenant_id, action) "
+                "VALUES ($1, $2, 'tenant.created')",
+                uuid.uuid4(), subject,
+            )
+            assert tag == "INSERT 0 1", f"retargeted INSERT must succeed, got {tag!r}"
     finally:
         await app.close()
 
