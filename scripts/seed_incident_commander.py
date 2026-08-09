@@ -4,8 +4,8 @@ Seed the `incident-commander` service account + mint a scoped token.
 The agent (github.com/kudratsingh/incident-commander) authenticates as
 this principal on every MCP call. Run this once against a running
 platform stack; the plaintext token is printed to stdout exactly once
-— paste it into the agent's `.env` as PLATFORM_MCP_TOKEN and never
-commit it.
+— paste it into the agent's `.env` as PLATFORM_TOKEN (the name the
+commander's `Settings.platform_token` reads) and never commit it.
 
 Scopes granted by default match the agent's Phase 0–3 needs:
 `telemetry:read` (consumer lag, health, deploy history) and
@@ -25,8 +25,12 @@ Env vars (all optional):
     SA_TENANT_SLUG   default: default
     SA_SCOPES        comma-separated (default: telemetry:read,incidents:read)
     SA_TTL_DAYS      token time-to-live (default: platform default, 90)
+    SA_REPLACE_SCOPES  set to 1 to REPLACE an existing account's scopes
+                     with SA_SCOPES verbatim instead of merging (see
+                     `_ensure_service_account`). Off by default.
 
-Idempotent: re-running finds the existing SA and mints a fresh token.
+Idempotent: re-running finds the existing SA, merges SA_SCOPES into the
+scopes it already holds (never narrowing them), and mints a fresh token.
 The old token stays valid until its expiry — revoke via the admin
 endpoint or the admin UI if you need to rotate.
 """
@@ -67,6 +71,13 @@ _SCOPES_ENV = os.getenv(
     f"{Scope.TELEMETRY_READ.value},{Scope.INCIDENTS_READ.value}",
 )
 _TTL_DAYS_ENV = os.getenv("SA_TTL_DAYS")
+# Deliberate-narrowing escape hatch. Default off: the seeder must never
+# silently drop a grant the live account already holds (D-01).
+_REPLACE_SCOPES = os.getenv("SA_REPLACE_SCOPES", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+}
 
 
 def _parse_scopes(raw: str) -> list[str]:
@@ -101,17 +112,28 @@ async def _ensure_service_account(
 ) -> tuple[object, bool]:
     """Return (service_account, created). Idempotent.
 
-    On re-run against an existing SA, this now widens the scope set
-    to match the requested list (previously left it alone). That
-    matches the operator's expectation when re-running with a wider
-    SA_SCOPES — e.g. after Phase 6 needs `chaos:invoke` +
-    `actions:execute` added onto the existing incident-commander
-    account without recreating it (which would invalidate every
-    outstanding token).
+    On re-run against an existing SA the requested scopes are UNIONED
+    with the ones the account already holds — seeding is additive and
+    never removes a grant. `ServiceAccountService.update_scopes`, which
+    this calls, has replace semantics (its docstring: "Replace the
+    account's scope set"), so passing SA_SCOPES straight through used to
+    down-scope the live 4-scope incident-commander account to the two
+    default read scopes on every `make seed-incident-commander`, and the
+    token minted moments later in the same transaction inherited the
+    narrowed set (D-01).
 
-    `update_scopes` itself is a no-op when the sorted scope lists
-    match, so re-runs with identical SA_SCOPES don't flood the audit
-    log."""
+    Widening still works: requesting scopes the account lacks — e.g.
+    adding `chaos:invoke` + `actions:execute` onto the existing account
+    rather than recreating it, which would invalidate every outstanding
+    token — adds them.
+
+    Deliberate narrowing is the escape hatch, not the default: with
+    SA_REPLACE_SCOPES=1 the requested list is passed verbatim and the
+    scopes being removed are named on stderr. (Ad-hoc revocation is
+    better done through the admin API, which is replace-by-design.)
+
+    `update_scopes` itself is a no-op when the sorted scope lists match,
+    so idempotent re-runs stay audit-quiet."""
     sa_repo = ServiceAccountRepository(session)
     service = ServiceAccountService(
         sa_repo,
@@ -121,9 +143,23 @@ async def _ensure_service_account(
 
     existing = await sa_repo.get_by_name(tenant_id, name)
     if existing is not None:
+        current = set(existing.scopes)
+        if _REPLACE_SCOPES:
+            target = list(scopes)
+            removed = sorted(current - set(scopes))
+            if removed:
+                print(
+                    "WARNING: SA_REPLACE_SCOPES=1 — removing scope(s) from "
+                    f"{name!r}: {', '.join(removed)}. Tokens already minted "
+                    "keep the scopes they carry; revoke them if this is a "
+                    "privilege reduction.",
+                    file=sys.stderr,
+                )
+        else:
+            target = sorted(current | set(scopes))
         await service.update_scopes(
             service_account=existing,
-            scopes=scopes,
+            scopes=target,
             updated_by_user_id=None,
         )
         return existing, False
@@ -169,10 +205,10 @@ def _print_banner(name: str, scopes: list[str], created: bool, plaintext: str) -
     print("|  CAPTURE THIS TOKEN NOW — it is not printed anywhere again.  |")
     print("+---------------------------------------------------------------+")
     print()
-    print(f"PLATFORM_MCP_TOKEN={plaintext}")
+    print(f"PLATFORM_TOKEN={plaintext}")
     print()
-    print("Paste that line into the agent repo's .env (or wherever it")
-    print("reads PLATFORM_MCP_TOKEN from). Never commit it.")
+    print("Paste that line into the incident-commander repo's .env — that")
+    print("is the name it reads (Settings.platform_token). Never commit it.")
     print()
 
 
