@@ -19,10 +19,15 @@ rest of the suite still runs.
 """
 
 import os
+import subprocess
+import sys
 import uuid
+from pathlib import Path
 from typing import Any
 
 import pytest
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
 
 try:
     from testcontainers.postgres import PostgresContainer  # type: ignore[import-untyped]
@@ -39,21 +44,33 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.fixture(scope="module")
 def pg() -> Any:
-    with PostgresContainer("postgres:16-alpine") as container:
+    # driver="asyncpg" so get_connection_url() emits postgresql+asyncpg://
+    # (asyncpg is a main dependency; psycopg2 is not installed).
+    with PostgresContainer("postgres:16-alpine", driver="asyncpg") as container:
         yield container
 
 
-def _run_migrations(sync_url: str) -> None:
-    """Run alembic upgrade head against the container."""
-    import subprocess
+def _run_migrations(database_url: str) -> None:
+    """Run alembic upgrade head against the container.
 
+    Uses the current interpreter and an absolute -c path so the call
+    works regardless of cwd and PATH; env.py routes on the URL's dialect
+    (postgresql+asyncpg here, so the async engine path).
+    """
     env = os.environ.copy()
-    env["DATABASE_URL"] = sync_url
-    env["RUN_ALEMBIC_SYNC"] = "1"
-    # alembic.ini lives at repo root; backend/ is cwd
+    env["DATABASE_URL"] = database_url
     subprocess.check_call(
-        ["alembic", "upgrade", "head"],
+        [
+            sys.executable,
+            "-m",
+            "alembic",
+            "-c",
+            str(REPO_ROOT / "alembic.ini"),
+            "upgrade",
+            "head",
+        ],
         env=env,
+        cwd=REPO_ROOT,
     )
 
 
@@ -64,9 +81,13 @@ async def test_rls_isolates_tenants(pg: Any) -> None:
     """
     import asyncpg
 
-    superuser_dsn = pg.get_connection_url().replace("postgresql+psycopg2", "postgresql")
-    sync_url = pg.get_connection_url()
-    _run_migrations(sync_url)
+    # Build DSNs from container attributes — never by string surgery on
+    # get_connection_url() (testcontainers 4.x credentials are test/test,
+    # so replacing "postgres:postgres@" silently matched nothing).
+    host = pg.get_container_host_ip()
+    port = pg.get_exposed_port(5432)
+    superuser_dsn = f"postgresql://{pg.username}:{pg.password}@{host}:{port}/{pg.dbname}"
+    _run_migrations(pg.get_connection_url())
 
     sup = await asyncpg.connect(superuser_dsn)
     try:
@@ -91,10 +112,13 @@ async def test_rls_isolates_tenants(pg: Any) -> None:
             "VALUES ($1, $2, $3, 'x', 'user', true), ($4, $5, $6, 'x', 'user', true)",
             user_a, tenant_a, "a@a.test", user_b, tenant_b, "b@b.test",
         )
+        # retry_count / max_retries are NOT NULL without server defaults
+        # (the defaults are ORM-side), so the raw INSERT must supply them.
         await sup.execute(
-            "INSERT INTO jobs (id, tenant_id, user_id, type, status, priority, payload) "
-            "VALUES ($1, $2, $3, 'csv_upload', 'pending', 5, '{}'::jsonb), "
-            "       ($4, $5, $6, 'csv_upload', 'pending', 5, '{}'::jsonb)",
+            "INSERT INTO jobs (id, tenant_id, user_id, type, status, priority, "
+            "                  retry_count, max_retries, payload) "
+            "VALUES ($1, $2, $3, 'csv_upload', 'pending', 5, 0, 3, '{}'::jsonb), "
+            "       ($4, $5, $6, 'csv_upload', 'pending', 5, 0, 3, '{}'::jsonb)",
             uuid.uuid4(), tenant_a, user_a,
             uuid.uuid4(), tenant_b, user_b,
         )
@@ -102,9 +126,7 @@ async def test_rls_isolates_tenants(pg: Any) -> None:
         await sup.close()
 
     # Connect as the non-superuser app role — RLS now applies.
-    app_dsn = superuser_dsn.replace(
-        "postgres:postgres@", "app_role:app_pw@"
-    )
+    app_dsn = f"postgresql://app_role:app_pw@{host}:{port}/{pg.dbname}"
     app = await asyncpg.connect(app_dsn)
     try:
         async with app.transaction():

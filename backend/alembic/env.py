@@ -1,10 +1,22 @@
+"""Alembic migration environment.
+
+Online migrations are routed on the configured database URL's dialect:
+async dialects (e.g. postgresql+asyncpg) run through an async engine,
+sync dialects (e.g. postgresql / postgresql+psycopg2) through a plain
+sync engine. Setting the RUN_ALEMBIC_SYNC environment variable to any
+non-empty value is an explicit operator override that forces the sync
+path regardless of the URL's dialect.
+"""
+
 import asyncio
 import os
 import sys
 from logging.config import fileConfig
 
 from alembic import context
+from sqlalchemy import create_engine
 from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.pool import NullPool
 
 # Make sure the backend package is importable when running alembic from the
 # project root (e.g. `alembic -c alembic.ini upgrade head`).
@@ -15,6 +27,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 import app.models.audit  # noqa: E402, F401
 import app.models.job  # noqa: E402, F401
 import app.models.user  # noqa: E402, F401
+from app.core.db_url import is_async_url  # noqa: E402
 from app.models.base import Base  # noqa: E402
 
 config = context.config
@@ -61,7 +74,21 @@ async def run_migrations_online() -> None:
     await engine.dispose()
 
 
+def run_migrations_online_sync() -> None:
+    """Run migrations against a live DB using a sync engine.
+
+    Taken when the URL's dialect is sync (e.g. postgresql+psycopg2) or
+    when the RUN_ALEMBIC_SYNC operator override is set.
+    """
+    engine = create_engine(_get_url(), poolclass=NullPool)
+    with engine.connect() as connection:
+        do_run_migrations(connection)
+    engine.dispose()
+
+
 if context.is_offline_mode():
     run_migrations_offline()
+elif os.environ.get("RUN_ALEMBIC_SYNC") or not is_async_url(_get_url()):
+    run_migrations_online_sync()
 else:
     asyncio.run(run_migrations_online())
