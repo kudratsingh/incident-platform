@@ -43,6 +43,14 @@ def _make_session() -> AsyncMock:
     session.__aenter__ = AsyncMock(return_value=session)
     session.__aexit__ = AsyncMock(return_value=False)
     session.begin = MagicMock(return_value=begin_ctx)
+    # `execute` returns an empty result set rather than a bare AsyncMock so
+    # the pause probe's `JobDependencyRepository.parents` walk resolves to
+    # "no parents" instead of raising into `find_blocking_pause`'s fail-open
+    # branch — the dispatch paths are unpaused in these tests by intent, not
+    # by an accidental exception.
+    empty_result = MagicMock()
+    empty_result.all = MagicMock(return_value=[])
+    session.execute = AsyncMock(return_value=empty_result)
     return session
 
 
@@ -807,3 +815,177 @@ async def test_requeue_stale_pending_once_respects_a_live_backoff() -> None:
         await dispatcher._requeue_stale_pending_once(factory, redis)
 
     outbox.add.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# DAG pause enforcement on the dispatch paths (E1-08)
+# ---------------------------------------------------------------------------
+
+
+async def test_promote_delayed_once_holds_a_job_in_a_paused_dag() -> None:
+    """E1-08: the retry cycle was a pause bypass.
+
+    FAILED -> PENDING -> `jobs:delayed` -> this pass republished the job
+    with no pause probe at all, so a failing step inside a paused chain
+    kept re-executing every backoff while `get_dag_state` reported the
+    DAG paused. ADR 0011's enforcement covered the resolver and the
+    resume sweep only — a retry is a *new* dispatch, not the "work in
+    flight" the pause deliberately does not recall.
+
+    The held job must be re-pushed onto `jobs:delayed`, never dropped:
+    `pop_ready_delayed` already ZREM'd it, so the "job not found"
+    `continue` path would lose the retry permanently.
+    """
+    job_id = uuid.uuid4()
+    job = _make_job(id=job_id, tenant_id=uuid.uuid4())
+
+    job_repo = AsyncMock()
+    job_repo.get_by_id.return_value = job
+    outbox = AsyncMock()
+    redis = AsyncMock()
+    factory = MagicMock(return_value=_make_session())
+    paused_by = uuid.uuid4()
+
+    with patch("app.workers.dispatcher.JobRepository", return_value=job_repo), \
+         patch(
+             "app.workers.dispatcher.OutboxRepository",
+             new=MagicMock(return_value=outbox),
+         ), \
+         patch(
+             "app.workers.dispatcher.queue.pop_ready_delayed",
+             new=AsyncMock(return_value=[str(job_id)]),
+         ), \
+         patch(
+             "app.workers.dispatcher.find_blocking_pause",
+             new=AsyncMock(return_value=paused_by),
+         ), \
+         patch(
+             "app.workers.dispatcher.queue.push_delayed", new=AsyncMock()
+         ) as mock_push:
+        await dispatcher._promote_delayed_once(factory, redis)
+
+    outbox.add.assert_not_awaited()
+    mock_push.assert_awaited_once_with(
+        redis, str(job_id), dispatcher._PAUSE_RECHECK_SECONDS
+    )
+
+
+async def test_promote_delayed_once_promotes_when_no_pause_holds() -> None:
+    """The other half of the pause assertion: an unpaused job still takes
+    the normal path — published once, and NOT re-pushed onto the delayed
+    set (which would run it twice)."""
+    job_id = uuid.uuid4()
+    job = _make_job(id=job_id, tenant_id=uuid.uuid4())
+
+    job_repo = AsyncMock()
+    job_repo.get_by_id.return_value = job
+    outbox = AsyncMock()
+    redis = AsyncMock()
+    factory = MagicMock(return_value=_make_session())
+
+    with patch("app.workers.dispatcher.JobRepository", return_value=job_repo), \
+         patch(
+             "app.workers.dispatcher.OutboxRepository",
+             new=MagicMock(return_value=outbox),
+         ), \
+         patch(
+             "app.workers.dispatcher.queue.pop_ready_delayed",
+             new=AsyncMock(return_value=[str(job_id)]),
+         ), \
+         patch(
+             "app.workers.dispatcher.find_blocking_pause",
+             new=AsyncMock(return_value=None),
+         ), \
+         patch(
+             "app.workers.dispatcher.queue.push_delayed", new=AsyncMock()
+         ) as mock_push:
+        await dispatcher._promote_delayed_once(factory, redis)
+
+    outbox.add.assert_awaited_once()
+    assert outbox.add.await_args.kwargs["payload"]["job_id"] == str(job_id)
+    mock_push.assert_not_awaited()
+
+
+async def test_promote_dlq_replay_loop_defers_a_paused_replay() -> None:
+    """A scheduled DLQ replay that lands inside a paused DAG must be
+    RE-SCHEDULED, not refused.
+
+    This loop's `except` deliberately does not re-enqueue (the operator
+    sees the missed replay in the audit trail), so letting `replay_job`'s
+    JobError be the mechanism here would silently discard the
+    `wait_and_replay` remediation. Probe first, push the replay back onto
+    the ZSET, and the deliberate no-re-enqueue policy stays intact for
+    real failures.
+    """
+    tenant_id = uuid.uuid4()
+    principal_id = uuid.uuid4()
+    job_id = uuid.uuid4()
+    redis = AsyncMock()
+    factory = MagicMock(return_value=_make_session())
+    replay = AsyncMock()
+
+    with patch(
+        "app.workers.dispatcher.dlq_replay_scheduler.pop_ready",
+        new=AsyncMock(
+            side_effect=[
+                [(tenant_id, principal_id, job_id)],
+                asyncio.CancelledError(),
+            ]
+        ),
+    ), \
+         patch(
+             "app.workers.dispatcher.dlq_replay_scheduler.schedule_replay",
+             new=AsyncMock(return_value=1_900_000_000.0),
+         ) as mock_schedule, \
+         patch(
+             "app.workers.dispatcher.find_blocking_pause",
+             new=AsyncMock(return_value=uuid.uuid4()),
+         ), \
+         patch("app.services.job.JobService.replay_job", new=replay), \
+         patch("asyncio.sleep", new=AsyncMock()):
+        await dispatcher._promote_dlq_replay_loop(factory, redis)
+
+    replay.assert_not_awaited()
+    mock_schedule.assert_awaited_once()
+    assert mock_schedule.await_args.kwargs["job_id"] == job_id
+    assert (
+        mock_schedule.await_args.kwargs["delay_seconds"]
+        == dispatcher._PAUSED_REPLAY_DEFER_SECONDS
+        == 30
+    )
+
+
+async def test_run_job_defers_a_paused_job_before_claiming_it() -> None:
+    """Pre-claim re-check: a `job.submitted` already in Kafka when the
+    pause lands would otherwise claim RUNNING and execute, which is what
+    made every promotion-time probe advisory. The job stays PENDING and
+    goes back onto `jobs:delayed` for a re-check."""
+    job = _make_job()
+    factory, job_repo, audit_repo = _make_session_factory(job)
+    redis = AsyncMock()
+    paused_by = uuid.uuid4()
+
+    with patch("app.workers.dispatcher.JobRepository", return_value=job_repo), \
+         patch("app.workers.dispatcher.AuditRepository", return_value=audit_repo), \
+         patch(
+             "app.workers.dispatcher.OutboxRepository",
+             new=MagicMock(return_value=AsyncMock()),
+         ), \
+         patch(
+             "app.workers.dispatcher.find_blocking_pause",
+             new=AsyncMock(return_value=paused_by),
+         ), \
+         patch(
+             "app.workers.dispatcher.kafka_producer.publish_job_progress",
+             new=AsyncMock(),
+         ) as mock_progress, \
+         patch(
+             "app.workers.dispatcher.queue.push_delayed", new=AsyncMock()
+         ) as mock_push:
+        await dispatcher._run_job(str(job.id), factory, redis)
+
+    job_repo.claim_for_running.assert_not_awaited()
+    mock_progress.assert_not_awaited()
+    mock_push.assert_awaited_once_with(
+        redis, str(job.id), dispatcher._PAUSE_RECHECK_SECONDS
+    )

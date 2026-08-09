@@ -12,6 +12,7 @@ from app.repositories.job import JobRepository
 from app.repositories.job_dependency import JobDependencyRepository
 from app.repositories.outbox import OutboxRepository
 from app.utils.cache import JobCache
+from app.utils.dag_pause import find_blocking_pause
 from redis.asyncio import Redis
 from sqlalchemy.exc import IntegrityError
 
@@ -72,6 +73,29 @@ class JobService:
         # Cycles are impossible: new ids can't appear among existing parents.
         has_unmet = any(p.status != JobStatus.COMPLETED for p in parent_jobs)
         initial_status = JobStatus.WAITING if has_unmet else JobStatus.PENDING
+
+        # E1-08: all-COMPLETED parents used to mean "dispatch now" even
+        # when those parents sit in a paused chain, so creating a job onto
+        # a paused DAG dispatched it immediately. Hold it WAITING instead —
+        # a WAITING job with all deps met is exactly what
+        # `_resume_unblocked_waiting_loop` promotes once the pause lifts,
+        # so no new resume machinery is needed. Dep-less jobs join no
+        # chain and are deliberately out of scope.
+        if initial_status == JobStatus.PENDING and deps and self.dep_repo is not None:
+            for parent in parent_jobs:
+                paused_by = await find_blocking_pause(
+                    self.redis, self.dep_repo, parent.id
+                )
+                if paused_by is not None:
+                    logger.info(
+                        "job created into a paused DAG — held waiting",
+                        extra={
+                            "parent_id": str(parent.id),
+                            "paused_by": str(paused_by),
+                        },
+                    )
+                    initial_status = JobStatus.WAITING
+                    break
 
         # Carry the current OTel span context through the queue boundary so the
         # worker can create a proper child span linked to this request's trace.
@@ -259,6 +283,25 @@ class JobService:
             raise NotFoundError(f"Job {job_id} not found")
         if job.status not in (JobStatus.FAILED, JobStatus.DEAD_LETTER):
             raise JobError(f"Only failed/dead_letter jobs can be replayed, got: {job.status}")
+
+        # E1-08: a replay is a NEW dispatch, not the "work in flight"
+        # `pause_dag` deliberately does not recall — so it must respect the
+        # pause. This is the single choke point for the admin endpoint, the
+        # three MCP replay tools and the scheduled DLQ-replay loop, and the
+        # refusal has to precede every mutation below: a job already flipped
+        # to PENDING with an audit row and an outbox event has been
+        # dispatched whatever the caller does with the exception.
+        #
+        # The scheduled loop probes the pause itself and re-schedules — it
+        # never relies on this refusal, because its except deliberately
+        # drops failed items.
+        if self.dep_repo is not None:
+            paused_by = await find_blocking_pause(self.redis, self.dep_repo, job_id)
+            if paused_by is not None:
+                raise JobError(
+                    f"Job {job_id} is in a paused DAG (paused via {paused_by}); "
+                    "replay refused while the pause holds"
+                )
 
         # Reset retry_count so a DLQ replay actually gets fresh retries.
         # Without this, a job at retry_count==max_retries would dead-letter

@@ -1,10 +1,18 @@
 """
 `pause_dag` — pause promotion of children in a job dependency DAG.
 
-Mechanism: Redis key `dag:paused:<root_id>` with a TTL. The
-DependencyResolver consumer checks the key before promoting a
-`WAITING` child; if any ancestor (or the child itself) is paused,
-the child stays waiting.
+Mechanism: Redis key `dag:paused:<root_id>` with a TTL. Every path
+that dispatches work checks the key first; if any ancestor (or the
+job itself) is paused, the work is held. Enforced at six points —
+the DependencyResolver's promotion, the resume sweep, delayed-retry
+promotion, `JobService.replay_job`, the scheduled DLQ-replay loop,
+and `_run_job`'s pre-claim re-check — plus a create-time hold that
+starts a new job `WAITING` when its parents' chain is paused. See
+ADR 0011 and its 2026-08-09 amendment for the table and the
+refuse-vs-defer split.
+
+Work already `RUNNING` is not recalled: pause stops dispatch, not
+work in flight.
 
 Real effect self-cleans on TTL: `_resume_unblocked_waiting_loop`
 promotes any child left behind once the flag is gone, so a pause is
