@@ -50,7 +50,6 @@ resource "aws_ecs_task_definition" "backend" {
         # re-checks the same pair at boot.
         { name = "CHAOS_ENABLED", value = var.chaos_enabled ? "true" : "false" },
         { name = "DEBUG", value = "false" },
-        { name = "REDIS_URL", value = local.redis_url },
         { name = "STORAGE_BUCKET", value = aws_s3_bucket.storage.bucket },
         { name = "AWS_DEFAULT_REGION", value = var.aws_region },
         # ALB DNS name so the backend allows cross-origin requests from the frontend.
@@ -70,6 +69,12 @@ resource "aws_ecs_task_definition" "backend" {
         {
           name      = "ALERT_WEBHOOK_SECRET"
           valueFrom = aws_secretsmanager_secret.alert_webhook_secret.arn
+        },
+        {
+          # rediss:// URL embedding the ElastiCache AUTH token — a credential,
+          # so it must not appear in the task definition's plaintext environment.
+          name      = "REDIS_URL"
+          valueFrom = aws_secretsmanager_secret.redis_url.arn
         },
       ]
 

@@ -173,7 +173,7 @@ Backend reads from environment directly. Key variables:
 | Variable | Default | Description |
 |---|---|---|
 | `DATABASE_URL` | `postgresql+asyncpg://...` | asyncpg connection string |
-| `REDIS_URL` | `redis://localhost:6379/0` | Redis connection |
+| `REDIS_URL` | `redis://localhost:6379/0` | Redis connection. In production the scheme is `rediss://` (TLS) with the ElastiCache AUTH token embedded, injected from Secrets Manager |
 | `KAFKA_BOOTSTRAP_SERVERS` | `localhost:9092` | Redpanda / MSK bootstrap |
 | `SECRET_KEY` | — | JWT signing key (required) |
 | `ANTHROPIC_API_KEY` | — | Required only if enabling LLM features |
