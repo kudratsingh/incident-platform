@@ -222,6 +222,13 @@ async def test_run_job_dead_letters_compensation_when_no_processor() -> None:
       * NOT raise
       * mark the job DEAD_LETTER (not FAILED)
       * enqueue a `job.dlq` outbox row so the saga coordinator settles
+
+    The dlq row asserted below is the settlement trigger: SagaCoordinator
+    routes terminal events for `.compensate` jobs of a COMPENSATING saga
+    into `_handle_compensation_settlement`, which lands the saga in FAILED
+    (rollback dead-lettered) or COMPENSATED (rollback succeeded). Until
+    WO-P4-01 that transition did not exist and the saga hung in
+    COMPENSATING forever — see ADR 0017.
     """
     outbox_mock = AsyncMock()
     outbox_ctor = MagicMock(return_value=outbox_mock)

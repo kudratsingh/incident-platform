@@ -33,11 +33,16 @@ export default function SagaDetailPage() {
   }, [load])
 
   // Poll while the saga is still in flight. Stop once it reaches a terminal
-  // state — completed/compensated are stable; failed/compensating are kept
-  // polling because compensation jobs may still be running.
+  // state. `compensating` keeps polling because compensation jobs are still
+  // running; `failed` is now terminal too — the coordinator settles a
+  // COMPENSATING saga to `failed` when a compensation step dead-letters
+  // (ADR 0017), so nothing further will change.
   useEffect(() => {
     if (!saga) return
-    const terminal = saga.status === 'completed' || saga.status === 'compensated'
+    const terminal =
+      saga.status === 'completed' ||
+      saga.status === 'compensated' ||
+      saga.status === 'failed'
     if (terminal) return
     const t = setInterval(() => void load(), POLL_MS)
     return () => clearInterval(t)
