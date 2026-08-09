@@ -24,4 +24,19 @@ export const jobsApi = {
   },
 
   get: (id: string) => api.get<Job>(`/jobs/${id}`),
+
+  /**
+   * Mint a short-lived, single-purpose token for this job's SSE stream.
+   *
+   * Native EventSource cannot send an Authorization header, so the stream GET
+   * authenticates with this token in its query string instead of the primary
+   * access JWT (ADR 0014). This POST is a normal fetch and carries the usual
+   * Authorization header; the backend authorizes the job (tenant + ownership)
+   * before minting. The token expires in ~60s — fetch a fresh one per
+   * (re)connect.
+   */
+  streamToken: async (id: string): Promise<string> => {
+    const res = await api.post<{ token: string }>(`/jobs/${id}/stream-token`)
+    return res.token
+  },
 }

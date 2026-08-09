@@ -39,6 +39,16 @@ class JobResponse(BaseModel):
     completed_at: datetime | None
 
 
+class StreamTokenResponse(BaseModel):
+    """A short-lived, single-purpose token for GET /jobs/{id}/stream?token=…
+
+    Minted by POST /jobs/{id}/stream-token after the caller was authorized
+    for the job. Expires in STREAM_TOKEN_TTL_SECONDS (see ADR 0014).
+    """
+
+    token: str
+
+
 class JobListParams(PaginationParams):
     status: JobStatus | None = None
     type: JobType | None = None
