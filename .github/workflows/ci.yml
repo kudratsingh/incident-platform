@@ -28,6 +28,14 @@ jobs:
         run: npx tsc --noEmit
         working-directory: frontend
 
+      # eslint 9 flat config (frontend/eslint.config.js). The script carries
+      # --max-warnings 0 because react-hooks/exhaustive-deps is a warning in
+      # the plugin's recommended tier, and eslint exits 0 on warnings — without
+      # it a missing-dependency regression would pass this job silently.
+      - name: Lint
+        run: npm run lint
+        working-directory: frontend
+
       - name: Tests
         run: npm test
         working-directory: frontend
