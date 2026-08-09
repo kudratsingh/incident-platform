@@ -2,6 +2,11 @@
 
 **Status:** Accepted (Phase 12 PR #37) · **Date:** 2026 Q2 · **Owner:** Platform
 
+> **Amended by [ADR 0015](0015-force-rls-and-nonowner-app-role.md) (2026-08-09):** FORCE row-level
+> security and full tenant-table policy coverage shipped (migration `a7e3d9c41f28`); the "FORCE
+> would break Alembic" claim below is corrected there, and the non-owner `incident_app` runtime
+> role is specified there as phase 2 of the rollout.
+
 ## Context
 
 After Phase 12 PR B, every tenant-scoped query at the application layer passes through a repository method that explicitly filters by `tenant_id`. That works for code-reviewed paths. But it has one mode of failure: a future contributor writes a new query, forgets the filter, and ships it. The bug is silent — endpoints return rows; admins see them; until someone notices the count is "wrong" or a tenant complains about seeing another tenant's job ID.
@@ -35,6 +40,7 @@ The `IS NULL OR = ''` branch means "if `app.tenant_id` is unset, all rows are vi
 
 - **Workers** carry mixed-tenant traffic. The outbox relay publishes events for all tenants in the same loop; the dispatcher's `_run_job` processes one tenant's job per call but the surrounding loops don't pin to any tenant. Forcing them to set the context per-statement would be invasive and offer no real defense (workers are trusted code paths).
 - **Migrations** run as the table owner; with `FORCE ROW LEVEL SECURITY` they'd need a setting before every statement, breaking Alembic.
+  *(2026-08-09: this claim was incorrect and is superseded by [ADR 0015](0015-force-rls-and-nonowner-app-role.md) — the unset-tenant escape hatch above already admits tenant-less owner sessions even under FORCE, and row security never constrains DDL. FORCE is now live on every covered table.)*
 - **Boot-time queries** (e.g. health checks) have no user context.
 
 The permissive escape preserves correctness for these trusted paths. The defense kicks in for the API process specifically.
@@ -92,7 +98,7 @@ A SQLAlchemy event listener that rewrites every query to inject `WHERE tenant_id
 - **SQLite test environment doesn't see RLS.** All unit + API tests run against SQLite, which has no concept of RLS. The integration test covers the gap, but day-to-day development can't catch RLS-specific bugs.
 - **Performance.** Each query's WHERE clause grows by the policy predicate. The predicate is on an indexed column (`tenant_id`); EXPLAIN ANALYZE shows it folds into existing index scans. Measured negligible.
 - **Operational footgun.** Forgetting to set `app.tenant_id` in a new code path means *all rows visible*, not "no rows visible". The fallout is silent. Mitigated by: only `get_current_user` is supposed to set it; new code paths inherit from that dependency.
-- **Production deployment still requires a non-owner DB role to fully enforce.** Documented in the migration; not yet wired in Terraform. Tracked.
+- **Production deployment still requires a non-owner DB role to fully enforce.** Documented in the migration; ~~not yet wired in Terraform. Tracked.~~ *(2026-08-09: overtaken by [ADR 0015](0015-force-rls-and-nonowner-app-role.md) — `FORCE ROW LEVEL SECURITY` now binds the owner connection, so the policies enforce in production without the role split; the non-owner `incident_app` role remains phase 2 there.)*
 
 ### Reversibility
 

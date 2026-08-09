@@ -104,7 +104,7 @@ Phase 12 — Multi-tenancy:
 
 - **`#35` — model + auth context**: `tenants` table, `tenant_id` on every domain table, `DEFAULT_TENANT_ID` bootstrap (mixed-hex UUID for SQLite compat). JWT carries `tenant_id` claim. `tenant_id_var` contextvar logged in every structured entry.
 - **`#36` — enforce tenant_id everywhere**: every repository / service / outbox call site threads tenant_id through. Per-tenant composite UNIQUE on `(tenant_id, idempotency_key)` replaces the global UNIQUE. Cascading signature changes across ~30 call sites.
-- **`#37` — RLS + Kafka partition key + quotas**: Postgres row-level security policy on 6 tables; `get_current_user` sets `app.tenant_id` via `set_config`; Kafka partition key changes to composite `{tenant_id}:{user_id}` across all 9 producer call sites; `tenants.rate_limit_per_minute` + `tenants.quota_jobs_per_month` columns; `check_tenant_limits` runs at top of `POST /jobs`. Header chip + admin Tenants tab. Testcontainers Postgres integration test.
+- **`#37` — RLS + Kafka partition key + quotas**: Postgres row-level security policy on 6 tables (since extended by migration `a7e3d9c41f28` to all 11 tenant tables with `FORCE ROW LEVEL SECURITY` — see [ADR 0015](docs/ADR/0015-force-rls-and-nonowner-app-role.md)); `get_current_user` sets `app.tenant_id` via `set_config`; Kafka partition key changes to composite `{tenant_id}:{user_id}` across all 9 producer call sites; `tenants.rate_limit_per_minute` + `tenants.quota_jobs_per_month` columns; `check_tenant_limits` runs at top of `POST /jobs`. Header chip + admin Tenants tab. Testcontainers Postgres integration test.
 - **`#38` — platform admin role**: `users.is_platform_admin` boolean (data migration backfills for default-tenant admins); `require_platform_admin` dependency; `?tenant_id=` cross-tenant scope override on list endpoints; CQRS read-model keyed by tenant_id (fixed a Phase 12 leak); self-service tenant creation at `/auth/register` via `new_tenant_name`; admin Tenants tab with create-modal + drill-down page.
 
 ---
@@ -850,7 +850,7 @@ Three role tiers, with `is_platform_admin` as an additive cross-tenant flag. Ful
 | Cross-tenant `?tenant_id=` | — | — | — | ✓ |
 | Manage tenant limits | — | — | — | ✓ |
 
-Enforcement is layered: application-layer filter in `JobService.list_jobs` + Postgres RLS via `set_config('app.tenant_id', …)` in `get_current_user`. RLS catches the bug class "forgot a WHERE clause".
+Enforcement is layered: application-layer filter in `JobService.list_jobs` + Postgres RLS via `set_config('app.tenant_id', …)` in `get_current_user`. RLS catches the bug class "forgot a WHERE clause". All 11 tenant tables carry the `tenant_isolation` policy with `FORCE ROW LEVEL SECURITY`, so it binds the table owner the app connects as; `users` is the single exclusion (auth reads it pre-context — ADR 0003 bootstrap), `deploy_markers` additionally admits `tenant_id IS NULL` rows, and `audit_logs` is UPDATE/DELETE-immutable via RESTRICTIVE policies ([ADR 0015](docs/ADR/0015-force-rls-and-nonowner-app-role.md)).
 
 ---
 
