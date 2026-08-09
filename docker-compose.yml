@@ -88,14 +88,26 @@ services:
     # and the loser 500s. Deterministic serialisation kills the race.
     build: .
     environment:
+      # Superuser URL on purpose: migrations need DDL rights (the
+      # two-URL scheme from ADR 0015 — the app/mcp services below run as
+      # the non-owner incident_app role instead).
       DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/incident_platform
+      # Local password for the incident_app role; db_bootstrap syncs it
+      # after migrations. The app service's custom `command:` bypasses
+      # scripts/entrypoint.sh, so the sync MUST ride this one-shot.
+      INCIDENT_APP_DB_PASSWORD: localdev
       PYTHONPATH: /app/backend
     depends_on:
       postgres:
         condition: service_healthy
     volumes:
       - ./backend:/app/backend
-    command: ["alembic", "-c", "/app/alembic.ini", "upgrade", "head"]
+    command:
+      [
+        "sh",
+        "-c",
+        "alembic -c /app/alembic.ini upgrade head && python -m app.core.db_bootstrap",
+      ]
     restart: "no"
 
   app:
@@ -103,7 +115,12 @@ services:
     ports:
       - "8000:8000"
     environment:
-      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/incident_platform
+      # Non-owner incident_app role — same posture as production after
+      # the ADR 0015 phase-2 flip. The superuser bypasses RLS silently,
+      # so a superuser URL here would keep the local topology lying
+      # about what the policies actually do. The role + password come
+      # from the migrate one-shot above.
+      DATABASE_URL: postgresql+asyncpg://incident_app:localdev@postgres:5432/incident_platform
       REDIS_URL: redis://redis:6379/0
       STORAGE_ENDPOINT: http://minio:9000
       ENVIRONMENT: development
@@ -171,7 +188,8 @@ services:
     ports:
       - "8001:8001"
     environment:
-      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/incident_platform
+      # Non-owner incident_app role — see the app service comment.
+      DATABASE_URL: postgresql+asyncpg://incident_app:localdev@postgres:5432/incident_platform
       REDIS_URL: redis://redis:6379/0
       ENVIRONMENT: development
       DEBUG: "true"

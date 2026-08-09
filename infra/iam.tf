@@ -39,6 +39,12 @@ resource "aws_iam_role_policy" "ecs_execution_secrets" {
           aws_secretsmanager_secret.secret_key.arn,
           aws_secretsmanager_secret.alert_webhook_secret.arn,
           aws_secretsmanager_secret.redis_url.arn,
+          # WO-P2-03: the execution role enumerates secret ARNs
+          # explicitly — without these two, every phase-2 task dies at
+          # provisioning with a secrets-fetch error before the container
+          # even starts.
+          aws_secretsmanager_secret.database_url_owner.arn,
+          aws_secretsmanager_secret.app_db_password.arn,
         ]
       }
     ]

@@ -42,10 +42,17 @@ async def _mcp_lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
     behind the code is fatal — see the v0.4.1 postmortem for why we
     fail loud instead of allowing 500s per call.
     """
+    from app.config import get_settings
     from app.core.migration_check import assert_migrations_current
+    from app.core.rls_check import assert_rls_posture
     from app.dependencies import get_session_factory
 
-    await assert_migrations_current(get_session_factory())
+    session_factory = get_session_factory()
+    await assert_migrations_current(session_factory)
+    # Same RLS posture probe as the API lifespan — the MCP process shares
+    # dependencies._engine's settings but boots separately, and it hits
+    # the DB on every tool call (ADR 0015).
+    await assert_rls_posture(session_factory, get_settings())
     yield
 
 

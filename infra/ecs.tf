@@ -57,10 +57,26 @@ resource "aws_ecs_task_definition" "backend" {
         { name = "ALERT_WEBHOOK_URL", value = var.alert_webhook_url },
       ]
 
+      # NOTE (WO-P2-03): the backend service has lifecycle
+      # ignore_changes = [task_definition] — CI's deploy job re-renders
+      # only the image on the current family revision, so the revision
+      # registered here (with the two new secrets) is picked up by the
+      # NEXT CI deploy. Apply Terraform BEFORE triggering that deploy.
       secrets = [
         {
           name      = "DATABASE_URL"
           valueFrom = aws_secretsmanager_secret.database_url.arn
+        },
+        {
+          # Owner (RDS master) URL for `alembic upgrade head` and the
+          # db_bootstrap password sync in scripts/entrypoint.sh; the app
+          # itself connects with DATABASE_URL above (incident_app).
+          name      = "ALEMBIC_DATABASE_URL"
+          valueFrom = aws_secretsmanager_secret.database_url_owner.arn
+        },
+        {
+          name      = "INCIDENT_APP_DB_PASSWORD"
+          valueFrom = aws_secretsmanager_secret.app_db_password.arn
         },
         {
           name      = "SECRET_KEY"
