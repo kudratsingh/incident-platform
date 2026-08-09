@@ -11,6 +11,24 @@ from starlette.responses import Response
 
 logger = get_logger(__name__)
 
+# The event loop keeps only a weak reference to a running task, so a bare
+# `asyncio.create_task(...)` whose handle is discarded may be garbage-collected
+# mid-flight. Holding the handle here until the task finishes prevents that and
+# gives the done-callback somewhere to report failures from. Scope is narrow:
+# emit_gauge already swallows boto errors and is a no-op outside production, so
+# what this surfaces is scheduling/programming errors, not delivery failures.
+_metric_tasks: set[asyncio.Task[None]] = set()
+
+
+def _on_metric_task_done(task: asyncio.Task[None]) -> None:
+    """Drop the retained handle and log anything the task raised. Never raises."""
+    _metric_tasks.discard(task)
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.warning("latency metric emit failed", extra={"error": str(exc)})
+
 
 class RequestContextMiddleware(BaseHTTPMiddleware):
     """
@@ -50,7 +68,7 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
             )
 
             # Fire-and-forget: emit latency metric without blocking the response
-            asyncio.create_task(
+            task = asyncio.create_task(
                 metrics.emit_gauge(
                     "RequestLatency",
                     latency_ms,
@@ -61,6 +79,8 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
                     },
                 )
             )
+            _metric_tasks.add(task)
+            task.add_done_callback(_on_metric_task_done)
 
             if response is not None:
                 response.headers["X-Request-ID"] = request_id

@@ -74,7 +74,7 @@ target-version = "py312"
 exclude = ["backend/alembic/versions/"]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "N", "W", "UP"]
+select = ["E", "F", "I", "N", "W", "UP", "RUF006"]
 ignore = ["N818", "UP046"]
 
 [tool.coverage.run]

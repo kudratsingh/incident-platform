@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 from app.core.circuit_breaker import (
     CircuitBreaker,
@@ -88,3 +90,116 @@ async def test_half_open_failure_reopens(breaker: CircuitBreaker) -> None:
         await breaker.call(_fail)
 
     assert breaker.state == CircuitState.OPEN
+
+
+# --- HALF_OPEN admits exactly one probe (concurrent callers) ---------------
+
+
+async def _open_and_expire(breaker: CircuitBreaker) -> None:
+    """Trip the breaker, then wind the clock back past recovery_timeout."""
+    for _ in range(3):
+        with pytest.raises(RuntimeError):
+            await breaker.call(_fail)
+    assert breaker.state == CircuitState.OPEN
+    breaker._opened_at = breaker._opened_at - (breaker.recovery_timeout + 1)  # type: ignore[operator]
+
+
+async def test_half_open_admits_only_one_probe(breaker: CircuitBreaker) -> None:
+    await _open_and_expire(breaker)
+
+    gate = asyncio.Event()
+    entered = asyncio.Event()
+    calls = 0
+
+    async def _gated() -> str:
+        nonlocal calls
+        calls += 1
+        entered.set()
+        await gate.wait()
+        return "ok"
+
+    probe = asyncio.create_task(breaker.call(_gated))
+    await entered.wait()  # task A is inside fn(), breaker is HALF_OPEN
+
+    # Task B arrives while the probe is still in flight: it must be rejected,
+    # and it must NOT have executed fn(). Driven as a task (rather than awaited
+    # inline) so the unfixed behaviour — B falling through into the gated fn —
+    # fails this test instead of hanging it on the same gate.
+    concurrent = asyncio.create_task(breaker.call(_gated))
+    await asyncio.sleep(0.05)
+    assert calls == 1, "HALF_OPEN admitted a second concurrent probe"
+    assert concurrent.done()
+    with pytest.raises(CircuitOpenError):
+        await concurrent
+
+    gate.set()
+    assert await probe == "ok"
+    assert breaker.state == CircuitState.CLOSED
+
+    # The breaker is usable again once the probe resolved.
+    assert await breaker.call(_gated) == "ok"
+    assert calls == 2
+
+
+async def test_half_open_probe_failure_clears_flag(breaker: CircuitBreaker) -> None:
+    await _open_and_expire(breaker)
+
+    gate = asyncio.Event()
+    entered = asyncio.Event()
+    calls = 0
+
+    async def _gated_fail() -> str:
+        nonlocal calls
+        calls += 1
+        entered.set()
+        await gate.wait()
+        raise RuntimeError("boom")
+
+    probe = asyncio.create_task(breaker.call(_gated_fail))
+    await entered.wait()
+
+    concurrent = asyncio.create_task(breaker.call(_gated_fail))
+    await asyncio.sleep(0.05)
+    assert calls == 1, "HALF_OPEN admitted a second concurrent probe"
+    assert concurrent.done()
+    with pytest.raises(CircuitOpenError):
+        await concurrent
+
+    gate.set()
+    with pytest.raises(RuntimeError):
+        await probe
+
+    assert breaker.state == CircuitState.OPEN
+    assert breaker._probe_in_flight is False
+
+    # The flag did not leak: a later expired call may probe again.
+    breaker._opened_at = breaker._opened_at - (breaker.recovery_timeout + 1)  # type: ignore[operator]
+    assert await breaker.call(_ok) == "ok"
+
+
+async def test_probe_raising_circuit_open_error_does_not_deadlock(
+    breaker: CircuitBreaker,
+) -> None:
+    """A nested breaker's rejection during a probe must not strand HALF_OPEN.
+
+    `except CircuitOpenError: raise` deliberately passes through without
+    counting the rejection as this breaker's own upstream failure, so it
+    bypasses _on_success/_on_failure and must undo the probe itself.
+    """
+    await _open_and_expire(breaker)
+    opened_at_before = breaker._opened_at
+
+    async def _nested_rejected() -> str:
+        raise CircuitOpenError("inner")
+
+    with pytest.raises(CircuitOpenError):
+        await breaker.call(_nested_rejected)
+
+    assert breaker.state == CircuitState.OPEN
+    assert breaker._probe_in_flight is False
+    # _opened_at is untouched, so the next caller may re-probe immediately
+    # instead of waiting out another full recovery_timeout.
+    assert breaker._opened_at == opened_at_before
+
+    assert await breaker.call(_ok) == "ok"
+    assert breaker.state == CircuitState.CLOSED
