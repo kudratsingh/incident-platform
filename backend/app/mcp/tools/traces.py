@@ -87,26 +87,32 @@ async def get_trace(inp: GetTraceInput, ctx: ToolContext) -> GetTraceOutput:
     audit_rows: list[TracedAuditRow] = []
     if inp.include_audit:
         audit_repo = AuditRepository(ctx.db)
-        # Pull recent audit rows carrying this request_id. AuditRepository
+        # Pull the audit rows carrying this request_id. AuditRepository
         # doesn't have a trace_id column — it stores the request_id which
         # is the same value in our middleware.
+        #
+        # Both predicates run in SQL: filtering request_id in Python over a
+        # recent window made the lookup decay as audit_logs grew (every MCP
+        # call appends a row), and the tenant filter is the actual isolation
+        # here — audit_logs is in the RLS list but RLS is inert in the real
+        # deployment. limit stays as a bound on the now-filtered query.
         rows, _ = await audit_repo.list_logs(
             offset=0,
             limit=200,
-            principal_type=None,
+            request_id=inp.trace_id,
+            tenant_id=ctx.principal.tenant_id,
         )
         for row in rows:
-            if row.request_id == inp.trace_id:
-                audit_rows.append(
-                    TracedAuditRow(
-                        action=row.action,
-                        resource_type=row.resource_type,
-                        resource_id=row.resource_id,
-                        principal_type=row.principal_type,
-                        created_at=row.created_at,
-                        extra_data=row.extra_data,
-                    )
+            audit_rows.append(
+                TracedAuditRow(
+                    action=row.action,
+                    resource_type=row.resource_type,
+                    resource_id=row.resource_id,
+                    principal_type=row.principal_type,
+                    created_at=row.created_at,
+                    extra_data=row.extra_data,
                 )
+            )
 
     return GetTraceOutput(
         trace_id=inp.trace_id,

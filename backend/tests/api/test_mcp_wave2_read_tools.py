@@ -26,9 +26,11 @@ from app.dependencies import get_db, get_redis
 from app.mcp import protocol
 from app.mcp.standalone import create_mcp_app
 from app.models.alert import Alert
+from app.models.audit import PRINCIPAL_TYPE_SERVICE_ACCOUNT, AuditLog
 from app.models.enums import JobStatus, JobType
 from app.models.job import Job
 from app.models.job_dependency import JobDependency
+from app.models.tenant import Tenant
 from app.repositories.audit import AuditRepository
 from app.repositories.service_account import (
     ServiceAccountRepository,
@@ -232,6 +234,120 @@ async def test_get_trace_returns_matching_job(
     assert payload["trace_id"] == "trace-abc-123"
     assert len(payload["jobs"]) == 1
     assert payload["jobs"][0]["status"] == JobStatus.COMPLETED.value
+
+
+async def test_get_trace_finds_audit_row_outside_newest_200(
+    mcp_client, db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
+) -> None:
+    """D-02: the trace's audit row must be found by request_id, not by
+    happening to fall inside the newest-200 audit window.
+
+    Every MCP call appends an `agent.tool_invoked` row to audit_logs, so in
+    a live run the seeded rows for a trace scroll out of a fixed recent
+    window and get_trace silently returns audit_events=[] for rows still
+    present in the DB.
+    """
+    ac, _ = mcp_client
+    trace_id = "trace-window-decay"
+    base = datetime.now(UTC) - timedelta(hours=1)
+
+    db_session.add(
+        Job(
+            tenant_id=default_tenant.id,
+            user_id=test_user.id,
+            type=JobType.CSV_UPLOAD.value,
+            status=JobStatus.FAILED.value,
+            trace_id=trace_id,
+        )
+    )
+    # The row we care about — oldest of the lot.
+    db_session.add(
+        AuditLog(
+            tenant_id=default_tenant.id,
+            action="job.failed",
+            principal_type=PRINCIPAL_TYPE_SERVICE_ACCOUNT,
+            resource_type="job",
+            request_id=trace_id,
+            created_at=base,
+        )
+    )
+    # 205 unrelated rows, each explicitly newer (SQLite ordering on equal
+    # timestamps is unstable, so set created_at rather than relying on
+    # insertion order).
+    for i in range(205):
+        db_session.add(
+            AuditLog(
+                tenant_id=default_tenant.id,
+                action="agent.tool_invoked",
+                principal_type=PRINCIPAL_TYPE_SERVICE_ACCOUNT,
+                request_id="trace-unrelated",
+                created_at=base + timedelta(seconds=i + 1),
+            )
+        )
+    await db_session.flush()
+
+    token = await _token(
+        db_session, default_tenant.id, [Scope.INCIDENTS_READ.value]
+    )
+    payload = _content(
+        await _call(ac, token, "get_trace", {"trace_id": trace_id})
+    )
+    assert len(payload["audit_events"]) >= 1, payload["audit_events"]
+    assert {e["action"] for e in payload["audit_events"]} == {"job.failed"}
+
+
+async def test_get_trace_audit_events_scoped_to_caller_tenant(
+    mcp_client, db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
+) -> None:
+    """Audit rows carrying the same request_id from another tenant must not
+    leak into the caller's trace (audit_logs is in the RLS list but RLS is
+    inert — this SQL filter is the actual enforcement)."""
+    ac, _ = mcp_client
+    trace_id = "trace-shared-id"
+    other = Tenant(
+        id=uuid.uuid4(),
+        slug=f"other-{uuid.uuid4().hex[:8]}",
+        name="Other Co.",
+        is_active=True,
+    )
+    db_session.add(other)
+    await db_session.flush()
+
+    db_session.add(
+        Job(
+            tenant_id=default_tenant.id,
+            user_id=test_user.id,
+            type=JobType.CSV_UPLOAD.value,
+            status=JobStatus.FAILED.value,
+            trace_id=trace_id,
+        )
+    )
+    db_session.add(
+        AuditLog(
+            tenant_id=default_tenant.id,
+            action="job.failed",
+            principal_type=PRINCIPAL_TYPE_SERVICE_ACCOUNT,
+            request_id=trace_id,
+        )
+    )
+    db_session.add(
+        AuditLog(
+            tenant_id=other.id,
+            action="other.tenant.secret",
+            principal_type=PRINCIPAL_TYPE_SERVICE_ACCOUNT,
+            request_id=trace_id,
+        )
+    )
+    await db_session.flush()
+
+    token = await _token(
+        db_session, default_tenant.id, [Scope.INCIDENTS_READ.value]
+    )
+    payload = _content(
+        await _call(ac, token, "get_trace", {"trace_id": trace_id})
+    )
+    actions = {e["action"] for e in payload["audit_events"]}
+    assert actions == {"job.failed"}, actions
 
 
 async def test_search_traces_filters_by_status(
