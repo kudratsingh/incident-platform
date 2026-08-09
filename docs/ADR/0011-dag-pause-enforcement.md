@@ -63,3 +63,51 @@ The alternative — fail closed — means a Redis blip silently freezes every DA
 **Enforce in `JobService` at submission time instead of the resolver** — wrong layer. Promotion is the event being paused, and it happens in the resolver; putting the check at submission would miss every child promoted by the dependency path.
 
 **Have `pause_dag` set job status to a new `PAUSED` state** — considered and rejected. It makes the pause durable (survives Redis loss) but requires a status migration, a new terminal-vs-transient classification across every status consumer, and an unwind on expiry. The Redis flag with a resume sweep gets the same observable behaviour without touching the status enum.
+
+## Amendment — 2026-08-09 (WO-P4-06)
+
+*The accepted decision above stands unchanged; this note extends its enforcement surface from the two points it named to every path that dispatches work.*
+
+### The decision scoped enforcement to promotion, and promotion is not the only dispatch
+
+§1 put the probe in `DependencyResolver` and §2 added `_resume_unblocked_waiting_loop`; those were the two places a `WAITING` child became `PENDING`. Four other paths turn a job into a running job without ever passing through either, and all four ignored the flag (finding E1-08):
+
+1. **The retry cycle.** `FAILED -> PENDING -> jobs:delayed -> _promote_delayed_once` re-published with no pause probe, so a failing step inside a paused chain kept re-executing on every backoff while `get_dag_state` reported the DAG paused.
+2. **`JobService.replay_job`.** The single choke point for `POST /admin/jobs/{id}/replay`, all three MCP replay tools, and the scheduled DLQ-replay loop — every one of them fired into paused DAGs.
+3. **`JobService.create_job`.** A new job whose declared parents are all `COMPLETED` was created `PENDING` and published immediately, even when those parents sit in a paused chain.
+4. **Execution start.** `_run_job` never re-checked the pause before claiming `RUNNING`, so any `job.submitted` already in Kafka when the pause landed still executed — which made every promotion-time probe advisory rather than binding.
+
+A retry, a replay, and a newly created job are all **new dispatches**. They are not the "work in flight" that `pause_dag` deliberately does not recall, and treating them as such was the gap between what the tool reported and what the platform did.
+
+### Enforcement points (amended)
+
+`find_blocking_pause` is now probed at six points. The first two are the original decision; the rest are this amendment.
+
+| # | Probe site | On a blocking pause |
+|---|---|---|
+| 1 | `DependencyResolver` (promotion on `job.completed`) | child stays `WAITING` |
+| 2 | `_resume_unblocked_waiting_loop` (10s resume sweep) | child stays `WAITING`, re-evaluated next pass |
+| 3 | `_promote_delayed_once` (delayed-retry promotion) | no outbox row; job re-pushed onto `jobs:delayed` with `_PAUSE_RECHECK_SECONDS` (10s) |
+| 4 | `JobService.replay_job` (interactive replays) | `JobError` before any mutation — no status change, no audit row, no outbox row |
+| 5 | `_promote_dlq_replay_loop` (scheduled DLQ replays) | re-scheduled with `_PAUSED_REPLAY_DEFER_SECONDS` (30s), *not* refused |
+| 6 | `_run_job` step 1 (pre-claim re-check) | job left `PENDING`, pushed onto `jobs:delayed` for a re-check; nothing is claimed |
+
+Plus one hold that is not a probe-and-defer: `JobService.create_job` creates the job `WAITING` instead of `PENDING` when any declared parent's chain is paused. That needs no new resume machinery — a `WAITING` job with all dependencies met is exactly what §2's sweep promotes once the pause lifts.
+
+**Refuse vs defer is deliberate.** Interactive replays refuse (§4): a human or an agent is holding the response and can retry after the pause, and the refusal is per-item, so the MCP replay tools' savepoint counts the id as failed with the batch shape unchanged. Scheduled replays defer (§5): `_promote_dlq_replay_loop` deliberately does not re-enqueue on failure — the operator sees the miss in the audit trail — so a refusal there would silently discard a `wait_and_replay` remediation instead of holding it.
+
+**Held, never dropped.** Every deferral re-pushes onto the set it was popped from. `pop_ready_delayed` is destructive (the Lua script `ZREM`s the batch), so a paused job that took the "not found" `continue` path would lose its retry permanently.
+
+### What this does not do (amended)
+
+The original list stands: there is still no `resume_dag` tool, and the only way to lift a pause early is to wait out the TTL. Three additions:
+
+- **Work already `RUNNING` is still not recalled.** `pause_dag`'s docstring carve-out is unchanged and remains accurate: a job that won its `claim_for_running` before the flag landed runs to completion, retries and children excepted. The pre-claim re-check (§6) moves the boundary to the claim, not to the processor — it does not cancel work, it declines to start it.
+- **The stale-`PENDING` backstop has no pause awareness, by design.** `_requeue_stale_pending_once` skips any job carrying a live `jobs:delayed` score, which is exactly the state every pause-deferred job is left in, and §6 is a terminal gate for anything it does re-publish anyway: a paused job that reaches `_run_job` is declined and re-deferred. Adding a seventh probe would buy a per-row ancestor walk (up to 100 rows a minute) for a case already covered twice.
+- **Dep-less jobs are out of scope at create time.** A job with no declared dependencies joins no chain, so nothing in its ancestry can be paused; the create-time hold only applies when `dependencies` is non-empty.
+
+### Unchanged
+
+Fail-open on Redis errors (§4 of the decision) applies identically at all six probes: a lookup that raises dispatches as if unpaused and logs the fall-through. A Redis blip letting one retry through is the accepted trade; a Redis blip freezing every DAG in the system is not.
+
+Cost: one `JobDependencyRepository.parents()` walk plus one `MGET` per dispatch. On the `_run_job` path the probe sits inside the existing load transaction so no extra session is opened, and the dispatch-latency SLO (95% < 30s) has orders of magnitude of headroom.

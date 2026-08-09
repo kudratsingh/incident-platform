@@ -84,6 +84,19 @@ _STALE_PENDING_SWEEP_INTERVAL = 60  # seconds between passes
 _STALE_PENDING_AGE_SECONDS = 300  # how long PENDING-without-progress is "stale"
 _STALE_PENDING_LIMIT = 100  # PENDING rows examined per pass
 
+# E1-08 / ADR 0011 amendment. Delay applied when a dispatch is held back
+# because the job's DAG is paused: the work is pushed onto `jobs:delayed`
+# to be re-evaluated rather than dropped. 10s matches the resume sweep's
+# cadence, so a held retry resumes on the same clock as a held child.
+_PAUSE_RECHECK_SECONDS = 10.0
+
+# Same idea for a *scheduled* DLQ replay whose DAG is paused, but on the
+# replay's own ZSET and with a longer window: an operator-scheduled replay
+# is not latency-sensitive, and re-scheduling keeps
+# `_promote_dlq_replay_loop`'s deliberate no-re-enqueue-on-failure policy
+# for real failures.
+_PAUSED_REPLAY_DEFER_SECONDS = 30
+
 MAX_CONCURRENT_JOBS = 10  # cap on simultaneously running jobs
 
 # Strategy map: job type → processor coroutine
@@ -159,6 +172,7 @@ async def _run_job(
     # ------------------------------------------------------------------ #
     # 1. Load job and atomically claim PENDING -> RUNNING                  #
     # ------------------------------------------------------------------ #
+    held_by: uuid.UUID | None = None
     async with session_factory() as session:
         async with session.begin():
             repo = JobRepository(session)
@@ -199,14 +213,45 @@ async def _run_job(
             # the end of this block, before processor execution, so the
             # loser's UPDATE re-evaluates against the committed row and
             # matches zero rows.
-            claimed = await repo.claim_for_running(job_id)
-            if not claimed:
-                logger.info(
-                    "job already claimed by another delivery, skipping",
-                    extra={"job_id": job_id_str},
-                )
-                job_id_var.reset(token)
-                return
+            # E1-08: pre-claim pause re-check. Every other pause probe is
+            # at promotion time, which makes them all advisory — a
+            # `job.submitted` already sitting in Kafka when `pause_dag`
+            # lands would still claim RUNNING and execute. Probed inside
+            # this transaction (one parents() query + one Redis MGET) so
+            # no extra session is opened; the pause is only *held* after
+            # the block, because `push_delayed` must not run inside the
+            # DB transaction.
+            held_by = await find_blocking_pause(
+                redis, JobDependencyRepository(session), job_id
+            )
+            if held_by is None:
+                claimed = await repo.claim_for_running(job_id)
+                if not claimed:
+                    logger.info(
+                        "job already claimed by another delivery, skipping",
+                        extra={"job_id": job_id_str},
+                    )
+                    job_id_var.reset(token)
+                    return
+
+    if held_by is not None:
+        # Status stays PENDING — the job is re-dispatched by the delayed
+        # set once the pause lifts, exactly like a held retry. Dropping it
+        # here would strand the job until the stale-PENDING backstop.
+        logger.info(
+            "execution held (dag paused)",
+            extra={"job_id": job_id_str, "paused_by": str(held_by)},
+        )
+        try:
+            await queue.push_delayed(redis, job_id_str, _PAUSE_RECHECK_SECONDS)
+        except Exception as exc:
+            logger.error(
+                "pause re-check re-queue failed — job may strand in PENDING; "
+                "backstop sweep will recover",
+                extra={"job_id": job_id_str, "error": str(exc)},
+            )
+        job_id_var.reset(token)
+        return
 
     await kafka_producer.publish_job_progress(
         job_id=job_id,
@@ -697,6 +742,9 @@ async def _promote_delayed_once(
     thing that's broken. If the re-push fails too the job is genuinely
     stranded in PENDING, and only `_requeue_stale_pending_once` recovers
     it.
+
+    A paused DAG takes the same re-push route for the same reason (E1-08,
+    ADR 0011 amendment): the retry is held, never dropped.
     """
     settings = get_settings()
     ready_ids = await queue.pop_ready_delayed(redis)
@@ -707,6 +755,7 @@ async def _promote_delayed_once(
             logger.warning("invalid delayed job id", extra={"id": job_id_str})
             continue
 
+        held_by: uuid.UUID | None = None
         try:
             async with session_factory() as session:
                 async with session.begin():
@@ -717,12 +766,20 @@ async def _promote_delayed_once(
                             extra={"job_id": job_id_str},
                         )
                         continue
-                    await OutboxRepository(session).add(
-                        tenant_id=job.tenant_id,
-                        topic=settings.kafka_topic_job_submitted,
-                        key=f"{job.tenant_id}:{job.user_id}",
-                        payload=_job_submitted_payload(job),
+                    # E1-08: a retry is a new dispatch, so the pause has
+                    # to hold it. Probed here — after the row exists, so a
+                    # deleted job still takes the drop path above — and
+                    # before the outbox add, which is the actual dispatch.
+                    held_by = await find_blocking_pause(
+                        redis, JobDependencyRepository(session), job_id
                     )
+                    if held_by is None:
+                        await OutboxRepository(session).add(
+                            tenant_id=job.tenant_id,
+                            topic=settings.kafka_topic_job_submitted,
+                            key=f"{job.tenant_id}:{job.user_id}",
+                            payload=_job_submitted_payload(job),
+                        )
         except Exception as exc:
             logger.error(
                 "delayed promotion failed, re-queueing job",
@@ -735,6 +792,25 @@ async def _promote_delayed_once(
             except Exception as push_exc:
                 logger.error(
                     "delayed re-queue failed — job may strand in PENDING; "
+                    "backstop sweep will recover",
+                    extra={"job_id": job_id_str, "error": str(push_exc)},
+                )
+            continue
+
+        if held_by is not None:
+            # Held, not dropped: the pop already ZREM'd this id, so the
+            # "job not found" `continue` above would lose the retry for
+            # good. Re-push (outside the transaction) and let the next
+            # pass re-evaluate the pause.
+            logger.info(
+                "delayed retry held (dag paused)",
+                extra={"job_id": job_id_str, "paused_by": str(held_by)},
+            )
+            try:
+                await queue.push_delayed(redis, job_id_str, _PAUSE_RECHECK_SECONDS)
+            except Exception as push_exc:
+                logger.error(
+                    "paused retry re-queue failed — job may strand in PENDING; "
                     "backstop sweep will recover",
                     extra={"job_id": job_id_str, "error": str(push_exc)},
                 )
@@ -952,6 +1028,9 @@ async def _promote_dlq_replay_loop(
     — so the eventual execution is indistinguishable from an
     immediate replay, aside from the paired `job.replay_scheduled`
     row written at scheduling time.
+
+    A due entry whose DAG is paused is re-scheduled (E1-08) instead of
+    fired, keeping the remediation alive until the pause lifts.
     """
     # Local imports keep the module-level graph flat and match the
     # style of other supporting loops in this file.
@@ -963,25 +1042,55 @@ async def _promote_dlq_replay_loop(
             ready = await dlq_replay_scheduler.pop_ready(redis)
             for tenant_id, principal_id, job_id in ready:
                 try:
+                    held_by: uuid.UUID | None = None
                     async with session_factory() as session:
                         async with session.begin():
-                            service = JobService(
-                                JobRepository(session),
-                                AuditRepository(session),
-                                OutboxRepository(session),
-                                redis,
-                                dep_repo=JobDependencyRepository(session),
+                            # E1-08: probe the pause BEFORE the replay
+                            # rather than letting `replay_job`'s JobError
+                            # be the mechanism. This loop's except
+                            # deliberately does not re-enqueue, so a
+                            # refusal here would silently discard the
+                            # `wait_and_replay` remediation the operator
+                            # (or the agent) scheduled.
+                            held_by = await find_blocking_pause(
+                                redis, JobDependencyRepository(session), job_id
                             )
-                            # Scheduled DLQ replays only come from SA
-                            # callers today (Tier-1 tools). If we grow a
-                            # human path we'd carry principal_type in
-                            # the ZSET member; for now, assume SA.
-                            await service.replay_job(
-                                job_id=job_id,
-                                tenant_id=tenant_id,
-                                principal_type="service_account",
-                                principal_id=principal_id,
-                            )
+                            if held_by is None:
+                                service = JobService(
+                                    JobRepository(session),
+                                    AuditRepository(session),
+                                    OutboxRepository(session),
+                                    redis,
+                                    dep_repo=JobDependencyRepository(session),
+                                )
+                                # Scheduled DLQ replays only come from SA
+                                # callers today (Tier-1 tools). If we grow a
+                                # human path we'd carry principal_type in
+                                # the ZSET member; for now, assume SA.
+                                await service.replay_job(
+                                    job_id=job_id,
+                                    tenant_id=tenant_id,
+                                    principal_type="service_account",
+                                    principal_id=principal_id,
+                                )
+                    if held_by is not None:
+                        await dlq_replay_scheduler.schedule_replay(
+                            redis,
+                            tenant_id=tenant_id,
+                            principal_id=principal_id,
+                            job_id=job_id,
+                            delay_seconds=_PAUSED_REPLAY_DEFER_SECONDS,
+                        )
+                        logger.info(
+                            "dlq replay deferred (dag paused)",
+                            extra={
+                                "job_id": str(job_id),
+                                "tenant_id": str(tenant_id),
+                                "paused_by": str(held_by),
+                                "delay_seconds": _PAUSED_REPLAY_DEFER_SECONDS,
+                            },
+                        )
+                        continue
                     logger.info(
                         "dlq replay scheduled fired",
                         extra={

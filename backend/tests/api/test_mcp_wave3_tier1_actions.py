@@ -45,6 +45,9 @@ class _RedisStub:
         self._store[key] = value
         return True
 
+    async def mget(self, keys: list[str]) -> list[bytes | str | None]:
+        return [self._store.get(k) for k in keys]
+
     async def delete(self, *keys: str) -> int:
         removed = 0
         for k in keys:
@@ -494,3 +497,59 @@ async def test_replay_dlq_messages_mid_loop_crash_isolates_via_savepoint(
         if j.id != doomed_id:
             assert j.status == JobStatus.PENDING.value
             assert j.retry_count == 0
+
+
+async def test_replay_dlq_by_ids_refuses_a_job_in_a_paused_dag(
+    mcp_client, db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
+) -> None:
+    """E1-08 through the agent's own surface: `pause_dag` held promotion
+    but every replay tool fired straight into the paused DAG.
+
+    The refusal rides the existing per-item savepoint (a JobError is an
+    AppError, so it is counted as a failed item) — the batch response
+    shape is unchanged, which is what keeps the tool contract frozen.
+    """
+    ac, redis_stub = mcp_client
+    jobs = []
+    for i in range(2):
+        job = Job(
+            tenant_id=default_tenant.id,
+            user_id=test_user.id,
+            type=JobType.CSV_UPLOAD.value,
+            status=JobStatus.DEAD_LETTER.value,
+            retry_count=3,
+            error_message=f"stuck-{i}",
+        )
+        db_session.add(job)
+        jobs.append(job)
+    await db_session.flush()
+    paused_id = jobs[1].id
+    redis_stub._store[f"dag:paused:{paused_id}"] = "paused"
+
+    token = await _token(
+        db_session, default_tenant.id, [Scope.ACTIONS_EXECUTE.value]
+    )
+    body = await _call(
+        ac,
+        token,
+        "replay_dlq_by_ids",
+        {
+            "job_ids": [str(j.id) for j in jobs],
+            "idempotency_key": "paused-dag-replay-k-1",
+        },
+    )
+    assert "error" not in body, body
+    payload = _content(body)
+    assert payload["requested"] == 2
+    assert payload["replayed"] == 1
+    assert payload["failed"] == 1
+    failures = [r for r in payload["results"] if not r["ok"]]
+    assert [r["id"] for r in failures] == [str(paused_id)]
+    assert "paused" in failures[0]["error"]
+
+    # DB state matches the response: the paused job was not dispatched.
+    for job in jobs:
+        await db_session.refresh(job)
+    assert jobs[1].status == JobStatus.DEAD_LETTER.value
+    assert jobs[1].retry_count == 3
+    assert jobs[0].status == JobStatus.PENDING.value

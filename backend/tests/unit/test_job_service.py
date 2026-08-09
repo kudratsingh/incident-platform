@@ -1,7 +1,7 @@
 """Unit tests for JobService — repositories are mocked, no DB needed."""
 
 import uuid
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from app.core.exceptions import AuthorizationError, JobError, NotFoundError
@@ -342,3 +342,122 @@ async def test_resolve_incident_invalidates_job_cache() -> None:
     svc.redis.delete.assert_awaited_once_with(  # type: ignore[attr-defined]
         f"cache:job:{tenant_id}:{job.id}"
     )
+
+
+# ---------------------------------------------------------------------------
+# DAG pause enforcement on the replay / create dispatch paths (E1-08)
+# ---------------------------------------------------------------------------
+
+
+async def test_replay_job_refused_while_the_dag_is_paused() -> None:
+    """E1-08: `replay_job` is the choke point for the admin endpoint, all
+    three MCP replay tools and the scheduled DLQ-replay loop — and none of
+    them probed the pause. A replay is a NEW dispatch, so `pause_dag`'s
+    "work in flight is not recalled" carve-out does not cover it.
+
+    Refusal has to happen before *any* mutation: a job that flipped to
+    PENDING with an audit row and an outbox event has already been
+    dispatched, whatever the caller does with the exception.
+    """
+    svc, job_repo, audit_repo, outbox_repo = _make_service()
+    svc.dep_repo = AsyncMock()
+    tenant_id = uuid.uuid4()
+    dead_job = _make_job(status=JobStatus.DEAD_LETTER, tenant_id=tenant_id)
+    job_repo.get_for_tenant.return_value = dead_job
+    paused_by = uuid.uuid4()
+
+    with patch(
+        "app.services.job.find_blocking_pause",
+        new=AsyncMock(return_value=paused_by),
+    ):
+        with pytest.raises(JobError) as exc_info:
+            await svc.replay_job(
+                dead_job.id, tenant_id, requesting_user_id=uuid.uuid4()
+            )
+
+    assert "paused" in str(exc_info.value)
+    assert str(paused_by) in str(exc_info.value)
+    job_repo.update_status.assert_not_awaited()
+    audit_repo.log.assert_not_awaited()
+    outbox_repo.add.assert_not_awaited()
+
+
+async def test_replay_job_proceeds_when_no_pause_holds() -> None:
+    """The guard is a probe, not a new precondition: an unpaused DAG
+    replays exactly as before."""
+    svc, job_repo, audit_repo, outbox_repo = _make_service()
+    svc.dep_repo = AsyncMock()
+    tenant_id = uuid.uuid4()
+    dead_job = _make_job(status=JobStatus.DEAD_LETTER, tenant_id=tenant_id)
+    job_repo.get_for_tenant.return_value = dead_job
+    job_repo.update_status.return_value = dead_job
+
+    with patch(
+        "app.services.job.find_blocking_pause", new=AsyncMock(return_value=None)
+    ):
+        await svc.replay_job(
+            dead_job.id, tenant_id, requesting_user_id=uuid.uuid4()
+        )
+
+    job_repo.update_status.assert_awaited_once()
+    audit_repo.log.assert_awaited_once()
+    outbox_repo.add.assert_awaited_once()
+
+
+async def test_create_job_onto_a_paused_chain_is_held_waiting() -> None:
+    """The bypass the audit's sketch missed: a job whose parents are all
+    COMPLETED is created straight to PENDING and published immediately —
+    even when those parents sit in a paused chain. It must be created
+    WAITING instead, which `_resume_unblocked_waiting_loop` promotes once
+    the pause lifts (no new resume machinery needed).
+    """
+    svc, job_repo, _, outbox_repo = _make_service()
+    svc.dep_repo = AsyncMock()
+    tenant_id = uuid.uuid4()
+    parent = _make_job(status=JobStatus.COMPLETED, tenant_id=tenant_id)
+    job_repo.get_by_idempotency_key.return_value = None
+    job_repo.get_by_id.return_value = parent
+    job_repo.create.return_value = _make_job(
+        status=JobStatus.WAITING, tenant_id=tenant_id
+    )
+
+    with patch(
+        "app.services.job.find_blocking_pause",
+        new=AsyncMock(return_value=uuid.uuid4()),
+    ):
+        await svc.create_job(
+            user_id=uuid.uuid4(),
+            tenant_id=tenant_id,
+            job_type=JobType.CSV_UPLOAD,
+            dependencies=[parent.id],
+        )
+
+    assert job_repo.create.await_args.kwargs["status"] == JobStatus.WAITING
+    outbox_repo.add.assert_not_awaited()
+
+
+async def test_create_job_with_met_deps_still_promotes_when_unpaused() -> None:
+    """Unpaused chain: all-COMPLETED parents still mean PENDING + a
+    `job.submitted` row, exactly as before the pause probe."""
+    svc, job_repo, _, outbox_repo = _make_service()
+    svc.dep_repo = AsyncMock()
+    tenant_id = uuid.uuid4()
+    parent = _make_job(status=JobStatus.COMPLETED, tenant_id=tenant_id)
+    job_repo.get_by_idempotency_key.return_value = None
+    job_repo.get_by_id.return_value = parent
+    job_repo.create.return_value = _make_job(
+        status=JobStatus.PENDING, tenant_id=tenant_id
+    )
+
+    with patch(
+        "app.services.job.find_blocking_pause", new=AsyncMock(return_value=None)
+    ):
+        await svc.create_job(
+            user_id=uuid.uuid4(),
+            tenant_id=tenant_id,
+            job_type=JobType.CSV_UPLOAD,
+            dependencies=[parent.id],
+        )
+
+    assert job_repo.create.await_args.kwargs["status"] == JobStatus.PENDING
+    outbox_repo.add.assert_awaited_once()
