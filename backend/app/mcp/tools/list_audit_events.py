@@ -41,7 +41,7 @@ class ListAuditEventsInput(BaseModel):
         default=None,
         description="Prefix match against the action string. Useful "
         "for whole streams — `agent.` covers all agent activity, "
-        "`chaos.` covers chaos, `service_account.` covers principal "
+        "`service_account.` covers principal "
         "lifecycle. Ignored when `action` is set.",
     )
     principal_type: str | None = Field(
@@ -73,7 +73,7 @@ class ListAuditEventsOutput(BaseModel):
     "list_audit_events",
     description=(
         "Read the immutable audit log for the caller's tenant. "
-        "Every user + agent + chaos action lands here — use it to "
+        "Every user + agent action lands here — use it to "
         "reconcile state after a restart or to check what an "
         "operator did before the current incident. Filter by "
         "`action`, `action_prefix` (e.g. `agent.`), or "

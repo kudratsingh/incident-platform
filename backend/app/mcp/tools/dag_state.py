@@ -30,7 +30,7 @@ class GetDagStateInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     job_id: uuid.UUID = Field(
-        description="Seed job. Its parents (dependencies) and children "
+        description="Root job. Its parents (dependencies) and children "
         "(dependents) are traversed one hop each direction."
     )
 
@@ -53,7 +53,12 @@ class DagEdge(BaseModel):
 
 
 class GetDagStateOutput(BaseModel):
-    seed_id: str
+    # Explicit title only. The property name stays `seed_id` — renaming it
+    # would be a breaking output-contract change — but Pydantic's derived
+    # title ("Seed Id") is serialized into `outputSchema` and reads as lab
+    # vocabulary on the wire. Titling it after the graph sense keeps the
+    # ADR 0012 screen strict with no allowlist.
+    seed_id: str = Field(title="Root Job Id")
     nodes: list[DagNode]
     edges: list[DagEdge]
     paused: bool = Field(

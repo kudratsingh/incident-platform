@@ -54,7 +54,8 @@ class DlqEntry(BaseModel):
     retry_count: int
     remediation_hint: str | None = Field(
         default=None,
-        description="Coarse category set by triage / seed / chaos. See "
+        description="Coarse category set by the platform's triage "
+        "pipeline. See "
         "`RemediationHint` for the fixed value set. `null` means the "
         "platform hasn't categorized this entry yet — agent should "
         "treat as unknown, not as replay-safe.",

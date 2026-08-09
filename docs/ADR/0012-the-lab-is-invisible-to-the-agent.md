@@ -87,6 +87,32 @@ So the operative constraint is now: **do not cut a tag before the rerun.** Taggi
 
 **A rule that now needs enforcing.** "Non-chaos tools never name chaos internals" is currently upheld by one regression test on one tool. Every new Tier-1 action is an opportunity to reintroduce the leak. The durable fix is a registry-level test asserting that no non-chaos tool's schema or description contains chaos vocabulary; sized as a follow-up.
 
+> **Follow-up built (2026-08-09).** That registry-level test now exists:
+> `backend/tests/unit/test_lab_invisibility.py` screens every tool whose
+> `required_scope != chaos:invoke` — description plus serialized `inputSchema`
+> and `outputSchema` — for a word-boundary match on
+> `chaos|eval|seed|seeded|fixture|harness|scenario`. It keys on `required_scope`
+> rather than `is_chaos` so the screen still holds in a chaos-*enabled*
+> environment, where the chaos tools are registered but remain exempt.
+>
+> It caught six leaks the one-tool regression test could not, all shipped in
+> `v0.4.9`'s 26-tool surface: `list_active_alerts` ("chaos runs"),
+> `list_audit_events` (the `chaos.` stream, named twice), `list_dlq_messages`
+> (`remediation_hint` "set by triage / seed / chaos", inside `outputSchema`),
+> `get_consumer_lag` ("7 eval-seed groups", "the eval seed script"),
+> `get_deploy_history` ("the seed script annotates one row … for exactly this
+> hypothesis-testing use case"), and `get_dag_state` ("Seed job" — the
+> legitimate graph sense, reworded to "Root job" so the screen needs no
+> allowlist). All six are reworded; the lab-provenance phrases are gone and no
+> FRESHNESS or semantic content was touched.
+>
+> **The screen is stricter than prose.** Pydantic derives a JSON-Schema `title`
+> from every field name, so `get_dag_state`'s `seed_id` output property
+> serialized as `"title": "Seed Id"` — lab vocabulary on the wire that no
+> author ever typed. Renaming the property would break the output contract, so
+> the field carries an explicit `title="Root Job Id"` instead. If a future
+> wording trips the screen, reword it or title it; do not widen the pattern.
+
 > **Scope limit (recorded 2026-08-09): invisibility is per ENVIRONMENT, not per PRINCIPAL.**
 > `tools/list` is dispatched without the caller's principal, so in a chaos-*enabled* environment any
 > authenticated principal — including a read-only smoke token — can enumerate all 8 chaos tools with

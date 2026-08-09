@@ -49,7 +49,7 @@ class GetConsumerLagInput(BaseModel):
     consumer_group: str = Field(
         default="worker-dispatcher",
         description=(
-            "Kafka consumer group to inspect. Seeded groups: "
+            "Kafka consumer group to inspect. Known groups: "
             + ", ".join(SEEDED_CONSUMER_GROUPS)
             + ". Any other name is accepted and returns lag: null when "
             "the platform has no cached value for it."
@@ -61,7 +61,7 @@ class GetConsumerLagOutput(BaseModel):
     consumer_group: str
     lag: int | None = Field(
         description="Messages the group is behind, per the metrics loop's "
-        "last emission (or the eval seed script). `null` when the cache "
+        "last emission. `null` when the cache "
         "is empty — typical for unknown groups or a Redis restart within "
         "the last ~60s."
     )
@@ -74,11 +74,10 @@ class GetConsumerLagOutput(BaseModel):
     "get_consumer_lag",
     description=(
         "Read the last-emitted Kafka consumer lag for one of the "
-        "platform's consumer groups. Advertised groups include "
-        "worker-dispatcher (real platform group) plus 7 eval-seed "
-        "groups (billing-consumer, orders-consumer, "
+        "platform's consumer groups. Known consumer groups: "
+        "worker-dispatcher, billing-consumer, orders-consumer, "
         "notifications-consumer, analytics-consumer, payments-consumer, "
-        "shipping-consumer, healthy-consumer).\n"
+        "shipping-consumer, healthy-consumer.\n"
         "FRESHNESS: cached in Redis, refreshed by a background loop "
         "every ~60s with a 90s TTL — never a live Kafka query. Measured "
         "behaviour: after a fault begins, the cached value catches up "

@@ -84,10 +84,9 @@ class GetDeployHistoryOutput(BaseModel):
     description=(
         "Return recent deploys, newest first. Prefers the "
         "`deploy_markers` table; falls back to a single-entry env "
-        "snapshot when unseeded. Useful for correlating incidents "
-        "with a recent deploy — the seed script annotates one row "
-        "with a `notes` string for exactly this hypothesis-testing "
-        "use case.\n"
+        "snapshot when the table is empty. Useful for correlating "
+        "incidents with a recent deploy — some deploys carry a "
+        "`notes` annotation useful for that correlation.\n"
         "FRESHNESS: live read from Postgres, no cache. Deploy markers "
         "are written by the release pipeline, so a very recent deploy "
         "may not have a row yet — absence of a marker is weak evidence "
