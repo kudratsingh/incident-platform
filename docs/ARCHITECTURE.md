@@ -18,7 +18,7 @@ External dependencies, all managed:
 
 - **Postgres** (RDS) — system of record
 - **Redis** (ElastiCache) — cache, locks, Pub/Sub, CQRS read-model sets
-- **Kafka** (Amazon MSK in prod, Redpanda locally) — durable event log
+- **Kafka** (Redpanda locally; no production broker is provisioned — [ADR 0018](ADR/0018-production-kafka-posture.md)) — durable event log
 - **S3 / MinIO** — uploaded files + artifacts
 - **CloudWatch** — metrics, logs, alarms
 - **AWS Secrets Manager** — DB password, JWT secret, Anthropic API key
@@ -46,7 +46,7 @@ The three processes share nothing in-process but coordinate via Postgres, Redis,
             ▼            ▼    ▼              ▼
        ┌────────┐   ┌─────────┐   ┌───────┐  ┌──────────┐
        │Postgres│   │ Redis   │   │ Kafka │  │   S3     │
-       │(RDS)   │   │(ElastiC)│   │ (MSK) │  │          │
+       │(RDS)   │   │(ElastiC)│   │       │  │          │
        └────────┘   └─────────┘   └───────┘  └──────────┘
             ▲           ▲           ▲   ▲
             │           │           │   │
@@ -418,13 +418,16 @@ What happens when a component dies, in priority order.
 **Data loss:** depends on persistence. With AOF every-second (production), <1s of writes. Delayed queue entries from that window are gone — those jobs are stuck in `failed` until manually replayed.
 **Runbook:** `runbooks/rb-redis-memory-low.yaml`.
 
-### Kafka (MSK)
+### Kafka
+
+**No production broker exists.** `infra/` provisions none, and the ECS deploy job is gated off behind the `ENABLE_ECS_DEPLOY` repository variable — see [ADR 0018](ADR/0018-production-kafka-posture.md). What follows describes broker loss against the broker the platform actually runs on (Redpanda in `docker-compose.yml`), and against whatever production broker is eventually chosen; the client-side behaviour is a property of this codebase, not of any particular cluster. Broker-side recovery characteristics (replication factor, multi-AZ failover, failover time) belong to the broker and cannot be stated here until one is provisioned.
 
 **Symptom:** outbox table grows; the relay logs publish failures. Direct-publish (progress) silently drops. Consumer groups stop receiving (they were already stopped because the broker is unreachable).
-**Detection:** consumer lag alarm; queue depth alarm; ECS task can't reach broker (logged).
-**Recovery:** MSK auto-recovers (multi-AZ, 3-broker replication). Producers retry on reconnect. Consumers resume from last committed offset. This also covers the boot-time case: if an API/worker task starts while the broker is down, `start_producer()` fails, the producer singleton stays unset, and the publish paths lazily restart it (one attempt per 5s) — the outbox relay's next tick after the broker returns brings the producer up and drains the backlog. No redeploy needed.
+**Detection:** consumer lag alarm; queue depth alarm; task can't reach broker (logged).
+**Recovery (client side):** producers retry on reconnect; consumers resume from the last committed offset. This also covers the boot-time case: if an API/worker task starts while the broker is down, `start_producer()` fails, the producer singleton stays unset, and the publish paths lazily restart it (one attempt per 5s) — the outbox relay's next tick after the broker returns brings the producer up and drains the backlog. No redeploy needed.
 **Data loss:** no. Outbox keeps unpublished rows.
 **Operational shape:** the more time spent before recovery, the more outbox rows pile up; the relay catches up over the next minute or two after the broker is back.
+**Degenerate case worth naming:** a deployed stack with `KAFKA_BOOTSTRAP_SERVERS` unset is indistinguishable, from the API's point of view, from a permanently-down broker — jobs are accepted, outbox rows accumulate, and nothing ever executes. That is today's state on an ungated AWS deploy, and it is the reason the deploy is gated rather than merely documented.
 
 ### Anthropic API
 

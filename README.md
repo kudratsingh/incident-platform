@@ -13,7 +13,7 @@ Built as an intentional showcase of senior-level distributed-systems patterns: t
 - **React SPA** admin console with live SSE progress, saga DAG timelines, DLQ triage, natural-language admin search, and incident digest cards.
 - **Multi-tenancy** with application-layer filtering + Postgres row-level security as defense-in-depth.
 - **LLM features** (Claude via Anthropic SDK): DLQ triage, retry-policy advisor, natural-language admin queries, periodic incident summaries — all off-by-default and fail-open.
-- **Full AWS deployment** via Terraform: VPC + ECS Fargate + RDS + ElastiCache + MSK + S3 + ALB + CloudWatch alarms with linked runbooks.
+- **AWS deployment** via Terraform: VPC + ECS Fargate + RDS + ElastiCache + S3 + ALB + CloudWatch alarms with linked runbooks. No Kafka broker is provisioned and the deploy job is opt-in — see [ADR 0018](docs/ADR/0018-production-kafka-posture.md).
 
 Current test suite: **243 passing tests** (161 unit + 82 API contract + 3 gated Testcontainers integration). `mypy --strict` clean; 70% coverage gate.
 
@@ -34,7 +34,7 @@ Current test suite: **243 passing tests** (161 unit + 82 API contract + 3 gated 
                     ▼            ▼ ▼                ▼
               ┌─────────┐   ┌────────┐         ┌────────┐
               │Postgres │   │ Redis  │         │ Kafka  │
-              │ (RDS)   │   │(Elasti)│         │ (MSK)  │
+              │ (RDS)   │   │(Elasti)│         │        │
               └────┬────┘   └───┬────┘         └───┬────┘
                    │            │                  │
                    ▼            ▼                  ▼
@@ -63,14 +63,14 @@ Full architecture with request lifecycles, concurrency model, and failure-mode c
 | API | Python 3.12, FastAPI, Uvicorn, Pydantic v2 |
 | Database | PostgreSQL 16 with row-level security, SQLAlchemy 2 async, Alembic migrations |
 | Cache / Locks / Pub-Sub | Redis 7 (ElastiCache in prod) |
-| Event log | Kafka (Redpanda locally, Amazon MSK in prod), JSON Schema validation on both producer + consumer |
+| Event log | Kafka (Redpanda locally; no production broker provisioned — [ADR 0018](docs/ADR/0018-production-kafka-posture.md)), JSON Schema validation on both producer + consumer |
 | Object storage | S3 (MinIO locally) |
 | Frontend | React 18, TypeScript, Vite, Tailwind CSS, React Router |
 | Auth | JWT with tenant_id claim, refresh tokens, 3 role tiers + platform-admin flag |
 | Streaming | Server-Sent Events (Kafka → Redis Pub/Sub → browser) |
 | Observability | OpenTelemetry (auto-instrumented FastAPI + SQLAlchemy + Redis) → OTLP → X-Ray; CloudWatch metrics + alarms + linked runbooks |
 | LLM | Anthropic Python SDK (Claude Opus 4.7 with adaptive thinking + prompt caching) |
-| Infrastructure | Terraform (VPC, ECS Fargate, RDS, ElastiCache, MSK, ALB, ACM, IAM, Secrets Manager) |
+| Infrastructure | Terraform (VPC, ECS Fargate, RDS, ElastiCache, ALB, ACM, IAM, Secrets Manager) |
 | CI/CD | GitHub Actions — ruff + mypy + pytest + tsc; Docker build → ECR → ECS deploy |
 
 ---
@@ -81,7 +81,7 @@ Twelve of thirteen planned phases are shipped:
 
 **Phase 1–3 · Foundations** — clean backend, background execution across asyncio / threads / multiprocessing, live SSE progress, React admin console with request-correlation IDs.
 
-**Phase 4 · Production deployment** — Docker, Terraform, ECS Fargate, RDS Postgres, ElastiCache Redis, MSK Kafka, secrets management, CI/CD.
+**Phase 4 · Production deployment** — Docker, Terraform, ECS Fargate, RDS Postgres, ElastiCache Redis, secrets management, CI/CD. Kafka is the gap: no production broker is provisioned ([ADR 0018](docs/ADR/0018-production-kafka-posture.md)).
 
 **Phase 5 · Hardening** — sliding-window rate limiting, cache layer, load testing via Locust, `mypy --strict`, 70% coverage gate.
 
@@ -174,7 +174,7 @@ Backend reads from environment directly. Key variables:
 |---|---|---|
 | `DATABASE_URL` | `postgresql+asyncpg://...` | asyncpg connection string |
 | `REDIS_URL` | `redis://localhost:6379/0` | Redis connection. In production the scheme is `rediss://` (TLS) with the ElastiCache AUTH token embedded, injected from Secrets Manager |
-| `KAFKA_BOOTSTRAP_SERVERS` | `localhost:9092` | Redpanda / MSK bootstrap |
+| `KAFKA_BOOTSTRAP_SERVERS` | `localhost:9092` | Broker bootstrap. Points at local Redpanda; no production broker exists yet, and Terraform omits this variable from the task definition unless `kafka_bootstrap_servers` is set ([ADR 0018](docs/ADR/0018-production-kafka-posture.md)) |
 | `SECRET_KEY` | — | JWT signing key (required) |
 | `ANTHROPIC_API_KEY` | — | Required only if enabling LLM features |
 | `LLM_TRIAGE_ENABLED` | `False` | DLQ triage feature flag |
@@ -359,20 +359,21 @@ The dispatcher's `_PROCESSORS` map routes each `JobType` to the right primitive.
 
 ## Deployment
 
-Terraform provisions the full AWS stack in `infra/`:
+Terraform provisions the AWS stack in `infra/`:
 
 - VPC with public/private subnets
 - ECS Fargate cluster with a service each for API and worker
 - RDS Postgres with automated backups
 - ElastiCache Redis
-- Amazon MSK for Kafka
 - S3 for artifacts
 - ALB with target-group health checks
 - ACM (planned in Phase 8), IAM roles per service, Secrets Manager for DB password + JWT + Anthropic key
 - CloudWatch metrics + 7 alarms (5 baseline + 2 SLO fast-burn) with runbook URLs in their descriptions
 - SNS topic for alarm delivery
 
-CI builds Docker images, pushes to ECR, and triggers an ECS service update on merge to `master`.
+**Not provisioned: Kafka.** There is no broker in `infra/` — no MSK cluster, no self-managed nodes. A deployed stack therefore accepts jobs and never executes them, because every client falls back to `localhost:9092`. This is a recorded decision, not an oversight: see [ADR 0018](docs/ADR/0018-production-kafka-posture.md) for why, and for what to do when a production broker is actually wanted.
+
+CI builds Docker images, pushes to ECR, and updates the ECS services on merge to `master` — but only when the `ENABLE_ECS_DEPLOY` repository variable is set to `'true'`. It is unset, so that job skips.
 
 ---
 

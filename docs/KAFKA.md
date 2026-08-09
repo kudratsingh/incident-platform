@@ -113,7 +113,7 @@ docker compose exec redpanda rpk topic consume job.completed --num 5
 docker compose exec redpanda rpk group seek read-model --to start
 ```
 
-In production we use **Amazon MSK**, provisioned in `infra/msk.tf`. Same `kafka-python` / `aiokafka` client paths; the only thing that changes is `kafka_bootstrap_servers`.
+**Production Kafka is not yet provisioned.** `infra/` creates no broker of any kind — no MSK cluster, no self-managed nodes — and the ECS deploy job is gated off behind the `ENABLE_ECS_DEPLOY` repository variable precisely because a deployed stack without a broker accepts jobs and never executes them. The client paths do not change when a broker appears: `kafka-python` / `aiokafka` talk to Redpanda and to any Kafka-protocol broker identically, and the only thing that has to change is `kafka_bootstrap_servers` (Terraform passes it through `var.kafka_bootstrap_servers`, which omits the env var entirely while empty). See [ADR 0018](ADR/0018-production-kafka-posture.md).
 
 ---
 
@@ -174,7 +174,7 @@ The base class handles schema validation, offset management, error handling, and
 2. Add `kafka_consumer_group_<name>` if it'll have a consumer.
 3. Write the JSON Schema in `backend/app/schemas/kafka/<name>.schema.json`.
 4. Register it in `schema_registry.py` (it's auto-loaded by filename; the topic name in the schema must match `kafka_topic_*`).
-5. In production: add the topic + partition count to `infra/msk.tf` (we don't auto-create topics in MSK).
+5. In production: nothing to do yet — no broker is provisioned ([ADR 0018](ADR/0018-production-kafka-posture.md)). Whoever provisions one owns creating the topics with explicit partition counts; auto-creation is off on every broker worth running.
 
 ---
 
@@ -186,5 +186,5 @@ The base class handles schema validation, offset management, error handling, and
 - `backend/app/workers/dispatcher.py` — `worker_loop` (orchestrates all 8 groups)
 - `backend/app/schemas/kafka/*.schema.json` — schema definitions
 - `backend/tests/integration/test_kafka_e2e.py` — Testcontainers round-trip
-- `infra/msk.tf` — production MSK provisioning
 - `docker-compose.yml` — Redpanda for local dev
+- [`docs/ADR/0018`](ADR/0018-production-kafka-posture.md) — why there is no production broker, and what to do when one is wanted

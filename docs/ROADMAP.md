@@ -28,6 +28,7 @@ These are sized at "phase" level in the milestone plan. Not repeated here, but r
 
 | Item | Size | Notes |
 |---|---|---|
+| Provision a production Kafka broker, then enable the ECS deploy | M | Today there is none — `infra/` creates no broker, so a deployed stack accepts jobs and never executes them, which is why the deploy job is gated off ([ADR 0018](ADR/0018-production-kafka-posture.md)). Pick MSK or Redpanda on ECS (cheaper at this traffic), set `var.kafka_bootstrap_servers`, apply, verify a job executes end-to-end on the deployed stack, and only then set the `ENABLE_ECS_DEPLOY` repository variable. Blocked on there being an actual consumer of the AWS deployment — Phase 8 staging is the natural trigger. |
 | Outbox → CDC migration via Debezium | L | Replace `_outbox_relay_loop` with a Debezium source connector against the `outbox_events` table. Easier than full CDC because we keep the application-controlled event taxonomy. Sunset the polling relay at the end. |
 | Distributed lock manager (Redlock) | M | Single Redis SETNX is enough today. Redlock with multiple Redis nodes is the next step when one Redis cluster isn't enough. Demonstrate via a "lease the job" pattern that prevents double-execution even on broker redelivery. |
 | Workflow versioning | L | Deploy v2 of a saga template without breaking in-flight v1 sagas. Add a `version` column to `sagas`; processors register per-version; runtime picks the version the saga was created with. |
