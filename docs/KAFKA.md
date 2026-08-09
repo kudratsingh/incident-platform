@@ -67,7 +67,9 @@ Each one has independent offsets. If the event-log consumer falls behind because
 
 ### At-least-once delivery
 
-Every consumer in this codebase commits its Kafka offset **only after** `handle_message` returns successfully (see `BaseKafkaConsumer._process_one`). If the consumer crashes mid-message, Kafka redelivers on next start. Combined with:
+Every consumer in this codebase commits its Kafka offset **only after** `handle_message` returns successfully, and every commit is explicit and scoped to one partition: `commit({TopicPartition: message.offset + 1})` in `BaseKafkaConsumer._process_one`. The argument-less `commit()` form is banned — in aiokafka it snapshots the fetch position of *every* assigned partition, silently committing past unprocessed and failed messages.
+
+On handler failure the consumer commits nothing, seeks back to the failed offset, and abandons the rest of that partition's batch (`BaseKafkaConsumer._process_batch`); the **next poll** redelivers from the failure point — redelivery happens within seconds on a live consumer, not just after a restart. Other partitions keep processing, so a persistently failing message head-of-line-blocks only its own partition (retrying roughly every 1.5s: poll timeout + a 1s pacing sleep). Schema-invalid messages are the one exception: they are poison pills, committed past per-partition so they can never stall the partition. Combined with:
 
 - **Job idempotency keys** (`idempotency_key` UNIQUE constraint on `jobs`) — prevent double-execution when the dispatcher redelivers `job.submitted`
 - **Event log uniqueness** (`UNIQUE (kafka_topic, kafka_partition, kafka_offset)` on `job_events`) — `IntegrityError` is caught and swallowed in `EventLogConsumer.handle_message`, so redelivery is a no-op
@@ -132,8 +134,9 @@ To roll back a buggy projection or to investigate a poison message:
 
 ```bash
 # Stop the worker process (in ECS: scale the service to 0)
-# The consumer group's offsets are committed only after successful handle_message,
-# so unprocessed messages will be redelivered when you bring the worker back.
+# Offsets are committed per message per partition, only after successful
+# handle_message — anything unprocessed (or seeked back after a handler
+# failure) is redelivered when you bring the worker back.
 ```
 
 To rewind:

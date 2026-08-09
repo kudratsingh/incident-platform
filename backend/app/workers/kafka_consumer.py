@@ -3,9 +3,16 @@ Base Kafka consumer — handles connection lifecycle, offset management, and
 graceful shutdown. Subclasses implement handle_message() for their specific logic.
 
 Offset management strategy:
-  - Offsets are committed ONLY after handle_message() returns successfully.
-  - If handle_message() raises, the offset is NOT committed. On restart, the
-    message will be re-delivered (at-least-once delivery).
+  - After each successful handle_message(), the consumer commits
+    {TopicPartition: message.offset + 1} — exactly that message's partition.
+    The argument-less commit() form is never used: it would snapshot every
+    assigned partition's fetch position, committing past unprocessed messages.
+  - If handle_message() raises, nothing is committed; the consumer seeks back
+    to the failed offset and abandons the rest of that partition's batch, so
+    the NEXT POLL redelivers the message (at-least-once delivery). Other
+    partitions keep processing.
+  - Schema-invalid messages are poison pills: committed past, per-partition,
+    so they can never stall their partition.
   - Duplicate deliveries are made safe by the dispatcher's atomic
     PENDING->RUNNING claim (`JobRepository.claim_for_running`) — idempotency
     keys only dedupe job CREATION, not execution.
@@ -16,7 +23,11 @@ import json
 from abc import ABC, abstractmethod
 from typing import Any
 
-from aiokafka import AIOKafkaConsumer, ConsumerRecord  # type: ignore[import-untyped]
+from aiokafka import (  # type: ignore[import-untyped]
+    AIOKafkaConsumer,
+    ConsumerRecord,
+    TopicPartition,
+)
 from app.config import get_settings
 from app.core.logging import get_logger
 from app.workers.schema_registry import SchemaValidationError
@@ -135,7 +146,8 @@ class BaseKafkaConsumer(ABC):
     async def run(self) -> None:
         """
         Main consume loop. Runs until stop() is called.
-        Commits offset only after successful handle_message().
+        Commits each message's offset (per partition) only after successful
+        handle_message(); failed messages are seeked back for redelivery.
         """
         if self._consumer is None:
             raise RuntimeError("Consumer not started — call start() first")
@@ -162,13 +174,16 @@ class BaseKafkaConsumer(ABC):
 
             try:
                 # getmany() batches up to 10 messages per poll for efficiency
-                records: dict[Any, list[ConsumerRecord]] = await asyncio.wait_for(
+                records: dict[TopicPartition, list[ConsumerRecord]] = await asyncio.wait_for(
                     self._consumer.getmany(timeout_ms=500, max_records=10),
                     timeout=2.0,
                 )
-                for _tp, messages in records.items():
-                    for message in messages:
-                        await self._process_one(message)
+                had_failure = await self._process_batch(records)
+                if had_failure:
+                    # Pace the hot retry of a persistently failing message
+                    # (it is refetched on the very next poll after seek-back);
+                    # matches the loop-error backoff below.
+                    await asyncio.sleep(1.0)
 
             except TimeoutError:
                 # No messages — just loop again
@@ -183,14 +198,63 @@ class BaseKafkaConsumer(ABC):
                 )
                 await asyncio.sleep(1.0)
 
-    async def _process_one(self, message: ConsumerRecord) -> None:
-        """Process a single message, committing offset on success."""
+    async def _process_batch(self, records: dict[TopicPartition, list[ConsumerRecord]]) -> bool:
+        """Process one getmany() batch; return True when any partition failed.
+
+        Messages are processed in order within each partition. On the first
+        failure the consumer seeks back to the failed offset and abandons the
+        REST of that partition's batch — aiokafka discards its buffered
+        records for a partition on seek and refetches from the seek offset,
+        so the next poll redelivers from the failure point. Other partitions
+        keep processing: a persistently failing message head-of-line-blocks
+        only its own partition.
+        """
+        consumer = self._consumer
+        if consumer is None:
+            raise RuntimeError("Consumer not started — call start() first")
+
+        had_failure = False
+        for tp, messages in records.items():
+            for message in messages:
+                ok = await self._process_one(message)
+                if not ok:
+                    had_failure = True
+                    try:
+                        # seek() is synchronous in aiokafka — do not await.
+                        consumer.seek(tp, message.offset)
+                    except Exception as exc:
+                        # A rebalance can deassign the partition between the
+                        # failure and the seek (IllegalStateError). The new
+                        # assignee resumes from the last committed offset,
+                        # which is at or before this message — nothing lost.
+                        logger.warning(
+                            "seek-back failed — partition likely reassigned; "
+                            "redelivery falls to committed offset",
+                            extra={
+                                "group_id": self.group_id,
+                                "topic": tp.topic,
+                                "partition": tp.partition,
+                                "offset": message.offset,
+                                "error": str(exc),
+                            },
+                        )
+                    break  # abandon the rest of THIS partition's batch only
+        return had_failure
+
+    async def _process_one(self, message: ConsumerRecord) -> bool:
+        """Process a single message, committing its partition's offset on success.
+
+        Returns True when the partition may advance past this message (handled
+        successfully, or a poison pill committed past); False when the message
+        must be redelivered — the caller seeks back to this offset.
+        """
         value: dict[str, Any] = message.value
         key: str | None = message.key
+        tp = TopicPartition(message.topic, message.partition)
 
         # Schema validation — bad messages are a poison pill: re-delivering them
-        # would block the partition forever. Commit and move on; the producer
-        # side never should have sent this.
+        # would block the partition forever. Commit past it (this partition
+        # only) and move on; the producer side never should have sent this.
         try:
             validate_schema(message.topic, value)
         except SchemaValidationError as exc:
@@ -204,8 +268,8 @@ class BaseKafkaConsumer(ABC):
                     "error": str(exc),
                 },
             )
-            await self._consumer.commit()  # type: ignore[union-attr]
-            return
+            await self._consumer.commit({tp: message.offset + 1})  # type: ignore[union-attr]
+            return True
 
         try:
             await self.handle_message(
@@ -215,11 +279,16 @@ class BaseKafkaConsumer(ABC):
                 partition=message.partition,
                 offset=message.offset,
             )
-            # Commit after successful processing — at-least-once delivery
-            await self._consumer.commit()  # type: ignore[union-attr]
+            # Commit this message's offset, for exactly this partition —
+            # at-least-once delivery.
+            await self._consumer.commit({tp: message.offset + 1})  # type: ignore[union-attr]
+            return True
         except Exception as exc:
+            # A failed commit (e.g. CommitFailedError on rebalance) lands here
+            # too: report failure so the caller seeks back — reprocessing is
+            # safe because handlers are idempotent under redelivery.
             logger.error(
-                "kafka message handler failed — offset not committed, will retry on restart",
+                "kafka message handler failed — offset not committed, seeking back for redelivery",
                 extra={
                     "group_id": self.group_id,
                     "topic": message.topic,
@@ -228,7 +297,7 @@ class BaseKafkaConsumer(ABC):
                     "error": str(exc),
                 },
             )
-            # Do NOT commit — message will be re-delivered on next startup
+            return False
 
     @abstractmethod
     async def handle_message(

@@ -6,6 +6,9 @@ a job.submitted message and asserts:
   1. The producer's schema validation accepts a valid payload.
   2. The consumer reads back the same payload.
   3. An invalid payload is rejected at produce time (schema validation).
+  4. A handler failure triggers seek-back redelivery: the failed message is
+     re-consumed on a later poll and the group's committed offset ends past
+     both messages of the batch (BaseKafkaConsumer at-least-once contract).
 
 Skipped automatically if Docker isn't reachable, so CI without Docker still
 runs the unit/api suites.
@@ -16,13 +19,17 @@ Run only this file:  pytest backend/tests/integration/test_kafka_e2e.py -v
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import uuid
 from collections.abc import AsyncGenerator
+from typing import Any
 
 import pytest
 import pytest_asyncio
-from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
+from aiokafka import AIOKafkaConsumer, AIOKafkaProducer, TopicPartition
+from app.config import get_settings
+from app.workers.kafka_consumer import BaseKafkaConsumer
 from app.workers.schema_registry import SchemaValidationError
 from app.workers.schema_registry import validate as validate_schema
 
@@ -159,3 +166,82 @@ async def test_producer_rejects_invalid_schema() -> None:
     }
     with pytest.raises(SchemaValidationError):
         validate_schema("job.submitted", bad)
+
+
+class _FlakyConsumer(BaseKafkaConsumer):
+    """Fails the FIRST delivery of one scripted message, succeeds after."""
+
+    def __init__(self, topics: list[str], group_id: str, fail_first_n: int) -> None:
+        super().__init__(topics=topics, group_id=group_id)
+        self.processed: list[int] = []
+        self._fail_first_n = fail_first_n
+        self._failed_once = False
+
+    async def handle_message(
+        self,
+        topic: str,
+        key: str | None,
+        value: dict[str, Any],
+        *,
+        partition: int = 0,
+        offset: int = 0,
+    ) -> None:
+        if value["n"] == self._fail_first_n and not self._failed_once:
+            self._failed_once = True
+            raise RuntimeError("scripted first-delivery failure")
+        self.processed.append(value["n"])
+
+
+async def test_handler_failure_seeks_back_and_redelivers(
+    redpanda: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Live redelivery round-trip (E1-01): the handler fails the first
+    delivery of message 2 in a 2-message batch. The consumer must commit
+    only past message 1, seek back, redeliver message 2 on a later poll,
+    and end with the group's committed offset at 2 — not silently commit
+    past the failure."""
+    topic = f"test.redelivery.{uuid.uuid4().hex[:8]}"
+    group = f"test-redelivery-{uuid.uuid4().hex[:8]}"
+
+    producer = AIOKafkaProducer(
+        bootstrap_servers=redpanda,
+        value_serializer=lambda v: json.dumps(v).encode(),
+        key_serializer=lambda k: k.encode(),
+    )
+    await producer.start()
+    try:
+        await producer.send_and_wait(topic, value={"n": 1}, key="k")
+        await producer.send_and_wait(topic, value={"n": 2}, key="k")
+    finally:
+        await producer.stop()
+
+    # Point the app consumer at the ephemeral broker. get_settings is
+    # lru_cached, so clear it around the env override.
+    monkeypatch.setenv("KAFKA_BOOTSTRAP_SERVERS", redpanda)
+    monkeypatch.setenv("CHAOS_ENABLED", "false")
+    get_settings.cache_clear()
+    consumer = _FlakyConsumer([topic], group, fail_first_n=2)
+    try:
+        await consumer.start()
+        run_task = asyncio.create_task(consumer.run())
+        try:
+            # Message 1 processes once; message 2 fails, is seeked back,
+            # then processes on a later poll.
+            await _await_until(lambda: consumer.processed == [1, 2], timeout=60.0)
+        finally:
+            run_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await run_task
+            await consumer.stop()
+    finally:
+        get_settings.cache_clear()
+
+    assert consumer.processed == [1, 2]  # redelivered exactly once, in order
+
+    checker = AIOKafkaConsumer(bootstrap_servers=redpanda, group_id=group)
+    await checker.start()
+    try:
+        committed = await checker.committed(TopicPartition(topic, 0))
+    finally:
+        await checker.stop()
+    assert committed == 2  # committed past BOTH messages, only after success
