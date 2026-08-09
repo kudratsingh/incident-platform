@@ -32,10 +32,28 @@ logger = get_logger(__name__)
 
 
 def _client_key(request: Request) -> str:
-    """Derive a stable per-client identifier from the request."""
+    """Derive a stable per-client identifier from the request.
+
+    Trust model (finding E2-05): the only trusted proxy in production is
+    the ALB, which APPENDS the connecting client's IP as the LAST
+    X-Forwarded-For hop. Everything to the left of that hop is
+    caller-supplied and forgeable — keying on the leftmost entry let a
+    client mint a fresh rate bucket per request just by rotating the
+    header, so we key on the rightmost hop. request.client.host cannot be
+    the primary identity: scripts/entrypoint.sh runs uvicorn without
+    --proxy-headers, so in production it is the ALB node IP, shared by
+    every client. If a CDN/WAF layer is ever added in front of the ALB,
+    the rightmost hop becomes that layer's IP and this needs a
+    trusted-hop-count knob — do not build the knob before the topology
+    exists.
+    """
     forwarded_for = request.headers.get("X-Forwarded-For")
     if forwarded_for:
-        return forwarded_for.split(",")[0].strip()
+        # Drop empty entries so a degenerate header of only commas or
+        # whitespace falls through to the direct peer address.
+        parts = [p.strip() for p in forwarded_for.split(",") if p.strip()]
+        if parts:
+            return parts[-1]
     return request.client.host if request.client else "unknown"
 
 
