@@ -27,6 +27,9 @@ class AuditRepository(BaseRepository[AuditLog]):
         request_id: str | None = None,
         ip_address: str | None = None,
         extra_data: dict[str, Any] | None = None,
+        kafka_topic: str | None = None,
+        kafka_partition: int | None = None,
+        kafka_offset: int | None = None,
     ) -> AuditLog:
         """Convenience wrapper — callers name what happened, repo writes the row.
 
@@ -36,6 +39,10 @@ class AuditRepository(BaseRepository[AuditLog]):
         `user_id` is provided we default `principal_type='user'` and mirror
         the value into `principal_id`, so every row has a populated
         principal_type going forward.
+
+        Kafka coordinates: set only by the AuditConsumer for event.* rows —
+        they feed uq_audit_logs_kafka_coord so redelivery dedups. Inline
+        transactional writers leave them None (NULLs never collide).
         """
         if principal_type is None:
             principal_type = PRINCIPAL_TYPE_USER
@@ -53,6 +60,9 @@ class AuditRepository(BaseRepository[AuditLog]):
             request_id=request_id,
             ip_address=ip_address,
             extra_data=extra_data,
+            kafka_topic=kafka_topic,
+            kafka_partition=kafka_partition,
+            kafka_offset=kafka_offset,
         )
 
     async def list_logs(
