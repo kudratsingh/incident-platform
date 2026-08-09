@@ -86,6 +86,9 @@ services:
     # arrangement had app + mcp each run migrations on boot; concurrent
     # `CREATE TABLE` statements race on Postgres's `pg_type` uniqueness
     # and the loser 500s. Deterministic serialisation kills the race.
+    # The ECS path has no such one-shot — every task runs `alembic upgrade
+    # head` from scripts/entrypoint.sh — and is now serialized instead by
+    # the session-level advisory lock in app/core/migration_lock.py.
     build: .
     environment:
       # Superuser URL on purpose: migrations need DDL rights (the

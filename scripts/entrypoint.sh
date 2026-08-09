@@ -1,6 +1,8 @@
 #!/bin/sh
 # Run database migrations then start the application.
-# Alembic uses an advisory lock so concurrent task startups are safe.
+# Migrations are serialized by a session-level Postgres advisory lock taken
+# in backend/alembic/env.py (see app/core/migration_lock.py) — concurrent
+# task startups are safe.
 set -e
 
 # /app/backend is the Python root — both alembic (import app.models.*) and
