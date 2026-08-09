@@ -66,6 +66,27 @@ async def _check_chaos_kill(group_id: str) -> bool:
         return False
 
 
+async def _check_chaos_kill_strict(group_id: str) -> bool:
+    """Return True when a `chaos:kill:<group>` key exists in Redis, and RAISE
+    when the lookup itself fails.
+
+    Supervisor kill-window use: a lookup failure must read as still-killed,
+    not as cleared — the poll-loop variant above deliberately fails open,
+    this one deliberately does not. Treating an unknown kill state as
+    "cleared" resurrects the consumer in the middle of the very window the
+    chaos scenario is measuring.
+
+    Trade-off: if Redis stays down for the whole window, the consumer stays
+    down with it. Acceptable because the kill key carries a TTL — by the time
+    Redis answers again the key has usually expired, so the restart proceeds.
+    Import is deferred for the same reason as above."""
+    from app.core.redis import get_redis_client
+
+    client = get_redis_client()
+    val = await client.get(kill_key_for(group_id))
+    return val is not None
+
+
 async def _check_chaos_latency(group_id: str) -> int:
     """Return the sleep duration in milliseconds from the chaos latency
     key, or 0 when unset / on any error. Best-effort like the kill

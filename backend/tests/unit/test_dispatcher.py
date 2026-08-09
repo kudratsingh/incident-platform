@@ -379,3 +379,125 @@ async def test_dispatcher_consumer_semaphore_releases_on_run_failure() -> None:
 
     # Semaphore should be back at 1 — i.e. a fresh acquire returns immediately.
     assert consumer.semaphore.locked() is False
+
+
+# ---------------------------------------------------------------------------
+# Supervisor lifecycle (ADR 0009): boot-start retry + fail-closed kill window
+# ---------------------------------------------------------------------------
+
+
+class _FakeSupervisedConsumer:
+    """BaseKafkaConsumer stand-in with scripted start()/run() outcomes.
+
+    Exposes only the surface `_supervise_consumer` touches: group_id,
+    start/stop/run, is_running, chaos_killed.
+    """
+
+    def __init__(
+        self,
+        *,
+        start_failures: int = 0,
+        killed_runs: int = 0,
+        running: bool = False,
+    ) -> None:
+        self.group_id = "fake-group"
+        self.start_calls = 0
+        self.stop_calls = 0
+        self.run_calls = 0
+        self._start_failures = start_failures
+        self._killed_runs = killed_runs
+        self.is_running = running
+        self.chaos_killed = False
+
+    async def start(self) -> None:
+        self.start_calls += 1
+        if self.start_calls <= self._start_failures:
+            raise ConnectionError("kafka bootstrap unreachable")
+        self.is_running = True
+
+    async def stop(self) -> None:
+        self.stop_calls += 1
+        self.is_running = False
+
+    async def run(self) -> None:
+        self.run_calls += 1
+        # run() always returns "stopped" shaped — is_running False is what
+        # stop() would have left behind. chaos_killed is scripted so the
+        # supervisor takes the kill-window branch only on the first N runs.
+        self.is_running = False
+        self.chaos_killed = self.run_calls <= self._killed_runs
+
+
+class _FlakyRedis:
+    """Redis client whose GET raises for the first `failures` calls, then
+    reports the key as absent."""
+
+    def __init__(self, failures: int) -> None:
+        self.get_calls = 0
+        self._failures = failures
+
+    async def get(self, key: str) -> None:
+        self.get_calls += 1
+        if self.get_calls <= self._failures:
+            raise ConnectionError("redis saturated")
+        return None
+
+
+async def test_supervise_consumer_retries_failed_boot_start() -> None:
+    """A consumer whose start() fails at boot is retried, not dropped.
+
+    Supervision owns start(): worker_loop hands over an unstarted consumer,
+    so a transient Kafka/DNS error at boot must go through the same
+    stop()+start() backoff as a crash restart.
+    """
+    consumer = _FakeSupervisedConsumer(start_failures=1)
+
+    with patch("asyncio.sleep", new=AsyncMock()):
+        await dispatcher._supervise_consumer(consumer)
+
+    assert consumer.start_calls >= 2, "boot start failure was not retried"
+    assert consumer.run_calls >= 1, "run() never entered after the retried start"
+
+
+async def test_supervise_consumer_holds_consumer_down_on_kill_key_lookup_error() -> None:
+    """A Redis error during the chaos kill window must not read as 'cleared'.
+
+    Fail-open would restart the consumer after the very first failed lookup,
+    resurrecting it mid-kill-window and voiding the chaos scenario.
+    """
+    consumer = _FakeSupervisedConsumer(killed_runs=1, running=True)
+    flaky = _FlakyRedis(failures=2)
+    lookups_at_restart: list[int] = []
+
+    async def _record_restart(_consumer: object) -> None:
+        lookups_at_restart.append(flaky.get_calls)
+
+    with (
+        patch("app.core.redis.get_redis_client", return_value=flaky),
+        patch(
+            "app.workers.dispatcher._restart_consumer",
+            new=AsyncMock(side_effect=_record_restart),
+        ) as mock_restart,
+        patch("asyncio.sleep", new=AsyncMock()),
+    ):
+        await dispatcher._supervise_consumer(consumer)
+
+    assert mock_restart.await_count == 1
+    # Restart only after the 3rd lookup — the first two raised, and an
+    # unknown kill state must hold the consumer down.
+    assert lookups_at_restart == [3]
+
+
+async def test_supervise_consumer_does_not_resurrect_on_orderly_stop() -> None:
+    """run() returning with is_running False and no chaos kill ends supervision.
+
+    Guards the boot-start guard's placement: inside the while loop it would
+    restart every consumer during shutdown.
+    """
+    consumer = _FakeSupervisedConsumer(running=True)
+
+    with patch("asyncio.sleep", new=AsyncMock()):
+        await dispatcher._supervise_consumer(consumer)
+
+    assert consumer.run_calls == 1
+    assert consumer.start_calls == 0, "orderly stop resurrected the consumer"

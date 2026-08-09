@@ -47,7 +47,7 @@ from app.workers import (
 from app.workers.audit_consumer import AuditConsumer
 from app.workers.dependency_resolver import DependencyResolver
 from app.workers.event_log_consumer import EventLogConsumer
-from app.workers.kafka_consumer import BaseKafkaConsumer, _check_chaos_kill
+from app.workers.kafka_consumer import BaseKafkaConsumer, _check_chaos_kill_strict
 from app.workers.read_model import ReadModelProjector
 from app.workers.saga_coordinator import SagaCoordinator
 from app.workers.sse_consumer import SseConsumer
@@ -964,7 +964,8 @@ async def _restart_consumer(consumer: BaseKafkaConsumer) -> None:
 
 
 async def _supervise_consumer(consumer: BaseKafkaConsumer) -> None:
-    """Keep one consumer's run() loop alive across chaos kills and crashes.
+    """Own one consumer's whole lifecycle: the first start(), then run()
+    across chaos kills and crashes.
 
     Fills the gap three docstrings referenced but nothing implemented:
     `kill_consumer` makes run() exit and `restart_consumer_group` only
@@ -972,14 +973,27 @@ async def _supervise_consumer(consumer: BaseKafkaConsumer) -> None:
     stayed dead until the worker process restarted, so live remediation
     evals could never observe recovery.
 
+    Boot: the consumer arrives unstarted. Starting it here (through the same
+    backoff helper the crash path uses) means a transient Kafka/DNS error at
+    boot is retried instead of silently dropping that consumer group for the
+    life of the process. The guard sits BEFORE the loop on purpose — inside
+    it, an orderly stop() (which leaves is_running False) would resurrect the
+    consumer during shutdown.
+
     run() outcomes:
       * raises                 -> log, backoff, stop/start, re-enter.
-      * returns, chaos_killed  -> poll until the kill key clears
+      * returns, chaos_killed  -> poll until the kill key is observed absent
         (restart_consumer_group or TTL expiry), then stop/start for a
-        fresh AIOKafkaConsumer and re-enter run().
+        fresh AIOKafkaConsumer and re-enter run(). A failed lookup is NOT
+        an absent key: the consumer stays down until Redis answers.
       * returns otherwise      -> stop() was called (orderly shutdown) or
         run() swallowed a cancellation during teardown; supervision ends.
     """
+    if not consumer.is_running:
+        # Boot (or a start() that never took). stop() on a never-started
+        # consumer is a safe no-op, so this is exactly the crash path.
+        await _restart_consumer(consumer)
+
     while True:
         try:
             await consumer.run()
@@ -999,7 +1013,19 @@ async def _supervise_consumer(consumer: BaseKafkaConsumer) -> None:
                 "consumer killed by chaos; supervisor waiting for kill key",
                 extra={"group_id": consumer.group_id},
             )
-            while await _check_chaos_kill(consumer.group_id):
+            # Fail CLOSED: only an observed-absent key releases the consumer.
+            # A lookup error means "unknown", and unknown must not read as
+            # "cleared" — the chaos hook that killed this consumer can be the
+            # same one saturating Redis. One warning per 2s poll is the cost.
+            while True:
+                try:
+                    if not await _check_chaos_kill_strict(consumer.group_id):
+                        break
+                except Exception as exc:
+                    logger.warning(
+                        "kill-key lookup failed; holding consumer down",
+                        extra={"group_id": consumer.group_id, "error": str(exc)},
+                    )
                 await asyncio.sleep(_SUPERVISOR_POLL_SECONDS)
             await _restart_consumer(consumer)
             continue
@@ -1019,6 +1045,13 @@ async def worker_loop(
 ) -> None:
     """
     Start the Kafka consumers and the supporting background loops.
+
+    Every consumer is handed to `_supervise_consumer` UNSTARTED — the
+    supervisor owns start() (ADR 0009 amendment). worker_loop therefore never
+    drops a consumer group because its first start() hit a transient
+    Kafka/DNS error; the supervisor retries with capped backoff until it
+    sticks. The corollary is that a permanently unreachable broker leaves all
+    8 supervisors retrying rather than disabling the worker.
 
     Concurrent tasks that make up the worker — 8 Kafka consumers + 7 loops:
 
@@ -1066,27 +1099,10 @@ async def worker_loop(
         triage,
     ]
 
-    started: list[BaseKafkaConsumer] = []
-    for c in consumers:
-        try:
-            await c.start()
-            started.append(c)
-        except Exception as exc:
-            logger.error(
-                "kafka consumer failed to start",
-                extra={"group_id": c.group_id, "error": str(exc)},
-            )
-
-    if dispatcher not in started:
-        logger.error("dispatcher consumer not running — worker disabled")
-        for c in started:
-            await c.stop()
-        return
-
     logger.info(
-        "worker loop started", extra={"consumers": [c.group_id for c in started]}
+        "worker loop started", extra={"consumers": [c.group_id for c in consumers]}
     )
-    tasks = [asyncio.create_task(_supervise_consumer(c)) for c in started]
+    tasks = [asyncio.create_task(_supervise_consumer(c)) for c in consumers]
     tasks.extend(
         [
             asyncio.create_task(_promote_delayed_loop(session_factory, redis)),
@@ -1112,5 +1128,6 @@ async def worker_loop(
             await asyncio.gather(*dispatcher.in_flight, return_exceptions=True)
         raise
     finally:
-        for c in started:
+        # stop() is idempotent and safe on a consumer that never started.
+        for c in consumers:
             await c.stop()
