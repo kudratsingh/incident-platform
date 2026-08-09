@@ -50,13 +50,20 @@ services:
     depends_on:
       redpanda:
         condition: service_healthy
+    # Idempotent, and kept in step with incident-commander/demo/compose.yml's
+    # redpanda-init (the demo fixed this on 2026-08-08; the fix is mirrored
+    # back here). `rpk topic create` exits 1 on an existing topic, so the old
+    # `&&` chain hard-failed the whole one-shot on any bring-up where the
+    # topics already existed — which now matters, because app and mcp below
+    # wait on this service completing SUCCESSFULLY. TOPIC_ALREADY_EXISTS is
+    # success for our purposes. `|| true` does mask genuine broker failures
+    # at init time; that is deliberate — the consumers surface those loudly
+    # when they boot, rather than the stack half-starting behind a one-shot.
     entrypoint: >
       /bin/bash -c "
-        rpk topic create job.submitted --brokers=redpanda:9092 --partitions=6 --replicas=1 &&
-        rpk topic create job.progress  --brokers=redpanda:9092 --partitions=6 --replicas=1 &&
-        rpk topic create job.completed --brokers=redpanda:9092 --partitions=6 --replicas=1 &&
-        rpk topic create job.failed    --brokers=redpanda:9092 --partitions=6 --replicas=1 &&
-        rpk topic create job.dlq       --brokers=redpanda:9092 --partitions=6 --replicas=1
+        for t in job.submitted job.progress job.completed job.failed job.dlq; do
+          rpk topic create $$t --brokers=redpanda:9092 --partitions=6 --replicas=1 || true;
+        done
       "
 
   minio:
@@ -158,14 +165,23 @@ services:
         condition: service_healthy
       redpanda:
         condition: service_healthy
+      redpanda-init:
+        # Topics must exist before the consumer groups subscribe. This
+        # process hosts all 8 of them, and nothing depended on the one-shot
+        # until now — invisible on a warm stack, but redpanda has no volume,
+        # so on every cold bring-up the consumers could reach a broker with
+        # no topics on it. Mirrors the `migrate` pattern below, and the
+        # equivalent edge in incident-commander/demo/compose.yml.
+        condition: service_completed_successfully
       migrate:
         condition: service_completed_successfully
     volumes:
       - ./backend:/app/backend
-      # scripts/ isn't in the Dockerfile COPY list (only entrypoint.sh
-      # is), so operator scripts like seed_incident_commander.py aren't
-      # baked into the image. Mount the whole directory so
-      # `docker compose exec app python scripts/<name>.py` just works.
+      # scripts/ IS baked into the image — Dockerfile does
+      # `COPY scripts/ ./scripts/` — so `docker compose exec app python
+      # scripts/<name>.py` works with or without this mount. The bind mount
+      # stays so local edits to the seed/ops scripts take effect without an
+      # image rebuild.
       - ./scripts:/app/scripts
       # services/runbooks.py resolves /app/runbooks at import (E2-03).
       # Mount the source dir so the dev stack sees it and --reload picks
@@ -218,6 +234,14 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      redpanda:
+        # poison_message opens a direct Kafka connection (see the
+        # KAFKA_BOOTSTRAP_SERVERS comment above), so mcp needs the broker up
+        # and the topics created just as much as app does. It depended on
+        # neither until now.
+        condition: service_healthy
+      redpanda-init:
+        condition: service_completed_successfully
       migrate:
         condition: service_completed_successfully
     volumes:
