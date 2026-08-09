@@ -131,3 +131,26 @@ So the operative constraint is now: **do not cut a tag before the rerun.** Taggi
 **Per-scenario tenant isolation** instead of an empty DLQ baseline (commander ADR 0010's option 3). The clean-room answer, and multi-tenancy could support it — but it multiplies seed time per scenario and complicates the service-account story (scope per tenant per scenario) to solve a problem the empty baseline already solves for the only shared surface that has actually bitten. Revisit if traces or deploy history start contaminating scenarios the same way.
 
 **Keep the fixture pool, document it as expected furniture.** Rejected: it asks the agent to learn which populated DLQ is real and which is scenery. That is not a skill worth training, and it is not a distinction an on-call SRE would ever have to make.
+
+## Amendment (2026-08-09) — reset disposal vs audit ground truth: `resource_id` is the durable join key
+
+Rule 2's disposal decision ("declared scaffolding is **deleted** on reset, not cancelled") is unchanged and stands. This amendment records the consequence it has for the audit log, which was previously implicit, plus the contract that consequence forces on anything grading against audit rows.
+
+**What the DELETEs do to `audit_logs`.** `reset_eval_state.py` hard-DELETEs jobs (`_delete_seeded_dlq_fixtures`) and chaos-owner users together with their jobs (`_delete_chaos_owner_users`). `audit_logs.job_id` and `audit_logs.user_id` are FKs declared `ON DELETE SET NULL` (`app/models/audit.py`), so **every audit row referencing deleted scaffolding has those two columns nulled on every reset.** That is by design and stays: the alternative — `ON DELETE CASCADE` — would destroy audit rows outright, and audit is ground truth (commander invariant 6). `job_triages` rows do CASCADE-delete with their job (`app/models/triage.py`); recorded here as a decision rather than an accident, on the same reasoning as the disposal rule itself — a triage row about a seeded fixture is scaffolding's scaffolding, never a real user's history.
+
+**What the reset never does.** It does not write, update or delete a single `audit_logs` row. No statement in the script names the table; `backend/tests/unit/test_eval_reset.py::test_reset_sql_never_names_audit_logs` parses the module's `text()` literals and fails if one ever does. The DB layer backs this up independently for the runtime role: migration `b8e4a1c92f35` revokes UPDATE/DELETE on `audit_logs` from `incident_app` ([ADR 0015](0015-force-rls-and-nonowner-app-role.md)), while the FK's SET NULL still fires because referential actions run with the referencing table owner's privileges.
+
+**The contract.** The durable identity of a deleted job or user, as seen from the audit log, is:
+
+- **`audit_logs.resource_id`** — a `String(255)`, written as `str(job.id)` by every Tier-1 audit writer (`replay_dlq_by_ids.py`, `replay_dlq_by_category.py`, `mark_dlq_permanent.py`, and the seed script). It is not a foreign key, so nothing nulls it.
+- **`audit_logs.extra_data`** — the JSON side-car carrying the action's before/after detail.
+
+Both survive the reset byte-identical. **Any audit-based grading, trajectory analysis or forensic query must join on `resource_id`, never on `job_id` / `user_id`.** A grader joining on `job_id` silently undercounts — it does not error, it just stops seeing the rows whose subject the reset disposed of, and the undercount grows with every campaign.
+
+This is the same shape the machine-principal identity already uses: `principal_id` is a plain unconstrained UUID precisely so a deleted principal neither cascades nor blocks audit reads ([ADR 0007](0007-machine-principal-scope-model.md)). The rejected fix here was to give `job_id` that treatment too — dropping the FK "to preserve the value". Rejected: it rewrites migration history and the read paths of a convenience column to duplicate an identity `resource_id` already carries.
+
+Also rejected, explicitly: replacing the DELETEs with status flips or a shadow-table archive so the FKs survive. That contradicts rule 2's accepted disposal decision, and an accepted ADR is not silently contradicted by a patch. If the disposal rule should change, that is a revision of this ADR, argued on its own merits.
+
+**Enforcement.** `backend/tests/integration/test_eval_reset_postgres.py::test_delete_chaos_owner_users_nulls_audit_fks_but_keeps_resource_id` asserts all three halves on real Postgres (SQLite's FK enforcement is PRAGMA-dependent, so the unit harness cannot): the audit row survives, `job_id` / `user_id` are NULL, and `resource_id` still equals the deleted job's UUID string. Asserting the NULLs — rather than ignoring them — is deliberate: a future migration flipping either FK to CASCADE would delete the audit row and fail that test loudly.
+
+**Cross-repo follow-up (not actioned here).** The commander side must be checked against this contract: any grader or trajectory analysis joining audit rows on `job_id` needs to move to `resource_id`. That is a commander PR; this ADR only makes the platform-side guarantee explicit enough to hold it to.
