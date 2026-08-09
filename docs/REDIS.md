@@ -18,9 +18,24 @@ For the broader architectural context, see [`docs/ARCHITECTURE.md`](ARCHITECTURE
 | `jobs:tenant:{tenant_id}:status:{status}` | set of job_ids | `read_model.py` `_move` | `admin.py` `system_stats` via `read_global_stats` | None | No — read model goes stale |
 | `jobs:user:{user_id}:status:{status}` | set of job_ids | `read_model.py` `_move` | `admin.py` `user_stats` via `read_user_stats` | None | No — read model goes stale |
 | `cache:job:{job_id}` | JSON string | `cache.py` `JobCache.put` | `cache.py` `JobCache.get` | 300s | Yes — cache miss = DB read |
-| `kafka:consumer_lag:dispatcher` | string (int) | `dispatcher.py` `_metrics_loop` | `backpressure.py` `check_backpressure` | 90s | Yes — falls back to "no backpressure" |
+| `kafka:consumer_lag:worker-dispatcher` | string (int) | `dispatcher.py` `_metrics_loop` | `backpressure.py` `check_backpressure` | 90s | Yes — falls back to "no backpressure" |
 | `priority_queue` (sorted set) | sorted set of job_ids by priority score | `queue.py` `push` | `queue.py` `pop` | None | Critical — see below |
 | `delayed_queue` (sorted set) | sorted set of job_ids by ready-at timestamp | `queue.py` `push_delayed` | `queue.py` `pop_ready_delayed` | None | Critical — see below |
+
+### Agent-era keys (chaos, Tier-1 action residue, eval fixtures)
+
+These namespaces are written by the incident-commander MCP tools and the eval tooling, not by the platform's own request/worker paths. The `chaos:*` tools are registered only when `CHAOS_ENABLED=true` (ADR 0008); the rows marked **eval-only** are seeded by `scripts/seed_eval_fixtures.py` and never appear outside an eval stack. `scripts/reset_eval_state.py` clears residue between scenarios: a `chaos:*` scan-and-delete, the `jobs:dlq_replay_delayed` ZSET, every `dag:paused:*` flag, and a re-seed of the fixture keys.
+
+| Key pattern | Type | Writer | Reader | TTL | Eviction-safe? | Cleared by eval reset? |
+|---|---|---|---|---|---|---|
+| `chaos:kill:{group}` | string flag | `kill_consumer` chaos tool (`kill_key_for`) | `kafka_consumer.py` `_check_chaos_kill` — top of every poll; consumer shuts down while set | `ttl_seconds` (default 300s) | Yes — chaos ends early | Yes (`chaos:*` scan) |
+| `chaos:latency:{group}` | string (ms) | `inject_latency` chaos tool (`latency_key_for`) | `kafka_consumer.py` `_check_chaos_latency` — sleep before each poll | `ttl_seconds` (default 300s) | Yes — chaos ends early | Yes (`chaos:*` scan) |
+| `chaos:bad_deploy` | string (label) | `bad_deploy` chaos tool (`BAD_DEPLOY_KEY`) | Nothing yet — the fired `critical` alert is the observable signal | `ttl_seconds` (default 600s) | Yes | Yes (`chaos:*` scan) |
+| `chaos:sat:{run_id}:{i}` | string (filler) | `saturate_redis` chaos tool (default 1000 keys × 1 KiB) | Nobody — exists purely for memory pressure | `ttl_seconds` (default 60s) | Yes — eviction is the point | Yes (`chaos:*` scan; usually already expired) |
+| `dag:paused:{root_job_id}` | string flag | `pause_dag` action tool (`pause_key_for` in `app/utils/dag_pause.py`) | `DependencyResolver` promotion check — holds WAITING descendants (ADR 0011); reported by `get_dag_state` | `ttl_seconds` (default 600s) | Yes — pause fails open, DAG resumes | Yes (`dag:paused:*` scan) |
+| `jobs:dlq_replay_delayed` | sorted set of job_ids by fire-at time | `replay_dlq_by_ids` / `replay_dlq_by_category` (`delay_seconds` path) | `dlq_replay_scheduler.py` via the worker's `_promote_dlq_replay_loop` | None | No — pending delayed replays disappear silently | Yes (ZSET deleted) |
+| `cache:jobs:worker-dispatcher:hot_set` (**eval-only**) | JSON array of seeded DLQ job ids | `seed_eval_fixtures.py` `_seed_hot_set`; also the `create_stale_cache` chaos tool | The stale-cache scenario observes it, then deletes it via `invalidate_cache_key` | 24h (seed) / `ttl_seconds` default 600s (tool) | Yes — re-seeded | Re-populated by reset |
+| `kafka:consumer_lag:{group}` (**eval-only** except `worker-dispatcher`) | string (int) | Metrics loop writes only `worker-dispatcher` (row above); `seed_eval_fixtures.py` writes the 7 synthetic groups (`billing-consumer` … `healthy-consumer`) | `get_consumer_lag` MCP tool (any group); `check_backpressure` reads only `worker-dispatcher` | 24h on seeded groups (90s on the real one) | Yes | Re-seeded by reset |
 
 ---
 
@@ -70,7 +85,7 @@ The tenant scoping landed in Phase 12 PR D — before that, the sets were keyed 
 
 Read-through cache for `GET /jobs/{id}` and `GET /admin/jobs/{id}`. JSON serialization of the `JobResponse` schema. TTL 300s. Cache invalidated explicitly on replay (`JobCache.delete`) so admins re-hitting after a Replay see the fresh state immediately.
 
-### Consumer lag (`kafka:consumer_lag:dispatcher`)
+### Consumer lag (`kafka:consumer_lag:worker-dispatcher`)
 
 The metrics loop calls `dispatcher.consumer_lag()` every 60 seconds and writes the result here with TTL 90 (so the key is always fresh-or-missing, never stale).
 
@@ -122,7 +137,7 @@ docker compose exec redis redis-cli
 > SCAN 0 MATCH 'jobs:tenant:*' COUNT 100  # do this in prod
 > SMEMBERS jobs:tenant:<tid>:status:completed
 > ZRANGEBYSCORE delayed_queue 0 +inf WITHSCORES
-> GET kafka:consumer_lag:dispatcher
+> GET kafka:consumer_lag:worker-dispatcher
 ```
 
 ### Rebuild the read-model
