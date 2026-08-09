@@ -5,7 +5,30 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from app.services.triage import TriageAnalysis, TriageDisabledError
+
+# The producer contract, imported rather than re-typed: this is the exact key
+# set both `job.dlq` outbox payloads in `dispatcher._run_job` write. Importing
+# it (instead of hand-rolling a fixture, which is how E1-14 hid) means a
+# producer that drops a key fails the tests below instead of silently zeroing
+# every triage's context.
+from app.workers.dispatcher import DLQ_EVENT_KEYS as PRODUCER_DLQ_KEYS
 from app.workers.triage_consumer import LlmTriageConsumer
+
+# Every key `LlmTriageConsumer.handle_message` reads off the event value.
+CONSUMER_READ_KEYS = frozenset(
+    {
+        "event",
+        "dead_lettered",
+        "tenant_id",
+        "job_id",
+        "job_type",
+        "error",
+        "retry_count",
+        "max_retries",
+        "payload",
+        "trace_id",
+    }
+)
 
 
 def _factory() -> MagicMock:
@@ -20,6 +43,7 @@ def _factory() -> MagicMock:
 
 
 def _dlq_value(**overrides: object) -> dict[str, object]:
+    """A `job.dlq` event value shaped exactly like the dispatcher's."""
     base: dict[str, object] = {
         "event": "job.failed",
         "dead_lettered": True,
@@ -28,12 +52,30 @@ def _dlq_value(**overrides: object) -> dict[str, object]:
         "user_id": str(uuid.uuid4()),
         "job_type": "csv_upload",
         "error": "timeout calling upstream",
+        "message": "Job exhausted after 3 attempts: timeout calling upstream",
         "retry_count": 3,
         "max_retries": 3,
+        "payload": {"file": "x.csv"},
         "trace_id": "trace-abc",
     }
     base.update(overrides)
     return base
+
+
+def test_dlq_fixture_mirrors_the_producer() -> None:
+    """E1-14's root enabler: this fixture used to invent fields the producer
+    never sent, so the consumer's triage context looked fine in tests and was
+    empty in production. Pin the fixture to the producer's key set."""
+    assert set(_dlq_value()) == set(PRODUCER_DLQ_KEYS)
+
+
+def test_producer_covers_every_key_the_consumer_reads() -> None:
+    """Drift detector: `dispatcher`'s DLQ payloads must remain a superset of
+    what `LlmTriageConsumer.handle_message` reads. A key the consumer reads
+    but the producer never writes silently degrades triage (max_retries
+    defaults to 0, payload/trace_id to None) instead of failing loudly."""
+    missing = CONSUMER_READ_KEYS - set(PRODUCER_DLQ_KEYS)
+    assert not missing, f"triage reads keys the dispatcher never writes: {sorted(missing)}"
 
 
 async def test_skips_when_triage_disabled() -> None:

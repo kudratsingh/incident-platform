@@ -8,6 +8,10 @@ from app.models.enums import JobStatus, JobType
 from app.models.job import Job
 from app.workers import dispatcher
 
+# A well-formed W3C traceparent, so `extract_context` gets something real to
+# parse when a test exercises the carrier-popping path.
+_TRACEPARENT = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+
 
 def _make_job(**kwargs: object) -> MagicMock:
     defaults: dict[str, object] = {
@@ -128,16 +132,23 @@ async def test_run_job_retries_on_failure() -> None:
 
 
 async def test_run_job_dead_letters_after_exhaustion() -> None:
-    job = _make_job(type=JobType.BULK_API_SYNC, retry_count=2, max_retries=3)
+    job = _make_job(
+        type=JobType.BULK_API_SYNC,
+        retry_count=2,
+        max_retries=3,
+        payload={"file": "x.csv", "__traceparent": {"traceparent": _TRACEPARENT}},
+        trace_id="trace-exhausted",
+    )
     factory, job_repo, audit_repo = _make_session_factory(job)
     redis = AsyncMock()
 
+    outbox_mock = AsyncMock()
     processor = AsyncMock(side_effect=RuntimeError("boom"))
     with patch("app.workers.dispatcher.JobRepository", return_value=job_repo), \
          patch("app.workers.dispatcher.AuditRepository", return_value=audit_repo), \
          patch(
              "app.workers.dispatcher.OutboxRepository",
-             new=MagicMock(return_value=AsyncMock()),
+             new=MagicMock(return_value=outbox_mock),
          ), \
          patch.dict(dispatcher._PROCESSORS, {JobType.BULK_API_SYNC: processor}), \
          patch("app.workers.dispatcher.queue.push_delayed", new=AsyncMock()) as mock_delay:
@@ -146,6 +157,17 @@ async def test_run_job_dead_letters_after_exhaustion() -> None:
     mock_delay.assert_not_awaited()
     calls = [c.args[1] for c in job_repo.update_status.call_args_list]
     assert JobStatus.DEAD_LETTER in calls
+
+    # E1-14: the DLQ event has to carry the triage context the LLM triage
+    # consumer reads. Without it every triage ran with max_retries=0,
+    # payload=None and trace_id=None — "retry 3 of 0" with no evidence.
+    dlq_payload = outbox_mock.add.await_args.kwargs["payload"]
+    assert {"max_retries", "payload", "trace_id"}.issubset(dlq_payload.keys())
+    assert dlq_payload["max_retries"] == job.max_retries
+    assert dlq_payload["trace_id"] == "trace-exhausted"
+    # The OTel carrier is popped before execution and must not ride along.
+    assert dlq_payload["payload"] == {"file": "x.csv"}
+    assert set(dlq_payload) == dispatcher.DLQ_EVENT_KEYS
 
 
 async def test_run_job_llm_policy_forces_dead_letter_before_exhaustion() -> None:
@@ -239,7 +261,13 @@ async def test_run_job_dead_letters_compensation_when_no_processor() -> None:
     outbox_ctor = MagicMock(return_value=outbox_mock)
 
     # `type` is the compensate string, not a JobType member.
-    job = _make_job(type="csv_upload.compensate", retry_count=0, max_retries=3)
+    job = _make_job(
+        type="csv_upload.compensate",
+        retry_count=0,
+        max_retries=3,
+        payload={"parent_job_id": "abc"},
+        trace_id="trace-compensate",
+    )
     factory, job_repo, audit_repo = _make_session_factory(job)
     redis = AsyncMock()
 
@@ -262,10 +290,35 @@ async def test_run_job_dead_letters_compensation_when_no_processor() -> None:
     assert outbox_payload["dead_lettered"] is True
     assert outbox_payload["job_type"] == "csv_upload.compensate"
 
+    # E1-14: the unregistered-type branch is a DLQ producer too, so it owes
+    # triage the same context as the exhaustion branch.
+    assert {"max_retries", "payload", "trace_id"}.issubset(outbox_payload.keys())
+    assert outbox_payload["max_retries"] == job.max_retries
+    assert outbox_payload["payload"] == {"parent_job_id": "abc"}
+    assert outbox_payload["trace_id"] == "trace-compensate"
+    assert set(outbox_payload) == dispatcher.DLQ_EVENT_KEYS
+
     # And an audit row was written so the incident is visible in /audit/logs.
     audit_repo.log.assert_awaited()
     action = audit_repo.log.await_args.args[0]
     assert action == "job.dead_letter"
+
+
+def test_payload_for_event_passes_small_payloads_through() -> None:
+    payload = {"file": "x.csv", "rows": 10}
+    assert dispatcher._payload_for_event(payload) == payload
+
+
+def test_payload_for_event_truncates_oversized_payloads() -> None:
+    """The DLQ event fans out to four consumer groups and is appended to
+    `job_events`, so a user-controlled payload can't ride along unbounded."""
+    payload = {"blob": "x" * (dispatcher.DLQ_PAYLOAD_MAX_BYTES * 2)}
+    result = dispatcher._payload_for_event(payload)
+
+    assert result is not None
+    assert result["_truncated"] is True
+    assert result["_original_bytes"] > dispatcher.DLQ_PAYLOAD_MAX_BYTES
+    assert "blob" not in result
 
 
 async def test_run_job_dead_letters_when_type_string_is_junk() -> None:

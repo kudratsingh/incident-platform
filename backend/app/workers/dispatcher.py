@@ -21,6 +21,7 @@ Concurrency model selection (this is the core design decision):
 """
 
 import asyncio
+import json
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -93,6 +94,57 @@ _PROCESSORS = {
     JobType.REPORT_GEN: cpu_processors.process_report_gen,
 }
 
+# Ceiling on the serialized job payload copied onto a `job.dlq` event.
+# Job payloads are numerically bounded at the creation surfaces but can still
+# carry arbitrary user keys up to the request size limit, and this event fans
+# out to four consumer groups *and* is appended verbatim to `job_events` by
+# the event-log consumer. Anything larger is replaced by a marker so triage
+# still learns the payload existed without bloating every downstream row.
+DLQ_PAYLOAD_MAX_BYTES = 4096
+
+# The exact key set every `job.dlq` outbox payload below carries. It is the
+# producer half of a contract whose consumer half is
+# `LlmTriageConsumer.handle_message` (plus the saga coordinator and the event
+# log); `tests/unit/test_triage_consumer.py` asserts this stays a superset of
+# what triage reads, because a key triage reads and the producer never writes
+# degrades silently (max_retries → 0, payload/trace_id → None) instead of
+# failing. Keep it in step with both dlq payload dicts in `_run_job`.
+DLQ_EVENT_KEYS: frozenset[str] = frozenset(
+    {
+        "event",
+        "tenant_id",
+        "job_id",
+        "user_id",
+        "job_type",
+        "error",
+        "message",
+        "retry_count",
+        "max_retries",
+        "payload",
+        "trace_id",
+        "dead_lettered",
+    }
+)
+
+
+def _payload_for_event(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """Bounded copy of a job payload for embedding in a `job.dlq` event.
+
+    Returns the payload unchanged when it serializes to at most
+    `DLQ_PAYLOAD_MAX_BYTES`, a `{"_truncated": True, "_original_bytes": n}`
+    marker when it doesn't, and `None` when it can't be serialized at all
+    (a payload that would break the outbox row must not take the DLQ event
+    down with it — triage degrades to "no payload", which is the pre-fix
+    behaviour and strictly better than losing the event).
+    """
+    try:
+        size = len(json.dumps(payload).encode("utf-8"))
+    except (TypeError, ValueError):
+        return None
+    if size <= DLQ_PAYLOAD_MAX_BYTES:
+        return payload
+    return {"_truncated": True, "_original_bytes": size}
+
 
 async def _run_job(
     job_id_str: str,
@@ -132,6 +184,11 @@ async def _run_job(
             retry_count = job.retry_count
             max_retries = job.max_retries
             prior_error = job.error_message  # filled when this is a retry
+            # The raw column, not `trace_id_var`: that var falls back to the
+            # job id when the column is NULL, and a job id masquerading as a
+            # trace id sends triage (and anyone following the link) to a
+            # trace that doesn't exist.
+            job_trace_id = job.trace_id
 
             # E1-04: the status check above is only a cheap pre-filter (and
             # a distinct log line) — under at-least-once delivery a second
@@ -226,6 +283,12 @@ async def _run_job(
                         "error": error,
                         "message": error,
                         "retry_count": retry_count,
+                        # Triage context (E1-14). `payload` already has the
+                        # OTel carrier popped, so no tracing plumbing leaks
+                        # into the event or the job_events row.
+                        "max_retries": max_retries,
+                        "payload": _payload_for_event(payload),
+                        "trace_id": job_trace_id,
                         "dead_lettered": True,
                     },
                 )
@@ -380,6 +443,11 @@ async def _run_job(
                                 "error": str(exc),
                                 "message": dlq_message,
                                 "retry_count": new_retry_count,
+                                # Triage context (E1-14) — see the
+                                # unregistered-type branch above.
+                                "max_retries": max_retries,
+                                "payload": _payload_for_event(payload),
+                                "trace_id": job_trace_id,
                                 "dead_lettered": True,
                             },
                         )
