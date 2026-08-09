@@ -9,33 +9,57 @@ import type { JobType, SagaStepRequest } from '../types'
 
 const JOB_TYPES: JobType[] = ['csv_upload', 'bulk_api_sync', 'doc_analysis', 'report_gen']
 
+/**
+ * A step as the form holds it. The payload stays RAW TEXT while the user
+ * types — parsing on every keystroke would reject every intermediate state of
+ * hand-typed JSON and snap the controlled textarea back to the last valid
+ * value. It is parsed once, at submit, into the `SagaStepRequest` wire shape.
+ */
+interface StepDraft {
+  type: JobType
+  payloadText: string
+}
+
+const EMPTY_STEP: StepDraft = { type: 'csv_upload', payloadText: '{}' }
+
 export default function SagaNewPage() {
   const navigate = useNavigate()
   const toast = useToast()
   const [name, setName] = useState('')
-  const [steps, setSteps] = useState<SagaStepRequest[]>([
-    { type: 'csv_upload', payload: {} },
-  ])
+  const [steps, setSteps] = useState<StepDraft[]>([EMPTY_STEP])
+  const [error, setError] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
 
   function addStep() {
-    setSteps((s) => [...s, { type: 'csv_upload', payload: {} }])
+    setSteps((s) => [...s, EMPTY_STEP])
   }
 
   function removeStep(i: number) {
     setSteps((s) => s.filter((_, idx) => idx !== i))
   }
 
-  function updateStep(i: number, patch: Partial<SagaStepRequest>) {
+  function updateStep(i: number, patch: Partial<StepDraft>) {
     setSteps((s) => s.map((st, idx) => (idx === i ? { ...st, ...patch } : st)))
   }
 
   async function submit(e: React.FormEvent) {
     e.preventDefault()
+    setError(null)
     if (!name.trim() || steps.length === 0) return
+
+    const payloadSteps: SagaStepRequest[] = []
+    for (const [i, step] of steps.entries()) {
+      try {
+        payloadSteps.push({ type: step.type, payload: JSON.parse(step.payloadText) })
+      } catch {
+        setError(`Step ${i + 1} payload must be valid JSON`)
+        return
+      }
+    }
+
     setSubmitting(true)
     try {
-      const saga = await sagasApi.create({ name: name.trim(), steps })
+      const saga = await sagasApi.create({ name: name.trim(), steps: payloadSteps })
       toast.success(`Saga "${saga.name}" created`)
       navigate(`/sagas/${saga.id}`)
     } catch (err) {
@@ -108,14 +132,8 @@ export default function SagaNewPage() {
                       ))}
                     </select>
                     <textarea
-                      value={JSON.stringify(step.payload ?? {}, null, 2)}
-                      onChange={(e) => {
-                        try {
-                          updateStep(i, { payload: JSON.parse(e.target.value) })
-                        } catch {
-                          /* swallow until user finishes typing */
-                        }
-                      }}
+                      value={step.payloadText}
+                      onChange={(e) => updateStep(i, { payloadText: e.target.value })}
                       rows={3}
                       placeholder='{"file": "data.csv"}'
                       className="w-full bg-gray-800/60 border border-gray-700/50 rounded px-3 py-1.5 text-xs text-gray-200 placeholder-gray-600 focus:outline-none focus:border-blue-500/50 font-mono"
@@ -135,6 +153,8 @@ export default function SagaNewPage() {
               ))}
             </div>
           </div>
+
+          {error && <p className="text-sm text-red-400">{error}</p>}
 
           <div className="flex gap-2">
             <button
