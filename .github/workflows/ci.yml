@@ -12,9 +12,9 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "20"
           cache: npm
@@ -41,9 +41,9 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
           cache: pip
@@ -93,9 +93,9 @@ jobs:
       ENVIRONMENT: test
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
           cache: pip
@@ -111,9 +111,9 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
         with:
           terraform_version: "1.9.x"
           # No wrapper — the chaos-gate step below inspects terraform's own
@@ -164,6 +164,57 @@ jobs:
           fi
           echo "Chaos gate verified: chaos_enabled=true is refused when environment=production."
 
+  workflows:
+    name: Workflow lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # actionlint checks every workflow under .github/workflows/ — YAML
+      # syntax, expression types, and shellcheck on run: scripts. Both the
+      # download script (pinned by commit, like the actions above) and the
+      # binary version are fixed, so runs are reproducible.
+      - name: actionlint
+        run: |
+          set -euo pipefail
+          bash <(curl -fsSL "https://raw.githubusercontent.com/rhysd/actionlint/914e7df21a07ef503a81201c76d2b11c789d3fca/scripts/download-actionlint.bash") 1.7.12
+          ./actionlint -color
+
+      # Regression guard for the release.yml injection fix: workflow_dispatch
+      # inputs may reach a script only via env (e.g. INPUT_VERSION), never by
+      # expression interpolation inside a run: body. actionlint does not treat
+      # dispatch inputs as untrusted, so this is asserted explicitly.
+      - name: Forbid dispatch-input interpolation in run scripts
+        run: |
+          python3 - <<'EOF'
+          import glob
+          import re
+          import sys
+
+          import yaml
+
+          PATTERN = re.compile(r"github\.event\.inputs|\$\{\{\s*inputs\.")
+          bad = []
+          for path in sorted(glob.glob(".github/workflows/*.yml")):
+              with open(path) as fh:
+                  doc = yaml.safe_load(fh)
+              for job_id, job in (doc.get("jobs") or {}).items():
+                  for idx, step in enumerate(job.get("steps") or [], start=1):
+                      run = step.get("run")
+                      if isinstance(run, str) and PATTERN.search(run):
+                          name = step.get("name", f"step {idx}")
+                          bad.append(
+                              f"{path}: job '{job_id}', step '{name}': "
+                              "workflow_dispatch input interpolated inside "
+                              "run: — pass it via env instead"
+                          )
+          if bad:
+              print("\n".join(bad))
+              sys.exit(1)
+          print("OK: no run: script interpolates workflow_dispatch inputs.")
+          EOF
+
   deploy:
     name: Build & Deploy to ECS
     runs-on: ubuntu-latest
@@ -187,10 +238,10 @@ jobs:
       IMAGE_TAG: sha-${{ github.sha }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -198,36 +249,36 @@ jobs:
 
       - name: Login to Amazon ECR
         id: ecr-login
-        uses: aws-actions/amazon-ecr-login@v2
+        uses: aws-actions/amazon-ecr-login@d539f0932e70871a027e9d5a9d8fc38589180a64 # v2.1.6
 
       - name: Set ECR registry
-        run: echo "ECR_REGISTRY=${{ steps.ecr-login.outputs.registry }}" >> $GITHUB_ENV
+        run: echo "ECR_REGISTRY=${{ steps.ecr-login.outputs.registry }}" >> "$GITHUB_ENV"
 
       # ── Build & push backend ────────────────────────────────────────────────
       - name: Build backend image
         run: |
           docker build \
-            -t $ECR_REGISTRY/incident-platform/backend:$IMAGE_TAG \
-            -t $ECR_REGISTRY/incident-platform/backend:latest \
+            -t "$ECR_REGISTRY/incident-platform/backend:$IMAGE_TAG" \
+            -t "$ECR_REGISTRY/incident-platform/backend:latest" \
             .
 
       - name: Push backend image
         run: |
-          docker push $ECR_REGISTRY/incident-platform/backend:$IMAGE_TAG
-          docker push $ECR_REGISTRY/incident-platform/backend:latest
+          docker push "$ECR_REGISTRY/incident-platform/backend:$IMAGE_TAG"
+          docker push "$ECR_REGISTRY/incident-platform/backend:latest"
 
       # ── Build & push frontend ───────────────────────────────────────────────
       - name: Build frontend image
         run: |
           docker build \
-            -t $ECR_REGISTRY/incident-platform/frontend:$IMAGE_TAG \
-            -t $ECR_REGISTRY/incident-platform/frontend:latest \
+            -t "$ECR_REGISTRY/incident-platform/frontend:$IMAGE_TAG" \
+            -t "$ECR_REGISTRY/incident-platform/frontend:latest" \
             ./frontend
 
       - name: Push frontend image
         run: |
-          docker push $ECR_REGISTRY/incident-platform/frontend:$IMAGE_TAG
-          docker push $ECR_REGISTRY/incident-platform/frontend:latest
+          docker push "$ECR_REGISTRY/incident-platform/frontend:$IMAGE_TAG"
+          docker push "$ECR_REGISTRY/incident-platform/frontend:latest"
 
       # ── Deploy backend ──────────────────────────────────────────────────────
       - name: Download backend task definition
@@ -239,14 +290,14 @@ jobs:
 
       - name: Update backend image in task definition
         id: backend-task-def
-        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        uses: aws-actions/amazon-ecs-render-task-definition@138c24f321fdbdf7edee4a685519d253cae2cdea # v1.9.0
         with:
           task-definition: backend-task-def.json
           container-name: backend
           image: ${{ env.ECR_REGISTRY }}/incident-platform/backend:${{ env.IMAGE_TAG }}
 
       - name: Deploy backend to ECS
-        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        uses: aws-actions/amazon-ecs-deploy-task-definition@c465972ecbd160473f22e683363b422a5412a3de # v2.6.3
         with:
           task-definition: ${{ steps.backend-task-def.outputs.task-definition }}
           service: incident-platform-backend
@@ -263,14 +314,14 @@ jobs:
 
       - name: Update frontend image in task definition
         id: frontend-task-def
-        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        uses: aws-actions/amazon-ecs-render-task-definition@138c24f321fdbdf7edee4a685519d253cae2cdea # v1.9.0
         with:
           task-definition: frontend-task-def.json
           container-name: frontend
           image: ${{ env.ECR_REGISTRY }}/incident-platform/frontend:${{ env.IMAGE_TAG }}
 
       - name: Deploy frontend to ECS
-        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        uses: aws-actions/amazon-ecs-deploy-task-definition@c465972ecbd160473f22e683363b422a5412a3de # v2.6.3
         with:
           task-definition: ${{ steps.frontend-task-def.outputs.task-definition }}
           service: incident-platform-frontend
