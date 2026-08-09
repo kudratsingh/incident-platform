@@ -73,6 +73,12 @@ The rule-2 implementation merged to `master` ahead of the deferral being recorde
 
 So the operative constraint is now: **do not cut a tag before the rerun.** Tagging would build an image containing the new tool, and the commander's pin bump would drag in the contract change the deferral exists to avoid. Merging was never the risk; releasing is.
 
+> **Superseded (2026-08-08).** This operative constraint — and only it — is replaced by
+> [ADR 0013](0013-release-before-rerun.md): the 2026-08 fix campaign ships **fixes → new version →
+> re-pin → eval**, with the 26→27 tool drift consumed as the planned, ledgered diff of a single
+> end-of-campaign rebless. Rules 1 and 2 of this ADR, and rule 2's deferred baseline flip, stand
+> unchanged.
+
 ## Consequences
 
 **Positive.** Investigation quality becomes attributable to the agent rather than to ambient state. DLQ scenario expectations become exact — declared rows in, graded outcomes against those rows — instead of calibrated against a pool that drifts as scenarios replay and mark rows.
