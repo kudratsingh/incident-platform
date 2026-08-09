@@ -147,7 +147,7 @@ Cycle-free by construction: dependencies can only reference existing jobs, which
 
 A saga is a container; the actual steps live in `jobs` with `saga_id` set. Step ordering is encoded via `job_dependencies` — step N depends on step N-1.
 
-`SagaCoordinator` consumer marks the saga complete when all steps are completed, or kicks off compensation (`{type}.compensate` jobs in reverse order) when any step dead-letters.
+`SagaCoordinator` consumer marks the saga complete when all steps are completed, or kicks off compensation when any step dead-letters. Compensation steps are real `jobs` rows in the same saga (`type = {type}.compensate`, created in reverse order), so they appear in the saga's step list. When every compensation step is terminal the saga settles to `compensated` (all completed) or `failed` (any dead-lettered/cancelled) — see ADR 0017.
 
 ---
 
