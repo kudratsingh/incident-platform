@@ -35,6 +35,13 @@ async def start_producer() -> None:
         key_serializer=lambda k: k.encode() if isinstance(k, str) else k,
         # Wait for all in-sync replicas to acknowledge — strongest durability guarantee
         acks="all",
+        # Broker-side dedup of producer retries (requires acks="all"): a
+        # network-level resend of the same batch can no longer append twice.
+        # This covers ONLY broker-retry duplicates — app-level duplicates
+        # (outbox relay crash window, resolver-vs-resume-sweep race) still
+        # happen and are made safe by the dispatcher's atomic
+        # PENDING->RUNNING claim (JobRepository.claim_for_running).
+        enable_idempotence=True,
         # Retry up to 5 times on transient errors
         retry_backoff_ms=200,
     )

@@ -7,11 +7,13 @@ children. A child is promoted to PENDING (and a job.submitted event
 emitted via the outbox) once every one of its dependencies has reached
 COMPLETED.
 
-Idempotency: re-delivery of the same job.completed event may re-promote
-the same child. The promotion is guarded by a status check (we only flip
-WAITING → PENDING), so the worst case is a redundant job.submitted in the
-outbox. Combined with the dispatcher's per-job idempotency, the worker
-still processes the child only once.
+Idempotency: re-delivery of the same job.completed event may race another
+promoter (a second delivery, or the dispatcher's resume sweep) for the
+same child. The promotion is an atomic WAITING → PENDING compare-and-set
+(`JobRepository.promote_waiting_to_pending`), and the loser skips the
+outbox add as well — so no redundant job.submitted is minted. Any
+duplicate delivery that still reaches the dispatcher is neutralized by
+its atomic PENDING → RUNNING claim.
 
 Pause: a child is held in WAITING while it or any ancestor carries a
 `dag:paused:*` flag (set by the `pause_dag` tool). Before this check
@@ -105,9 +107,12 @@ class DependencyResolver(BaseKafkaConsumer):
                             )
                             continue
 
-                    await job_repo.update_status(
-                        child_id, JobStatus.PENDING, extra={"error_message": None}
-                    )
+                    # E1-04: CAS the promotion — the resume sweep (or a
+                    # redelivered job.completed) may have promoted this
+                    # child already. The loser must skip the outbox add
+                    # too, or it still mints a duplicate job.submitted.
+                    if not await job_repo.promote_waiting_to_pending(child_id):
+                        continue
                     await outbox_repo.add(
                         tenant_id=child.tenant_id,
                         topic=settings.kafka_topic_job_submitted,

@@ -67,9 +67,38 @@ async def test_run_job_success_marks_completed() -> None:
          patch.dict(dispatcher._PROCESSORS, {JobType.BULK_API_SYNC: processor}):
         await dispatcher._run_job(str(job.id), factory, redis)
 
+    # The RUNNING transition goes through the atomic claim (E1-04), not a
+    # blind update_status write.
+    job_repo.claim_for_running.assert_awaited_once_with(job.id)
     calls = [c.args[1] for c in job_repo.update_status.call_args_list]
-    assert JobStatus.RUNNING in calls
     assert JobStatus.COMPLETED in calls
+
+
+async def test_run_job_duplicate_delivery_loses_claim_and_executes_nothing() -> None:
+    """E1-04: two at-least-once deliveries of one job.submitted race into
+    _run_job. The loser's atomic PENDING->RUNNING claim returns False and it
+    must execute NOTHING: no processor call, no COMPLETED/DEAD_LETTER status
+    writes, no outbox row. Before the fix, the check-then-act (SELECT +
+    status check + blind UPDATE) let both deliveries run the processor."""
+    job = _make_job(type=JobType.BULK_API_SYNC)
+    factory, job_repo, audit_repo = _make_session_factory(job)
+    job_repo.claim_for_running.return_value = False  # the other delivery won
+    redis = AsyncMock()
+
+    processor = AsyncMock(return_value={"ok": True})
+    outbox_mock = AsyncMock()
+    with patch("app.workers.dispatcher.JobRepository", return_value=job_repo), \
+         patch("app.workers.dispatcher.AuditRepository", return_value=audit_repo), \
+         patch(
+             "app.workers.dispatcher.OutboxRepository",
+             new=MagicMock(return_value=outbox_mock),
+         ), \
+         patch.dict(dispatcher._PROCESSORS, {JobType.BULK_API_SYNC: processor}):
+        await dispatcher._run_job(str(job.id), factory, redis)
+
+    processor.assert_not_awaited()
+    job_repo.update_status.assert_not_awaited()
+    outbox_mock.add.assert_not_awaited()
 
 
 async def test_run_job_retries_on_failure() -> None:

@@ -1,11 +1,11 @@
 import uuid
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 
 from app.models.enums import JobStatus
 from app.models.job import Job
 from app.repositories.base import BaseRepository
-from sqlalchemy import and_, func, select, update
+from sqlalchemy import CursorResult, and_, func, select, update
 
 
 class JobRepository(BaseRepository[Job]):
@@ -103,6 +103,56 @@ class JobRepository(BaseRepository[Job]):
         )
         await self.session.flush()
         return await self.get_by_id(job_id)
+
+    async def claim_for_running(self, job_id: uuid.UUID) -> bool:
+        """Atomically claim a PENDING job for execution (E1-04).
+
+        Emits the conditional UPDATE
+
+            UPDATE jobs SET status='running', started_at=now()
+            WHERE id=:id AND status='pending'
+
+        and returns True only when THIS caller flipped the row
+        (rowcount == 1). Kafka delivers job.submitted at-least-once, so
+        two deliveries of the same job can race into the dispatcher; the
+        status predicate makes the database arbitrate — the loser's
+        UPDATE matches zero rows and it must skip execution. Unlike the
+        generic `update_status` (whose callers intentionally overwrite
+        from many prior states), this CAS never fires on a non-PENDING
+        row, and it never re-fetches: the boolean is the whole contract.
+        """
+        result = cast(
+            CursorResult[Any],
+            await self.session.execute(
+                update(Job)
+                .where(Job.id == job_id, Job.status == JobStatus.PENDING)
+                .values(
+                    status=JobStatus.RUNNING, started_at=datetime.now(UTC)
+                )
+            ),
+        )
+        await self.session.flush()
+        return result.rowcount == 1
+
+    async def promote_waiting_to_pending(self, job_id: uuid.UUID) -> bool:
+        """Atomically promote a WAITING job to PENDING (E1-04).
+
+        Same CAS shape as `claim_for_running`, for the two concurrent
+        promoters — the DependencyResolver and the dispatcher's resume
+        sweep. On rowcount == 0 the caller lost the race and MUST also
+        skip its outbox add: CAS-ing the status alone still mints the
+        duplicate job.submitted if the loser falls through to the outbox.
+        """
+        result = cast(
+            CursorResult[Any],
+            await self.session.execute(
+                update(Job)
+                .where(Job.id == job_id, Job.status == JobStatus.WAITING)
+                .values(status=JobStatus.PENDING, error_message=None)
+            ),
+        )
+        await self.session.flush()
+        return result.rowcount == 1
 
     async def dlq_stats(self, tenant_id: uuid.UUID) -> tuple[int, dict[str, int]]:
         """Total DLQ count plus per-job-type breakdown, scoped to one tenant."""

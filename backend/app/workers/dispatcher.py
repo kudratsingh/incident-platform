@@ -90,7 +90,7 @@ async def _run_job(
     token = job_id_var.set(job_id_str)
 
     # ------------------------------------------------------------------ #
-    # 1. Load job and mark RUNNING                                         #
+    # 1. Load job and atomically claim PENDING -> RUNNING                  #
     # ------------------------------------------------------------------ #
     async with session_factory() as session:
         async with session.begin():
@@ -118,7 +118,23 @@ async def _run_job(
             max_retries = job.max_retries
             prior_error = job.error_message  # filled when this is a retry
 
-            await repo.update_status(job_id, JobStatus.RUNNING)
+            # E1-04: the status check above is only a cheap pre-filter (and
+            # a distinct log line) — under at-least-once delivery a second
+            # delivery of this job can pass it concurrently. The atomic
+            # conditional UPDATE (WHERE status='pending') is the
+            # authoritative gate: exactly one delivery wins. It must stay
+            # in THIS short transaction — the winner's commit happens at
+            # the end of this block, before processor execution, so the
+            # loser's UPDATE re-evaluates against the committed row and
+            # matches zero rows.
+            claimed = await repo.claim_for_running(job_id)
+            if not claimed:
+                logger.info(
+                    "job already claimed by another delivery, skipping",
+                    extra={"job_id": job_id_str},
+                )
+                job_id_var.reset(token)
+                return
 
     await kafka_producer.publish_job_progress(
         job_id=job_id,
@@ -640,11 +656,14 @@ async def _resume_unblocked_waiting_loop(
                         ):
                             continue
 
-                        await job_repo.update_status(
-                            child.id,
-                            JobStatus.PENDING,
-                            extra={"error_message": None},
-                        )
+                        # E1-04: CAS the promotion — the DependencyResolver
+                        # (or a concurrent sweep pass) may promote the same
+                        # child first. The loser must skip the outbox add
+                        # too, or it still mints a duplicate job.submitted.
+                        if not await job_repo.promote_waiting_to_pending(
+                            child.id
+                        ):
+                            continue
                         await outbox_repo.add(
                             tenant_id=child.tenant_id,
                             topic=settings.kafka_topic_job_submitted,

@@ -434,7 +434,7 @@ Concrete implementation pointers for each pattern this project demonstrates end-
 
 | Concept | Where It Lives | Notes |
 |---|---|---|
-| **At-least-once delivery** | `BaseKafkaConsumer._process_one` commits offset only after `handle_message` returns | Combined with idempotency keys to avoid double-execution |
+| **At-least-once delivery** | `BaseKafkaConsumer._process_one` commits offset only after `handle_message` returns | Duplicate deliveries are safe: the dispatcher claims PENDING→RUNNING via atomic conditional UPDATE (`JobRepository.claim_for_running`) so exactly one executes; idempotency keys dedupe job *creation* only |
 | **Exactly-once dedup via unique constraint** | `job_events.uq_job_events_kafka_coord` on `(topic, partition, offset)`; sibling `audit_logs.uq_audit_logs_kafka_coord` (nullable coords — inline audit writes exempt) | Kafka redelivery → `IntegrityError` → consumer swallows + commits |
 | **Backpressure** | `app/utils/backpressure.py` checks Redis-cached `ConsumerLag` from the dispatcher; `POST /jobs` raises `BackpressureError` (503) | Threshold in settings; metrics loop populates the cache |
 | **Circuit breaker** | `app/utils/circuit_breaker.py` wraps external API calls | Open / half-open / closed states; metrics emitted |
