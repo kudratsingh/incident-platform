@@ -147,6 +147,11 @@ services:
       # baked into the image. Mount the whole directory so
       # `docker compose exec app python scripts/<name>.py` just works.
       - ./scripts:/app/scripts
+      # services/runbooks.py resolves /app/runbooks at import (E2-03).
+      # Mount the source dir so the dev stack sees it and --reload picks
+      # up runbook YAML edits without a rebuild. Only `app` needs it —
+      # the mcp process never imports app.services.runbooks.
+      - ./runbooks:/app/runbooks
     command:
       - uvicorn
       - app.main:app
