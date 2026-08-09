@@ -11,6 +11,7 @@ from app.repositories.audit import AuditRepository
 from app.repositories.job import JobRepository
 from app.repositories.job_dependency import JobDependencyRepository
 from app.repositories.outbox import OutboxRepository
+from app.utils.cache import JobCache
 from redis.asyncio import Redis
 from sqlalchemy.exc import IntegrityError
 
@@ -268,6 +269,13 @@ class JobService:
             JobStatus.PENDING,
             extra={"retry_count": 0, "error_message": None, "result": None},
         )
+        # Invalidate here, in the service, not in the REST wrapper (E2-02):
+        # this is the single choke point every replay path goes through —
+        # the three MCP replay tools, the scheduled DLQ-replay loop in
+        # workers/dispatcher.py, and POST /admin/jobs/{id}/replay. Doing it
+        # only in the REST wrapper left GET /jobs/{id} serving the pre-replay
+        # status for a whole TTL after any agent-driven replay.
+        await JobCache.delete(self.redis, job_id, tenant_id)
         audit_user_id: uuid.UUID | None
         if principal_type == "user":
             audit_user_id = requesting_user_id
@@ -329,6 +337,9 @@ class JobService:
             raise NotFoundError(f"Job {job_id} not found")
 
         updated = await self.job_repo.update_status(job_id, JobStatus.COMPLETED)
+        # Same invariant as replay_job: the service layer owns invalidation,
+        # so every caller of resolve_incident is coherent (E2-02).
+        await JobCache.delete(self.redis, job_id, tenant_id)
         await self.audit_repo.log(
             "incident.resolved",
             tenant_id=job.tenant_id,

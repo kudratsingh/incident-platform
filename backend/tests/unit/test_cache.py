@@ -10,6 +10,14 @@ _TENANT_ID = uuid.uuid4()
 _JOB_DATA = {"id": str(_JOB_ID), "status": "pending", "type": "csv_upload"}
 
 
+def test_key_shape_is_pinned() -> None:
+    """The exact key string is load-bearing: the `cache:` namespace is what
+    makes the key reachable by the MCP `invalidate_cache_key` compensator
+    (E2-02) and the tenant segment is what keeps hits inside one tenant
+    (E2-01). Pin it here so a rename can't happen silently."""
+    assert JobCache._key("abc", "t1") == "cache:job:t1:abc"
+
+
 async def test_get_returns_none_on_miss() -> None:
     redis = AsyncMock()
     redis.get.return_value = None
@@ -25,7 +33,7 @@ async def test_get_returns_dict_on_hit() -> None:
     result = await JobCache.get(redis, _JOB_ID, _TENANT_ID)
     assert result == _JOB_DATA
     # The lookup key is tenant-scoped — cross-tenant hits are impossible.
-    redis.get.assert_awaited_once_with(f"job:{_TENANT_ID}:{_JOB_ID}")
+    redis.get.assert_awaited_once_with(f"cache:job:{_TENANT_ID}:{_JOB_ID}")
 
 
 async def test_get_returns_none_on_redis_error() -> None:
@@ -40,7 +48,7 @@ async def test_set_calls_redis_set_with_ttl() -> None:
     await JobCache.set(redis, _JOB_ID, _TENANT_ID, _JOB_DATA)
     redis.set.assert_awaited_once()
     args, kwargs = redis.set.await_args  # type: ignore[misc]
-    assert args[0] == f"job:{_TENANT_ID}:{_JOB_ID}"
+    assert args[0] == f"cache:job:{_TENANT_ID}:{_JOB_ID}"
     assert "ex" in kwargs
     assert kwargs["ex"] > 0
 
@@ -54,7 +62,7 @@ async def test_set_silently_ignores_redis_error() -> None:
 async def test_delete_calls_redis_delete() -> None:
     redis = AsyncMock()
     await JobCache.delete(redis, _JOB_ID, _TENANT_ID)
-    redis.delete.assert_awaited_once_with(f"job:{_TENANT_ID}:{_JOB_ID}")
+    redis.delete.assert_awaited_once_with(f"cache:job:{_TENANT_ID}:{_JOB_ID}")
 
 
 async def test_delete_silently_ignores_redis_error() -> None:
