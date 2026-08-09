@@ -87,6 +87,17 @@ So the operative constraint is now: **do not cut a tag before the rerun.** Taggi
 
 **A rule that now needs enforcing.** "Non-chaos tools never name chaos internals" is currently upheld by one regression test on one tool. Every new Tier-1 action is an opportunity to reintroduce the leak. The durable fix is a registry-level test asserting that no non-chaos tool's schema or description contains chaos vocabulary; sized as a follow-up.
 
+> **Scope limit (recorded 2026-08-09): invisibility is per ENVIRONMENT, not per PRINCIPAL.**
+> `tools/list` is dispatched without the caller's principal, so in a chaos-*enabled* environment any
+> authenticated principal — including a read-only smoke token — can enumerate all 8 chaos tools with
+> their schemas and `[chaos: …]` description prefixes, and a probing `tools/call` confirms existence
+> via the scope-denial message. Invoking them still requires `chaos:invoke`, so this is an
+> information leak inside the lab, not a path to firing chaos. Closing it (a scope-filtered
+> `tools/list` plus not-found masking for chaos denials only) is deferred past the eval restart:
+> it changes what every principal sees in the exact call that generates the commander's contract
+> snapshot, and this campaign performs that rebless exactly once. Reasoning and implementation
+> sketch in [ADR 0016](0016-defer-principal-scoped-tools-list.md).
+
 ## Alternatives considered
 
 **Redact chaos keys at the serialization layer** rather than removing the fields. Rejected: it keeps a field whose value is always redacted, which is a worse contract than not having the field, and it invites the assumption that redaction is a general safety net when it would only ever cover the patterns someone remembered to list.
