@@ -446,7 +446,7 @@ Concrete implementation pointers for each pattern this project demonstrates end-
 | **Schema evolution** | `backend/app/schemas/kafka/*.schema.json` validated on both producer and consumer | `additionalProperties: true` for backward compatibility |
 | **Dead-letter queue** | `job.dlq` topic; `dead_letter` job status; `/admin/dlq/*` endpoints; `LlmTriageConsumer` (Phase 10) analyses each entry | Admin replay resets `retry_count`; unregistered `.compensate` types also route here |
 | **Fan-out / fan-in** | Seven Kafka consumer groups subscribed to the lifecycle topics, all processing independently | No coordination needed; each group has its own offset |
-| **Consumer group isolation** | Each consumer in `worker_loop` is its own group; failure of one doesn't affect others | `started: list[BaseKafkaConsumer]` filters out failed starters |
+| **Consumer group isolation** | Each consumer in `worker_loop` is its own group; failure of one doesn't affect others | `_supervise_consumer` owns start(): a consumer that fails to start at boot is retried with backoff, not dropped |
 | **Distributed locking** | Redis `SETNX` for job deduplication (open opportunity in the rate-limit code path) | Idempotency key is the primary dedup mechanism today |
 | **Connection pool sizing** | SQLAlchemy `pool_pre_ping=True`; pool tuning is a Phase 8 item (PgBouncer) | — |
 | **Time-series partitioning** | Phase 8 item: partition `audit_logs` by month | — |

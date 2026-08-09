@@ -88,3 +88,31 @@ Reverting is deleting `_supervise_consumer` + `_restart_consumer` in `dispatcher
 - `backend/tests/api/test_mcp_wave3_tier1_actions.py` — the two contract tests.
 - Related ADRs: [0006 — MCP server standalone process](0006-mcp-server-standalone-process.md), [0008 — Chaos framework triple-gating](0008-chaos-gating.md).
 - Postmortem: [0002 — The phantom supervisor](../postmortems/0002-phantom-supervisor.md).
+
+## Amendment — 2026-08-09 (WO-P4-05)
+
+*The accepted decision above stands unchanged; this note extends it to the two states it did not name — the consumer's FIRST start, and a kill-key lookup that fails rather than answers.*
+
+### Supervision owns `start()`
+
+The decision says "the supervisor is the only owner of the consumer's start/stop transitions during normal operation", but `worker_loop` still performed the initial `start()` itself and supervised only the consumers that survived it (a `started: list[BaseKafkaConsumer]` that failed starters were filtered out of). Boot was therefore the one transition the supervisor did not own, and it failed in exactly the shape [postmortem 0002](../postmortems/0002-phantom-supervisor.md) describes: one transient Kafka/DNS error at startup and that consumer group was silently gone for the life of the process, with no supervisor to bring it back.
+
+`worker_loop` now hands every consumer to `_supervise_consumer` unstarted. The supervisor starts it through `_restart_consumer` — the same capped-backoff `stop()`+`start()` helper the crash path uses — so a boot failure heals like any other transient. The guard sits *before* the `while True`, not inside it: inside, an orderly `stop()` (which leaves `is_running` False, the ADR's third exit reason) would restart every consumer during shutdown.
+
+Consequence worth stating plainly: the "dispatcher consumer not running — worker disabled" special case is gone. A permanently unreachable broker now leaves all 8 supervisors retrying with capped backoff instead of the worker shutting itself down. That is this ADR's stated bias — transients heal — applied to boot; a hard, permanent broker outage is an infrastructure alarm, not a reason to discard the consumer groups.
+
+### The kill-window wait fails closed
+
+The chaos-kill branch polled `_check_chaos_kill`, which returns False on *any* Redis error. In the consumer's own poll loop that fail-open bias is right (a Redis blip must not stall real message processing), but in the supervisor it inverts the meaning of the wait: a blip — including one caused by the `saturate_redis` chaos hook running concurrently — read as "kill cleared" and resurrected the consumer in the middle of the window the scenario was measuring.
+
+The supervisor now polls `_check_chaos_kill_strict` (`kafka_consumer.py`), which lets lookup errors propagate, and holds the consumer down on error, logging one warning per 2s poll. Only an *observed-absent* key releases it. `_check_chaos_kill` is unchanged and remains the poll-loop variant. Trade-off: a permanent Redis outage keeps the consumer down until Redis returns — acceptable because the kill key carries a TTL, so by then it has usually expired and the restart proceeds.
+
+### Verification (supersedes the "no direct unit test" note above)
+
+The gap the Verification section admitted — "the supervisor itself does not have a direct unit test" — is now closed for the lifecycle branches, in `backend/tests/unit/test_dispatcher.py`:
+
+- `test_supervise_consumer_retries_failed_boot_start` — start() fails once, then succeeds; supervision retries rather than dropping the group.
+- `test_supervise_consumer_holds_consumer_down_on_kill_key_lookup_error` — two failing kill-key lookups do not restart the consumer; only the third, non-error, absent-key answer does.
+- `test_supervise_consumer_does_not_resurrect_on_orderly_stop` — the third exit reason still exits, with no extra `start()`.
+
+The crash branch (`run()` raises) is still covered only by the live eval scenario.
