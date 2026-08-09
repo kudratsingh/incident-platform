@@ -267,7 +267,15 @@ class JobService:
         updated = await self.job_repo.update_status(
             job_id,
             JobStatus.PENDING,
-            extra={"retry_count": 0, "error_message": None, "result": None},
+            extra={
+                "retry_count": 0,
+                "error_message": None,
+                "result": None,
+                # Clear the previous run's DLQ attribution too — a replay is a
+                # fresh lifecycle, and a stale value would badge the row for
+                # a dead-letter that this run has not had (F2-16).
+                "dead_lettered_by": None,
+            },
         )
         # Invalidate here, in the service, not in the REST wrapper (E2-02):
         # this is the single choke point every replay path goes through —

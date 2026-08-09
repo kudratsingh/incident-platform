@@ -121,6 +121,10 @@ class JobResponse(BaseModel):
     error_message: str | None
     retry_count: int
     max_retries: int
+    # Attribution for a DLQ row (F2-16). REST-only on purpose: the MCP tool
+    # output models are contract-frozen, and the admin UI is the only
+    # consumer that needs it.
+    dead_lettered_by: str | None = None
     priority: int
     trace_id: str | None
     saga_id: uuid.UUID | None = None

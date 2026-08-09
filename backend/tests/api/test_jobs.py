@@ -474,6 +474,56 @@ async def test_admin_replay_resets_retry_count(
     assert body["error_message"] is None
 
 
+async def test_get_job_exposes_dead_lettered_by(
+    client: AsyncClient, auth_headers: dict[str, str]
+) -> None:
+    """F2-16: the DLQ badge needs a per-row attribution signal on the REST
+    payload. A job that never dead-lettered carries it as null."""
+    create_resp = await client.post(
+        "/api/v1/jobs", json={"type": "doc_analysis"}, headers=auth_headers
+    )
+    job_id = create_resp.json()["id"]
+
+    resp = await client.get(f"/api/v1/jobs/{job_id}", headers=auth_headers)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "dead_lettered_by" in body
+    assert body["dead_lettered_by"] is None
+
+
+async def test_admin_replay_clears_dead_lettered_by(
+    client: AsyncClient,
+    db_session,  # type: ignore[no-untyped-def]
+    admin_user,  # type: ignore[no-untyped-def]
+    admin_headers: dict[str, str],
+) -> None:
+    """A replayed job starts a fresh lifecycle — it must not carry the
+    previous run's dead-letter attribution into it."""
+    from app.models.enums import JobStatus, JobType
+    from app.models.job import Job
+
+    job = Job(
+        tenant_id=admin_user.tenant_id,
+        user_id=admin_user.id,
+        type=JobType.CSV_UPLOAD,
+        status=JobStatus.DEAD_LETTER,
+        retry_count=1,
+        max_retries=3,
+        priority=0,
+        error_message="401 Unauthorized",
+        dead_lettered_by="llm_retry_policy",
+    )
+    db_session.add(job)
+    await db_session.flush()
+    await db_session.refresh(job)
+
+    resp = await client.post(
+        f"/api/v1/admin/jobs/{job.id}/replay", headers=admin_headers
+    )
+    assert resp.status_code == 200
+    assert resp.json()["dead_lettered_by"] is None
+
+
 # ---------------------------------------------------------------------------
 # Processor payload bounds (WO-P4-04 / E1-05)
 #

@@ -56,6 +56,10 @@ export interface Job {
   error_message: string | null
   retry_count: number
   max_retries: number
+  // Which mechanism forced this job into the DLQ, when it was not the
+  // default one. `llm_retry_policy` is the only value today; null means
+  // retries simply ran out (or the job never dead-lettered at all).
+  dead_lettered_by: string | null
   priority: number
   trace_id: string | null
   saga_id?: string | null

@@ -54,6 +54,14 @@ class Job(TimestampMixin, Base):
     # Kept as a plain string (no CHECK constraint) so new categories can
     # be added without a schema change.
     remediation_hint: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # Which mechanism forced this job into the DLQ, when it was NOT the
+    # default one. Today's sole value is `llm_retry_policy` — the LLM-guided
+    # retry policy returning `dead_letter_now` while retries remained.
+    # NULL = the default mechanism (retries exhausted, no registered
+    # processor, or the dispatcher's safety net), so a NULL row renders
+    # unbadged rather than being attributed to a policy that never ran.
+    # A different axis from remediation_hint, which says what to do NEXT.
+    dead_lettered_by: Mapped[str | None] = mapped_column(String(32), nullable=True)
     # Higher number = higher priority in the queue
     priority: Mapped[int] = mapped_column(Integer, default=0, nullable=False, index=True)
     # Correlation ID from the originating HTTP request, for end-to-end tracing
