@@ -434,7 +434,7 @@ Concrete implementation pointers for each pattern this project demonstrates end-
 
 | Concept | Where It Lives | Notes |
 |---|---|---|
-| **At-least-once delivery** | `BaseKafkaConsumer._process_one` commits offset only after `handle_message` returns | Duplicate deliveries are safe: the dispatcher claims PENDING→RUNNING via atomic conditional UPDATE (`JobRepository.claim_for_running`) so exactly one executes; idempotency keys dedupe job *creation* only |
+| **At-least-once delivery** | `BaseKafkaConsumer._process_one` commits `{TopicPartition: offset + 1}` per message only after `handle_message` returns; on failure `_process_batch` seeks back so the next poll redelivers | Duplicate deliveries are safe: the dispatcher claims PENDING→RUNNING via atomic conditional UPDATE (`JobRepository.claim_for_running`) so exactly one executes; idempotency keys dedupe job *creation* only |
 | **Exactly-once dedup via unique constraint** | `job_events.uq_job_events_kafka_coord` on `(topic, partition, offset)`; sibling `audit_logs.uq_audit_logs_kafka_coord` (nullable coords — inline audit writes exempt) | Kafka redelivery → `IntegrityError` → consumer swallows + commits |
 | **Backpressure** | `app/utils/backpressure.py` checks Redis-cached `ConsumerLag` from the dispatcher; `POST /jobs` raises `BackpressureError` (503) | Threshold in settings; metrics loop populates the cache |
 | **Circuit breaker** | `app/utils/circuit_breaker.py` wraps external API calls | Open / half-open / closed states; metrics emitted |
@@ -531,7 +531,7 @@ All four services use `client.messages.parse(..., output_format=SomePydanticMode
   - **Producer**: `app/workers/kafka_producer.py` publishes lifecycle events; `publish_raw` propagates schema-validation errors so the outbox can mark rows failed.
   - **Consumer groups**: eight, all running concurrently in the worker process (seven were shipped in Phase 7; `llm-triage` joined in Phase 10). See "Current Implementation Status" above for the full list.
   - **Partitioning strategy**: every event keyed by `user_id` so per-user ordering is preserved within each consumer group.
-  - **Offset management**: committed only after `handle_message` returns successfully — at-least-once. Combined with idempotency keys (jobs) and a unique constraint (event log) to avoid double effects.
+  - **Offset management**: explicit per-message per-partition commits (`{TopicPartition: offset + 1}`) only after `handle_message` returns successfully; on handler failure the consumer seeks back to the failed offset and the next poll redelivers (poison pills are committed past per-partition) — at-least-once. Combined with idempotency keys (jobs) and a unique constraint (event log) to avoid double effects.
   - **Dead-letter topic**: `job.dlq`. Admin UI inspects (with per-type breakdown) and replays. Replay resets `retry_count` (a bug we fixed in `#27`).
   - **Schema Registry** ✅ — file-based JSON Schema in `backend/app/schemas/kafka/`; format checker on (enforces `uuid` etc.); producer + consumer validate on every message.
   - **Local dev**: Redpanda in `docker-compose.yml`; MSK in production via `infra/msk.tf`.
