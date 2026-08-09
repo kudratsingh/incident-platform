@@ -76,7 +76,11 @@ class AuditLog(Base):
     action: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
     resource_type: Mapped[str | None] = mapped_column(String(100), nullable=True)
     resource_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    request_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Indexed: the MCP `get_trace` tool looks rows up by correlation id
+    # (request_id == trace_id in this platform's middleware).
+    request_id: Mapped[str | None] = mapped_column(
+        String(255), nullable=True, index=True
+    )
     ip_address: Mapped[str | None] = mapped_column(String(50), nullable=True)
     extra_data: Mapped[dict[str, Any] | None] = mapped_column(PortableJSON, nullable=True)
     # Kafka coordinates — set ONLY by the AuditConsumer for event.* rows so

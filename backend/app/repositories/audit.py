@@ -75,6 +75,7 @@ class AuditRepository(BaseRepository[AuditLog]):
         action_prefix: str | None = None,
         principal_type: str | None = None,
         tenant_id: uuid.UUID | None = None,
+        request_id: str | None = None,
     ) -> tuple[list[AuditLog], int]:
         filters = []
         if user_id is not None:
@@ -91,6 +92,11 @@ class AuditRepository(BaseRepository[AuditLog]):
             filters.append(AuditLog.principal_type == principal_type)
         if tenant_id is not None:
             filters.append(AuditLog.tenant_id == tenant_id)
+        if request_id is not None:
+            # Correlation-id lookup — the MCP `get_trace` tool pins the
+            # query to one trace instead of scanning a recent window.
+            # Indexed as ix_audit_logs_request_id.
+            filters.append(AuditLog.request_id == request_id)
 
         where = and_(*filters) if filters else None
         total = await self._count(where) if where is not None else await self._count()
