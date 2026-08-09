@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import type { ProgressEvent } from '../types'
-import { getAccessToken } from '../utils/tokens'
+import { jobsApi } from '../api/jobs'
 
 interface StreamState {
   events: ProgressEvent[]
@@ -15,11 +15,14 @@ const BASE_URL = import.meta.env.VITE_API_URL ?? '/api/v1'
 /**
  * Subscribes to the SSE progress stream for a job.
  *
- * The native EventSource API doesn't support custom headers, so we append
- * the token as a query param.  The backend trusts it the same way.
- * (In production you'd use httpOnly cookies instead.)
+ * The native EventSource API doesn't support custom headers, so before each
+ * connect we POST /jobs/{id}/stream-token (a normal fetch, with the usual
+ * Authorization header) for a short-lived token bound to this job, and open
+ * the EventSource with that token as a query param.  The backend validates
+ * it — never the primary access JWT, which must not appear in URLs (ADR 0014).
  *
- * Reconnects automatically if the connection drops before a terminal event.
+ * Reconnects automatically if the connection drops before a terminal event,
+ * minting a fresh stream token each time (the old one expires in ~60s).
  */
 export function useJobStream(jobId: string | null): StreamState {
   const [state, setState] = useState<StreamState>({
@@ -32,11 +35,26 @@ export function useJobStream(jobId: string | null): StreamState {
 
   useEffect(() => {
     if (!jobId) return
+    const id = jobId
+    let cancelled = false
 
-    function connect() {
-      const token = getAccessToken()
-      const url = `${BASE_URL}/jobs/${jobId}/stream${token ? `?token=${token}` : ''}`
-      const es = new EventSource(url)
+    async function connect() {
+      let streamToken: string
+      try {
+        streamToken = await jobsApi.streamToken(id)
+      } catch {
+        // Could not mint a token (expired session, network blip). Retry on
+        // the same cadence as a dropped stream, unless the job already ended.
+        if (cancelled) return
+        setState((s) => {
+          if (!s.done) setTimeout(connect, 2000)
+          return { ...s, connected: false }
+        })
+        return
+      }
+      if (cancelled) return
+
+      const es = new EventSource(`${BASE_URL}/jobs/${id}/stream?token=${streamToken}`)
       esRef.current = es
 
       es.onopen = () => {
@@ -77,6 +95,7 @@ export function useJobStream(jobId: string | null): StreamState {
     connect()
 
     return () => {
+      cancelled = true
       esRef.current?.close()
     }
   }, [jobId])

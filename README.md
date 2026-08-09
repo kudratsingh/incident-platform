@@ -303,7 +303,8 @@ Core surface:
 | `POST` | `/jobs` | Create job (rate-limited + quota-checked + backpressure-gated) |
 | `GET` | `/jobs` | List own jobs (paginated + filtered) |
 | `GET` | `/jobs/{id}` | Job detail |
-| `GET` | `/jobs/{id}/stream` | SSE live-progress stream |
+| `POST` | `/jobs/{id}/stream-token` | Mint a 60s single-purpose token for the SSE stream (authorizes the job) |
+| `GET` | `/jobs/{id}/stream` | SSE live-progress stream (auth via `?token=` stream token, ADR 0014) |
 | `POST` | `/sagas` | Create multi-step workflow with dependencies |
 | `GET` | `/sagas/{id}` | Saga detail with step chain |
 | `GET` | `/admin/jobs` | Admin: search all jobs (accepts `?tenant_id=` for platform admins) |

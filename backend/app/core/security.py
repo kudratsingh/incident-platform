@@ -55,6 +55,29 @@ def create_refresh_token(data: dict[str, Any]) -> str:
     )
 
 
+# Native EventSource cannot set an Authorization header, so the SSE stream
+# authenticates with a token in the URL. That token must never be the primary
+# access JWT — URLs end up in access logs, proxies, and browser history.
+# Instead we mint a single-purpose token that only authorizes streaming ONE
+# job and dies after this many seconds. See ADR 0014.
+STREAM_TOKEN_TTL_SECONDS = 60
+
+
+def create_stream_token(job_id: uuid.UUID, tenant_id: uuid.UUID) -> str:
+    """Mint a short-lived token authorizing the SSE stream for exactly one job.
+
+    The subject is the JOB id, not a user id: the stream route compares it to
+    its path parameter, so a token minted for job X can never open job Y's
+    stream. Callers must authorize the job (tenant scope + ownership) BEFORE
+    minting — the stream route trusts the token alone.
+    """
+    return _make_token(
+        {"sub": str(job_id), "tenant_id": str(tenant_id)},
+        timedelta(seconds=STREAM_TOKEN_TTL_SECONDS),
+        "stream",
+    )
+
+
 def decode_token(token: str, expected_type: str = "access") -> dict[str, Any]:
     settings = get_settings()
     try:

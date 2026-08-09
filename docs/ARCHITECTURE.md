@@ -138,16 +138,20 @@ The DB transaction does three things atomically: writes the job row, writes the 
 
 ```
 Browser                          API process              Worker process            Kafka          Redis
-  │  GET /jobs/{id}/stream         │                          │                       │              │
-  │  (Accept: text/event-stream)   │                          │                       │              │
+  │  POST /jobs/{id}/stream-token  │                          │                       │              │
+  │  (Authorization: Bearer JWT)   │                          │                       │              │
   │ ──────────────────────────────►│                          │                       │              │
-  │                                 │ load job from DB         │                       │              │
-  │                                 │ ──► emit initial state   │                       │              │
-  │  data: {status: pending, 0%}    │                          │                       │              │
+  │                                 │ authorize job from DB    │                       │              │
+  │                                 │ (tenant + ownership)     │                       │              │
+  │  {token: <60s stream token>}    │                          │                       │              │
   │ ◄──────────────────────────────│                          │                       │              │
+  │  GET /jobs/{id}/stream          │                          │                       │              │
+  │  ?token=<stream token>          │                          │                       │              │
+  │ ──────────────────────────────►│                          │                       │              │
+  │                                 │ validate stream token    │                       │              │
+  │                                 │ (type, expiry, job bind) │                       │              │
   │                                 │ SUBSCRIBE job:progress:{id} on Redis             │              │
   │                                 │ ────────────────────────────────────────────────────────────► │
-  │                                 │                          │                       │              │
   │                                 │                          │  Worker is running    │              │
   │                                 │                          │  processor(payload)   │              │
   │                                 │                          │ ──► publish_job_progress to Kafka   │
@@ -162,7 +166,7 @@ Browser                          API process              Worker process        
   │                                 │ close                    │                       │              │
 ```
 
-The browser connects, the API loads the job's current state from DB and emits it, then subscribes to a Redis Pub/Sub channel and forwards every received message as an SSE frame. The worker publishes progress directly to Kafka (the only direct-publish path, see [KAFKA.md](KAFKA.md)); the `sse-broadcaster` consumer republishes to Redis Pub/Sub.
+The browser first POSTs for a **stream token**: native `EventSource` cannot set an `Authorization` header, so the stream GET authenticates with a short-lived (60s), single-purpose token in its query string instead of the primary JWT ([ADR 0014](ADR/0014-sse-stream-token-transport.md)). The mint endpoint is where authorization happens — it loads the job tenant-scoped (404 cross-tenant, 403 non-owner) and binds the job id into the token, so a token minted for job X cannot open job Y's stream. The GET validates that token, subscribes to a Redis Pub/Sub channel, and forwards every received message as an SSE frame. On reconnect the client mints a fresh token (the previous one has expired by then). The worker publishes progress directly to Kafka (the only direct-publish path, see [KAFKA.md](KAFKA.md)); the `sse-broadcaster` consumer republishes to Redis Pub/Sub.
 
 If Redis dies mid-stream, the API logs the error and the connection stays open with no further events. The browser eventually times out and reconnects.
 
