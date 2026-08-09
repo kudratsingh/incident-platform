@@ -16,12 +16,17 @@ Covered here:
   - the stream route rejects: missing token, the primary access JWT, an
     expired stream token, and a stream token minted for a different job
   - the stream route accepts a freshly minted stream token (no more 401 loop)
+  - a job that already finished short-circuits off the jobs row into one
+    synthetic terminal event instead of hanging on a silent channel (E1-10)
 
 The SSE generator itself is not drained — conftest's Redis is an AsyncMock, so
 the accept test patches app.api.streaming.subscribe with an empty async
-generator and asserts on the auth decision only.
+generator and asserts on the auth decision only.  The short-circuit tests are
+the exception: they never reach subscribe(), so they can read the real body.
 """
 
+import asyncio
+import json
 import uuid
 from collections.abc import AsyncGenerator
 from datetime import UTC, datetime, timedelta
@@ -29,7 +34,7 @@ from unittest import mock
 
 import pytest_asyncio
 from app.config import get_settings
-from app.core.security import create_access_token, decode_token, hash_password
+from app.core.security import create_access_token, create_stream_token, decode_token, hash_password
 from app.models.enums import JobStatus, JobType, UserRole
 from app.models.job import Job
 from app.models.tenant import Tenant
@@ -124,6 +129,36 @@ async def _empty_subscribe(*args: object) -> AsyncGenerator[ProgressEvent, None]
     """Stand-in for progress.subscribe — yields nothing and ends the stream."""
     return
     yield  # pragma: no cover — unreachable; makes this an async generator
+
+
+async def _never_ending_subscribe(*args: object) -> AsyncGenerator[ProgressEvent, None]:
+    """Stand-in for a live-but-silent channel: yields nothing, never returns.
+
+    This is what the endpoint used to do to a late subscriber. The E1-10 tests
+    patch it in so that "the endpoint fell through to subscribe()" shows up as
+    a timeout rather than a happy empty body.
+    """
+    await asyncio.Event().wait()
+    yield  # pragma: no cover — unreachable; makes this an async generator
+
+
+def _sse_events(body: str) -> list[dict[str, object]]:
+    """Parse an SSE body into the JSON payload of each `data:` line."""
+    return [
+        json.loads(line.removeprefix("data:").strip())
+        for line in body.splitlines()
+        if line.startswith("data:")
+    ]
+
+
+async def _fetch_stream(client: AsyncClient, job_id: uuid.UUID, tenant_id: uuid.UUID):  # type: ignore[no-untyped-def]
+    """GET the stream with a valid token, failing fast if it does not close."""
+    token = create_stream_token(job_id, tenant_id)
+    with mock.patch("app.api.streaming.subscribe", _never_ending_subscribe):
+        return await asyncio.wait_for(
+            client.get(f"/api/v1/jobs/{job_id}/stream", params={"token": token}),
+            timeout=5,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -288,3 +323,137 @@ async def test_stream_route_accepts_valid_stream_token(
         )
     assert resp.status_code == 200
     assert resp.headers["content-type"].startswith("text/event-stream")
+
+
+# ---------------------------------------------------------------------------
+# GET /jobs/{id}/stream — the late-subscriber short-circuit (E1-10)
+# ---------------------------------------------------------------------------
+
+
+async def _finished_job(  # type: ignore[no-untyped-def]
+    db_session, test_user: User, status: JobStatus, **fields: object
+) -> Job:
+    fields.setdefault("retry_count", 0)
+    job = Job(
+        tenant_id=test_user.tenant_id,
+        user_id=test_user.id,
+        type=JobType.CSV_UPLOAD,
+        status=status,
+        max_retries=3,
+        priority=0,
+        **fields,
+    )
+    db_session.add(job)
+    await db_session.flush()
+    return job
+
+
+async def test_stream_of_completed_job_closes_immediately(
+    client: AsyncClient,
+    db_session,  # type: ignore[no-untyped-def]
+    test_user: User,
+) -> None:
+    """THE E1-10 assertion at the HTTP layer.
+
+    The job finished before this client connected and Redis retained nothing
+    (conftest's redis.get returns None, i.e. the key was evicted or predates
+    the snapshot).  Pre-fix the endpoint subscribed to a channel that will
+    never speak again and the response never ended — here subscribe() is
+    patched to a generator that never returns, so falling through to it shows
+    up as the timeout it really is.
+    """
+    job = await _finished_job(db_session, test_user, JobStatus.COMPLETED)
+
+    resp = await _fetch_stream(client, job.id, job.tenant_id)
+
+    assert resp.status_code == 200
+    events = _sse_events(resp.text)
+    assert len(events) == 1
+    assert events[0]["status"] == "completed"
+    assert events[0]["progress"] == 100
+    assert events[0]["job_id"] == str(job.id)
+
+
+async def test_stream_of_cancelled_job_closes_immediately(
+    client: AsyncClient,
+    db_session,  # type: ignore[no-untyped-def]
+    test_user: User,
+) -> None:
+    """Saga-cancelled jobs are terminal too — the case the audit sketch missed."""
+    job = await _finished_job(db_session, test_user, JobStatus.CANCELLED)
+
+    resp = await _fetch_stream(client, job.id, job.tenant_id)
+
+    events = _sse_events(resp.text)
+    assert [e["status"] for e in events] == ["cancelled"]
+    assert events[0]["progress"] == 0
+
+
+async def test_stream_of_dead_lettered_job_reports_the_error(
+    client: AsyncClient,
+    db_session,  # type: ignore[no-untyped-def]
+    test_user: User,
+) -> None:
+    """The synthetic event carries the row's error message and retry count."""
+    job = await _finished_job(
+        db_session,
+        test_user,
+        JobStatus.DEAD_LETTER,
+        error_message="upstream 500",
+        retry_count=3,
+    )
+
+    resp = await _fetch_stream(client, job.id, job.tenant_id)
+
+    events = _sse_events(resp.text)
+    assert events[0]["status"] == "dead_letter"
+    assert events[0]["message"] == "upstream 500"
+    assert events[0]["retry_count"] == 3
+
+
+async def test_stream_of_running_job_still_subscribes(
+    client: AsyncClient, job: Job
+) -> None:
+    """A live job must NOT be short-circuited — the row says nothing final."""
+    token = create_stream_token(job.id, job.tenant_id)
+
+    with mock.patch("app.api.streaming.subscribe", _empty_subscribe):
+        resp = await asyncio.wait_for(
+            client.get(f"/api/v1/jobs/{job.id}/stream", params={"token": token}),
+            timeout=5,
+        )
+
+    assert resp.status_code == 200
+    assert _sse_events(resp.text) == []
+
+
+async def test_retained_snapshot_takes_precedence_over_the_row(
+    client: AsyncClient,
+    db_session,  # type: ignore[no-untyped-def]
+    test_user: User,
+) -> None:
+    """When Redis still holds a snapshot, subscribe() owns the stream.
+
+    The DB short-circuit is the fallback for an evicted/absent key only; it
+    must never pre-empt events the pub/sub path is about to deliver.
+    """
+    job = await _finished_job(db_session, test_user, JobStatus.COMPLETED)
+    token = create_stream_token(job.id, job.tenant_id)
+    retained = ProgressEvent(
+        job_id=str(job.id), status="completed", progress=100, message="from redis"
+    )
+
+    async def _snapshot(*args: object) -> ProgressEvent:
+        return retained
+
+    with (
+        mock.patch("app.api.streaming.read_last_event", _snapshot),
+        mock.patch("app.api.streaming.subscribe", _empty_subscribe),
+    ):
+        resp = await asyncio.wait_for(
+            client.get(f"/api/v1/jobs/{job.id}/stream", params={"token": token}),
+            timeout=5,
+        )
+
+    # subscribe() (stubbed empty here) was used — no synthetic event was emitted.
+    assert _sse_events(resp.text) == []

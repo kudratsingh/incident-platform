@@ -9,7 +9,11 @@ interface StreamState {
   done: boolean
 }
 
-const TERMINAL = new Set(['completed', 'failed', 'dead_letter'])
+// Mirrors TERMINAL_STATUSES in backend/app/workers/progress.py. `cancelled`
+// belongs here: the server closes the stream on it (saga rollbacks cancel
+// jobs), so treating it as non-terminal would turn every close into a
+// reconnect that immediately receives the same event again.
+const TERMINAL = new Set(['completed', 'failed', 'dead_letter', 'cancelled'])
 const BASE_URL = import.meta.env.VITE_API_URL ?? '/api/v1'
 
 /**

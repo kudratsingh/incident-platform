@@ -117,6 +117,30 @@ describe('useJobStream', () => {
     expect(result.current.connected).toBe(false)
   })
 
+  it('treats a cancelled event as terminal and does not reconnect', async () => {
+    // The server closes the stream on `cancelled` (saga rollback). If the hook
+    // did not consider it terminal, that close would arrive as an error and
+    // start a reconnect loop that keeps re-reading the same retained event.
+    const { result } = await renderStream()
+    act(() => { latest().simulateOpen() })
+
+    act(() => {
+      latest().simulateMessage({
+        job_id: JOB_ID, status: 'cancelled', progress: 0,
+        message: 'Saga rolled back', retry_count: 0, timestamp: new Date().toISOString(),
+      })
+    })
+
+    expect(result.current.done).toBe(true)
+    expect(result.current.connected).toBe(false)
+
+    const instancesAfterTerminal = MockEventSource.instances.length
+    act(() => { latest()?.simulateError() })
+    await act(async () => { vi.advanceTimersByTime(2500) })
+
+    expect(MockEventSource.instances.length).toBe(instancesAfterTerminal)
+  })
+
   it('reconnects after error if not done, with a FRESH stream token', async () => {
     await renderStream()
     const firstEs = latest()

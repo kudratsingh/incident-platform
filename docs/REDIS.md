@@ -15,6 +15,7 @@ For the broader architectural context, see [`docs/ARCHITECTURE.md`](ARCHITECTURE
 | `rate:{client}:{window_start}` | string (counter) | `rate_limit.py` `_check` | `rate_limit.py` `_check` | `window * 2` (e.g. 120s) | Yes — fails open |
 | `rate:tenant:{tenant_id}:{window_start}` | string (counter) | `quota.py` `_check_tenant_rate` | `quota.py` `_check_tenant_rate` | 120s | Yes — fails open |
 | `job:progress:{job_id}` | Pub/Sub channel (no persisted key) | `progress.py` `publish` | `streaming.py` SSE endpoint via `subscribe` | N/A (Pub/Sub is fire-and-forget) | No — listeners must be connected |
+| `job:progress:last:{job_id}` | string (last `ProgressEvent` as JSON) | `progress.py` `publish` (fed by `sse_consumer`) | `progress.py` `subscribe` / `read_last_event`, for the SSE endpoint | 1h (`LAST_EVENT_TTL_SECONDS`) | Yes — degrades to the pre-snapshot stream; the `jobs` row is the fallback |
 | `jobs:tenant:{tenant_id}:status:{status}` | set of job_ids | `read_model.py` `_move` | `admin.py` `system_stats` via `read_global_stats` | None | No — read model goes stale |
 | `jobs:user:{user_id}:status:{status}` | set of job_ids | `read_model.py` `_move` | `admin.py` `user_stats` via `read_user_stats` | None | No — read model goes stale |
 | `cache:job:{tenant_id}:{job_id}` | JSON string | `cache.py` `JobCache.set` | `cache.py` `JobCache.get` | 10s | Yes — cache miss = DB read |
@@ -55,11 +56,15 @@ Configuration:
 - Per-client limits are hard-coded per endpoint (e.g. `rate_limiter(limit=30, window=60)` on `POST /jobs`).
 - Per-tenant limit is `tenants.rate_limit_per_minute`, configurable via `PATCH /admin/tenants/{id}`, defaults to 120 r/min. `0` disables.
 
-### SSE progress bridge (`job:progress:{job_id}` Pub/Sub channel)
+### SSE progress bridge (`job:progress:{job_id}` Pub/Sub channel + `job:progress:last:{job_id}` snapshot)
 
 The worker publishes progress to Kafka. The `sse-broadcaster` consumer reads Kafka and republishes to Redis Pub/Sub on channel `job:progress:{job_id}`. The browser-facing SSE endpoint at `GET /jobs/{id}/stream` opens a Pub/Sub subscription on that channel and streams events down to the client.
 
-Pub/Sub is fire-and-forget — no key is stored. A subscriber that disconnects mid-job will miss intervening events and won't see them on reconnect (the SSE endpoint sends the *current* job state via DB query on subscribe, then streams Pub/Sub from there). This is acceptable: the UI uses Pub/Sub only for live updates; durable state lives in `jobs` + `job_events`.
+Pub/Sub itself is fire-and-forget and at-most-once, so `publish()` also SETs the event as a retained snapshot at `job:progress:last:{job_id}` (1h TTL) — **before** the PUBLISH, so a subscriber can never both miss the live event and find no snapshot. `subscribe()` then reads that snapshot as its first event, and it reads it *after* the SUBSCRIBE has taken effect: the overlap can at worst deliver one event twice (harmless — the UI is last-write-wins on a progress bar), whereas reading first would leave a gap in which an event is lost entirely.
+
+That snapshot is what stops a late subscriber from hanging. A client that connects after the job already finished (or reconnects across a Redis blip) receives the terminal snapshot immediately and the stream closes, instead of waiting forever on a channel that will never speak again. Terminal for this purpose is `completed | failed | dead_letter | cancelled` — `cancelled` included because saga rollbacks cancel jobs.
+
+Eviction is safe by design: with no snapshot the behaviour degrades to exactly the old pure-Pub/Sub stream, and the SSE endpoint covers the terminal case from durable state instead — it loads the `jobs` row (tenant-scoped) up front and, if the job is already in a terminal status **and** no snapshot is retained, emits one synthetic `ProgressEvent` built from the row and closes. Redis is never a correctness dependency here; durable state lives in `jobs` + `job_events`. A subscriber that disconnects mid-job still misses the intervening events — only the latest one is retained — which is fine for a progress bar.
 
 ### CQRS read-model sets (`jobs:tenant:*`, `jobs:user:*`)
 

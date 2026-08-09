@@ -5,16 +5,38 @@ The worker publishes ProgressEvents to a per-job channel.
 The SSE endpoint subscribes to that channel and forwards events to the browser.
 
 Channel naming: job:progress:{job_id}
+Retained snapshot: job:progress:last:{job_id} (string, 1h TTL)
+
+Pub/Sub is at-most-once: a subscriber that connects after the terminal event
+was published sees nothing at all and would hold a silent connection forever.
+Every publish therefore also SETs the event as a retained snapshot, and every
+subscriber reads that snapshot as its first event — so a late subscriber to a
+finished job is told the job finished instead of waiting on a dead channel.
+The snapshot is a convenience, never a source of truth: if Redis evicts it the
+behaviour degrades to exactly the pre-snapshot stream (durable state lives in
+the `jobs` table, and the SSE endpoint short-circuits off it).
 """
 
 import json
+import logging
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
+from typing import Any
 
 from redis.asyncio import Redis
 
+logger = logging.getLogger(__name__)
+
 CHANNEL_PREFIX = "job:progress"
+LAST_EVENT_PREFIX = "job:progress:last"
+LAST_EVENT_TTL_SECONDS = 3600
+
+# Statuses after which no further progress event can arrive, so the stream is
+# closed. `cancelled` is here because saga rollbacks cancel jobs and their
+# streams used to hang forever; no producer publishes it as an event status
+# today, but the DB short-circuit in api/streaming.py synthesizes one.
+TERMINAL_STATUSES = frozenset({"completed", "failed", "dead_letter", "cancelled"})
 
 
 @dataclass
@@ -38,6 +60,27 @@ def _channel(job_id: str) -> str:
     return f"{CHANNEL_PREFIX}:{job_id}"
 
 
+def _last_key(job_id: str) -> str:
+    return f"{LAST_EVENT_PREFIX}:{job_id}"
+
+
+def _parse_event(raw: Any) -> ProgressEvent | None:
+    """Decode a retained snapshot. Returns None for anything unusable."""
+    try:
+        return ProgressEvent(**json.loads(raw))
+    except (TypeError, ValueError) as exc:
+        logger.warning("discarding malformed progress snapshot: %s", exc)
+        return None
+
+
+async def read_last_event(redis: Redis, job_id: str) -> ProgressEvent | None:
+    """The most recent published event for a job, or None if nothing is retained."""
+    raw = await redis.get(_last_key(job_id))
+    if raw is None:
+        return None
+    return _parse_event(raw)
+
+
 # Type alias for the publish callable passed into processors
 ProgressPublisher = Callable[[int, str], Awaitable[None]]
 
@@ -57,24 +100,42 @@ async def publish(
         message=message,
         retry_count=retry_count,
     )
-    await redis.publish(_channel(job_id), event.to_json())
+    payload = event.to_json()
+    # Retain BEFORE publishing: a subscriber that has just subscribed must
+    # never be able to miss the live event AND find no snapshot. The reverse
+    # order leaves exactly that window open.
+    await redis.set(_last_key(job_id), payload, ex=LAST_EVENT_TTL_SECONDS)
+    await redis.publish(_channel(job_id), payload)
 
 
 async def subscribe(
     redis: Redis, job_id: str
 ) -> AsyncGenerator[ProgressEvent, None]:
-    """Async generator that yields ProgressEvents until the job reaches a terminal state."""
+    """Async generator that yields ProgressEvents until the job reaches a terminal state.
+
+    The first event is the retained snapshot (if any), read AFTER the channel
+    subscription is live. That ordering matters: subscribe-then-read can at
+    worst deliver the same event twice (harmless — the UI is last-write-wins on
+    a progress bar), while read-then-subscribe leaves a gap in which an event
+    published between the two is lost, which is the hang this snapshot exists
+    to prevent.
+    """
     pubsub = redis.pubsub()
     await pubsub.subscribe(_channel(job_id))
-    terminal = {"completed", "failed", "dead_letter"}
 
     try:
+        snapshot = await read_last_event(redis, job_id)
+        if snapshot is not None:
+            yield snapshot
+            if snapshot.status in TERMINAL_STATUSES:
+                return
+
         async for message in pubsub.listen():
             if message["type"] != "message":
                 continue
             event = ProgressEvent(**json.loads(message["data"]))
             yield event
-            if event.status in terminal:
+            if event.status in TERMINAL_STATUSES:
                 break
     finally:
         await pubsub.unsubscribe(_channel(job_id))
