@@ -10,9 +10,13 @@
 #
 # Trigger surfaces:
 #   1. `push` on a `v*` tag  → real release, produces `ghcr.io/…:v1.2.3`
-#      and `ghcr.io/…:latest`. Contract tag is `platform-v1.2.3`.
+#      and `ghcr.io/…:latest`. Contract tag is `platform-v1.2.3`. This is
+#      the ONLY path that moves `:latest`.
 #   2. `workflow_dispatch`   → manual pre-release / smoke-test build.
-#      Tagged with the input version or the short SHA.
+#      Tagged with the input version (format-validated as vX.Y.Z or
+#      vX.Y.Z-rcN, and refused if that tag already exists on GHCR) or,
+#      absent an input, the short commit SHA. Dispatch builds never
+#      move `:latest`.
 #
 # Requires the repository's Actions to have `packages: write`. GHCR uses
 # the built-in `GITHUB_TOKEN` — no extra secret provisioning.
@@ -40,10 +44,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -51,28 +55,53 @@ jobs:
 
       - name: Compute tags
         id: tags
+        # The dispatch input reaches the script only through env — raw
+        # ${{ }} interpolation of free text inside run: is a shell-injection
+        # surface. (`github.repository_owner` below is fine: an owner name,
+        # not free text.)
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
         run: |
           set -euo pipefail
           IMAGE="ghcr.io/${{ github.repository_owner }}/incident-platform"
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            # Real release (v* tag push): the only path that publishes
+            # :latest. Deliberately NO collision check on this path —
+            # re-releasing after deleting a git tag + its GHCR tag is a
+            # legitimate flow, and the commander pins images by digest,
+            # which contains a force-moved tag.
             VERSION="${GITHUB_REF_NAME}"
-          elif [[ -n "${{ github.event.inputs.version }}" ]]; then
-            VERSION="${{ github.event.inputs.version }}"
+            TAGS="${IMAGE}:${VERSION},${IMAGE}:latest"
+          elif [[ -n "${INPUT_VERSION}" ]]; then
+            [[ "${INPUT_VERSION}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc[0-9]+)?$ ]] || {
+              echo '::error::bad version format (expected vX.Y.Z or vX.Y.Z-rcN)'
+              exit 1
+            }
+            # The GHCR login happened in the previous step. `docker manifest
+            # inspect` exits non-zero when the tag is absent; the if-condition
+            # position is exempt from `set -e`.
+            if docker manifest inspect "${IMAGE}:${INPUT_VERSION}" >/dev/null 2>&1; then
+              echo '::error::tag already exists on GHCR — refusing to overwrite a published version'
+              exit 1
+            fi
+            VERSION="${INPUT_VERSION}"
+            TAGS="${IMAGE}:${VERSION}"
           else
             VERSION="sha-${GITHUB_SHA::7}"
+            TAGS="${IMAGE}:${VERSION}"
           fi
           {
             echo "image=${IMAGE}"
             echo "version=${VERSION}"
-            echo "tags=${IMAGE}:${VERSION},${IMAGE}:latest"
+            echo "tags=${TAGS}"
           } >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
       - name: Build & push
         id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           file: Dockerfile
