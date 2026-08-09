@@ -15,6 +15,7 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from aiokafka.errors import KafkaConnectionError  # type: ignore[import-untyped]
 from app.config import get_settings
 from app.workers import kafka_producer
 
@@ -90,3 +91,105 @@ async def test_publish_raw_propagates_errors(_mock_producer: AsyncMock) -> None:
                 "job_type": "csv_upload",
             },
         )
+
+
+# --------------------------------------------------------------------------
+# Producer lifecycle / self-heal after a boot-time start failure
+# --------------------------------------------------------------------------
+
+
+class _DownProducer:
+    """Stub whose start() fails the way an unreachable broker does."""
+
+    def __init__(self, **_kwargs: Any) -> None:
+        pass
+
+    async def start(self) -> None:
+        raise KafkaConnectionError("no brokers available")
+
+
+class _UpProducer:
+    """Stub whose start() succeeds; send_and_wait is an AsyncMock."""
+
+    def __init__(self, **_kwargs: Any) -> None:
+        self.started = False
+        self.send_and_wait = AsyncMock()
+
+    async def start(self) -> None:
+        self.started = True
+
+
+def _reset_producer_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Undo the autouse AsyncMock fixture and defeat the start-retry throttle."""
+    monkeypatch.setattr(kafka_producer, "_producer", None)
+    monkeypatch.setattr(kafka_producer, "_last_start_attempt", 0.0, raising=False)
+
+
+def _submitted_payload() -> dict[str, Any]:
+    return {
+        "event": "job.submitted",
+        "tenant_id": str(uuid.uuid4()),
+        "job_id": str(uuid.uuid4()),
+        "user_id": str(uuid.uuid4()),
+        "job_type": "csv_upload",
+    }
+
+
+async def test_failed_start_leaves_producer_unassigned(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A start() failure must leave the singleton as None, not as a broken,
+    un-started instance — otherwise every lazy-restart path is dead on arrival
+    and _get_producer() hands out an unusable producer."""
+    _reset_producer_state(monkeypatch)
+    monkeypatch.setattr(kafka_producer, "AIOKafkaProducer", _DownProducer)
+
+    with pytest.raises(KafkaConnectionError):
+        await kafka_producer.start_producer()
+
+    assert kafka_producer._producer is None
+
+
+async def test_publish_raw_self_heals_after_failed_boot(monkeypatch: pytest.MonkeyPatch) -> None:
+    """After a boot-time start failure, a later publish must restart the
+    producer once the broker is back — no process restart required."""
+    _reset_producer_state(monkeypatch)
+    monkeypatch.setattr(kafka_producer, "AIOKafkaProducer", _DownProducer)
+
+    with pytest.raises(KafkaConnectionError):
+        await kafka_producer.start_producer()
+
+    # Broker recovers. Clear the throttle stamp so the next publish retries now.
+    recovered = _UpProducer()
+    monkeypatch.setattr(kafka_producer, "AIOKafkaProducer", lambda **_kw: recovered)
+    monkeypatch.setattr(kafka_producer, "_producer", None)
+    monkeypatch.setattr(kafka_producer, "_last_start_attempt", 0.0, raising=False)
+
+    await kafka_producer.publish_raw(
+        topic="job.submitted", key="user-1", payload=_submitted_payload()
+    )
+
+    assert recovered.started is True
+    recovered.send_and_wait.assert_awaited_once()
+
+
+async def test_publish_raw_throttles_start_retries(monkeypatch: pytest.MonkeyPatch) -> None:
+    """While the broker is down, back-to-back publishes inside the retry window
+    must pay only one connection attempt."""
+    _reset_producer_state(monkeypatch)
+    built: list[dict[str, Any]] = []
+
+    def _factory(**kwargs: Any) -> _DownProducer:
+        built.append(kwargs)
+        return _DownProducer()
+
+    monkeypatch.setattr(kafka_producer, "AIOKafkaProducer", _factory)
+
+    with pytest.raises(KafkaConnectionError):
+        await kafka_producer.publish_raw(
+            topic="job.submitted", key="user-1", payload=_submitted_payload()
+        )
+    with pytest.raises(RuntimeError, match="failed recently"):
+        await kafka_producer.publish_raw(
+            topic="job.submitted", key="user-1", payload=_submitted_payload()
+        )
+
+    assert len(built) == 1
