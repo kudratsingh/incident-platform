@@ -472,3 +472,102 @@ async def test_admin_replay_resets_retry_count(
     assert body["status"] == "pending"
     assert body["retry_count"] == 0
     assert body["error_message"] is None
+
+
+# ---------------------------------------------------------------------------
+# Processor payload bounds (WO-P4-04 / E1-05)
+#
+# Unbounded payload knobs let a single POST /jobs schedule effectively
+# unbounded work in the worker process that also hosts the API. These assert
+# the per-type bound models reject the pathological values at the edge.
+# ---------------------------------------------------------------------------
+
+
+async def test_create_job_rejects_oversized_endpoint_count(
+    client: AsyncClient, auth_headers: dict[str, str]
+) -> None:
+    resp = await client.post(
+        "/api/v1/jobs",
+        json={"type": "bulk_api_sync", "payload": {"endpoint_count": 100_000_000}},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 422
+    assert "endpoint_count" in resp.text
+
+
+async def test_create_job_rejects_oversized_page_count(
+    client: AsyncClient, auth_headers: dict[str, str]
+) -> None:
+    resp = await client.post(
+        "/api/v1/jobs",
+        json={"type": "doc_analysis", "payload": {"page_count": 10**9}},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 422
+    assert "page_count" in resp.text
+
+
+async def test_create_job_rejects_oversized_row_count(
+    client: AsyncClient, auth_headers: dict[str, str]
+) -> None:
+    resp = await client.post(
+        "/api/v1/jobs",
+        json={"type": "report_gen", "payload": {"row_count": 10**9}},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 422
+    assert "row_count" in resp.text
+
+
+async def test_create_job_rejects_zero_group_count(
+    client: AsyncClient, auth_headers: dict[str, str]
+) -> None:
+    """group_count=0 is a ZeroDivisionError in _generate_report, not just a cost knob."""
+    resp = await client.post(
+        "/api/v1/jobs",
+        json={"type": "report_gen", "payload": {"row_count": 100, "group_count": 0}},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 422
+    assert "group_count" in resp.text
+
+
+async def test_create_job_rejects_zero_chunk_size(
+    client: AsyncClient, auth_headers: dict[str, str]
+) -> None:
+    """chunk_size=0 makes range(0, n, 0) raise ValueError in the csv processor."""
+    resp = await client.post(
+        "/api/v1/jobs",
+        json={"type": "csv_upload", "payload": {"row_count": 100, "chunk_size": 0}},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 422
+    assert "chunk_size" in resp.text
+
+
+async def test_create_job_accepts_boundary_endpoint_count(
+    client: AsyncClient, auth_headers: dict[str, str]
+) -> None:
+    """The cap itself is allowed — the bound is inclusive."""
+    resp = await client.post(
+        "/api/v1/jobs",
+        json={"type": "bulk_api_sync", "payload": {"endpoint_count": 100}},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 201
+
+
+async def test_create_job_allows_unrelated_payload_keys(
+    client: AsyncClient, auth_headers: dict[str, str]
+) -> None:
+    """Bound models are extra=allow — arbitrary user keys must still pass."""
+    resp = await client.post(
+        "/api/v1/jobs",
+        json={
+            "type": "doc_analysis",
+            "payload": {"page_count": 5, "source_uri": "s3://bucket/doc.pdf"},
+        },
+        headers=auth_headers,
+    )
+    assert resp.status_code == 201
+    assert resp.json()["payload"]["source_uri"] == "s3://bucket/doc.pdf"

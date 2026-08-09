@@ -124,3 +124,44 @@ async def test_list_sagas_returns_user_sagas(
     assert "beta" in names and "alpha" in names
     beta = next(i for i in body["items"] if i["name"] == "beta")
     assert beta["step_count"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Processor payload bounds on the saga surface (WO-P4-04 / E1-05)
+#
+# SagaStepRequest never goes through JobCreate, so bounds enforced only on
+# JobCreate would be trivially bypassable via POST /sagas.
+# ---------------------------------------------------------------------------
+
+
+async def test_create_saga_rejects_oversized_step_payload(
+    client: AsyncClient, auth_headers: dict[str, str]
+) -> None:
+    resp = await client.post(
+        "/api/v1/sagas",
+        json={
+            "name": "bypass-attempt",
+            "steps": [
+                {"type": "csv_upload"},
+                {"type": "doc_analysis", "payload": {"page_count": 10**9}},
+            ],
+        },
+        headers=auth_headers,
+    )
+    assert resp.status_code == 422
+    assert "page_count" in resp.text
+
+
+async def test_create_saga_allows_compensation_step_types(
+    client: AsyncClient, auth_headers: dict[str, str]
+) -> None:
+    """Non-JobType step types (e.g. `.compensate`) have no bound model — no-op."""
+    resp = await client.post(
+        "/api/v1/sagas",
+        json={
+            "name": "compensating",
+            "steps": [{"type": "csv_upload.compensate", "payload": {"anything": 1}}],
+        },
+        headers=auth_headers,
+    )
+    assert resp.status_code == 201
