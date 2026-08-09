@@ -23,7 +23,11 @@ from app.repositories.job import JobRepository
 from sqlalchemy.ext.asyncio import AsyncSession
 
 
-async def _make_job(db_session: AsyncSession, tenant_id: uuid.UUID) -> Job:
+async def _make_job(
+    db_session: AsyncSession,
+    tenant_id: uuid.UUID,
+    status: JobStatus = JobStatus.PENDING,
+) -> Job:
     user_id = uuid.uuid4()
     from app.core.security import hash_password
     from app.models.enums import UserRole
@@ -45,7 +49,7 @@ async def _make_job(db_session: AsyncSession, tenant_id: uuid.UUID) -> Job:
         tenant_id=tenant_id,
         user_id=user_id,
         type="csv_upload",
-        status=JobStatus.PENDING,
+        status=status,
         priority=0,
         payload={},
         retry_count=0,
@@ -97,3 +101,58 @@ async def test_update_status_completed_calls_datetime_now_utc(
         await repo.update_status(job.id, JobStatus.COMPLETED)
 
     mock_dt.now.assert_called_with(UTC)
+
+
+@pytest.mark.asyncio
+async def test_claim_for_running_duplicate_delivery_cannot_claim_twice(
+    db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
+) -> None:
+    """E1-04: Kafka delivers job.submitted at-least-once, so two deliveries
+    of the same job race into the dispatcher. The claim must be an atomic
+    conditional UPDATE (WHERE status='pending') so the database arbitrates:
+    the first delivery wins, the second matches zero rows and must skip
+    execution. A read-then-write let both proceed and double-execute.
+    """
+    job = await _make_job(db_session, default_tenant.id)
+    repo = JobRepository(db_session)
+
+    # First delivery wins the claim.
+    assert await repo.claim_for_running(job.id) is True
+    await db_session.refresh(job)
+    assert job.status == JobStatus.RUNNING
+    assert job.started_at is not None
+    started_at_after_win = job.started_at
+
+    # Second (duplicate) delivery loses: rowcount 0, row untouched.
+    assert await repo.claim_for_running(job.id) is False
+    await db_session.refresh(job)
+    assert job.status == JobStatus.RUNNING
+    assert job.started_at == started_at_after_win
+
+
+@pytest.mark.asyncio
+async def test_promote_waiting_to_pending_duplicate_promotion_loses(
+    db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
+) -> None:
+    """E1-04 companion CAS: the DependencyResolver and the resume sweep can
+    both try to promote the same WAITING child. Exactly one promoter may
+    flip WAITING->PENDING (and therefore mint the job.submitted event);
+    the loser gets False and leaves the row alone.
+    """
+    job = await _make_job(
+        db_session, default_tenant.id, status=JobStatus.WAITING
+    )
+    job.error_message = "held: parent retrying"
+    await db_session.flush()
+    repo = JobRepository(db_session)
+
+    # First promoter wins and clears the stale error message.
+    assert await repo.promote_waiting_to_pending(job.id) is True
+    await db_session.refresh(job)
+    assert job.status == JobStatus.PENDING
+    assert job.error_message is None
+
+    # Second promoter loses: rowcount 0, status unchanged.
+    assert await repo.promote_waiting_to_pending(job.id) is False
+    await db_session.refresh(job)
+    assert job.status == JobStatus.PENDING

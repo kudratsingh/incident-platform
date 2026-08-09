@@ -6,7 +6,9 @@ Offset management strategy:
   - Offsets are committed ONLY after handle_message() returns successfully.
   - If handle_message() raises, the offset is NOT committed. On restart, the
     message will be re-delivered (at-least-once delivery).
-  - Combined with idempotency keys on the job side, this prevents double execution.
+  - Duplicate deliveries are made safe by the dispatcher's atomic
+    PENDING->RUNNING claim (`JobRepository.claim_for_running`) — idempotency
+    keys only dedupe job CREATION, not execution.
 """
 
 import asyncio

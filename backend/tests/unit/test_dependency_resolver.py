@@ -57,11 +57,42 @@ async def test_promotes_child_when_all_parents_complete() -> None:
             value={"event": "job.completed", "job_id": str(parent_id)},
         )
 
-    job_repo.update_status.assert_awaited_once()
-    args = job_repo.update_status.await_args.args
-    assert args[0] == child.id
-    assert args[1] == JobStatus.PENDING
+    # Promotion goes through the atomic WAITING->PENDING CAS (E1-04), not a
+    # blind update_status write.
+    job_repo.promote_waiting_to_pending.assert_awaited_once_with(child.id)
     outbox_repo.add.assert_awaited_once()
+
+
+async def test_losing_promotion_cas_mints_no_duplicate_submitted() -> None:
+    """E1-04: when a concurrent promoter (the resume sweep, or a redelivered
+    job.completed) already flipped the child WAITING->PENDING, the losing
+    promoter must ALSO skip the outbox add. CAS-ing the status alone is not
+    enough — falling through to outbox_repo.add would still mint the
+    duplicate job.submitted the old docstring shrugged off as 'redundant'."""
+    factory, _ = _factory()
+    resolver = DependencyResolver(factory)
+    child = _waiting_child(uuid.uuid4())
+
+    dep_repo = AsyncMock()
+    dep_repo.children_of.return_value = [child.id]
+    dep_repo.unmet_count.return_value = 0
+
+    job_repo = AsyncMock()
+    job_repo.get_by_id.return_value = child
+    job_repo.promote_waiting_to_pending.return_value = False  # lost the CAS
+
+    outbox_repo = AsyncMock()
+
+    with patch("app.workers.dependency_resolver.JobDependencyRepository", return_value=dep_repo), \
+         patch("app.workers.dependency_resolver.JobRepository", return_value=job_repo), \
+         patch("app.workers.dependency_resolver.OutboxRepository", return_value=outbox_repo):
+        await resolver.handle_message(
+            topic="job.completed",
+            key="u",
+            value={"event": "job.completed", "job_id": str(uuid.uuid4())},
+        )
+
+    outbox_repo.add.assert_not_awaited()
 
 
 async def test_skips_child_with_remaining_unmet_deps() -> None:
@@ -87,7 +118,7 @@ async def test_skips_child_with_remaining_unmet_deps() -> None:
             value={"event": "job.completed", "job_id": str(uuid.uuid4())},
         )
 
-    job_repo.update_status.assert_not_awaited()
+    job_repo.promote_waiting_to_pending.assert_not_awaited()
     outbox_repo.add.assert_not_awaited()
 
 
@@ -114,7 +145,7 @@ async def test_skips_child_that_is_not_waiting() -> None:
             value={"event": "job.completed", "job_id": str(uuid.uuid4())},
         )
 
-    job_repo.update_status.assert_not_awaited()
+    job_repo.promote_waiting_to_pending.assert_not_awaited()
 
 
 async def _run_with_pause(redis: object) -> tuple[AsyncMock, AsyncMock, MagicMock]:
@@ -151,7 +182,7 @@ async def test_holds_child_while_dag_paused() -> None:
 
     job_repo, outbox_repo, _ = await _run_with_pause(redis)
 
-    job_repo.update_status.assert_not_awaited()
+    job_repo.promote_waiting_to_pending.assert_not_awaited()
     outbox_repo.add.assert_not_awaited()
 
 
@@ -161,8 +192,7 @@ async def test_promotes_child_when_no_pause_flag() -> None:
 
     job_repo, outbox_repo, child = await _run_with_pause(redis)
 
-    job_repo.update_status.assert_awaited_once()
-    assert job_repo.update_status.await_args.args[0] == child.id
+    job_repo.promote_waiting_to_pending.assert_awaited_once_with(child.id)
     outbox_repo.add.assert_awaited_once()
 
 
@@ -174,7 +204,7 @@ async def test_promotes_when_pause_lookup_fails() -> None:
 
     job_repo, outbox_repo, _ = await _run_with_pause(redis)
 
-    job_repo.update_status.assert_awaited_once()
+    job_repo.promote_waiting_to_pending.assert_awaited_once()
     outbox_repo.add.assert_awaited_once()
 
 
@@ -211,7 +241,7 @@ async def test_ancestor_pause_holds_descendant() -> None:
             value={"event": "job.completed", "job_id": str(uuid.uuid4())},
         )
 
-    job_repo.update_status.assert_not_awaited()
+    job_repo.promote_waiting_to_pending.assert_not_awaited()
 
 
 async def test_ignores_malformed_message() -> None:
