@@ -199,7 +199,7 @@ Once the stack is up, `make help` lists every target. The ones you'll hit most:
 | `make up` / `make down` | Bring the stack up (rebuild + detach) / stop it |
 | `make logs` | Tail the backend logs |
 | `make migrate` | Apply pending Alembic migrations (idempotent) |
-| `make seed-incident-commander` | Create the `incident-commander` service account and print a fresh scoped token (paste into the agent's `.env` as `PLATFORM_MCP_TOKEN`) |
+| `make seed-incident-commander` | Create or re-seed the `incident-commander` service account (existing scopes are merged, never narrowed — set `SA_REPLACE_SCOPES=1` to narrow deliberately) and print a fresh scoped token (paste into the agent's `.env` as `PLATFORM_TOKEN`) |
 | `make seed-eval-fixtures` | Populate the platform with realistic data for the incident-commander agent's live eval suite |
 | `make mcp-probe STEP=<preset>` | Smoke-test one MCP surface via `scripts/mcp_probe.sh`. `STEP` is one of `initialize`, `tools`, `lag`, `dlq`, `audit`, `forbidden` |
 
