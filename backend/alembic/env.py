@@ -15,6 +15,11 @@ sync dialects (e.g. postgresql / postgresql+psycopg2) through a plain
 sync engine. Setting the RUN_ALEMBIC_SYNC environment variable to any
 non-empty value is an explicit operator override that forces the sync
 path regardless of the URL's dialect.
+
+Both online paths funnel through do_run_migrations, which takes a
+session-level Postgres advisory lock on the migrating connection for the
+whole run (see app/core/migration_lock.py) — that is what makes
+concurrent ECS task startups serialize instead of racing on pg_type.
 """
 
 import asyncio
@@ -37,6 +42,10 @@ import app.models.audit  # noqa: E402, F401
 import app.models.job  # noqa: E402, F401
 import app.models.user  # noqa: E402, F401
 from app.core.db_url import is_async_url  # noqa: E402
+from app.core.migration_lock import (  # noqa: E402
+    acquire_migration_lock,
+    release_migration_lock,
+)
 from app.models.base import Base  # noqa: E402
 
 config = context.config
@@ -71,13 +80,27 @@ def run_migrations_offline() -> None:
 
 
 def do_run_migrations(connection: object) -> None:
-    context.configure(
-        connection=connection,  # type: ignore[arg-type]
-        target_metadata=target_metadata,
-        compare_type=True,
-    )
-    with context.begin_transaction():
-        context.run_migrations()
+    """Run the migrations on a SYNC connection, holding the advisory lock.
+
+    Shared by both online paths — the async engine reaches it through
+    run_sync (hence a sync Connection and no await), the sync engine calls
+    it directly. The lock is taken on this very connection and held for the
+    entire run, so a second task blocks here until the first finishes and
+    then no-ops on an already-current alembic_version. Non-Postgres
+    dialects report locked=False and nothing is executed.
+    """
+    locked = acquire_migration_lock(connection)  # type: ignore[arg-type]
+    try:
+        context.configure(
+            connection=connection,  # type: ignore[arg-type]
+            target_metadata=target_metadata,
+            compare_type=True,
+        )
+        with context.begin_transaction():
+            context.run_migrations()
+    finally:
+        if locked:
+            release_migration_lock(connection)  # type: ignore[arg-type]
 
 
 async def run_migrations_online() -> None:
