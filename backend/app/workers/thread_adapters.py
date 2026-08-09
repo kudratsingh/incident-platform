@@ -24,6 +24,11 @@ from app.workers.progress import ProgressPublisher
 # parses would exhaust RAM before they exhaust CPU.
 _thread_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="csv-worker")
 
+# Mirror of the bounds enforced at the creation surfaces
+# (schemas.job.CsvUploadPayload).
+MAX_ROW_COUNT = 1_000_000
+MAX_CHUNK_SIZE = 100_000
+
 
 def _parse_chunk_blocking(chunk_start: int, chunk_end: int) -> dict[str, Any]:
     """
@@ -51,8 +56,14 @@ async def process_csv_upload(
     async-aware.  run_in_executor offloads each blocking chunk-read to a thread
     while the event loop stays responsive for other requests.
     """
-    row_count: int = int(payload.get("row_count", 500))
-    chunk_size: int = int(payload.get("chunk_size", 100))
+    # Defensive clamps. The creation surfaces bound these (schemas.job.
+    # CsvUploadPayload), but replays republish the stored payload without
+    # revalidating, so pre-existing rows still reach us. chunk_size in
+    # particular is a divisor on the next line and a range() step below —
+    # chunk_size=0 raised ZeroDivisionError here and would have raised
+    # ValueError from range(0, n, 0).
+    row_count: int = max(0, min(int(payload.get("row_count", 500)), MAX_ROW_COUNT))
+    chunk_size: int = max(1, min(int(payload.get("chunk_size", 100)), MAX_CHUNK_SIZE))
     total_chunks = max(1, (row_count + chunk_size - 1) // chunk_size)
 
     await publish(0, f"Parsing {row_count} rows in chunks of {chunk_size}")

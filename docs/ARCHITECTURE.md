@@ -290,6 +290,31 @@ The worker calls thread-based processors via `await loop.run_in_executor(...)`. 
 
 The worker maintains a `ProcessPoolExecutor` and submits CPU-heavy jobs via `await loop.run_in_executor(pool, ...)`. Pickling overhead matters (a 5MB payload to a subprocess is expensive); we send only what's needed.
 
+Two things about that pool are deliberate:
+
+- **It is created lazily, on an explicit `spawn` context** (`_get_pool()`), never at import time. A pool built at import time would, on Linux, `fork` the worker process as it looked *then*; by the time a CPU job actually runs, the `csv-worker` thread pool and the Kafka/Redis clients are live, and forking a thread-laden process risks children that deadlock on a lock held by a thread the child does not have. `spawn` costs ~0.5–1s of child startup on the first CPU job and nothing after. macOS already defaults to `spawn`, which is why local development never surfaced this.
+- **`BrokenProcessPool` resets the pool** (`_reset_pool()`) and re-raises into the dispatcher's normal retry path. A pool whose child was killed (OOM killer, host pressure) is permanently broken; without the reset, one dead child failed *every* subsequent CPU job until the ECS task restarted.
+
+### Payload bounds — why processor knobs are capped
+
+Job payloads are user-controlled, and their knobs translate directly into work in the worker process — which is the same process that serves the API and hosts every consumer loop. `endpoint_count=10**7` eagerly creates ten million asyncio tasks and OOM-kills all of it at once; a large `page_count`/`row_count` pegs the four-worker process pool long enough to push the Kafka dispatcher past `max_poll_interval_ms` and get the consumer group kicked.
+
+So each knob is bounded twice:
+
+| Job type | Knob | Bound |
+| --- | --- | --- |
+| `bulk_api_sync` | `endpoint_count` | 0–100 |
+| `csv_upload` | `row_count` / `chunk_size` | 0–1,000,000 / 1–100,000 |
+| `doc_analysis` | `page_count` | 0–1000 |
+| `report_gen` | `row_count` / `group_count` | 0–1,000,000 / 1–1000 |
+
+1. **At every creation surface** — `schemas/job.py` defines per-type payload models (`extra="allow"`, so `__traceparent` and arbitrary caller keys pass through) and `validate_processor_payload()` applies them from *both* `JobCreate` (POST /jobs) and `SagaStepRequest` (POST /sagas). The saga path builds jobs through `SagaService` → `JobService.create_job` and never constructs a `JobCreate`, so validating only the latter would leave POST /sagas as an open bypass.
+2. **Inside the processors** — as clamps. Replays (`JobService.replay_job`) republish the *stored* payload without revalidating, so rows written before the bounds existed still reach a processor. The clamps are load-bearing, not belt-and-braces.
+
+The `chunk_size` and `group_count` floors are `1`, not `0`: both are divisors, and zero was a `ZeroDivisionError` and a silently-empty report respectively.
+
+These caps are conservative and deliberately defensive — the simulated processors have no real resource envelope to derive limits from. Real processors should replace them with limits derived from their actual memory and CPU cost.
+
 ### When to add a new processor
 
 The decision is concrete:

@@ -14,11 +14,21 @@ import random
 from typing import Any
 
 from app.core.circuit_breaker import CircuitOpenError, get_circuit_breaker
+from app.core.logging import get_logger
 from app.core.tracing import get_tracer
 from app.workers.progress import ProgressPublisher
 from opentelemetry.trace import SpanKind
 
+logger = get_logger(__name__)
 tracer = get_tracer(__name__)
+
+# Hard ceiling on eagerly-created tasks. POST /jobs and POST /sagas already
+# reject anything above this (schemas.job.BulkApiSyncPayload), but replays
+# republish the *stored* payload without revalidating, so rows written before
+# the bound existed still land here. This clamp is load-bearing, not
+# belt-and-braces: the worker shares its process with the API and every
+# consumer loop, so an unbounded fan-out OOM-kills all of them at once.
+MAX_ENDPOINT_COUNT = 100
 
 # One breaker per logical external service, shared across all jobs in this process.
 _bulk_api_breaker = get_circuit_breaker(
@@ -32,8 +42,28 @@ async def process_bulk_api_sync(
     payload: dict[str, Any],
     publish: ProgressPublisher,
 ) -> dict[str, Any]:
-    endpoint_count: int = int(payload.get("endpoint_count", 5))
+    requested_count: int = int(payload.get("endpoint_count", 5))
+    endpoint_count: int = max(0, min(requested_count, MAX_ENDPOINT_COUNT))
+    if endpoint_count != requested_count:
+        logger.warning(
+            "bulk_api_sync.endpoint_count clamped",
+            extra={
+                "requested_endpoint_count": requested_count,
+                "endpoint_count": endpoint_count,
+            },
+        )
     await publish(0, f"Starting sync of {endpoint_count} endpoints")
+
+    if endpoint_count == 0:
+        # No endpoints means no progress denominator — publish the terminal
+        # step explicitly rather than dividing by zero in the loop below.
+        await publish(100, "No endpoints to sync")
+        return {
+            "endpoints_synced": 0,
+            "errors": 0,
+            "total": 0,
+            "results": [],
+        }
 
     async def _call_one(index: int) -> dict[str, Any]:
         with tracer.start_as_current_span(

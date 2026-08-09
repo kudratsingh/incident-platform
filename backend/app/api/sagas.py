@@ -10,11 +10,11 @@ from app.repositories.job import JobRepository
 from app.repositories.job_dependency import JobDependencyRepository
 from app.repositories.outbox import OutboxRepository
 from app.repositories.saga import SagaRepository
-from app.schemas.job import JobResponse
+from app.schemas.job import JobResponse, validate_processor_payload
 from app.services.job import JobService
 from app.services.saga import SagaService, SagaStep
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -25,6 +25,17 @@ class SagaStepRequest(BaseModel):
     type: str
     payload: dict[str, Any] | None = None
     priority: int = Field(default=0, ge=0, le=100)
+
+    @model_validator(mode="after")
+    def _bound_payload(self) -> "SagaStepRequest":
+        # A saga step goes SagaService -> JobService.create_job directly and
+        # never constructs a JobCreate, so the bounds have to be applied here
+        # too or POST /sagas is an open bypass of the POST /jobs limits.
+        # `type` stays a plain str (compensation types like
+        # "csv_upload.compensate" are not JobType members); unknown types are
+        # a no-op in validate_processor_payload.
+        validate_processor_payload(self.type, self.payload)
+        return self
 
 
 class SagaCreateRequest(BaseModel):
