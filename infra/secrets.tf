@@ -49,3 +49,19 @@ resource "aws_secretsmanager_secret_version" "alert_webhook_secret" {
   secret_id     = aws_secretsmanager_secret.alert_webhook_secret.id
   secret_string = var.alert_webhook_secret
 }
+
+# ── REDIS_URL ─────────────────────────────────────────────────────────────────
+
+resource "aws_secretsmanager_secret" "redis_url" {
+  name                    = "${var.app_name}/redis-url"
+  description             = "Full rediss:// connection string for the backend (embeds the ElastiCache AUTH token)"
+  recovery_window_in_days = 7
+}
+
+resource "aws_secretsmanager_secret_version" "redis_url" {
+  secret_id = aws_secretsmanager_secret.redis_url.id
+
+  # Built from the ElastiCache primary endpoint after the replication group is
+  # created. rediss:// scheme: in-transit encryption is enabled on the group.
+  secret_string = "rediss://:${random_password.redis_auth.result}@${aws_elasticache_replication_group.redis.primary_endpoint_address}:6379/0"
+}

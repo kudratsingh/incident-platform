@@ -38,6 +38,7 @@ resource "aws_iam_role_policy" "ecs_execution_secrets" {
           aws_secretsmanager_secret.database_url.arn,
           aws_secretsmanager_secret.secret_key.arn,
           aws_secretsmanager_secret.alert_webhook_secret.arn,
+          aws_secretsmanager_secret.redis_url.arn,
         ]
       }
     ]

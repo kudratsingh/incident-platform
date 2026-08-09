@@ -129,6 +129,12 @@ jobs:
       - name: Terraform validate
         run: terraform -chdir=infra validate
 
+      # F2-15: Redis must stay encrypted. `validate` cannot catch a revert to
+      # the bare aws_elasticache_cluster resource (an unencrypted cluster is
+      # still valid HCL), so pin the two encryption flags textually.
+      - name: ElastiCache encryption flags present
+        run: grep -q transit_encryption_enabled infra/elasticache.tf && grep -q at_rest_encryption_enabled infra/elasticache.tf
+
       # ADR 0008: the production workspace must refuse chaos_enabled=true.
       # `terraform validate` cannot prove this — variable validations are only
       # evaluated by plan/apply with concrete values — so this is a negative

@@ -99,7 +99,10 @@ resource "aws_cloudwatch_metric_alarm" "redis_memory" {
   threshold           = 52428800 # 50 MB in bytes
 
   dimensions = {
-    CacheClusterId = aws_elasticache_cluster.redis.id
+    # The replication group has exactly one member cluster (num_cache_clusters
+    # = 1); one() fails the plan if that changes, forcing this alarm to be
+    # revisited alongside any scale-out.
+    CacheClusterId = one(aws_elasticache_replication_group.redis.member_clusters)
     CacheNodeId    = "0001"
   }
 

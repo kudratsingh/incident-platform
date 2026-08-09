@@ -45,8 +45,9 @@ Thumbs.db
 # providers) plaintext secrets from data sources. Never commit it; the
 # planned Phase 8 move to S3 remote state makes this even more of a hazard
 # to have sitting untracked in the working tree.
+# (.terraform.lock.hcl is deliberately NOT ignored: the provider lockfile is
+# committed so provider resolution is identical across machines and CI.)
 **/.terraform/
-**/.terraform.lock.hcl
 *.tfstate
 *.tfstate.*
 *.tfvars
