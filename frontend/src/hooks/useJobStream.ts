@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useState } from 'react'
 import type { ProgressEvent } from '../types'
 import { jobsApi } from '../api/jobs'
 
@@ -23,6 +23,14 @@ const BASE_URL = import.meta.env.VITE_API_URL ?? '/api/v1'
  *
  * Reconnects automatically if the connection drops before a terminal event,
  * minting a fresh stream token each time (the old one expires in ~60s).
+ *
+ * Lifecycle: everything the effect owns (disposal flag, pending reconnect
+ * timer, live EventSource, terminal-seen flag) lives in closure variables
+ * scoped to a single effect invocation, so StrictMode's dev mount → unmount →
+ * remount cycle gets a fresh set instead of the throwaway first cycle poisoning
+ * the second (as refs would).  setState updaters are pure — the reconnect is
+ * scheduled from the error handler off `sawTerminal`, never from inside an
+ * updater, which StrictMode double-invokes.
  */
 export function useJobStream(jobId: string | null): StreamState {
   const [state, setState] = useState<StreamState>({
@@ -31,72 +39,88 @@ export function useJobStream(jobId: string | null): StreamState {
     connected: false,
     done: false,
   })
-  const esRef = useRef<EventSource | null>(null)
 
   useEffect(() => {
     if (!jobId) return
     const id = jobId
-    let cancelled = false
+
+    // Per-invocation state. Fresh on every effect run, discarded by cleanup.
+    let disposed = false
+    let timer: ReturnType<typeof setTimeout> | null = null
+    let es: EventSource | null = null
+    let sawTerminal = false
+
+    function scheduleReconnect() {
+      if (disposed || sawTerminal) return
+      timer = setTimeout(() => {
+        timer = null
+        void connect()
+      }, 2000)
+    }
 
     async function connect() {
+      if (disposed) return
+
       let streamToken: string
       try {
         streamToken = await jobsApi.streamToken(id)
       } catch {
         // Could not mint a token (expired session, network blip). Retry on
         // the same cadence as a dropped stream, unless the job already ended.
-        if (cancelled) return
-        setState((s) => {
-          if (!s.done) setTimeout(connect, 2000)
-          return { ...s, connected: false }
-        })
+        if (disposed) return
+        setState((s) => ({ ...s, connected: false }))
+        scheduleReconnect()
         return
       }
-      if (cancelled) return
+      if (disposed) return
 
-      const es = new EventSource(`${BASE_URL}/jobs/${id}/stream?token=${streamToken}`)
-      esRef.current = es
+      const source = new EventSource(`${BASE_URL}/jobs/${id}/stream?token=${streamToken}`)
+      es = source
 
-      es.onopen = () => {
+      source.onopen = () => {
         setState((s) => ({ ...s, connected: true }))
       }
 
-      es.onmessage = (e) => {
+      source.onmessage = (e) => {
+        let event: ProgressEvent
         try {
-          const event: ProgressEvent = JSON.parse(e.data as string)
-          setState((s) => {
-            const done = TERMINAL.has(event.status)
-            return {
-              events: [...s.events, event],
-              latest: event,
-              connected: !done,
-              done,
-            }
-          })
-          if (TERMINAL.has(event.status)) {
-            es.close()
-          }
+          event = JSON.parse(e.data as string) as ProgressEvent
         } catch {
-          // ignore malformed events
+          return // ignore malformed events
         }
+        const isTerminal = TERMINAL.has(event.status)
+        if (isTerminal) {
+          // Recorded in the closure, not read back out of state: deciding a
+          // side effect inside an updater is the bug this hook used to have.
+          sawTerminal = true
+          source.close()
+        }
+        setState((s) => ({
+          events: [...s.events, event],
+          latest: event,
+          connected: !isTerminal,
+          done: isTerminal,
+        }))
       }
 
-      es.onerror = () => {
-        es.close()
+      source.onerror = () => {
+        source.close()
+        if (disposed || sawTerminal) return
         setState((s) => ({ ...s, connected: false }))
-        // Reconnect after 2s if not terminal
-        setState((s) => {
-          if (!s.done) setTimeout(connect, 2000)
-          return s
-        })
+        scheduleReconnect()
       }
     }
 
-    connect()
+    void connect()
 
     return () => {
-      cancelled = true
-      esRef.current?.close()
+      disposed = true
+      if (timer !== null) {
+        clearTimeout(timer)
+        timer = null
+      }
+      es?.close()
+      es = null
     }
   }, [jobId])
 

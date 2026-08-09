@@ -12,6 +12,7 @@
  *  - Cleans up EventSource on unmount, including a token fetch still in flight
  */
 
+import { StrictMode } from 'react'
 import { renderHook, act } from '@testing-library/react'
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { useJobStream } from '../hooks/useJobStream'
@@ -199,5 +200,43 @@ describe('useJobStream', () => {
     await renderStream(null)
     expect(MockEventSource.instances).toHaveLength(0)
     expect(streamTokenMock).not.toHaveBeenCalled()
+  })
+
+  // --- lifecycle discipline (F2-02) ---
+
+  it('cancels a pending reconnect on unmount (no zombie loop)', async () => {
+    const { unmount } = await renderStream()
+
+    // Drop the connection: this arms the 2s reconnect timer.
+    act(() => { latest().simulateError() })
+
+    unmount()
+    const instancesAtUnmount = MockEventSource.instances.length
+    const mintsAtUnmount = streamTokenMock.mock.calls.length
+
+    // Long enough for several reconnect generations to fire.
+    await act(async () => { vi.advanceTimersByTime(10000) })
+    await act(async () => {})
+
+    // Nothing may happen after unmount — not a token mint, not a socket.
+    expect(streamTokenMock.mock.calls.length).toBe(mintsAtUnmount)
+    expect(MockEventSource.instances.length).toBe(instancesAtUnmount)
+  })
+
+  it('schedules exactly one reconnect under StrictMode', async () => {
+    renderHook(() => useJobStream(JOB_ID), { wrapper: StrictMode })
+    await act(async () => {})
+
+    const instancesBefore = MockEventSource.instances.length
+    const mintsBefore = streamTokenMock.mock.calls.length
+
+    act(() => { latest().simulateError() })
+
+    await act(async () => { vi.advanceTimersByTime(2500) })
+    await act(async () => {})
+
+    // The errored socket closed (-1) and exactly one replacement opened (+1).
+    expect(MockEventSource.instances.length).toBe(instancesBefore)
+    expect(streamTokenMock.mock.calls.length).toBe(mintsBefore + 1)
   })
 })
