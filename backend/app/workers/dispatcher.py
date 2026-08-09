@@ -22,6 +22,7 @@ Concurrency model selection (this is the core design decision):
 
 import asyncio
 import uuid
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from app.config import get_settings
@@ -68,6 +69,20 @@ POLL_INTERVAL = 0.5  # seconds between queue checks
 # pause lifts is fine and the DB scan stays cheap.
 _RESUME_SWEEP_INTERVAL = 10  # seconds
 _RESUME_SWEEP_LIMIT = 200  # WAITING rows examined per pass
+
+# Delay applied when a delayed-retry promotion fails and the job is pushed
+# back onto `jobs:delayed`. Short on purpose: the backoff the job was
+# waiting out has already elapsed, this is only spacing against a
+# transient DB error, not a new backoff.
+_PROMOTE_RETRY_DELAY_SECONDS = 5.0
+
+# Stale-PENDING backstop. Deliberately much slower and much older than the
+# retry loop: it exists only for the crash windows nothing else covers, and
+# every pass it takes is a pass the normal path already failed to take.
+_STALE_PENDING_SWEEP_INTERVAL = 60  # seconds between passes
+_STALE_PENDING_AGE_SECONDS = 300  # how long PENDING-without-progress is "stale"
+_STALE_PENDING_LIMIT = 100  # PENDING rows examined per pass
+
 MAX_CONCURRENT_JOBS = 10  # cap on simultaneously running jobs
 
 # Strategy map: job type → processor coroutine
@@ -558,6 +573,94 @@ class JobDispatcherConsumer(BaseKafkaConsumer):
             return None
 
 
+def _job_submitted_payload(job: Job) -> dict[str, Any]:
+    """The canonical `job.submitted` outbox payload for a job row.
+
+    Shared by every path that re-publishes an existing job (delayed-retry
+    promotion, the stale-PENDING backstop) so a job dispatched by a
+    backstop is byte-identical to one dispatched by the normal path.
+    """
+    return {
+        "event": "job.submitted",
+        "tenant_id": str(job.tenant_id),
+        "job_id": str(job.id),
+        "user_id": str(job.user_id),
+        "job_type": job.type,
+        "payload": dict(job.payload or {}),
+        "priority": job.priority,
+        "trace_id": job.trace_id,
+    }
+
+
+async def _promote_delayed_once(
+    session_factory: async_sessionmaker[AsyncSession],
+    redis: Any,
+) -> None:
+    """One pass of delayed-retry promotion: pop the due entries and
+    re-publish each through the outbox.
+
+    Failure isolation is the whole point (E1-03). `pop_ready_delayed` is
+    destructive — the Lua script ZREMs the batch before returning it — so
+    every popped id is now held only by this coroutine. The pre-fix shape
+    wrapped the entire loop in one `try`, so the first DB error abandoned
+    the rest of the batch: those jobs were already out of `jobs:delayed`
+    and sat in PENDING with nothing left to publish them.
+
+    So: each item gets its own try/except (the discipline already applied
+    to `_promote_dlq_replay_loop`), and — unlike that loop, which
+    deliberately does NOT re-enqueue because the operator can see the
+    missed replay in the audit trail — a failed delayed retry is pushed
+    back onto `jobs:delayed`. A retry has no such audit trail; losing it
+    is silent.
+
+    The re-push happens *outside* the failed session context (the session
+    is dead once it raised) and in its own try, because Redis can be the
+    thing that's broken. If the re-push fails too the job is genuinely
+    stranded in PENDING, and only `_requeue_stale_pending_once` recovers
+    it.
+    """
+    settings = get_settings()
+    ready_ids = await queue.pop_ready_delayed(redis)
+    for job_id_str in ready_ids:
+        try:
+            job_id = uuid.UUID(job_id_str)
+        except ValueError:
+            logger.warning("invalid delayed job id", extra={"id": job_id_str})
+            continue
+
+        try:
+            async with session_factory() as session:
+                async with session.begin():
+                    job = await JobRepository(session).get_by_id(job_id)
+                    if job is None:
+                        logger.warning(
+                            "delayed job not found, dropping",
+                            extra={"job_id": job_id_str},
+                        )
+                        continue
+                    await OutboxRepository(session).add(
+                        tenant_id=job.tenant_id,
+                        topic=settings.kafka_topic_job_submitted,
+                        key=f"{job.tenant_id}:{job.user_id}",
+                        payload=_job_submitted_payload(job),
+                    )
+        except Exception as exc:
+            logger.error(
+                "delayed promotion failed, re-queueing job",
+                extra={"job_id": job_id_str, "error": str(exc)},
+            )
+            try:
+                await queue.push_delayed(
+                    redis, job_id_str, _PROMOTE_RETRY_DELAY_SECONDS
+                )
+            except Exception as push_exc:
+                logger.error(
+                    "delayed re-queue failed — job may strand in PENDING; "
+                    "backstop sweep will recover",
+                    extra={"job_id": job_id_str, "error": str(push_exc)},
+                )
+
+
 async def _promote_delayed_loop(
     session_factory: async_sessionmaker[AsyncSession],
     redis: Any,
@@ -567,42 +670,13 @@ async def _promote_delayed_loop(
 
     The re-publish goes through the outbox (not direct Kafka) so the retry
     survives a worker crash between Redis pop and Kafka publish.
+
+    The outer try only has to cover the pop itself now — per-item failures
+    are handled inside `_promote_delayed_once`.
     """
-    settings = get_settings()
     while True:
         try:
-            ready_ids = await queue.pop_ready_delayed(redis)
-            for job_id_str in ready_ids:
-                try:
-                    job_id = uuid.UUID(job_id_str)
-                except ValueError:
-                    logger.warning("invalid delayed job id", extra={"id": job_id_str})
-                    continue
-
-                async with session_factory() as session:
-                    async with session.begin():
-                        job = await JobRepository(session).get_by_id(job_id)
-                        if job is None:
-                            logger.warning(
-                                "delayed job not found, dropping",
-                                extra={"job_id": job_id_str},
-                            )
-                            continue
-                        await OutboxRepository(session).add(
-                            tenant_id=job.tenant_id,
-                            topic=settings.kafka_topic_job_submitted,
-                            key=f"{job.tenant_id}:{job.user_id}",
-                            payload={
-                                "event": "job.submitted",
-                                "tenant_id": str(job.tenant_id),
-                                "job_id": str(job.id),
-                                "user_id": str(job.user_id),
-                                "job_type": job.type,
-                                "payload": dict(job.payload or {}),
-                                "priority": job.priority,
-                                "trace_id": job.trace_id,
-                            },
-                        )
+            await _promote_delayed_once(session_factory, redis)
         except asyncio.CancelledError:
             break
         except Exception as exc:
@@ -689,6 +763,96 @@ async def _resume_unblocked_waiting_loop(
             logger.error("resume sweep error", extra={"error": str(exc)})
 
         await asyncio.sleep(_RESUME_SWEEP_INTERVAL)
+
+
+async def _requeue_stale_pending_once(
+    session_factory: async_sessionmaker[AsyncSession],
+    redis: Any,
+) -> None:
+    """One pass of the stale-PENDING backstop: re-publish PENDING jobs that
+    nothing is going to pick up.
+
+    Covers the two crash windows the per-item isolation in
+    `_promote_delayed_once` cannot (E1-03). Both leave a job PENDING with
+    no Redis timer and no Kafka message — invisible to every other loop:
+
+      1. The worker dies between the destructive Lua pop and the outbox
+         commit. The ids are already ZREM'd; nothing re-pushes them.
+      2. The worker dies between the retry transaction's commit (which
+         writes status=PENDING) and `queue.push_delayed`. The job never
+         made it into `jobs:delayed` at all.
+
+    The `jobs:delayed` ZSCORE check is what makes this safe to run.
+    A hit means the promotion loop still owns the job — it is legitimately
+    waiting out a backoff, and the LLM retry policy can set those to
+    minutes. Re-publishing then would run the job early, defeating the
+    backoff. Only a job that is old AND has no timer is actually orphaned.
+
+    Duplicate-safe by construction, which is why this depends on the
+    atomic claim from WO-P4-03: the sweep can still false-positive when
+    Kafka consumer lag exceeds the staleness window (the job.submitted is
+    real, just not consumed yet), and the resulting second delivery loses
+    `JobRepository.claim_for_running` and executes nothing.
+
+    Cross-tenant by design — same justification as
+    `_resume_unblocked_waiting_loop`: a platform-level scheduler, not a
+    request path, so it deliberately doesn't go through the tenant-scoped
+    `JobRepository.list_jobs`.
+    """
+    settings = get_settings()
+    cutoff = datetime.now(UTC) - timedelta(seconds=_STALE_PENDING_AGE_SECONDS)
+    async with session_factory() as session:
+        async with session.begin():
+            outbox_repo = OutboxRepository(session)
+            rows = (
+                await session.execute(
+                    select(Job)
+                    .where(
+                        Job.status == JobStatus.PENDING,
+                        Job.updated_at < cutoff,
+                    )
+                    .limit(_STALE_PENDING_LIMIT)
+                )
+            ).scalars()
+
+            for job in rows:
+                # `updated_at` is the right staleness signal (not
+                # `created_at`): the retry transaction's
+                # update_status(PENDING) touches it, so the age measured
+                # here is time-since-last-progress.
+                if await redis.zscore(queue.DELAYED_KEY, str(job.id)) is not None:
+                    continue
+                await outbox_repo.add(
+                    tenant_id=job.tenant_id,
+                    topic=settings.kafka_topic_job_submitted,
+                    key=f"{job.tenant_id}:{job.user_id}",
+                    payload=_job_submitted_payload(job),
+                )
+                logger.info(
+                    "stale PENDING re-published",
+                    extra={
+                        "job_id": str(job.id),
+                        "tenant_id": str(job.tenant_id),
+                    },
+                )
+
+
+async def _requeue_stale_pending_loop(
+    session_factory: async_sessionmaker[AsyncSession],
+    redis: Any,
+) -> None:
+    """Backstop sweep for jobs stranded in PENDING — see
+    `_requeue_stale_pending_once` for what it recovers and why the
+    `jobs:delayed` guard is load-bearing."""
+    while True:
+        try:
+            await _requeue_stale_pending_once(session_factory, redis)
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            logger.error("stale pending sweep error", extra={"error": str(exc)})
+
+        await asyncio.sleep(_STALE_PENDING_SWEEP_INTERVAL)
 
 
 async def _promote_dlq_replay_loop(
@@ -1053,7 +1217,7 @@ async def worker_loop(
     sticks. The corollary is that a permanently unreachable broker leaves all
     8 supervisors retrying rather than disabling the worker.
 
-    Concurrent tasks that make up the worker — 8 Kafka consumers + 7 loops:
+    Concurrent tasks that make up the worker — 8 Kafka consumers + 8 loops:
 
       Kafka consumers (each its own group, so failure of one doesn't
       affect the others):
@@ -1072,10 +1236,13 @@ async def worker_loop(
         2. _promote_dlq_replay_loop   — fires operator-scheduled DLQ replays.
         3. _resume_unblocked_waiting_loop — promotes WAITING children once their DAG
                                         pause lifts; backstops missed promotions.
-        4. _outbox_relay_loop         — publishes outbox rows to Kafka.
-        5. _metrics_loop              — emits gauges + cached lag for backpressure.
-        6. _digest_loop               — Phase 10: per-tenant LLM digests (opt-in).
-        7. _idempotency_reaper_loop   — hourly DELETE of expired idempotency records
+        4. _requeue_stale_pending_loop — backstops the delayed-retry pipeline:
+                                        re-publishes PENDING jobs with no
+                                        `jobs:delayed` timer left (crash windows).
+        5. _outbox_relay_loop         — publishes outbox rows to Kafka.
+        6. _metrics_loop              — emits gauges + cached lag for backpressure.
+        7. _digest_loop               — Phase 10: per-tenant LLM digests (opt-in).
+        8. _idempotency_reaper_loop   — hourly DELETE of expired idempotency records
                                         (ADR 0010's "no reaper" follow-up).
 
     Cancel signal: cancel all, wait for in-flight jobs, stop all consumers.
@@ -1109,6 +1276,9 @@ async def worker_loop(
             asyncio.create_task(_promote_dlq_replay_loop(session_factory, redis)),
             asyncio.create_task(
                 _resume_unblocked_waiting_loop(session_factory, redis)
+            ),
+            asyncio.create_task(
+                _requeue_stale_pending_loop(session_factory, redis)
             ),
             asyncio.create_task(_outbox_relay_loop(session_factory)),
             asyncio.create_task(_metrics_loop(redis, dispatcher)),

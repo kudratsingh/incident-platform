@@ -27,15 +27,9 @@ def _make_job(**kwargs: object) -> MagicMock:
     return job
 
 
-def _make_session_factory(job: MagicMock) -> MagicMock:
-    """Returns a session factory whose sessions yield a job_repo that returns `job`."""
-    job_repo = AsyncMock()
-    job_repo.get_by_id.return_value = job
-    job_repo.update_status.return_value = job
-
-    audit_repo = AsyncMock()
-    audit_repo.log = AsyncMock()
-
+def _make_session() -> AsyncMock:
+    """An AsyncSession stand-in usable as `async with factory() as session`
+    and `async with session.begin()`."""
     # session.begin() must be a regular (sync) call returning an async context manager
     begin_ctx = MagicMock()
     begin_ctx.__aenter__ = AsyncMock(return_value=None)
@@ -45,9 +39,20 @@ def _make_session_factory(job: MagicMock) -> MagicMock:
     session.__aenter__ = AsyncMock(return_value=session)
     session.__aexit__ = AsyncMock(return_value=False)
     session.begin = MagicMock(return_value=begin_ctx)
+    return session
+
+
+def _make_session_factory(job: MagicMock) -> MagicMock:
+    """Returns a session factory whose sessions yield a job_repo that returns `job`."""
+    job_repo = AsyncMock()
+    job_repo.get_by_id.return_value = job
+    job_repo.update_status.return_value = job
+
+    audit_repo = AsyncMock()
+    audit_repo.log = AsyncMock()
 
     factory = MagicMock()
-    factory.return_value = session
+    factory.return_value = _make_session()
 
     return factory, job_repo, audit_repo
 
@@ -508,3 +513,152 @@ async def test_supervise_consumer_does_not_resurrect_on_orderly_stop() -> None:
 
     assert consumer.run_calls == 1
     assert consumer.start_calls == 0, "orderly stop resurrected the consumer"
+
+
+# ---------------------------------------------------------------------------
+# Delayed-retry promotion (_promote_delayed_once)
+# ---------------------------------------------------------------------------
+
+
+async def test_promote_delayed_once_isolates_failures_and_requeues() -> None:
+    """E1-03: the batch popped from `jobs:delayed` is already ZREM'd, so
+    anything the promotion pass drops is gone from Redis forever and the job
+    sits in PENDING with nothing left to publish it.
+
+    Pre-fix the whole `for` loop lived inside one `try`, so the FIRST DB
+    error aborted the pass: three ids popped, zero promoted, all three lost.
+    Post-fix each item owns its try/except (the discipline already applied to
+    `_promote_dlq_replay_loop`) and — unlike that loop, which deliberately
+    does not re-enqueue because the operator can see the miss in the audit
+    trail — the failed delayed retry is pushed back onto `jobs:delayed`.
+    """
+    ids = [uuid.uuid4() for _ in range(3)]
+    jobs = [_make_job(id=job_id, tenant_id=uuid.uuid4()) for job_id in ids]
+
+    job_repo = AsyncMock()
+    # The first id never reaches the repo — its session_factory() call raises.
+    job_repo.get_by_id.side_effect = [jobs[1], jobs[2]]
+    outbox = AsyncMock()
+    redis = AsyncMock()
+
+    factory = MagicMock(
+        side_effect=[RuntimeError("db connection lost"), _make_session(), _make_session()]
+    )
+
+    with patch("app.workers.dispatcher.JobRepository", return_value=job_repo), \
+         patch(
+             "app.workers.dispatcher.OutboxRepository",
+             new=MagicMock(return_value=outbox),
+         ), \
+         patch(
+             "app.workers.dispatcher.queue.pop_ready_delayed",
+             new=AsyncMock(return_value=[str(job_id) for job_id in ids]),
+         ), \
+         patch(
+             "app.workers.dispatcher.queue.push_delayed", new=AsyncMock()
+         ) as mock_push:
+        await dispatcher._promote_delayed_once(factory, redis)
+
+    # The two healthy items still got promoted — one bad item no longer
+    # strands the rest of the batch.
+    assert outbox.add.await_count == 2
+    promoted = {c.kwargs["payload"]["job_id"] for c in outbox.add.await_args_list}
+    assert promoted == {str(ids[1]), str(ids[2])}
+
+    # ...and the bad item went back onto the delayed set instead of vanishing.
+    mock_push.assert_awaited_once_with(
+        redis, str(ids[0]), dispatcher._PROMOTE_RETRY_DELAY_SECONDS
+    )
+
+
+async def test_promote_delayed_once_survives_a_failing_re_push() -> None:
+    """If the re-enqueue itself fails (Redis blip) the pass must keep going —
+    the job is logged as possibly stranded and left to the backstop sweep."""
+    job_id = uuid.uuid4()
+    job_repo = AsyncMock()
+    outbox = AsyncMock()
+    redis = AsyncMock()
+    factory = MagicMock(side_effect=[RuntimeError("db connection lost")])
+
+    with patch("app.workers.dispatcher.JobRepository", return_value=job_repo), \
+         patch(
+             "app.workers.dispatcher.OutboxRepository",
+             new=MagicMock(return_value=outbox),
+         ), \
+         patch(
+             "app.workers.dispatcher.queue.pop_ready_delayed",
+             new=AsyncMock(return_value=[str(job_id)]),
+         ), \
+         patch(
+             "app.workers.dispatcher.queue.push_delayed",
+             new=AsyncMock(side_effect=RuntimeError("redis down")),
+         ):
+        # Must NOT raise out of the pass.
+        await dispatcher._promote_delayed_once(factory, redis)
+
+    outbox.add.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Stale-PENDING backstop sweep (_requeue_stale_pending_once)
+# ---------------------------------------------------------------------------
+
+
+def _stale_pending_factory(job: MagicMock) -> MagicMock:
+    """Session factory whose single `execute` returns `job` as the only row."""
+    session = _make_session()
+    result = MagicMock()
+    result.scalars = MagicMock(return_value=iter([job]))
+    session.execute = AsyncMock(return_value=result)
+    factory = MagicMock(return_value=session)
+    return factory
+
+
+async def test_requeue_stale_pending_once_republishes_orphaned_job() -> None:
+    """E1-03 crash windows: a worker that dies between the Lua pop and the
+    outbox commit (or between the retry tx commit and `push_delayed`) leaves a
+    job PENDING with no Redis timer and no Kafka message. Nothing but this
+    sweep can recover it.
+
+    Duplicate-safe on top of WO-P4-03: a second `job.submitted` loses the
+    atomic PENDING->RUNNING claim (`JobRepository.claim_for_running`) and
+    executes nothing.
+    """
+    job = _make_job(status=JobStatus.PENDING, tenant_id=uuid.uuid4())
+    factory = _stale_pending_factory(job)
+    outbox = AsyncMock()
+    redis = AsyncMock()
+    redis.zscore = AsyncMock(return_value=None)  # no live backoff timer
+
+    with patch(
+        "app.workers.dispatcher.OutboxRepository",
+        new=MagicMock(return_value=outbox),
+    ):
+        await dispatcher._requeue_stale_pending_once(factory, redis)
+
+    redis.zscore.assert_awaited_once_with(
+        dispatcher.queue.DELAYED_KEY, str(job.id)
+    )
+    outbox.add.assert_awaited_once()
+    payload = outbox.add.await_args.kwargs["payload"]
+    assert payload["event"] == "job.submitted"
+    assert payload["job_id"] == str(job.id)
+
+
+async def test_requeue_stale_pending_once_respects_a_live_backoff() -> None:
+    """The LLM retry policy can legitimately park a job in PENDING for
+    minutes. A ZSCORE hit on `jobs:delayed` means the promotion loop still
+    owns this job — re-publishing would run it before its backoff elapsed."""
+    job = _make_job(status=JobStatus.PENDING, tenant_id=uuid.uuid4())
+    factory = _stale_pending_factory(job)
+    outbox = AsyncMock()
+    redis = AsyncMock()
+    redis.zscore = AsyncMock(return_value=1_900_000_000.0)  # still waiting
+
+    with patch(
+        "app.workers.dispatcher.OutboxRepository",
+        new=MagicMock(return_value=outbox),
+    ):
+        await dispatcher._requeue_stale_pending_once(factory, redis)
+
+    outbox.add.assert_not_awaited()
