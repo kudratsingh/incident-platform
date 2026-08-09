@@ -339,6 +339,115 @@ async def test_delete_seeded_dlq_fixtures_removes_declared_rows(
 
 
 # ---------------------------------------------------------------------------
+# _resolve_chaos_alerts — D-03, the compensator ADR 0008's amendment requires
+# ---------------------------------------------------------------------------
+
+
+async def test_resolve_chaos_alerts_clears_bad_deploy_residue(
+    db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
+) -> None:
+    """`bad_deploy` fires a critical alert that nothing ever resolved, so
+    every invocation permanently added one active critical alert to the
+    surface later alert-count/noise scenarios are graded against.
+
+    The reset resolves it (never deletes — the alert id appears in the
+    invoking scenario's trajectory), leaves non-chaos alerts alone, and
+    doesn't re-stamp alerts that were already resolved."""
+    reset = _reset_module()
+    from app.models.alert import Alert
+    from app.repositories.alert import AlertRepository
+
+    now = datetime.now(UTC)
+    already_resolved_at = now - timedelta(hours=2)
+    tenant_id = default_tenant.id
+    chaos_active = Alert(
+        tenant_id=tenant_id,
+        severity="critical",
+        source="chaos:bad_deploy",
+        title="Simulated bad deploy",
+        fired_at=now - timedelta(minutes=5),
+        resolved_at=None,
+    )
+    kafka_active = Alert(
+        tenant_id=tenant_id,
+        severity="critical",
+        source="kafka",
+        title="billing-consumer lag exceeds 10k",
+        fired_at=now - timedelta(minutes=25),
+        resolved_at=None,
+    )
+    chaos_resolved = Alert(
+        tenant_id=tenant_id,
+        severity="critical",
+        source="chaos:bad_deploy",
+        title="Simulated bad deploy",
+        fired_at=now - timedelta(hours=3),
+        resolved_at=already_resolved_at,
+    )
+    db_session.add_all([chaos_active, kafka_active, chaos_resolved])
+    await db_session.flush()
+
+    # Same wrapper as `_delete_seeded_dlq_fixtures` above: the fixture
+    # session already owns a transaction, so `session.begin()` has to be
+    # a no-op while every statement still hits the real DB.
+    class _NullTx:
+        async def __aenter__(self):  # type: ignore[no-untyped-def]
+            return None
+
+        async def __aexit__(self, *_a):  # type: ignore[no-untyped-def]
+            return False
+
+    class _SessionProxy:
+        def __init__(self, s):  # type: ignore[no-untyped-def]
+            self._s = s
+
+        def begin(self):  # type: ignore[no-untyped-def]
+            return _NullTx()
+
+        def __getattr__(self, name):  # type: ignore[no-untyped-def]
+            return getattr(self._s, name)
+
+        async def __aenter__(self):  # type: ignore[no-untyped-def]
+            return self
+
+        async def __aexit__(self, *_a):  # type: ignore[no-untyped-def]
+            return False
+
+    chaos_active_id = chaos_active.id
+    kafka_active_id = kafka_active.id
+    chaos_resolved_id = chaos_resolved.id
+
+    resolved = await reset._resolve_chaos_alerts(lambda: _SessionProxy(db_session))
+
+    # Only the ACTIVE chaos alert is touched — the already-resolved one
+    # must not have its resolved_at re-stamped (idempotent second run).
+    assert resolved == 1
+
+    # The raw UPDATE bypassed the identity map; re-read from the DB.
+    db_session.expire_all()
+    rows = {
+        row.id: row
+        for row in (
+            await db_session.execute(
+                select(Alert).where(Alert.tenant_id == tenant_id)
+            )
+        ).scalars()
+    }
+    assert rows[chaos_active_id].resolved_at is not None
+    assert rows[kafka_active_id].resolved_at is None, "non-chaos alert untouched"
+    assert rows[chaos_resolved_id].resolved_at is not None
+
+    # The post-reset active-alert surface is the seeded baseline: no
+    # chaos residue survives where `list_active_alerts` can read it.
+    active, total = await AlertRepository(db_session).list_active_for_tenant(
+        tenant_id
+    )
+    assert total == 1
+    assert [a.source for a in active] == ["kafka"]
+    assert not [a for a in active if a.source.startswith("chaos:")]
+
+
+# ---------------------------------------------------------------------------
 # _refuse_in_production — FIX_PLAN #79 guardrail
 # ---------------------------------------------------------------------------
 

@@ -26,7 +26,15 @@ What gets cleared/reset:
      Catches chaos jobs attached to a real user, which the
      chaos-owner-user cleanup below can't reach. Also de-noises the
      planner on non-DLQ scenarios, which read the same surface.
-  5. **Idempotency records** — with `--purge-idempotency`, `DELETE`s
+  5. **Chaos-fired alerts** — every `alerts` row whose source matches
+     `chaos:%` and is still active gets `resolved_at` stamped, returning
+     the active-alert surface to the seeded baseline. `bad_deploy` is
+     the only producer today; without this the alert it fires is never
+     resolved by anything, so each invocation permanently adds one more
+     active `critical` alert to every later alert-count/noise scenario.
+     Resolved, never deleted — the alert id appears in the invoking
+     scenario's output and trajectories.
+  6. **Idempotency records** — with `--purge-idempotency`, `DELETE`s
      every `idempotency_records` row for the seeded incident-commander
      service account. Off by default; the 24h TTL from [ADR 0010]
      handles the common case, but opt-in purge is useful when a
@@ -231,6 +239,48 @@ async def _delete_chaos_owner_users(session_factory: Any) -> int:
             return int(result.rowcount or 0)
 
 
+async def _resolve_chaos_alerts(session_factory: Any) -> int:
+    """Stamp `resolved_at` on every still-active chaos-fired alert.
+
+    The compensating action for `bad_deploy`
+    (`app/mcp/tools/chaos/bad_deploy.py`), per the ADR 0008 v0.4.5
+    amendment: the hook fires a `critical` alert with source
+    `chaos:bad_deploy` and nothing else on the platform ever resolves it
+    — `AlertService` only has `create_alert`, and no REST or MCP surface
+    touches resolution. So every invocation left one more permanently
+    active critical alert behind, contaminating the alert-count and
+    noise scenarios of every campaign that followed.
+
+    Resolve rather than DELETE: the alert id is quoted in the invoking
+    scenario's output and trajectories, so deleting would mutate history
+    a graded run refers to. `resolved_at` is the model's designed
+    off-switch — `AlertRepository.list_active_for_tenant` filters on
+    `resolved_at IS NULL`, so a resolved row drops out of the surface the
+    agent reads while staying auditable.
+
+    The predicate is `source LIKE 'chaos:%'`, which provably spares the
+    5 seeded fixture alerts (`seed_eval_fixtures._alert_rows` uses
+    sources `kafka`/`dlq`/`api`/`db`). `CURRENT_TIMESTAMP` rather than
+    `now()` so this stays runnable on the SQLite unit harness.
+
+    Idempotent: a second run finds nothing active and returns 0.
+
+    Round-trip test:
+    `backend/tests/unit/test_eval_reset.py::test_resolve_chaos_alerts_clears_bad_deploy_residue`.
+
+    Returns the number of alerts resolved."""
+    async with session_factory() as session:
+        async with session.begin():
+            result = await session.execute(
+                text(
+                    "UPDATE alerts SET resolved_at = CURRENT_TIMESTAMP "
+                    "WHERE source LIKE 'chaos:%' "
+                    "AND resolved_at IS NULL"
+                )
+            )
+            return int(result.rowcount or 0)
+
+
 async def _delete_seeded_dlq_fixtures(session_factory: Any) -> int:
     """DELETE rows created by the `seed_dlq_messages` chaos hook.
 
@@ -351,6 +401,9 @@ async def reset(
         chaos_cleared = await _clear_chaos_keys(redis)
         timers_cleared = await _clear_scheduled_replays(redis)
         pauses_cleared = await _clear_dag_pauses(redis)
+        # Order-independent of the seed: the seeded fixture alerts use
+        # non-chaos sources, so this can neither race nor re-resolve them.
+        chaos_alerts_resolved = await _resolve_chaos_alerts(factory)
         seed_summary = await seed_eval_fixtures.seed(
             database_url=database_url,
             redis_url=redis_url,
@@ -377,6 +430,7 @@ async def reset(
         await engine.dispose()
 
     return {
+        "chaos_alerts_resolved": chaos_alerts_resolved,
         "chaos_keys_cleared": chaos_cleared,
         "chaos_owners_deleted": chaos_owners_deleted,
         "dag_pauses_cleared": pauses_cleared,
