@@ -17,12 +17,26 @@ chain (including both RLS migrations), then proves:
   6. deploy_markers rows with tenant_id NULL (platform-wide deploys)
      stay visible from a tenant-scoped session — the policy variant that
      keeps get_deploy_history working under service-account contexts.
-  7. audit_logs is immutable at the DB layer: UPDATE/DELETE from a
-     fully-granted non-owner role are silent no-ops — command tag
-     'UPDATE 0'/'DELETE 0', not an error (F1-07).
+  7. audit_logs is immutable at the DB layer: UPDATE/DELETE as the
+     runtime role raise insufficient_privilege — a loud error, because
+     migration b8e4a1c92f35 revokes those grants from incident_app
+     (F1-07). INSERT with a matching tenant still succeeds.
   8. Deleting a job still nulls audit_logs.job_id via the FK's ON DELETE
-     SET NULL: referential-integrity actions bypass RLS, so the
-     restrictive deny policies don't break scripts/reset_eval_state.py.
+     SET NULL: referential actions execute with the referencing table
+     owner's privileges and bypass RLS, so neither the grant revoke nor
+     the restrictive deny policies break scripts/reset_eval_state.py.
+  9. The migration-vs-runtime split is real: CREATE TABLE / ALTER TABLE
+     as incident_app raise insufficient_privilege, while the grants do
+     cover alembic_version (assert_migrations_current reads it at boot).
+ 10. The boot posture probe (app.core.rls_check.assert_rls_posture)
+     passes on a live incident_app engine and raises on a superuser
+     engine under production settings.
+
+Since WO-P2-03 the non-superuser sessions here connect as the actual
+production runtime role: `incident_app`, created by the migration chain
+itself and given its password by `python -m app.core.db_bootstrap`
+(exactly what scripts/entrypoint.sh and the compose migrate one-shot
+run) — not a hand-rolled test role.
 
 The third assertion is intentional: it documents the trade-off the
 migration was written under. If a future change tightens the policy
@@ -33,7 +47,6 @@ Skipped automatically when Docker / testcontainers isn't available so the
 rest of the suite still runs.
 """
 
-import asyncio
 import os
 import subprocess
 import sys
@@ -85,8 +98,8 @@ def pg() -> Any:
         yield container
 
 
-def _run_migrations(database_url: str) -> None:
-    """Run alembic upgrade head against the container.
+def _alembic(database_url: str, *args: str) -> None:
+    """Run an alembic command against the container.
 
     Uses the current interpreter and an absolute -c path so the call
     works regardless of cwd and PATH; env.py routes on the URL's dialect
@@ -95,15 +108,23 @@ def _run_migrations(database_url: str) -> None:
     env = os.environ.copy()
     env["DATABASE_URL"] = database_url
     subprocess.check_call(
-        [
-            sys.executable,
-            "-m",
-            "alembic",
-            "-c",
-            str(REPO_ROOT / "alembic.ini"),
-            "upgrade",
-            "head",
-        ],
+        [sys.executable, "-m", "alembic", "-c", str(REPO_ROOT / "alembic.ini"), *args],
+        env=env,
+        cwd=REPO_ROOT,
+    )
+
+
+def _run_db_bootstrap(database_url: str, password: str) -> None:
+    """Invoke the real boot-time password sync, exactly as the entrypoint
+    and the compose migrate one-shot do: `python -m app.core.db_bootstrap`
+    with the owner URL and INCIDENT_APP_DB_PASSWORD in the environment."""
+    env = os.environ.copy()
+    env["ALEMBIC_DATABASE_URL"] = database_url
+    env.pop("DATABASE_URL", None)
+    env["INCIDENT_APP_DB_PASSWORD"] = password
+    env["PYTHONPATH"] = str(REPO_ROOT / "backend")
+    subprocess.check_call(
+        [sys.executable, "-m", "app.core.db_bootstrap"],
         env=env,
         cwd=REPO_ROOT,
     )
@@ -113,42 +134,41 @@ def _run_migrations(database_url: str) -> None:
 class RlsDb:
     superuser_dsn: str
     app_dsn: str
+    app_async_url: str
+    superuser_async_url: str
 
 
 @pytest.fixture(scope="module")
 def rls_db(pg: Any) -> RlsDb:
-    """Migrated database plus a non-owner `app_role`, set up once per module.
+    """Migrated database with the production `incident_app` role, set up
+    once per module.
 
-    Plain roles (non-superuser, non-owner) never bypass RLS, so the
-    policies actually apply to `app_role` sessions. The superuser DSN is
-    for fixtures/verification only — superusers bypass RLS even under
-    FORCE, which is exactly why production posture matters (the RDS
-    master is an *owner*, not a superuser, so FORCE does bind it).
+    The migration chain itself creates `incident_app` (b8e4a1c92f35) and
+    `python -m app.core.db_bootstrap` gives it a password — the same two
+    steps scripts/entrypoint.sh runs at every boot — so the non-superuser
+    sessions in this module exercise the exact role production connects
+    as after the phase-2 flip. A `downgrade -1` / re-`upgrade head`
+    round-trip proves the role migration reverses cleanly. The superuser
+    DSN is for fixtures/verification only — superusers bypass RLS even
+    under FORCE.
     """
-    import asyncpg
-
     host = pg.get_container_host_ip()
     port = pg.get_exposed_port(5432)
     superuser_dsn = f"postgresql://{pg.username}:{pg.password}@{host}:{port}/{pg.dbname}"
-    app_dsn = f"postgresql://app_role:app_pw@{host}:{port}/{pg.dbname}"
-    _run_migrations(pg.get_connection_url())
+    app_dsn = f"postgresql://incident_app:app_pw@{host}:{port}/{pg.dbname}"
 
-    async def _setup() -> None:
-        sup = await asyncpg.connect(superuser_dsn)
-        try:
-            # Non-superuser role with full DML on the tables the tests
-            # touch. Plain users don't bypass RLS, so the policies enforce.
-            await sup.execute("CREATE ROLE app_role LOGIN PASSWORD 'app_pw'")
-            await sup.execute(
-                "GRANT SELECT, INSERT, UPDATE, DELETE "
-                "ON jobs, tenants, users, alerts, deploy_markers, audit_logs "
-                "TO app_role"
-            )
-        finally:
-            await sup.close()
+    async_url = pg.get_connection_url()
+    _alembic(async_url, "upgrade", "head")
+    _alembic(async_url, "downgrade", "-1")  # drops role + grants (b8e4a1c92f35)
+    _alembic(async_url, "upgrade", "head")  # recreates them
+    _run_db_bootstrap(async_url, "app_pw")
 
-    asyncio.run(_setup())
-    return RlsDb(superuser_dsn=superuser_dsn, app_dsn=app_dsn)
+    return RlsDb(
+        superuser_dsn=superuser_dsn,
+        app_dsn=app_dsn,
+        app_async_url=f"postgresql+asyncpg://incident_app:app_pw@{host}:{port}/{pg.dbname}",
+        superuser_async_url=async_url,
+    )
 
 
 async def _create_tenant(sup: Any, slug: str) -> uuid.UUID:
@@ -165,7 +185,8 @@ async def _create_tenant(sup: Any, slug: str) -> uuid.UUID:
 async def test_rls_isolates_tenants(rls_db: RlsDb) -> None:
     """Two tenants insert jobs. With app.tenant_id set, each sees only its own.
 
-    Connects as the non-owner app role so the policy actually applies.
+    Connects as the production non-owner role (incident_app) so the
+    policy applies exactly as it does after the phase-2 flip.
     """
     import asyncpg
 
@@ -321,13 +342,15 @@ async def test_deploy_markers_null_tenant_rows_visible_in_tenant_scope(rls_db: R
         await app.close()
 
 
-async def test_audit_logs_update_delete_are_silent_noops(rls_db: RlsDb) -> None:
-    """audit_logs is immutable at the DB layer (F1-07).
+async def test_audit_logs_update_delete_raise_insufficient_privilege(rls_db: RlsDb) -> None:
+    """audit_logs tampering is a loud error for the runtime role (F1-07).
 
-    The RESTRICTIVE deny policies make rows invisible to UPDATE/DELETE, so
-    a fully-granted non-owner role gets command tag 'UPDATE 0'/'DELETE 0'
-    — a silent no-op, NOT an error. (The loud insufficient_privilege
-    variant arrives with the WO-P2-03 grant revoke.)
+    Migration b8e4a1c92f35 revokes UPDATE/DELETE on audit_logs from
+    incident_app, so tampering fails at the grant layer with
+    insufficient_privilege — an error, no longer the silent 'UPDATE 0'
+    no-op that the restrictive deny policies alone produced for a
+    DML-granted role (that pre-P2-03 assertion lived in this test; the
+    deny policies still back-stop any owner-connected session).
     """
     import asyncpg
 
@@ -344,17 +367,19 @@ async def test_audit_logs_update_delete_are_silent_noops(rls_db: RlsDb) -> None:
 
     app = await asyncpg.connect(rls_db.app_dsn)
     try:
+        # Scope to the row's own tenant: the permissive tenant_isolation
+        # policy would admit the row, so what refuses the write is
+        # precisely the revoked grant.
         async with app.transaction():
-            # Scope to the row's own tenant: the permissive tenant_isolation
-            # policy admits the row, so what blocks the write is precisely
-            # the restrictive deny policy.
             await app.execute("SELECT set_config('app.tenant_id', $1, true)", str(tenant))
-            tag = await app.execute(
-                "UPDATE audit_logs SET action = 'tampered' WHERE id = $1", audit_id
-            )
-            assert tag == "UPDATE 0", f"audit_logs UPDATE must be a no-op, got {tag!r}"
-            tag = await app.execute("DELETE FROM audit_logs WHERE id = $1", audit_id)
-            assert tag == "DELETE 0", f"audit_logs DELETE must be a no-op, got {tag!r}"
+            with pytest.raises(asyncpg.exceptions.InsufficientPrivilegeError):
+                await app.execute(
+                    "UPDATE audit_logs SET action = 'tampered' WHERE id = $1", audit_id
+                )
+        async with app.transaction():
+            await app.execute("SELECT set_config('app.tenant_id', $1, true)", str(tenant))
+            with pytest.raises(asyncpg.exceptions.InsufficientPrivilegeError):
+                await app.execute("DELETE FROM audit_logs WHERE id = $1", audit_id)
     finally:
         await app.close()
 
@@ -366,13 +391,107 @@ async def test_audit_logs_update_delete_are_silent_noops(rls_db: RlsDb) -> None:
         await sup.close()
 
 
+async def test_audit_insert_with_matching_tenant_succeeds(rls_db: RlsDb) -> None:
+    """Append stays open: the runtime role can still INSERT audit rows.
+
+    The revoke covers UPDATE/DELETE only — audit_logs is append-only,
+    not read-only, for incident_app.
+    """
+    import asyncpg
+
+    sup = await asyncpg.connect(rls_db.superuser_dsn)
+    try:
+        tenant = await _create_tenant(sup, "audit-append")
+    finally:
+        await sup.close()
+
+    app = await asyncpg.connect(rls_db.app_dsn)
+    try:
+        async with app.transaction():
+            await app.execute("SELECT set_config('app.tenant_id', $1, true)", str(tenant))
+            tag = await app.execute(
+                "INSERT INTO audit_logs (id, tenant_id, action) VALUES ($1, $2, 'job.created')",
+                uuid.uuid4(), tenant,
+            )
+            assert tag == "INSERT 0 1", f"audit INSERT must succeed, got {tag!r}"
+    finally:
+        await app.close()
+
+
+async def test_ddl_denied_for_incident_app(rls_db: RlsDb) -> None:
+    """The migration-vs-runtime split is real: no DDL for incident_app.
+
+    CREATE TABLE needs CREATE on the schema (only USAGE is granted);
+    ALTER TABLE needs table ownership (the migration role owns
+    everything). Both must fail with insufficient_privilege — DDL,
+    TRUNCATE and DROP POLICY power stays off the network-facing process.
+    """
+    import asyncpg
+
+    app = await asyncpg.connect(rls_db.app_dsn)
+    try:
+        with pytest.raises(asyncpg.exceptions.InsufficientPrivilegeError):
+            await app.execute("CREATE TABLE rls_smoke_probe (id int)")
+        with pytest.raises(asyncpg.exceptions.InsufficientPrivilegeError):
+            await app.execute("ALTER TABLE jobs ADD COLUMN rls_smoke_probe int")
+    finally:
+        await app.close()
+
+
+async def test_incident_app_can_read_alembic_version(rls_db: RlsDb) -> None:
+    """GRANT ... ON ALL TABLES includes alembic_version — required: both
+    lifespans run assert_migrations_current as incident_app at boot."""
+    import asyncpg
+
+    app = await asyncpg.connect(rls_db.app_dsn)
+    try:
+        version = await app.fetchval("SELECT version_num FROM alembic_version")
+        assert version, "incident_app must be able to read alembic_version"
+    finally:
+        await app.close()
+
+
+async def test_rls_posture_probe_against_live_engines(rls_db: RlsDb) -> None:
+    """assert_rls_posture on real engines: the probe SQL itself.
+
+    As incident_app (non-superuser, non-owner) the posture is healthy —
+    no raise even under production settings. As the container superuser
+    RLS is bypassed wholesale, so production settings must raise. This is
+    the boot-time negative probe F1-01 asked for: it would have flagged
+    the original prod posture (owner, unforced) on the first deploy.
+    """
+    from app.config import Settings
+    from app.core.rls_check import assert_rls_posture
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    prod_settings = Settings(_env_file=None, environment="production", secret_key="x" * 48)
+
+    app_engine = create_async_engine(rls_db.app_async_url)
+    try:
+        await assert_rls_posture(
+            async_sessionmaker(app_engine, expire_on_commit=False), prod_settings
+        )  # no raise
+    finally:
+        await app_engine.dispose()
+
+    sup_engine = create_async_engine(rls_db.superuser_async_url)
+    try:
+        factory = async_sessionmaker(sup_engine, expire_on_commit=False)
+        with pytest.raises(RuntimeError, match="row-level security"):
+            await assert_rls_posture(factory, prod_settings)
+    finally:
+        await sup_engine.dispose()
+
+
 async def test_job_delete_still_nulls_audit_fk_via_ri_bypass(rls_db: RlsDb) -> None:
     """Deleting a job must still SET NULL audit_logs.job_id.
 
-    Referential-integrity actions bypass row security, so the restrictive
-    deny policies on audit_logs must not block the FK's ON DELETE SET NULL
-    — this is what keeps scripts/reset_eval_state.py (which deletes jobs
-    and users) working. A trigger-based immutability guard would break it.
+    Referential actions execute with the *referencing table owner's*
+    privileges and bypass row security, so neither the UPDATE revoke on
+    audit_logs nor the restrictive deny policies block the FK's ON
+    DELETE SET NULL — this is what keeps scripts/reset_eval_state.py
+    (which deletes jobs and users) working as incident_app. Do not "fix"
+    a failing cascade by re-granting UPDATE.
     """
     import asyncpg
 

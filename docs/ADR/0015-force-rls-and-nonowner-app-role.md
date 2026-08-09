@@ -46,13 +46,26 @@ Migration `a7e3d9c41f28` (this change) plus a follow-up role split (phase 2, bel
 3. **RESTRICTIVE deny policies on `audit_logs`** for UPDATE and DELETE (`USING (false)`).
    Restrictive policies AND with the permissive `tenant_isolation` policy, so with FORCE on
    they bind owner and app role alike.
-4. **Phase 2 — non-owner runtime role (`incident_app`), tracked separately:** create the role
-   in Terraform, grant it CRUD on the tenant tables (minus UPDATE/DELETE on `audit_logs`),
-   and point the API's `DATABASE_URL` at it; the owner remains for migrations and workers.
-   This is the "future hardening step is mechanical" paragraph of ADR 0003, made real. It is
-   not required for enforcement anymore (FORCE already binds the owner) but restores least
-   privilege and turns audit tampering from a silent no-op into a loud
-   `insufficient_privilege` error.
+4. **Phase 2 — non-owner runtime role (`incident_app`), landed with WO-P2-03:** migration
+   `b8e4a1c92f35` creates the role (guarded `CREATE ROLE ... LOGIN`, **no password** — see
+   the password-sync note below) and grants it DML on all tables minus UPDATE/DELETE on
+   `audit_logs`; Terraform owns the password (`random_password.app_db` → the
+   `app-db-password` secret) and the runtime `DATABASE_URL` flip, while migrations move to
+   `ALEMBIC_DATABASE_URL` (the owner URL — `alembic/env.py` prefers it). The API, worker
+   loops and MCP share one engine (`backend/app/dependencies.py`), so the flip moves all
+   three; the owner remains for **migrations only**. (A second owner engine for the workers
+   was considered and rejected: tenant-less worker sessions are exactly what the escape
+   hatch admits, and a second pool against a db.t3.micro buys zero security.) This restores
+   least privilege — no DDL, no TRUNCATE, no DROP POLICY on the network-facing process —
+   and turns audit tampering from a silent no-op into a loud `insufficient_privilege` error.
+5. **Boot-time guardrails (WO-P2-03):** `app/core/db_bootstrap.py`, an idempotent
+   injection-safe password sync run before uvicorn on every boot (the migration cannot own
+   the password: it runs exactly once, on a phase-1 deploy that predates the Terraform
+   secret — the sync also gives free rotation: change the secret, bounce the service); and
+   `app/core/rls_check.assert_rls_posture`, a probe in both lifespans that detects an
+   RLS-inert connection (superuser, or owner without FORCE), logs ERROR always, and refuses
+   to serve only in production — local superuser stacks and the commander's pinned eval
+   stack must keep booting.
 
 ## Correcting ADR 0003's "FORCE breaks Alembic" claim
 
@@ -110,12 +123,14 @@ exists, so nothing starts failing WITH CHECK when FORCE lands.
   trigger breaks every eval reset. Referential-integrity actions **bypass row security**, so
   restrictive policies do not have this failure mode.
 - **Grant revocation alone — insufficient.** Revoking UPDATE/DELETE binds nothing while the
-  app connects as the owner (owners hold implicit rights). It becomes a valuable second layer
-  in phase 2.
-- **RESTRICTIVE deny policies — chosen.** ANDed with the permissive policy; with FORCE they
-  bind owner and app role alike. The failure mode is a *silent no-op* — command tag
-  `UPDATE 0` / `DELETE 0`, not an error. The loud `insufficient_privilege` variant arrives
-  with the phase-2 grant revoke.
+  app connects as the owner (owners hold implicit rights). Phase 2 made it the first line:
+  `incident_app` holds no UPDATE/DELETE on `audit_logs`, so tampering from the runtime is a
+  loud `insufficient_privilege` error.
+- **RESTRICTIVE deny policies — chosen (and kept).** ANDed with the permissive policy; with
+  FORCE they bind owner and app role alike. For an owner-connected session (migrations,
+  operator scripts on the owner URL) the failure mode is a *silent no-op* — command tag
+  `UPDATE 0` / `DELETE 0`, not an error; that back-stop is why the policies stay even now
+  that the grant revoke fails the runtime loudly first.
 - **Deliberately not extended** to `job_events` or `outbox_events`: the outbox relay
   legitimately UPDATEs `outbox_events.published_at`, and `job_events` immutability is a
   separate decision, out of scope here.
@@ -133,13 +148,45 @@ through `jobs`, which is covered; `service_account_tokens` is reached through
 
 ## The two-phase production rollout
 
-1. **Phase 1 (this change):** FORCE + full policy coverage + audit deny policies, all in one
-   dialect-guarded migration. Enforcement begins the moment the next production deploy runs
-   `alembic upgrade head`. Nothing about the connection changes; the WITH CHECK audit above
-   is what makes this safe to flip.
-2. **Phase 2 (role split, tracked):** the Terraform-managed `incident_app` non-owner role and
-   the API connection-string switch, plus revoking UPDATE/DELETE on `audit_logs` from it.
-   Independent of phase 1 and deliberately a separate, individually revertible deploy.
+The ordering below is load-bearing — it is the whole reason the password lives in a
+boot-time sync and migrations get their own URL. **Sequence the phases; never parallelize.**
+
+1. **Phase 1 — merge and deploy the image, Secrets/task-def UNCHANGED.** The entrypoint's
+   `alembic upgrade head` still runs on the master `DATABASE_URL` and executes
+   `b8e4a1c92f35`: `incident_app` now exists with its grants, but — passwordless under
+   scram — cannot yet log in. The app keeps running as the master (RLS already enforced via
+   FORCE), and `db_bootstrap` no-ops because `INCIDENT_APP_DB_PASSWORD` does not exist yet.
+2. **Phase 2 — `terraform apply`, then force a new ECS deployment.** The apply creates the
+   `app-db-password` and `database-url-owner` secrets, repoints the `database-url` secret at
+   `incident_app`, registers the task-definition revision carrying `ALEMBIC_DATABASE_URL` +
+   `INCIDENT_APP_DB_PASSWORD`, and extends the execution role's `GetSecretValue` resource
+   list (forgetting the IAM entries kills every new task at provisioning, before the
+   container starts). On the next task boot: alembic runs on `ALEMBIC_DATABASE_URL` (owner),
+   `db_bootstrap` sets `incident_app`'s password, and uvicorn connects as `incident_app`.
+   Note the backend service's `lifecycle { ignore_changes = [task_definition] }`: CI's
+   deploy job re-renders only the image on the current family revision, so the
+   Terraform-registered revision is picked up by the **next CI deploy — apply Terraform
+   before triggering it.**
+
+Two ordering hazards, both by construction rather than by care:
+
+- Flipping the `database-url` secret early cannot break a RUNNING task (ECS injects secrets
+  at task start), but any restart before phase 1's migration has run crash-loops on auth
+  failure — hence phases, not one big-bang deploy.
+- The password deliberately does NOT live in the role-creating migration: on phase 1 the env
+  var doesn't exist, migrations never re-run, and the role would be passwordless forever.
+  The boot-time sync is the only ordering-safe place, and rotation comes free (change the
+  secret, bounce the service).
+
+**Grants maintenance caveat:** `ALTER DEFAULT PRIVILEGES` only covers objects created by the
+role that issued it — the master, which runs all migrations. If migrations are ever run as a
+different role, future tables silently lose `incident_app`'s grants. And the default
+privileges hand out full DML: any future *immutable* table needs its own explicit
+`REVOKE`, like `audit_logs` got in `b8e4a1c92f35`.
+
+Rollback: phase 2 reverts by re-applying the previous secret/task-def state (the owner URL
+still exists in `database-url-owner`); phase 1 reverts with `alembic downgrade -1`, which
+drops the role after revoking its grants. Each phase is individually revertible.
 
 ## Consequences
 
@@ -150,27 +197,49 @@ through `jobs`, which is covered; `service_account_tokens` is reached through
   - Any *future* request-context write whose row `tenant_id` differs from the session's
     `app.tenant_id` fails WITH CHECK at runtime instead of silently succeeding. That is the
     point, but it moves a class of bug from "silent data issue" to "500 + rollback".
-  - Superusers still bypass RLS entirely: local docker-compose connects as `postgres`
-    (superuser), and the SQLite suite has no RLS at all — only the Docker-gated integration
-    tier (`RUN_RLS_TEST=1`) proves enforcement.
-  - Audit UPDATE/DELETE from the app is a silent `UPDATE 0` until phase 2 makes it loud.
+  - Superusers still bypass RLS entirely. Since WO-P2-03 the compose `app`/`mcp` services
+    connect as `incident_app` (the migrate one-shot keeps the superuser URL for DDL), so the
+    local topology no longer lies — but the SQLite suite has no RLS at all, and only the
+    Docker-gated integration tier (`RUN_RLS_TEST=1`) proves real enforcement. The boot
+    posture probe logs ERROR on any superuser stack as a standing reminder.
+  - Audit UPDATE/DELETE from the runtime is now a loud `insufficient_privilege` error
+    (phase 2); owner-connected sessions still get the deny policies' silent `UPDATE 0`.
+  - Operator scripts that genuinely need owner powers (e.g. an ad-hoc backfill) must be run
+    with the owner URL (`database-url-owner`); `reset_eval_state.py` and the seeders work
+    unchanged as `incident_app` — their deletes ride the FK referential actions, which
+    execute with the table owner's privileges.
 
 ## Verification
 
 - `backend/tests/unit/test_rls_coverage.py` — model-vs-policy completeness gate (fails in
   plain CI if a tenant_id table ships without a policy; encodes the `users` exclusion).
 - `backend/tests/integration/test_rls_enforcement.py` (Testcontainers Postgres 16,
-  `RUN_RLS_TEST=1`) — posture: `relrowsecurity` AND `relforcerowsecurity` true for all 11
-  tables; `alerts` tenant isolation; `deploy_markers` NULL-tenant visibility under a scoped
-  session; `audit_logs` UPDATE/DELETE command tags `UPDATE 0`/`DELETE 0` with the row
-  unchanged; job delete still nulls `audit_logs.job_id` through the FK (RI bypasses RLS).
-- Alembic `upgrade head` → `downgrade -1` → `upgrade head` round-trip on Postgres 16.
+  `RUN_RLS_TEST=1`) — the non-superuser sessions connect as the real `incident_app` role,
+  created by the migration chain and password-synced by `python -m app.core.db_bootstrap`
+  (the exact entrypoint steps). Asserts: tenant isolation on `jobs`/`alerts`;
+  `deploy_markers` NULL-tenant visibility; `audit_logs` UPDATE/DELETE raise
+  `insufficient_privilege` with the row unchanged while INSERT still succeeds; job delete
+  still nulls `audit_logs.job_id` through the FK (referential actions run with the table
+  owner's privileges); CREATE/ALTER TABLE as `incident_app` refused; `alembic_version`
+  readable (boot checks); `assert_rls_posture` passes on a live `incident_app` engine and
+  raises on a superuser engine under production settings.
+- `backend/tests/unit/test_rls_check.py` — the probe's raise/log/no-op matrix on SQLite;
+  `backend/tests/unit/test_db_bootstrap.py` — no-op discipline and the injection-safe
+  `set_config` + `format('%L', ...)` statement shape.
+- Alembic `upgrade head` → `downgrade -1` → `upgrade head` round-trip on Postgres 16 (runs
+  inside the integration fixture, covering the role migration's downgrade).
 
 ## Pointers
 
-- `backend/alembic/versions/a7e3d9c41f28_rls_force_and_full_coverage.py` — the migration
+- `backend/alembic/versions/a7e3d9c41f28_rls_force_and_full_coverage.py` — the FORCE migration
+- `backend/alembic/versions/b8e4a1c92f35_incident_app_role.py` — the role + grants migration
+- `backend/app/core/db_bootstrap.py` — boot-time password sync; `backend/app/core/rls_check.py`
+  — the posture probe (both lifespans call it after `assert_migrations_current`)
 - `backend/alembic/versions/c4f8e9a52340_row_level_security.py` — the original six policies
-- `infra/variables.tf`, `infra/rds.tf`, `infra/secrets.tf` — why the app connects as the owner
+- `infra/secrets.tf`, `infra/ecs.tf`, `infra/iam.tf` — the two-URL scheme: runtime
+  `database-url` (incident_app), `database-url-owner` + `app-db-password`, task-def secrets,
+  execution-role ARNs
+- `infra/variables.tf`, `infra/rds.tf` — why the owner is the RDS master
 - `backend/app/dependencies.py` — `set_config` sites (`get_current_user`,
   `_apply_tenant_context`, `resolve_admin_tenant`)
 - `backend/app/models/deploy_marker.py` — nullable `tenant_id` rationale

@@ -390,7 +390,9 @@ The "own tenant" rows are enforced by:
 
 The platform-admin override (`?tenant_id=X`) re-issues `set_config('app.tenant_id', X, true)` so the RLS policy permits the cross-tenant query.
 
-See [ADR 0003](ADR/0003-rls-as-defense-in-depth.md) for the RLS design.
+**Database roles:** the API, the worker loops, and the MCP process all share one engine (`backend/app/dependencies.py`) and connect as the non-owner **`incident_app`** role — DML only, no DDL, and no UPDATE/DELETE on `audit_logs` (tampering raises `insufficient_privilege`). Migrations run as the owner (the RDS master) on the separate `ALEMBIC_DATABASE_URL`; a boot-time probe (`app/core/rls_check.assert_rls_posture`) hard-fails a production process whose connection would silently bypass RLS.
+
+See [ADR 0003](ADR/0003-rls-as-defense-in-depth.md) for the RLS design and [ADR 0015](ADR/0015-force-rls-and-nonowner-app-role.md) for FORCE RLS and the role split.
 
 ---
 

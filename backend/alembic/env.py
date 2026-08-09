@@ -1,5 +1,14 @@
 """Alembic migration environment.
 
+URL selection — the two-URL scheme (ADR 0015): migrations need the table
+*owner* (DDL rights), but since WO-P2-03 the runtime DATABASE_URL points
+at the non-owner incident_app role. ALEMBIC_DATABASE_URL therefore takes
+precedence: in production ECS it carries the owner (RDS master) URL, so
+`alembic upgrade head` keeps working after the runtime flip. When it is
+unset — phase-1 deploys, the local compose migrate one-shot, tests —
+DATABASE_URL is used unchanged, and the alembic.ini value is the last
+resort.
+
 Online migrations are routed on the configured database URL's dialect:
 async dialects (e.g. postgresql+asyncpg) run through an async engine,
 sync dialects (e.g. postgresql / postgresql+psycopg2) through a plain
@@ -39,8 +48,13 @@ target_metadata = Base.metadata
 
 
 def _get_url() -> str:
-    """Prefer DATABASE_URL env var; fall back to alembic.ini value."""
-    return os.environ.get("DATABASE_URL") or config.get_main_option("sqlalchemy.url", "")
+    """Prefer ALEMBIC_DATABASE_URL (owner URL — see module docstring),
+    then DATABASE_URL, then the alembic.ini value."""
+    return (
+        os.environ.get("ALEMBIC_DATABASE_URL")
+        or os.environ.get("DATABASE_URL")
+        or config.get_main_option("sqlalchemy.url", "")
+    )
 
 
 def run_migrations_offline() -> None:

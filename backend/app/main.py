@@ -36,6 +36,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     # Import here to avoid circular imports at module load time
     from app.core.migration_check import assert_migrations_current
+    from app.core.rls_check import assert_rls_posture
     from app.dependencies import get_session_factory
     from app.workers.dispatcher import worker_loop
     from app.workers.kafka_producer import start_producer, stop_producer
@@ -56,6 +57,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # A loud boot failure is strictly better than the silent run.
     _session_factory = get_session_factory()
     await assert_migrations_current(_session_factory)
+
+    # Fail fast (in production) if this connection would silently bypass
+    # row-level security — superuser, or table owner without FORCE. The
+    # runtime is supposed to be the non-owner incident_app role (ADR
+    # 0015); outside production the probe only logs, so local superuser
+    # compose stacks keep booting.
+    await assert_rls_posture(_session_factory, settings)
 
     # Live-eval fixtures — opt-in via SEED_EVAL_FIXTURES=true. Runs the
     # same script the operator would invoke via `make seed-eval-fixtures`,

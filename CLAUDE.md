@@ -162,6 +162,7 @@ Notably **not** granted: `actions:propose`. Tier-2 actions and the approvals sub
 
 - Two deployables from one image: `api` (the existing FastAPI app) and `mcp` (the ASGI entrypoint at `backend/app/mcp/standalone.py`). Same commit, same schemas, same service layer.
 - Each process gets its own DB pool sized to its rate limits — the MCP process runs a small pool.
+- Both processes (and the worker loops inside the API process) connect as the **non-owner `incident_app` DB role** — DML only, no DDL, no UPDATE/DELETE on `audit_logs`. Migrations run as the owner (RDS master) via `ALEMBIC_DATABASE_URL`; each lifespan runs `assert_rls_posture` after the migration check and refuses to serve in production if the connection would silently bypass RLS ([ADR 0015](docs/ADR/0015-force-rls-and-nonowner-app-role.md)).
 - The agent points at `PLATFORM_MCP_URL` for tools and `PLATFORM_REST_URL` for anything else (there shouldn't be much — everything the agent needs should surface as an MCP tool over time).
 - Contract stability between agent and platform is verified by contract snapshot testing against the pinned image, per agent-repo ADR 0007.
 
@@ -786,7 +787,7 @@ Deferred until the incident-commander agent is wired up and driving eval scenari
 │   └── cloudwatch.tf               # SNS topic + 7 alarms (5 baseline + 2 SLO fast-burn)
 │
 └── scripts/                        # seed data, migrations, ops helpers
-    ├── entrypoint.sh               # runs alembic upgrade head then uvicorn
+    ├── entrypoint.sh               # alembic upgrade head → db_bootstrap password sync → uvicorn
     └── seed_load_test_users.py
 ```
 
@@ -799,6 +800,7 @@ Deferred until the incident-commander agent is wired up and driving eval scenari
 - **Run the backend locally:** `docker compose up postgres redis redpanda minio -d`, then `./.venv/bin/uvicorn app.main:app --reload --app-dir backend`. Set `KAFKA_BOOTSTRAP_SERVERS=localhost:9092` and run the worker as a separate process (the same `app.main` lifespan starts both, so for local dev you typically just run the API and the worker fires in the same process).
 - **Run the frontend:** `cd frontend && npm run dev` — proxies `/api` to `http://localhost:8000`.
 - **Run tests:** `cd backend && ../.venv/bin/python -m pytest tests/` (skips integration unless you explicitly target `tests/integration/`). CI runs `mypy -p app`, `ruff check backend/`, and `pytest` on every PR.
+- **The two-URL scheme (`DATABASE_URL` vs `ALEMBIC_DATABASE_URL`):** since WO-P2-03 the runtime `DATABASE_URL` is the **non-owner `incident_app` role** (in compose: `incident_app:localdev`); alembic prefers `ALEMBIC_DATABASE_URL` — the owner URL — and falls back to `DATABASE_URL` when it's unset (local migrate one-shot, tests). The role's password is synced at boot by `python -m app.core.db_bootstrap` from `INCIDENT_APP_DB_PASSWORD` (in compose it rides the `migrate` one-shot, because the app service's custom `command:` bypasses `scripts/entrypoint.sh`). Anything needing owner powers — ad-hoc DDL, backfills — must use the owner URL (`database-url-owner` secret in prod, the `postgres:postgres` URL locally). The boot posture probe logs ERROR on an RLS-bypassing connection and hard-fails only in production ([ADR 0015](docs/ADR/0015-force-rls-and-nonowner-app-role.md), rollout section).
 - **Add a migration:** `cd backend && ../.venv/bin/alembic revision --autogenerate -m "describe change"` — but always **read the generated file** before committing; autogenerate misses things like enum updates and partial indexes.
 - **Add a Kafka consumer group:** subclass `BaseKafkaConsumer`, implement `handle_message`, instantiate in `worker_loop` in `app/workers/dispatcher.py`. The base class does schema validation, offset management, and per-message error handling.
 - **Add a CloudWatch alarm:** add it to `infra/cloudwatch.tf`, then add the matching `runbooks/rb-*.yaml` file and reference its `/admin/runbooks/{id}` URL in the alarm description.
