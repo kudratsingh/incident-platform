@@ -9,7 +9,7 @@ Built as an intentional showcase of senior-level distributed-systems patterns: t
 ## What's inside
 
 - **HTTP API** in FastAPI serving `/api/v1/*` behind an ALB.
-- **Worker process** running 8 concurrent Kafka consumer groups + 4 background loops (outbox relay, delayed-retry promote, metrics, LLM digest).
+- **Worker process** running 8 concurrent Kafka consumer groups + 9 background loops (outbox relay, delayed-retry promote, DLQ-replay promote, resume-waiting sweep, stale-PENDING backstop, stale-RUNNING crash-recovery sweep, metrics, LLM digest, idempotency reaper).
 - **React SPA** admin console with live SSE progress, saga DAG timelines, DLQ triage, natural-language admin search, and incident digest cards.
 - **Multi-tenancy** with application-layer filtering + Postgres row-level security as defense-in-depth.
 - **LLM features** (Claude via Anthropic SDK): DLQ triage, retry-policy advisor, natural-language admin queries, periodic incident summaries — all off-by-default and fail-open.
@@ -46,9 +46,11 @@ Current test suite: **243 passing tests** (161 unit + 82 API contract + 3 gated 
               │    read-model, dep-resolver,           │
               │    saga-coord, llm-triage              │
               │                                        │
-              │  4 background loops:                   │
+              │  9 background loops:                   │
               │    outbox relay, promote-delayed,      │
-              │    metrics, digest                     │
+              │    promote-replay, resume-waiting,     │
+              │    stale-pending, stale-running,       │
+              │    metrics, digest, idempotency-reaper │
               └───────────────────────────────────────┘
 ```
 

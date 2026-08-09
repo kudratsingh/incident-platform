@@ -97,6 +97,13 @@ _PAUSE_RECHECK_SECONDS = 10.0
 # for real failures.
 _PAUSED_REPLAY_DEFER_SECONDS = 30
 
+# E1-17 / ADR 0019. Crash-recovery sweep for jobs stranded in RUNNING by a
+# hard worker crash. Slow on purpose: the *age* threshold that decides what
+# is an orphan is `settings.stale_running_threshold_seconds` (900s), so a
+# minute of scan latency on top of it is noise, and the scan stays cheap.
+_STALE_RUNNING_SWEEP_INTERVAL = 60.0  # seconds between passes
+_STALE_RUNNING_SWEEP_LIMIT = 100  # RUNNING rows examined per pass
+
 MAX_CONCURRENT_JOBS = 10  # cap on simultaneously running jobs
 
 # Strategy map: job type → processor coroutine
@@ -566,7 +573,15 @@ class JobDispatcherConsumer(BaseKafkaConsumer):
     advances at dispatch time rather than at job completion. The trade-off:
       * Pro: high throughput, the consumer is never blocked by a long job.
       * Con: a worker crash between commit-and-completion leaves the job in DB
-        as RUNNING. Recovery is left to the outbox pattern in a follow-up.
+        as RUNNING with no message left to redeliver it.
+
+    Crash recovery for that window is `_stale_running_sweep_loop`, which
+    dead-letters RUNNING rows older than `stale_running_threshold_seconds`
+    that are not in `self.in_flight_job_ids` (ADR 0019). It does NOT
+    re-publish them: a partially-executed job is unsafe to re-run. The
+    in-flight set is what stops the sweep from reaping this process's own
+    legitimately-long jobs, so it must be populated before the task is
+    spawned and cleared only when the task settles.
     """
 
     def __init__(
@@ -584,6 +599,12 @@ class JobDispatcherConsumer(BaseKafkaConsumer):
         self.redis = redis
         self.semaphore = asyncio.Semaphore(max_concurrent)
         self.in_flight: set[asyncio.Task[None]] = set()
+        # Job ids this process is actively executing. Read by
+        # `_sweep_stale_running_once` to exclude live work from crash
+        # recovery (E1-17). Deliberately separate from `in_flight` above:
+        # that holds Task objects for shutdown draining, this answers
+        # "is job X mine right now?" without inspecting task internals.
+        self.in_flight_job_ids: set[str] = set()
 
     async def handle_message(
         self,
@@ -602,6 +623,11 @@ class JobDispatcherConsumer(BaseKafkaConsumer):
 
         # Acquire a slot — blocks (and stops polling) when at capacity.
         await self.semaphore.acquire()
+        # Claim the id BEFORE spawning the task, not inside it: between
+        # `create_task` and the coroutine's first step there is a scheduling
+        # gap in which the sweep could run and see the row as an orphan.
+        # `_run_and_release`'s finally block is the only place it is dropped.
+        self.in_flight_job_ids.add(job_id_str)
         task = asyncio.create_task(self._run_and_release(job_id_str))
         self.in_flight.add(task)
         task.add_done_callback(self.in_flight.discard)
@@ -630,6 +656,7 @@ class JobDispatcherConsumer(BaseKafkaConsumer):
                 )
         finally:
             self.semaphore.release()
+            self.in_flight_job_ids.discard(job_id_str)
 
     async def _force_dead_letter(self, job_id_str: str, error: str) -> None:
         """Best-effort: mark a job DEAD_LETTER when _run_job escapes with an
@@ -1008,6 +1035,205 @@ async def _requeue_stale_pending_loop(
             logger.error("stale pending sweep error", extra={"error": str(exc)})
 
         await asyncio.sleep(_STALE_PENDING_SWEEP_INTERVAL)
+
+
+async def _sweep_stale_running_once(
+    session_factory: async_sessionmaker[AsyncSession],
+    dispatcher: JobDispatcherConsumer,
+    threshold_seconds: int,
+) -> int:
+    """One pass of the stale-RUNNING crash recovery sweep (E1-17, ADR 0019).
+
+    `JobDispatcherConsumer` commits its Kafka offset at dispatch time, so a
+    hard worker crash (SIGKILL, OOM, node loss) leaves up to
+    MAX_CONCURRENT_JOBS rows in RUNNING with no message left to redeliver
+    them and no timer anywhere pointing at them. Nothing else in the tree
+    scans for those rows; before this sweep they stayed RUNNING forever.
+
+    Recovery is DEAD_LETTER, never re-publish. The crashed job may have run
+    an arbitrary prefix of its processor's side effects, and re-publishing
+    would re-run that prefix; dead-lettering instead routes the job into the
+    machinery that already exists for jobs needing human or agent judgement
+    (DLQ tab, LLM triage, saga compensation, Tier-1 replay). ADR 0019
+    records the revisit trigger.
+
+    Two exclusions, both load-bearing:
+
+      * `dispatcher.in_flight_job_ids` — this process's own live work. The
+        sweep shares a process with legitimately-long jobs (chaos
+        `inject_latency`, large payloads), and reaping one out from under
+        its own processor would fire a spurious `job.dlq` and then be
+        overwritten by the processor's COMPLETED write.
+      * the age cutoff, which is compared **in SQL**. `started_at` is
+        TIMESTAMP WITH TIME ZONE but SQLite hands back naive datetimes, so
+        aware-vs-naive Python math raises TypeError (the same trap
+        documented at `repositories/job.py:91-95`). The cutoff is computed
+        once as an aware datetime and pushed into the WHERE clause.
+
+    Each survivor is settled in its OWN session and transaction, mirroring
+    `_promote_dlq_replay_loop`'s per-item isolation: one row that fails to
+    recover must not roll back the recoveries beside it (the E1-03
+    antipattern). Returns the number of jobs dead-lettered.
+    """
+    settings = get_settings()
+    cutoff = datetime.now(UTC) - timedelta(seconds=threshold_seconds)
+
+    # Scan in its own read-only session; the recoveries below each open
+    # their own. `started_at IS NOT NULL` is belt-and-braces — the RUNNING
+    # transition always sets it, but a hand-seeded or legacy row without it
+    # must be skipped rather than crash the loop on a NULL comparison.
+    async with session_factory() as session:
+        rows = (
+            await session.execute(
+                select(
+                    Job.id,
+                    Job.tenant_id,
+                    Job.user_id,
+                    Job.type,
+                    Job.retry_count,
+                    Job.max_retries,
+                    Job.payload,
+                    Job.trace_id,
+                    Job.started_at,
+                )
+                .where(
+                    Job.status == JobStatus.RUNNING,
+                    Job.started_at.is_not(None),
+                    Job.started_at < cutoff,
+                )
+                .limit(_STALE_RUNNING_SWEEP_LIMIT)
+            )
+        ).all()
+
+    now = datetime.now(UTC)
+    recovered = 0
+    for row in rows:
+        job_id_str = str(row.id)
+        if job_id_str in dispatcher.in_flight_job_ids:
+            continue
+
+        # `row.started_at` came back naive on SQLite and aware on Postgres;
+        # normalise before subtracting so the observability fields below
+        # can't raise. The recovery decision itself was already made in SQL.
+        started_at = row.started_at
+        if started_at.tzinfo is None:
+            started_at = started_at.replace(tzinfo=UTC)
+        stale_seconds = (now - started_at).total_seconds()
+
+        error = "worker crash recovery: job exceeded stale-RUNNING threshold"
+        try:
+            async with session_factory() as session:
+                async with session.begin():
+                    repo = JobRepository(session)
+                    job = await repo.get_by_id(row.id)
+                    if job is None or job.status != JobStatus.RUNNING:
+                        # Settled between the scan and now — its own
+                        # processor won. Leave the terminal state alone.
+                        continue
+                    # retry_count is deliberately NOT touched. Replay resets
+                    # it on purpose; a crash recovery is not a replay, and
+                    # zeroing it here would erase the attempt history triage
+                    # and the DLQ tab reason about.
+                    await repo.update_status(
+                        row.id,
+                        JobStatus.DEAD_LETTER,
+                        extra={"error_message": error},
+                    )
+                    await AuditRepository(session).log(
+                        "job.dead_letter",
+                        tenant_id=row.tenant_id,
+                        job_id=row.id,
+                        extra_data={
+                            "error": error,
+                            "reason": "worker_crash_recovery",
+                            "stale_seconds": stale_seconds,
+                            "started_at": started_at.isoformat(),
+                        },
+                    )
+                    # The full `DLQ_EVENT_KEYS` set, not just the schema's
+                    # required fields: this event fans out to triage, the
+                    # saga coordinator and the event log exactly like a
+                    # `_run_job` dead-letter, and a key the producer omits
+                    # degrades those consumers silently.
+                    event_payload = _payload_for_event(
+                        {
+                            k: v
+                            for k, v in (row.payload or {}).items()
+                            if k != "__traceparent"
+                        }
+                    )
+                    await OutboxRepository(session).add(
+                        tenant_id=row.tenant_id,
+                        topic=settings.kafka_topic_job_dlq,
+                        key=f"{row.tenant_id}:{row.user_id}",
+                        payload={
+                            "event": "job.failed",
+                            "tenant_id": str(row.tenant_id),
+                            "job_id": job_id_str,
+                            "user_id": str(row.user_id),
+                            "job_type": row.type,
+                            "error": error,
+                            "message": error,
+                            "retry_count": row.retry_count,
+                            "max_retries": row.max_retries,
+                            "payload": event_payload,
+                            "trace_id": row.trace_id,
+                            "dead_lettered": True,
+                        },
+                    )
+        except Exception as exc:
+            # Per-job isolation: log and move to the next orphan. The row
+            # stays RUNNING and the next pass retries it.
+            logger.error(
+                "stale RUNNING recovery failed",
+                extra={"job_id": job_id_str, "error": str(exc)},
+            )
+            continue
+
+        recovered += 1
+        logger.error(
+            "stale RUNNING job dead-lettered (worker crash recovery)",
+            extra={
+                "job_id": job_id_str,
+                "tenant_id": str(row.tenant_id),
+                "job_type": row.type,
+                "stale_seconds": stale_seconds,
+            },
+        )
+        await metrics.emit_count(
+            "JobDeadLettered", dimensions={"JobType": str(row.type)}
+        )
+
+    return recovered
+
+
+async def _stale_running_sweep_loop(
+    session_factory: async_sessionmaker[AsyncSession],
+    dispatcher: JobDispatcherConsumer,
+) -> None:
+    """Crash-recovery sweep for jobs stranded in RUNNING — see
+    `_sweep_stale_running_once` for what it recovers and why it
+    dead-letters rather than re-publishes (ADR 0019).
+
+    Orderly shutdown does not need this loop: `worker_loop`'s
+    CancelledError path awaits `dispatcher.in_flight` before returning, so
+    a graceful stop settles its own jobs. This is for hard crashes only,
+    which is why the threshold is generous rather than responsive.
+    """
+    settings = get_settings()
+    while True:
+        try:
+            await _sweep_stale_running_once(
+                session_factory,
+                dispatcher,
+                settings.stale_running_threshold_seconds,
+            )
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            logger.error("stale running sweep error", extra={"error": str(exc)})
+
+        await asyncio.sleep(_STALE_RUNNING_SWEEP_INTERVAL)
 
 
 async def _promote_dlq_replay_loop(
@@ -1405,7 +1631,7 @@ async def worker_loop(
     sticks. The corollary is that a permanently unreachable broker leaves all
     8 supervisors retrying rather than disabling the worker.
 
-    Concurrent tasks that make up the worker — 8 Kafka consumers + 8 loops:
+    Concurrent tasks that make up the worker — 8 Kafka consumers + 9 loops:
 
       Kafka consumers (each its own group, so failure of one doesn't
       affect the others):
@@ -1432,6 +1658,8 @@ async def worker_loop(
         7. _digest_loop               — Phase 10: per-tenant LLM digests (opt-in).
         8. _idempotency_reaper_loop   — hourly DELETE of expired idempotency records
                                         (ADR 0010's "no reaper" follow-up).
+        9. _stale_running_sweep_loop  — dead-letters RUNNING jobs orphaned by a
+                                        hard worker crash (ADR 0019).
 
     Cancel signal: cancel all, wait for in-flight jobs, stop all consumers.
     """
@@ -1472,6 +1700,9 @@ async def worker_loop(
             asyncio.create_task(_metrics_loop(redis, dispatcher)),
             asyncio.create_task(_digest_loop(session_factory)),
             asyncio.create_task(_idempotency_reaper_loop(session_factory)),
+            asyncio.create_task(
+                _stale_running_sweep_loop(session_factory, dispatcher)
+            ),
         ]
     )
 
