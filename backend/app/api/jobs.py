@@ -88,8 +88,9 @@ async def get_job(
     db: AsyncSession = Depends(get_db),
     redis: Redis = Depends(get_redis),
 ) -> JobResponse:
-    # Cache hit — skip DB entirely for repeat reads
-    cached = await JobCache.get(redis, job_id)
+    # Cache hit — skip DB entirely for repeat reads. The key is scoped to
+    # the caller's tenant, so a hit can never serve another tenant's job.
+    cached = await JobCache.get(redis, job_id, current_user.tenant_id)
     if cached is not None:
         job_resp = JobResponse.model_validate(cached)
         privileged = current_user.role in (UserRole.ADMIN, UserRole.SUPPORT)
@@ -105,5 +106,7 @@ async def get_job(
         tenant_id=current_user.tenant_id,
     )
     response = JobResponse.model_validate(job)
-    await JobCache.set(redis, job_id, response.model_dump(mode="json"))
+    await JobCache.set(
+        redis, job_id, current_user.tenant_id, response.model_dump(mode="json")
+    )
     return response

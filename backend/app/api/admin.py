@@ -175,7 +175,7 @@ async def replay_job(
         requesting_user_id=current_user.id,
         tenant_id=current_user.tenant_id,
     )
-    await JobCache.delete(redis, job_id)
+    await JobCache.delete(redis, job_id, current_user.tenant_id)
     return JobResponse.model_validate(job)
 
 
@@ -589,7 +589,7 @@ async def resolve_incident(
         requesting_user_id=current_user.id,
         tenant_id=current_user.tenant_id,
     )
-    await JobCache.delete(redis, job_id)
+    await JobCache.delete(redis, job_id, current_user.tenant_id)
     return JobResponse.model_validate(job)
 
 

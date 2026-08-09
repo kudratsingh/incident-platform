@@ -4,14 +4,18 @@ Verify that with the enforcement in place, a user in tenant A cannot
 read, replay, or get a 4xx leak about a job belonging to tenant B.
 """
 
+import json
 import uuid
+from unittest.mock import AsyncMock
 
 import pytest_asyncio
 from app.core.security import create_access_token, hash_password
+from app.dependencies import get_redis
 from app.models.enums import JobStatus, JobType, UserRole
 from app.models.job import Job
 from app.models.tenant import Tenant
 from app.models.user import User
+from app.schemas.job import JobResponse
 from httpx import AsyncClient
 
 
@@ -265,6 +269,62 @@ async def test_create_job_tags_with_callers_tenant(
     )
     ids = {item["id"] for item in list_resp.json()["items"]}
     assert body["id"] in ids
+
+
+async def test_cache_hit_does_not_leak_cross_tenant_job(
+    client: AsyncClient,
+    db_session,  # type: ignore[no-untyped-def]
+    other_tenant,  # type: ignore[no-untyped-def]
+    other_tenant_user: User,
+    admin_headers: dict[str, str],
+) -> None:
+    """E2-01 regression: a cached tenant-B job must never be served to a
+    privileged tenant-A caller. The cache key is tenant-scoped, so tenant A's
+    lookup misses (`job:{A}:{id}`) and falls through to the tenant-scoped DB
+    path, which 404s."""
+    job = Job(
+        tenant_id=other_tenant.id,
+        user_id=other_tenant_user.id,
+        type=JobType.CSV_UPLOAD,
+        status=JobStatus.FAILED,
+        retry_count=1,
+        max_retries=3,
+        priority=0,
+        error_message="tenant B secret failure detail",
+    )
+    db_session.add(job)
+    await db_session.flush()
+    await db_session.refresh(job)
+
+    cached_payload = json.dumps(
+        JobResponse.model_validate(job).model_dump(mode="json")
+    )
+
+    # Simulate "tenant B's job sits in the Redis cache": serve the payload
+    # for the tenant-B-scoped key (what fixed code writes) and for the
+    # legacy global key (what unfixed code wrote — this is what makes the
+    # test red at HEAD), but NEVER for a key scoped to any other tenant.
+    # A naive mock answering every key could not tell a tenant-scoped
+    # lookup from a global one and would mask the fix.
+    tenant_b_keys = {f"job:{job.id}", f"job:{other_tenant.id}:{job.id}"}
+
+    async def _tenant_aware_get(key: str) -> str | None:
+        return cached_payload if key in tenant_b_keys else None
+
+    async def _override_redis():  # type: ignore[no-untyped-def]
+        mock = AsyncMock()
+        mock.get = AsyncMock(side_effect=_tenant_aware_get)
+        yield mock
+
+    app = client._transport.app  # type: ignore[attr-defined]
+    app.dependency_overrides[get_redis] = _override_redis
+
+    # Privileged (ADMIN) caller in tenant A asks for tenant B's job.
+    resp = await client.get(f"/api/v1/jobs/{job.id}", headers=admin_headers)
+
+    # Cache miss on job:{A}:{id} -> DB path -> get_for_tenant(A) -> 404.
+    assert resp.status_code == 404
+    assert "tenant B secret failure detail" not in json.dumps(resp.json())
 
 
 async def test_idempotency_key_reusable_across_tenants(
