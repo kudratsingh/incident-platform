@@ -408,9 +408,20 @@ async def _run_job(
                     async with session.begin():
                         repo = JobRepository(session)
                         audit = AuditRepository(session)
+                        job_extra: dict[str, Any] = {
+                            "retry_count": new_retry_count,
+                            "error_message": str(exc),
+                        }
+                        if llm_dead_lettered:
+                            # Persisted on the row, not only in the audit
+                            # extra_data below, because the admin DLQ table
+                            # badges per row and cannot afford an audit join
+                            # per row (F2-16). Left unset otherwise: retries
+                            # exhausting is the default mechanism and claims
+                            # no attribution.
+                            job_extra["dead_lettered_by"] = "llm_retry_policy"
                         await repo.update_status(
-                            job_id, JobStatus.DEAD_LETTER,
-                            extra={"retry_count": new_retry_count, "error_message": str(exc)},
+                            job_id, JobStatus.DEAD_LETTER, extra=job_extra,
                         )
                         dlq_extra: dict[str, Any] = {
                             "error": str(exc),

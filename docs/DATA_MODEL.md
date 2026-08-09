@@ -91,6 +91,7 @@ Adding a new role to a Postgres ENUM requires `ALTER TYPE`, which can't run insi
 | `error_message` | Text NULLABLE | Set on failure. Truncated/sanitized at the worker; not the full traceback. |
 | `retry_count` | Integer (default 0) | Incremented on each failure. Reset to 0 on admin Replay (previous value recorded in audit log). |
 | `max_retries` | Integer (default 3) | Per-job cap. |
+| `dead_lettered_by` | String(32) NULLABLE | Which mechanism forced the dead-letter, when it was not the default one — `llm_retry_policy` is the only value today. NULL = retries simply ran out (or no processor was registered, or the dispatcher's safety net fired), so the admin DLQ tab can badge the LLM rows without inferring it from `retry_count < max_retries`, which mislabelled every compensation job. Reset to NULL on admin Replay. Added in Alembic `c9a3e5d70b12`; not backfilled, so pre-migration rows read NULL. |
 | `priority` | Integer (default 0) | Indexed. Higher = more urgent. Currently informational; the priority-aware queue exists in `app/workers/queue.py` (legacy delayed-retry path) but Kafka itself doesn't respect priority — every event is FIFO within a partition. |
 | `trace_id` | String(255) NULLABLE | Indexed. Carries the OTel trace ID so the UI can show "request → API → worker → DB" as one trace. Pasted into the admin filter to find a specific request. |
 | `started_at`, `completed_at` | DateTime NULLABLE | Filled by the dispatcher on transition. Used by SLOs. |

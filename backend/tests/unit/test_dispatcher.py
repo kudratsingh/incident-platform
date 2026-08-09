@@ -208,6 +208,98 @@ async def test_run_job_llm_policy_forces_dead_letter_before_exhaustion() -> None
     assert JobStatus.DEAD_LETTER in calls
 
 
+def _dead_letter_extra(job_repo: AsyncMock) -> dict[str, object]:
+    """The `extra` dict of the DEAD_LETTER update_status write on `job_repo`."""
+    for call in job_repo.update_status.call_args_list:
+        if call.args[1] == JobStatus.DEAD_LETTER:
+            return dict(call.kwargs.get("extra") or {})
+    raise AssertionError("no DEAD_LETTER update_status call was made")
+
+
+async def test_run_job_llm_dead_letter_stamps_dead_lettered_by() -> None:
+    """F2-16: the LLM-forced dead-letter is the ONLY mechanism that may
+    claim attribution, and it must persist that on the jobs row — not just
+    in the audit extra_data — because the DLQ admin table badges per row and
+    cannot afford a per-row audit join."""
+    from app.services.retry_policy import RetryDecision
+
+    job = _make_job(type=JobType.BULK_API_SYNC, retry_count=1, max_retries=5)
+    factory, job_repo, audit_repo = _make_session_factory(job)
+    redis = AsyncMock()
+
+    processor = AsyncMock(side_effect=RuntimeError("401 Unauthorized"))
+    fake_decision = RetryDecision(
+        action="dead_letter_now",
+        backoff_seconds=0,
+        reasoning="Auth failure won't recover.",
+    )
+    with patch("app.workers.dispatcher.JobRepository", return_value=job_repo), \
+         patch("app.workers.dispatcher.AuditRepository", return_value=audit_repo), \
+         patch(
+             "app.workers.dispatcher.OutboxRepository",
+             new=MagicMock(return_value=AsyncMock()),
+         ), \
+         patch.dict(dispatcher._PROCESSORS, {JobType.BULK_API_SYNC: processor}), \
+         patch("app.workers.dispatcher.retry_policy.is_enabled", return_value=True), \
+         patch(
+             "app.workers.dispatcher.retry_policy.decide_retry",
+             new=AsyncMock(return_value=(fake_decision, {}, "claude-opus-4-7")),
+         ), \
+         patch("app.workers.dispatcher.queue.push_delayed", new=AsyncMock()):
+        await dispatcher._run_job(str(job.id), factory, redis)
+
+    assert _dead_letter_extra(job_repo)["dead_lettered_by"] == "llm_retry_policy"
+
+
+async def test_run_job_deterministic_exhaustion_does_not_stamp_dead_lettered_by() -> None:
+    """Retries exhausting on their own is the DEFAULT mechanism — it leaves
+    dead_lettered_by unset so the row renders unbadged."""
+    job = _make_job(type=JobType.BULK_API_SYNC, retry_count=2, max_retries=3)
+    factory, job_repo, audit_repo = _make_session_factory(job)
+    redis = AsyncMock()
+
+    processor = AsyncMock(side_effect=RuntimeError("boom"))
+    with patch("app.workers.dispatcher.JobRepository", return_value=job_repo), \
+         patch("app.workers.dispatcher.AuditRepository", return_value=audit_repo), \
+         patch(
+             "app.workers.dispatcher.OutboxRepository",
+             new=MagicMock(return_value=AsyncMock()),
+         ), \
+         patch.dict(dispatcher._PROCESSORS, {JobType.BULK_API_SYNC: processor}), \
+         patch("app.workers.dispatcher.queue.push_delayed", new=AsyncMock()):
+        await dispatcher._run_job(str(job.id), factory, redis)
+
+    assert _dead_letter_extra(job_repo).get("dead_lettered_by") is None
+
+
+async def test_run_job_compensation_dead_letter_is_not_attributed_to_the_llm() -> None:
+    """The case F2-16 actually mislabeled.
+
+    A saga compensation job with no registered processor dead-letters
+    immediately at retry_count=0 — by design, and with LLM features off.
+    Under the old `retry_count < max_retries` arithmetic that row was badged
+    'LLM'. The persisted field must stay None here, and retry_count must
+    still be below max_retries so the assertion genuinely covers the shape
+    the arithmetic got wrong.
+    """
+    job = _make_job(type="csv_upload.compensate", retry_count=0, max_retries=3)
+    factory, job_repo, audit_repo = _make_session_factory(job)
+    redis = AsyncMock()
+
+    with patch("app.workers.dispatcher.JobRepository", return_value=job_repo), \
+         patch("app.workers.dispatcher.AuditRepository", return_value=audit_repo), \
+         patch(
+             "app.workers.dispatcher.OutboxRepository",
+             new=MagicMock(return_value=AsyncMock()),
+         ), \
+         patch.dict(dispatcher._PROCESSORS, {}, clear=False):
+        await dispatcher._run_job(str(job.id), factory, redis)
+
+    extra = _dead_letter_extra(job_repo)
+    assert extra["retry_count"] == 0 < job.max_retries
+    assert extra.get("dead_lettered_by") is None
+
+
 async def test_run_job_llm_policy_failure_falls_back_to_deterministic() -> None:
     """If the LLM call raises (timeout, network, schema mismatch), the
     deterministic exponential-backoff retry still happens — the worker
