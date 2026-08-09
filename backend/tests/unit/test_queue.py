@@ -66,6 +66,32 @@ async def test_delayed_length_returns_zcard() -> None:
     redis.zcard.assert_awaited_once_with(queue.DELAYED_KEY)
 
 
+def test_pop_ready_lua_is_bounded_and_chunk_zrems() -> None:
+    """E1-12: the shared pop script used to call `unpack(due)` on the whole
+    ZRANGEBYSCORE result. Lua's `unpack` is capped by LUAI_MAXCSTACK (8000 by
+    default), so once ~8000 members came due the EVAL raised
+    "too many results to unpack" on EVERY tick — permanently wedging BOTH
+    `jobs:delayed` and `jobs:dlq_replay_delayed`, which share this script via
+    `_atomic_pop_ready`. The set only grows from there, so it never
+    self-heals.
+
+    Two markers, both required:
+      * `LIMIT` — the ZRANGEBYSCORE is bounded, so the result can never reach
+        the unpack ceiling in the first place.
+      * `unpack(due, i,` — the ZREM is chunked, which is what keeps the script
+        safe if anyone raises the LIMIT later.
+
+    Honest scope note: this is a source-shape assertion, not a behavioural
+    one. The >8000-member failure only reproduces against a real Redis Lua
+    interpreter — `redis.eval` is mocked everywhere in this suite, so no unit
+    test can observe it. A Docker-gated integration test seeding 9000 members
+    and asserting the pop returns 1000 without raising is the behavioural
+    proof; it is not written yet.
+    """
+    assert "LIMIT" in queue._POP_READY_LUA
+    assert "unpack(due, i," in queue._POP_READY_LUA
+
+
 def test_primary_queue_functions_removed() -> None:
     """Regression: `push`, `pop`, `promote_delayed`, `queue_length`, and
     `QUEUE_KEY` were removed in the queue-leak fix. If any of them come

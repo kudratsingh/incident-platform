@@ -11,7 +11,7 @@ For per-component reference, see [`docs/DATA_MODEL.md`](DATA_MODEL.md), [`docs/K
 The platform runs as **three logical processes**:
 
 1. **API process** — FastAPI behind an ALB. Serves `/api/v1/*`. One ECS task with autoscaling target on CPU.
-2. **Worker process** — runs `worker_loop` from `app/workers/dispatcher.py`. Hosts eight Kafka consumer groups + four background loops. One ECS task today (autoscaling on queue depth is a Phase 8 item).
+2. **Worker process** — runs `worker_loop` from `app/workers/dispatcher.py`. Hosts eight Kafka consumer groups + eight background loops. One ECS task today (autoscaling on queue depth is a Phase 8 item).
 3. **Frontend** — Nginx serving the React SPA. Same ALB, different listener rule.
 
 External dependencies, all managed:
@@ -332,9 +332,9 @@ Register the new processor in `_PROCESSORS` in `dispatcher.py`.
 
 1. Starts eight Kafka consumers (each with its own consumer group, started best-effort — one's failure doesn't kill the others).
 2. Validates the dispatcher consumer specifically — if that one fails to start, the worker exits since no jobs can run.
-3. Spawns the four background loops as asyncio tasks.
+3. Spawns the eight background loops as asyncio tasks.
 
-The eleven tasks run concurrently. They share:
+The sixteen tasks run concurrently. They share:
 
 - The same `session_factory` (so they share connection pool semantics; each task acquires/releases per transaction).
 - The same Redis client.
@@ -353,7 +353,8 @@ The eleven tasks run concurrently. They share:
 | `SagaCoordinator` | `job.completed`, `job.dlq` | `sagas` updates + outbox rows | Per-saga — one saga's failure doesn't affect others |
 | `LlmTriageConsumer` | `job.dlq` | `job_triages` rows | Per-job — LLM failure is logged and skipped |
 | `_outbox_relay_loop` | `outbox_events` table | Kafka via `publish_raw` | Per-row — schema failures mark row failed, others retry next tick |
-| `_promote_delayed_loop` | Redis `delayed_queue` zset | outbox row | Per-tick — exception logged, loop continues |
+| `_promote_delayed_loop` | Redis `delayed_queue` zset | outbox row | Per-item — a failed job is re-pushed onto the zset; the rest of the batch still promotes |
+| `_requeue_stale_pending_loop` | `jobs` rows `PENDING` for >300s with no `delayed_queue` timer | outbox row | Per-tick — exception logged, loop continues |
 | `_metrics_loop` | Dispatcher consumer + Redis | CloudWatch gauges | Per-tick — exception logged |
 | `_digest_loop` | DB + Anthropic API | `incident_summaries` rows | Per-tenant — one tenant's API failure doesn't stop the batch |
 

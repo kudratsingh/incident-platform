@@ -104,6 +104,14 @@ These predate Phase 7. They were the original job queue (push-pop via Redis sort
 
 These keys have **no TTL** and are critical: losing the delayed queue means delayed retries disappear silently. Persistence is enabled on the Redis instance in production (RDB snapshots + AOF). On local dev with the default `docker-compose.yml` setup, Redis is in-memory only — restarts lose state.
 
+#### Reader semantics for `jobs:delayed`
+
+The pop (`queue._atomic_pop_ready`, shared with `jobs:dlq_replay_delayed`) is a single Lua `EVAL` that does `ZRANGEBYSCORE` + `ZREM` in one round-trip, so two readers can never see the same member. Three consequences worth knowing before touching this path:
+
+- **The pop is bounded**: `LIMIT 0 1000`, so a call returns at most 1000 members and the `ZREM` is chunked. Without the bound, Lua's `unpack` hits `LUAI_MAXCSTACK` (8000 by default) once a backlog builds and the script raises on *every* tick — wedging both sorted sets permanently, since nothing is ever removed. A backlog over the limit drains across ticks instead: both readers poll every 0.5s, so ~2000 members/s per set. **Callers must not assume they received every due member.**
+- **The pop is destructive before the work happens**: members are gone from Redis the instant `EVAL` returns, so the promotion pass owns them. `_promote_delayed_once` therefore isolates each job in its own `try` and, on failure, pushes the id back with a short delay (`_PROMOTE_RETRY_DELAY_SECONDS`). One bad job cannot strand the rest of the batch.
+- **A backstop covers the crash windows** the re-push cannot. If the worker dies between the pop and the outbox commit, or between the retry transaction's commit and `push_delayed`, the job sits in `pending` with no timer in this ZSET and no Kafka message. `_requeue_stale_pending_loop` sweeps every 60s for jobs `PENDING` and untouched for 300s, skips any job with a live `ZSCORE` in `jobs:delayed` (it is legitimately waiting out a backoff — the LLM retry policy can set those to minutes), and re-publishes the rest. A re-publish is safe to duplicate: the second delivery loses the atomic `pending -> running` claim and executes nothing.
+
 ---
 
 ## Eviction policy
