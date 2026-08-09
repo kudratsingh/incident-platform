@@ -94,9 +94,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 extra={"error_type": type(exc).__name__, "error": str(exc)[:400]},
             )
 
-    # Kafka producer — if broker is unreachable we log and continue so the API
-    # still boots; publish_* calls will then no-op via the producer's internal
-    # error handling.
+    # Kafka producer — if the broker is unreachable we log and continue so the
+    # API still boots. The producer stays unset, and the publish paths lazily
+    # retry the start (throttled to one attempt per 5s), so the outbox relay's
+    # next tick after the broker returns restarts it: a boot-time broker outage
+    # self-heals without a redeploy.
     try:
         await start_producer()
     except Exception as exc:

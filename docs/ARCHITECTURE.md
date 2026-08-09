@@ -392,7 +392,7 @@ What happens when a component dies, in priority order.
 
 **Symptom:** outbox table grows; the relay logs publish failures. Direct-publish (progress) silently drops. Consumer groups stop receiving (they were already stopped because the broker is unreachable).
 **Detection:** consumer lag alarm; queue depth alarm; ECS task can't reach broker (logged).
-**Recovery:** MSK auto-recovers (multi-AZ, 3-broker replication). Producers retry on reconnect. Consumers resume from last committed offset.
+**Recovery:** MSK auto-recovers (multi-AZ, 3-broker replication). Producers retry on reconnect. Consumers resume from last committed offset. This also covers the boot-time case: if an API/worker task starts while the broker is down, `start_producer()` fails, the producer singleton stays unset, and the publish paths lazily restart it (one attempt per 5s) — the outbox relay's next tick after the broker returns brings the producer up and drains the backlog. No redeploy needed.
 **Data loss:** no. Outbox keeps unpublished rows.
 **Operational shape:** the more time spent before recovery, the more outbox rows pile up; the relay catches up over the next minute or two after the broker is back.
 
