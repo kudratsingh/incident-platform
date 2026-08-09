@@ -444,12 +444,12 @@ async def _seed_hot_set(redis: aioredis.Redis) -> None:
     inspecting Redis doesn't confuse it with production cache."""
     import json as _json
 
+    # Derived from `_dlq_specs()` (first three, keeping the
+    # schema-violation job first) so every member references a job the
+    # seed actually creates. Hardcoded stable() names drifted once when
+    # specs were renamed, leaving phantom UUIDs in the cache (D-14).
     payload = _json.dumps(
-        [
-            str(stable("dlq-job-schema-violation")),
-            str(stable("dlq-job-smtp-transient")),
-            str(stable("dlq-job-csv-baddata")),
-        ]
+        [str(spec["job_id"]) for spec in _dlq_specs()[:3]]
     )
     await redis.set(_HOT_SET_KEY, payload, ex=_HOT_SET_TTL_SECONDS)
 

@@ -58,6 +58,11 @@ async def test_seed_hot_set_populates_expected_key() -> None:
     parsed = json.loads(value)
     assert isinstance(parsed, list)
     assert len(parsed) >= 1
+    # Referential integrity (D-14): every hot_set member must be a job
+    # id that `_seed_dlq` actually seeds. Hardcoded stable() names
+    # drifted once when `_dlq_specs` entries were renamed, leaving 2 of
+    # 3 members pointing at jobs that never exist.
+    assert set(parsed) <= {str(spec["job_id"]) for spec in seed._dlq_specs()}
     # TTL passed so evals don't drift mid-run.
     assert redis.set.await_args.kwargs.get("ex") == 24 * 3600
 

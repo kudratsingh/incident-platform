@@ -121,9 +121,9 @@ Producer-side validation in `publish_raw` catches schema violations *before* the
 
 ### Consumer lag
 
-`kafka:consumer_lag:dispatcher` in Redis (TTL 90s) is the cached lag value from the dispatcher consumer's `consumer_lag()` method. The metrics loop emits it every 60s; the backpressure check in `POST /jobs` reads it without ever round-tripping to Kafka. Threshold: `Settings.backpressure_lag_threshold` (default 1000); above that, the API returns 503 with `BackpressureError`.
+`kafka:consumer_lag:worker-dispatcher` in Redis (TTL 90s) is the cached lag value from the dispatcher consumer's `consumer_lag()` method. The metrics loop emits it every 60s; the backpressure check in `POST /jobs` reads it without ever round-tripping to Kafka. Threshold: `Settings.backpressure_lag_threshold` (default 1000); above that, the API returns 503 with `BackpressureError`.
 
-For lag on the other 6 consumer groups, use Redpanda Console or `rpk group describe <group>`.
+For lag on the other 7 consumer groups, use Redpanda Console or `rpk group describe <group>`.
 
 ### Pause + resume a consumer group
 
@@ -167,7 +167,7 @@ The base class handles schema validation, offset management, error handling, and
 - `backend/app/workers/kafka_producer.py` — the producer + `publish_raw` (validation-loud) + `publish_job_progress` (validation-swallow)
 - `backend/app/workers/kafka_consumer.py` — `BaseKafkaConsumer` with offset + validation + retry handling
 - `backend/app/workers/schema_registry.py` — JSON Schema loading + format checker setup
-- `backend/app/workers/dispatcher.py` — `worker_loop` (orchestrates all 7 groups)
+- `backend/app/workers/dispatcher.py` — `worker_loop` (orchestrates all 8 groups)
 - `backend/app/schemas/kafka/*.schema.json` — schema definitions
 - `backend/tests/integration/test_kafka_e2e.py` — Testcontainers round-trip
 - `infra/msk.tf` — production MSK provisioning
