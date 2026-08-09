@@ -106,6 +106,58 @@ jobs:
       - name: Run tests
         run: pytest --cov=backend/app --cov-report=term-missing --cov-fail-under=70
 
+  infra:
+    name: Infra
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.x"
+          # No wrapper — the chaos-gate step below inspects terraform's own
+          # exit code and output, and the wrapper would sit between them.
+          terraform_wrapper: false
+
+      - name: Terraform fmt
+        run: terraform -chdir=infra fmt -check -diff
+
+      - name: Terraform init (no backend)
+        run: terraform -chdir=infra init -backend=false -input=false
+
+      - name: Terraform validate
+        run: terraform -chdir=infra validate
+
+      # ADR 0008: the production workspace must refuse chaos_enabled=true.
+      # `terraform validate` cannot prove this — variable validations are only
+      # evaluated by plan/apply with concrete values — so this is a negative
+      # plan. It runs credential-free: the validation failure alone forces a
+      # non-zero exit and puts its message in the output (the runner having no
+      # AWS credentials merely adds unrelated provider errors alongside).
+      # Deliberately no positive plan (chaos in staging): a valid plan proceeds
+      # to provider configuration and would fail on missing credentials — the
+      # wrong reason.
+      - name: Chaos gate refuses production (negative plan)
+        run: |
+          set -euo pipefail
+          if terraform -chdir=infra plan -input=false -refresh=false \
+              -var chaos_enabled=true -var environment=production -no-color \
+              > plan-output.txt 2>&1; then
+            echo "ERROR: plan succeeded — the production chaos gate is gone." >&2
+            cat plan-output.txt
+            exit 1
+          fi
+          echo "Plan refused (non-zero exit), as required. Verifying the refusal reason..."
+          # Terraform word-wraps diagnostics on non-TTY output, so normalize
+          # whitespace before matching the error_message substring.
+          if ! tr -s '[:space:]' ' ' < plan-output.txt | grep -Fq "refused in the production workspace (ADR 0008)"; then
+            echo "ERROR: plan failed, but not with the ADR 0008 production-refusal message:" >&2
+            cat plan-output.txt
+            exit 1
+          fi
+          echo "Chaos gate verified: chaos_enabled=true is refused when environment=production."
+
   deploy:
     name: Build & Deploy to ECS
     runs-on: ubuntu-latest

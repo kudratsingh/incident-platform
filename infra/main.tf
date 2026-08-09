@@ -1,5 +1,8 @@
 terraform {
-  required_version = ">= 1.7"
+  # 1.9+: the chaos_enabled validation (variables.tf) references
+  # var.environment, and cross-variable references inside variable
+  # validation conditions are only supported from Terraform 1.9.
+  required_version = ">= 1.9"
 
   required_providers {
     aws = {
