@@ -30,7 +30,6 @@ async def register(
     user = await svc.register(
         email=body.email,
         password=body.password,
-        role=body.role,
         tenant_slug=body.tenant_slug,
         new_tenant_name=body.new_tenant_name,
         ip_address=request.client.host if request.client else None,

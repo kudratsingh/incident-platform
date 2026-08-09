@@ -10,9 +10,12 @@ dependency lets the request through.
 """
 
 import uuid
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock
 
+import pytest
+from app.config import get_settings
 from app.core.scopes import Scope
 from app.dependencies import (
     Principal,
@@ -57,6 +60,44 @@ async def test_non_admin_user_cannot_create_service_account(
         "/api/v1/admin/service-accounts",
         headers=auth_headers,
         json={"name": "sneaky", "scopes": [Scope.TELEMETRY_READ.value]},
+    )
+    assert resp.status_code == 403
+
+
+async def test_tenant_admin_without_platform_flag_cannot_create_sa(
+    client: AsyncClient,
+    db_session,  # type: ignore[no-untyped-def]
+    default_tenant,  # type: ignore[no-untyped-def]
+) -> None:
+    """Service-account management is a platform-operator workflow (X-01
+    hop 2): a tenant admin (role=admin, is_platform_admin=False) must get
+    403, exactly like the cross-tenant admin endpoints."""
+    from app.core.security import create_access_token, hash_password
+    from app.models.enums import UserRole
+    from app.models.user import User
+
+    tenant_admin = User(
+        tenant_id=default_tenant.id,
+        email="sa-tenantadmin@example.com",
+        hashed_password=hash_password("password123"),
+        role=UserRole.ADMIN,
+        is_active=True,
+        is_platform_admin=False,
+    )
+    db_session.add(tenant_admin)
+    await db_session.flush()
+    await db_session.refresh(tenant_admin)
+    token = create_access_token(
+        {
+            "sub": str(tenant_admin.id),
+            "tenant_id": str(tenant_admin.tenant_id),
+            "role": tenant_admin.role,
+        }
+    )
+    resp = await client.post(
+        "/api/v1/admin/service-accounts",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"name": "not-allowed", "scopes": [Scope.TELEMETRY_READ.value]},
     )
     assert resp.status_code == 403
 
@@ -164,7 +205,6 @@ async def test_patch_widens_scopes(
             "scopes": [
                 Scope.TELEMETRY_READ.value,
                 Scope.INCIDENTS_READ.value,
-                Scope.CHAOS_INVOKE.value,
                 Scope.ACTIONS_EXECUTE.value,
             ]
         },
@@ -174,7 +214,6 @@ async def test_patch_widens_scopes(
     assert set(body["scopes"]) == {
         Scope.TELEMETRY_READ.value,
         Scope.INCIDENTS_READ.value,
-        Scope.CHAOS_INVOKE.value,
         Scope.ACTIONS_EXECUTE.value,
     }
 
@@ -187,7 +226,7 @@ async def test_patch_narrows_scopes(
     sa = await _create_sa(
         client,
         admin_headers,
-        [Scope.TELEMETRY_READ.value, Scope.CHAOS_INVOKE.value],
+        [Scope.TELEMETRY_READ.value, Scope.ACTIONS_EXECUTE.value],
     )
     resp = await client.patch(
         f"/api/v1/admin/service-accounts/{sa['id']}",
@@ -285,21 +324,151 @@ async def test_patch_then_mint_yields_wider_token(
         f"/api/v1/admin/service-accounts/{sa['id']}",
         headers=admin_headers,
         json={
-            "scopes": [Scope.TELEMETRY_READ.value, Scope.CHAOS_INVOKE.value]
+            "scopes": [Scope.TELEMETRY_READ.value, Scope.ACTIONS_EXECUTE.value]
         },
     )
     mint = await client.post(
         f"/api/v1/admin/service-accounts/{sa['id']}/tokens",
         headers=admin_headers,
         json={
-            "scopes": [Scope.TELEMETRY_READ.value, Scope.CHAOS_INVOKE.value]
+            "scopes": [Scope.TELEMETRY_READ.value, Scope.ACTIONS_EXECUTE.value]
         },
     )
     assert mint.status_code == 201
     assert set(mint.json()["token"]["scopes"]) == {
         Scope.TELEMETRY_READ.value,
-        Scope.CHAOS_INVOKE.value,
+        Scope.ACTIONS_EXECUTE.value,
     }
+
+
+# ---------------------------------------------------------------------------
+# chaos:invoke at the API boundary (X-01 hop 3)
+#
+# With the chaos gate closed (CHAOS_ENABLED unset/false — the default, and
+# forced false in production) chaos:invoke is not grantable through the human
+# API on any of the three grant paths, even by a platform admin. On a
+# chaos-enabled stack (the platform's own docker-compose, which the
+# incident-commander bootstrap targets) a platform admin can still grant it.
+# The operator seed script provisions through the service layer and is
+# unaffected either way.
+# ---------------------------------------------------------------------------
+
+
+async def test_api_refuses_chaos_scope_grant(
+    client: AsyncClient,
+    admin_headers: dict[str, str],
+    db_session,  # type: ignore[no-untyped-def]
+    default_tenant,  # type: ignore[no-untyped-def]
+) -> None:
+    """Chaos gate closed: create, PATCH, and mint all refuse chaos:invoke
+    with 403; the service layer (seed-script path) still provisions it."""
+    # create
+    resp = await client.post(
+        "/api/v1/admin/service-accounts",
+        headers=admin_headers,
+        json={"name": "chaos-via-create", "scopes": [Scope.CHAOS_INVOKE.value]},
+    )
+    assert resp.status_code == 403
+
+    # PATCH-widen
+    sa = await _create_sa(client, admin_headers, [Scope.TELEMETRY_READ.value])
+    resp = await client.patch(
+        f"/api/v1/admin/service-accounts/{sa['id']}",
+        headers=admin_headers,
+        json={"scopes": [Scope.TELEMETRY_READ.value, Scope.CHAOS_INVOKE.value]},
+    )
+    assert resp.status_code == 403
+
+    # mint — needs an account that legitimately holds chaos:invoke, which
+    # only the operator path can produce: provision through the service
+    # layer exactly like scripts/seed_incident_commander.py does.
+    from app.repositories.audit import AuditRepository
+    from app.repositories.service_account import ServiceAccountRepository
+    from app.services.service_account import ServiceAccountService
+
+    service = ServiceAccountService(
+        ServiceAccountRepository(db_session),
+        ServiceAccountTokenRepository(db_session),
+        AuditRepository(db_session),
+    )
+    seeded = await service.create_service_account(
+        tenant_id=default_tenant.id,
+        name="chaos-seeded-agent",
+        scopes=[Scope.TELEMETRY_READ.value, Scope.CHAOS_INVOKE.value],
+        created_by_user_id=None,
+    )
+    # The seed-script path is NOT gated — the agent's provisioning survives.
+    assert Scope.CHAOS_INVOKE.value in seeded.scopes
+
+    resp = await client.post(
+        f"/api/v1/admin/service-accounts/{seeded.id}/tokens",
+        headers=admin_headers,
+        json={"scopes": [Scope.CHAOS_INVOKE.value]},
+    )
+    assert resp.status_code == 403
+
+
+@pytest.fixture
+def chaos_enabled_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Simulate a chaos-enabled stack (CHAOS_ENABLED=true), matching the
+    platform docker-compose environment the incident-commander bootstrap
+    script runs against."""
+    monkeypatch.setenv("CHAOS_ENABLED", "true")
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
+
+
+async def test_chaos_scope_grantable_by_platform_admin_when_chaos_enabled(
+    client: AsyncClient,
+    admin_headers: dict[str, str],
+    chaos_enabled_env: None,
+) -> None:
+    """Chaos gate open: a platform admin can still provision a chaos:invoke
+    service account through the API. This is the incident-commander
+    `make bootstrap-token` flow (create a 4-scope SA, mint with an empty
+    body, PATCH-widen on re-run) and must keep working."""
+    bootstrap_scopes = [
+        Scope.TELEMETRY_READ.value,
+        Scope.INCIDENTS_READ.value,
+        Scope.ACTIONS_EXECUTE.value,
+        Scope.CHAOS_INVOKE.value,
+    ]
+    # Fresh bootstrap run: create carries chaos:invoke directly.
+    resp = await client.post(
+        "/api/v1/admin/service-accounts",
+        headers=admin_headers,
+        json={"name": "incident-commander", "scopes": bootstrap_scopes},
+    )
+    assert resp.status_code == 201, resp.text
+    sa = resp.json()
+    assert set(sa["scopes"]) == set(bootstrap_scopes)
+
+    # Bootstrap mints with an empty body — the token inherits all four.
+    mint = await client.post(
+        f"/api/v1/admin/service-accounts/{sa['id']}/tokens",
+        headers=admin_headers,
+        json={},
+    )
+    assert mint.status_code == 201, mint.text
+    assert Scope.CHAOS_INVOKE.value in mint.json()["token"]["scopes"]
+
+    # Re-run path: an SA that exists with narrower scopes is PATCH-widened.
+    narrow = await _create_sa(client, admin_headers, [Scope.TELEMETRY_READ.value])
+    patched = await client.patch(
+        f"/api/v1/admin/service-accounts/{narrow['id']}",
+        headers=admin_headers,
+        json={"scopes": bootstrap_scopes},
+    )
+    assert patched.status_code == 200, patched.text
+
+    # Explicit chaos mint is likewise allowed while the gate is open.
+    explicit = await client.post(
+        f"/api/v1/admin/service-accounts/{narrow['id']}/tokens",
+        headers=admin_headers,
+        json={"scopes": [Scope.CHAOS_INVOKE.value]},
+    )
+    assert explicit.status_code == 201, explicit.text
 
 
 # ---------------------------------------------------------------------------

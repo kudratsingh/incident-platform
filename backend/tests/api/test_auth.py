@@ -16,6 +16,23 @@ async def test_register_returns_201(client: AsyncClient) -> None:
     assert "hashed_password" not in body
 
 
+async def test_register_ignores_caller_supplied_role(client: AsyncClient) -> None:
+    """A caller-supplied `role` must never be honored (X-01 hop 1 / F1-04):
+    registering into an existing tenant always yields a plain user, even when
+    the request body asks for admin. The field is gone from UserCreate, so a
+    stray "role" key is ignored as an unknown extra."""
+    resp = await client.post(
+        "/api/v1/auth/register",
+        json={
+            "email": "wannabe-admin@example.com",
+            "password": "securepass",
+            "role": "admin",
+        },
+    )
+    assert resp.status_code == 201
+    assert resp.json()["role"] == "user"
+
+
 async def test_register_duplicate_email_returns_409(client: AsyncClient) -> None:
     payload = {"email": "dup@example.com", "password": "securepass"}
     await client.post("/api/v1/auth/register", json=payload)

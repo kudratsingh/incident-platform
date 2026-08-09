@@ -132,3 +132,39 @@ Dropping the scope model means folding all scopes into a single role bundle — 
 - `backend/app/dependencies.py` — `get_current_principal` fanning in both auth paths
 - `backend/app/core/scopes.py` — the fixed scope enum + `require_scope` dependency factory
 - Related ADRs: [0006 — MCP server standalone process](0006-mcp-server-standalone-process.md), [0008 — Chaos gating](0008-chaos-gating.md)
+
+## Amendment (v0.5.0) — Service-account management requires a platform admin; grants are API-gated
+
+The X-01 audit finding composed three individually-shipped behaviors into an
+unauthenticated privilege-escalation chain: the public register body accepted a
+caller-supplied `role` (so a stranger could become a tenant admin), and every
+endpoint under `/admin/service-accounts` accepted tenant `role=admin` (so that
+stranger could then create a machine principal and mint tokens carrying
+`actions:execute` — and `chaos:invoke` on chaos-enabled stacks). This amendment
+closes the chain; the original text above is unchanged and describes the scope
+model, which is not affected.
+
+1. **Registration never takes a role.** `UserCreate` no longer has a `role`
+   field and `AuthService.register` no longer accepts one. Registrants into an
+   existing tenant are always `user`. The single, bounded elevation is
+   service-internal: the founder of a brand-new self-service tenant becomes
+   that tenant's `admin` (never `is_platform_admin`).
+2. **All of `/admin/service-accounts` requires `is_platform_admin`.** Create,
+   list, PATCH scopes, mint, list tokens, and revoke are platform-operator
+   workflows. Tenant `role=admin` is no longer sufficient; the
+   `?tenant_id=` cross-tenant override already honored only platform admins,
+   so its behavior is unchanged.
+3. **Scope grants pass an API-boundary gate.** `assert_api_grantable`
+   (`backend/app/core/scopes.py`) refuses `chaos:invoke` on the three grant
+   paths (create / PATCH / mint) while the chaos gate is closed. It is called
+   only from the API endpoints — the service layer stays permissive so the
+   operator seed script (`scripts/seed_incident_commander.py`) keeps
+   provisioning the agent's `chaos:invoke` directly. On a chaos-enabled stack
+   (`CHAOS_ENABLED=true`, never production) a platform admin may still grant
+   `chaos:invoke` through the API — that is the incident-commander
+   `bootstrap_agent_token.py` flow. Details in the
+   [ADR 0008 amendment](0008-chaos-gating.md).
+
+The scope model itself (fixed enum, non-hierarchical, tokens carry subsets) is
+untouched; what changed is *who* may operate the grant machinery and *which*
+scopes the human API will grant.
