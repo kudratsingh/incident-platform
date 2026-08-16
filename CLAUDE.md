@@ -42,6 +42,13 @@ This file (`CLAUDE.md`) is the high-signal index. Treat it as the entry point �
   - [0009 — Consumer lifecycle and supervision](docs/ADR/0009-consumer-lifecycle-and-supervision.md)
 - [`docs/ROADMAP.md`](docs/ROADMAP.md) — open extension ideas, sized + categorized
 - [`runbooks/`](runbooks/) — machine-readable on-call playbooks for every CloudWatch alarm + SLO
+- [`context/INDEX.md`](context/INDEX.md) — **session history; read it at the start of a session.**
+  One line per session plus the findings that cost real time once: that the digest to pin is the
+  index and not the linux/amd64 child, that `tools/list` needs no rows so an empty database was
+  indistinguishable from a seeded one for the life of the project, that `AlertPayload` declares two
+  fields the webhook never sends. Most of the campaign history is agent-side in
+  `../incident-commander/context/INDEX.md` — the interesting failures have been on the seam between
+  the two repos, so read both. See "Session history" below for how to add one.
 
 ---
 
@@ -640,6 +647,12 @@ Deferred until the incident-commander agent is wired up and driving eval scenari
 │   └── workflows/
 │       └── ci.yml                  # lint, type, test, frontend, build, deploy
 │
+├── context/                        # session history; INDEX.md is the map, archives/ is gitignored
+│   ├── INDEX.md                    # one line per session — read first
+│   ├── README.md                   # the convention: packing, redaction, immutability
+│   ├── pack.sh                     # scrub → verify → zip a session's transcripts
+│   └── archives/                   # gitignored + immutable; absent from a fresh clone
+│
 ├── runbooks/                       # machine-readable runbooks (one per alarm + SLO)
 │   ├── rb-alb-5xx.yaml
 │   ├── rb-ecs-tasks-low.yaml
@@ -815,6 +828,7 @@ Deferred until the incident-commander agent is wired up and driving eval scenari
 - **Add a Kafka consumer group:** subclass `BaseKafkaConsumer`, implement `handle_message`, instantiate in `worker_loop` in `app/workers/dispatcher.py`. The base class does schema validation, offset management, and per-message error handling.
 - **Add a CloudWatch alarm:** add it to `infra/cloudwatch.tf`, then add the matching `runbooks/rb-*.yaml` file and reference its `/admin/runbooks/{id}` URL in the alarm description.
 - **Add an SLO:** declare in `SLOS` in `app/services/slo.py`, write a `runbooks/rb-slo-*.yaml`, and (optionally) add a fast-burn alarm in `infra/cloudwatch.tf`.
+- **Session history (`context/`):** read [`context/INDEX.md`](context/INDEX.md) first — one line per session, plus what already turned out to be a dead end. It is the counterpart to the workspace-root `STATE.md`: that says where things are, this says how they got there. `context/archives/` holds packed transcripts and is **gitignored, so it is absent from a clone** — transcripts carry live credentials and the raw set is ~120MB. Do not read an archive into context; pull one file (`unzip -p context/archives/<name>.zip SUMMARY.md`). At session end, `./context/pack.sh <slug>` redacts, verifies, and prints the `INDEX.md` line to paste — add it, since an unindexed archive never gets opened. Archives are read-only and user-immutable, so `rm`, `mv`, truncation and `git clean -xfd` all refuse. Full convention in `context/README.md`.
 - **Memory:** the user's auto-memory directory at `~/.claude/projects/.../memory/MEMORY.md` carries durable preferences across sessions — including branching convention (always feature branch, open PR, let user review), no Claude co-authoring on commits, and `.venv/bin/python` for everything.
 
 ---
