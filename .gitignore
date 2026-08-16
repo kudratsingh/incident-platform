@@ -57,3 +57,10 @@ crash.*.log
 
 # Claude Code local config
 .claude/
+
+# Session context archives (context/README.md). Deliberately NOT committed:
+# transcripts carry live credentials, and the raw set is >100MB of binary that
+# git would keep forever. context/INDEX.md is the committed part and is the
+# part a new session actually reads.
+context/archives/*
+!context/archives/.gitkeep
