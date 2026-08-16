@@ -20,7 +20,7 @@ An archive listed as *transcript only* means the raw session data is on disk und
 | 2026-08-10 → 08-12 | *transcript only* | **The fix campaign and v0.5.0.** Platform work orders merged, tag cut, image published. Tool surface went 26 → 27 tools; the rebless diff was verified to the leaf as exactly 10 scalar deltas and zero structural changes. |
 | 2026-08-12 | *transcript only* | **ECS deploy gated** (PR #96). The deploy job now requires `master` + `push` + `vars.ENABLE_ECS_DEPLOY == 'true'`, so a fork or a stray branch cannot reach the cluster. |
 | 2026-08-13 | *transcript only* | **Seeding bug found from the agent side.** `SEED_EVAL_FIXTURES` was set on the `platform` service, which overrides `command:` to run the standalone MCP process and so never executes the REST app's startup hook that reads the flag. Nothing had ever seeded the demo stack. |
-| 2026-08-16 | *transcript only* | **This convention.** `context/` added to both repos. No code changed. |
+| 2026-08-16 | `2026-08-16-campaign-backfill.zip` | **This convention, plus a backfill.** `context/` added to both repos; the whole campaign's 175 transcripts packed. The archive is identical in both repos — transcripts are workspace-level, not repo-level, and it predates the convention. Future archives go in whichever repo the session worked in. No product code changed. |
 
 ## Things a future session should not have to rediscover
 
