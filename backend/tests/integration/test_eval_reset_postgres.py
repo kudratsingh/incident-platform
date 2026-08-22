@@ -80,6 +80,8 @@ _TABLES_IN_DELETE_ORDER = (
     "job_triages",
     "idempotency_records",
     "jobs",
+    "alerts",
+    "deploy_markers",
     "service_accounts",
     "users",
     "tenants",
@@ -469,3 +471,50 @@ async def test_delete_chaos_owner_users_nulls_audit_fks_but_keeps_resource_id(
     )
     assert surviving.action == "job.replayed"
     assert surviving.extra_data == extra_data
+
+
+# ---------------------------------------------------------------------------
+# _rebaseline_timestamps — BUILD_PLAN 2.5, on real timestamptz columns
+# ---------------------------------------------------------------------------
+
+
+async def test_rebaseline_timestamps_on_postgres(session_factory: Any) -> None:
+    """The unit harness runs on SQLite, where DateTime(timezone=True)
+    round-trips as naive UTC; the aware/naive normalisation inside
+    `_drifted` only meets real timestamptz values here. Also pins the
+    no-op idempotency of an immediate second run against Postgres."""
+    from datetime import UTC, datetime, timedelta
+
+    from app.models.deploy_marker import DeployMarker
+    from sqlalchemy import select
+
+    now = datetime.now(UTC)
+    stale = timedelta(days=2)
+    specs = seed_eval_fixtures._deploy_rows(None)
+    async with session_factory() as session:
+        async with session.begin():
+            for spec in specs:
+                session.add(
+                    DeployMarker(
+                        **{**spec, "deployed_at": spec["deployed_at"] - stale}
+                    )
+                )
+
+    async with session_factory() as session:
+        async with session.begin():
+            shifted = await seed_eval_fixtures._rebaseline_timestamps(session)
+    assert shifted == len(specs)
+
+    async with session_factory() as session:
+        markers = (await session.execute(select(DeployMarker))).scalars().all()
+    by_version_env = {(m.version, m.environment): m for m in markers}
+    hotfix = by_version_env[("v0.4.2", "prod")]
+    latest = by_version_env[("v0.4.3", "prod")]
+    tol = timedelta(minutes=2)
+    assert abs(hotfix.deployed_at - (now - timedelta(hours=6))) < tol
+    # Shift, don't flatten: the 4-hour hotfix→latest spacing survives.
+    assert abs((latest.deployed_at - hotfix.deployed_at) - timedelta(hours=4)) < tol
+
+    async with session_factory() as session:
+        async with session.begin():
+            assert await seed_eval_fixtures._rebaseline_timestamps(session) == 0

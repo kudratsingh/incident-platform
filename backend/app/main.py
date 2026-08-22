@@ -1,6 +1,7 @@
 import asyncio
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from typing import Any
 
 from app.config import assert_chaos_gate, get_settings
 from app.core.exceptions import AppError
@@ -20,6 +21,63 @@ setup_tracing(service_name="incident-platform", otlp_endpoint=_settings.otlp_end
 RedisInstrumentor().instrument()
 
 logger = get_logger(__name__)
+
+
+def _import_eval_seeder() -> tuple[Any, Any]:
+    """Resolve the eval seeder's entry points at call time.
+
+    `scripts/` is bind-mounted (dev) or baked (image) at /app and picked
+    up as an implicit namespace package (no __init__.py). Split out of
+    the boot path so tests can substitute the (seed, write_pins_json)
+    pair without faking a package tree."""
+    import sys as _sys
+
+    if "/app" not in _sys.path:
+        _sys.path.insert(0, "/app")
+    from scripts.seed_eval_fixtures import (  # type: ignore[import-not-found,unused-ignore]
+        seed,
+        write_pins_json,
+    )
+
+    return seed, write_pins_json
+
+
+async def _boot_seed_eval_fixtures() -> None:
+    """SEED_EVAL_FIXTURES=true boot path, with its two failure domains
+    kept unconflatable in the log:
+
+      * "eval fixture seed failed"       — the fixtures did NOT land.
+      * "eval fixture pins write failed" — the fixtures DID land; only
+        the pin manifest is missing.
+
+    They used to share one try/except, so the EACCES from the pins write
+    (whose old default lived under the root-owned /app) was reported as
+    a seed failure while 5 alerts, 9 jobs and 6 deploy markers sat
+    committed in the database — anyone reading the log concluded the
+    fixtures were absent when they were present. Neither failure blocks
+    boot: worst case the tools serve an unseeded (or unpinned) world,
+    which every tool already handles defensively."""
+    try:
+        seed, write_pins_json = _import_eval_seeder()
+        await seed()
+    except Exception as exc:
+        logger.error(
+            "eval fixture seed failed",
+            extra={"error_type": type(exc).__name__, "error": str(exc)[:400]},
+        )
+        return
+    logger.info("seeded eval fixtures")
+
+    try:
+        pins_path = write_pins_json()
+    except Exception as exc:
+        logger.error(
+            "eval fixture pins write failed — fixtures are seeded; only the "
+            "pin manifest is missing",
+            extra={"error_type": type(exc).__name__, "error": str(exc)[:400]},
+        )
+    else:
+        logger.info("wrote eval fixture pins", extra={"pins_path": pins_path})
 
 
 @asynccontextmanager
@@ -73,34 +131,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # migrations (which the compose command executes first) so the
     # deploy_markers / alerts / etc. tables exist.
     if settings.seed_eval_fixtures:
-        try:
-            import sys as _sys
-
-            _sys.path.insert(0, "/app")
-            # `scripts/` is mounted at runtime and picked up as an
-            # implicit namespace package (no __init__.py). This branch
-            # only runs when SEED_EVAL_FIXTURES=true, which requires
-            # the mount to exist. The two-code ignore covers both
-            # Python 3.12 (finds it via namespace) and 3.13 (doesn't).
-            from scripts.seed_eval_fixtures import (  # type: ignore[import-not-found,unused-ignore]
-                seed,
-                write_pins_json,
-            )
-
-            await seed()
-            pins_path = write_pins_json()
-            logger.info(
-                "seeded eval fixtures",
-                extra={"pins_path": pins_path},
-            )
-        except Exception as exc:
-            # Never let a seed failure block boot — worst case the tools
-            # return empty responses (already handled defensively in each
-            # tool). Log loud so operators notice.
-            logger.error(
-                "eval fixture seed failed",
-                extra={"error_type": type(exc).__name__, "error": str(exc)[:400]},
-            )
+        await _boot_seed_eval_fixtures()
 
     # Kafka producer — if the broker is unreachable we log and continue so the
     # API still boots. The producer stays unset, and the publish paths lazily
