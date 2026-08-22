@@ -11,6 +11,7 @@ from app.mcp.tools.chaos import (  # noqa: F401
     bad_deploy,
     create_bad_data_job,
     create_stale_cache,
+    create_stuck_dag,
     inject_latency,
     kill_consumer,
     poison_message,

@@ -16,6 +16,13 @@ time. That's the `wait_and_replay` remediation category: give the
 transient dependency time to recover before retrying.
 
 `actions:execute` + idempotent (via the standard dispatch wrapper).
+
+Compensator pairing (ADR 0008 amendment): this tool is the unstick
+path for the `create_stuck_dag` chaos hook — replaying the chain's
+dead-lettered root lets the dispatcher complete it and the resolver
+promote the held descendants. Round-trip test:
+`test_create_stuck_dag_round_trip_with_replay_dlq_by_ids` in
+`tests/api/test_mcp_chaos_stuck_dag.py`.
 """
 
 import uuid
