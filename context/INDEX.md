@@ -21,6 +21,7 @@ An archive listed as *transcript only* means the raw session data is on disk und
 | 2026-08-12 | *transcript only* | **ECS deploy gated** (PR #96). The deploy job now requires `master` + `push` + `vars.ENABLE_ECS_DEPLOY == 'true'`, so a fork or a stray branch cannot reach the cluster. |
 | 2026-08-13 | *transcript only* | **Seeding bug found from the agent side.** `SEED_EVAL_FIXTURES` was set on the `platform` service, which overrides `command:` to run the standalone MCP process and so never executes the REST app's startup hook that reads the flag. Nothing had ever seeded the demo stack. |
 | 2026-08-16 | `2026-08-16-campaign-backfill.zip` | **This convention, plus a backfill.** `context/` added to both repos; the whole campaign's 175 transcripts packed. The archive is identical in both repos — transcripts are workspace-level, not repo-level, and it predates the convention. Future archives go in whichever repo the session worked in. No product code changed. |
+| 2026-08-21 | *transcript only* | **`get_cache_key_info` read tool.** Closes the readiness-sweep finding that `create_stale_cache` writes a Redis key no read tool can see. Exact-key existence / TTL / type / size (never the value), `telemetry:read`, allowlisted to the same four prefixes `invalidate_cache_key` may delete; subset relations tripwired in `test_cache_key_allowlist.py`. Chaos-enabled MCP surface 27 → 28 — the next re-pin's rebless diff gains `+get_cache_key_info`. |
 
 ## Things a future session should not have to rediscover
 
