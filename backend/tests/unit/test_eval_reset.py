@@ -228,6 +228,174 @@ async def test_reset_dlq_state_leaves_non_fixture_rows_untouched(
 
 
 # ---------------------------------------------------------------------------
+# _rebaseline_timestamps — BUILD_PLAN 2.5 (time re-baselining)
+# ---------------------------------------------------------------------------
+
+
+def _utc(dt: datetime) -> datetime:
+    """SQLite returns naive datetimes; they're UTC by construction."""
+    return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt
+
+
+_SHIFT_TOL = timedelta(minutes=2)
+
+
+async def test_rebaseline_refreshes_stale_fixture_timestamps(
+    db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
+) -> None:
+    """Two days after seeding, `search_traces(since_hours=1)` found
+    nothing: created_at offsets are computed at seed time and no reset
+    restored them, so age-sensitive scenarios graded against an
+    apparently healthy system (verified live 2026-08-16 — post-reset
+    dead_letter rows still carried created_at from 2026-08-14).
+
+    The re-baseline re-anchors every fixture row to its spec offset from
+    *now* — shifted, not flattened, so the stories the offsets encode
+    keep their relative spacing."""
+    seed = _seed_module()
+    from app.models.alert import Alert
+    from app.models.deploy_marker import DeployMarker
+
+    stale = timedelta(days=2)
+    now = datetime.now(UTC)
+
+    # A failed-trace job aged 2 days past its 45-minute offset — the
+    # exact row the search_traces(since_hours=1) scenario asserts on.
+    trace_spec = seed._failed_trace_specs()[0]
+    stale_created = now - stale - trace_spec["created_offset"]
+    db_session.add(
+        Job(
+            id=trace_spec["job_id"],
+            tenant_id=default_tenant.id,
+            user_id=test_user.id,
+            type=trace_spec["type"],
+            status=JobStatus.FAILED.value,
+            payload={"eval_fixture": True},
+            retry_count=2,
+            error_message=trace_spec["error_message"],
+            trace_id=trace_spec["trace_id"],
+            created_at=stale_created,
+            updated_at=stale_created,
+        )
+    )
+    # Two deploy markers whose 4-hour hotfix→latest spacing must survive.
+    deploy_specs = seed._deploy_rows(default_tenant.id)
+    d_hotfix = next(s for s in deploy_specs if s["version"] == "v0.4.2")
+    d_latest = next(
+        s
+        for s in deploy_specs
+        if s["version"] == "v0.4.3" and s["environment"] == "prod"
+    )
+    for spec in (d_hotfix, d_latest):
+        db_session.add(
+            DeployMarker(**{**spec, "deployed_at": spec["deployed_at"] - stale})
+        )
+    # An active fixture alert, aged the same way.
+    alert_spec = next(
+        s
+        for s in seed._alert_rows(default_tenant.id)
+        if s["id"] == seed.stable("alert-kafka-active")
+    )
+    db_session.add(Alert(**{**alert_spec, "fired_at": alert_spec["fired_at"] - stale}))
+    await db_session.flush()
+
+    shifted = await seed._rebaseline_timestamps(db_session)
+    assert shifted == 4
+
+    db_session.expire_all()
+    job = (
+        await db_session.execute(select(Job).where(Job.id == trace_spec["job_id"]))
+    ).scalar_one()
+    job_target = now - trace_spec["created_offset"]
+    assert abs(_utc(job.created_at) - job_target) < _SHIFT_TOL
+    assert abs(_utc(job.updated_at) - job_target) < _SHIFT_TOL
+
+    markers = {
+        m.id: m
+        for m in (
+            await db_session.execute(
+                select(DeployMarker).where(
+                    DeployMarker.id.in_([d_hotfix["id"], d_latest["id"]])
+                )
+            )
+        ).scalars()
+    }
+    hotfix = markers[d_hotfix["id"]]
+    latest = markers[d_latest["id"]]
+    assert abs(_utc(hotfix.deployed_at) - (now - timedelta(hours=6))) < _SHIFT_TOL
+    # Shift, don't flatten: the hotfix stays 4 hours before the latest
+    # prod deploy — the deploy-then-failure story survives the re-anchor.
+    assert (
+        abs((_utc(latest.deployed_at) - _utc(hotfix.deployed_at)) - timedelta(hours=4))
+        < _SHIFT_TOL
+    )
+
+    alert = (
+        await db_session.execute(
+            select(Alert).where(Alert.id == alert_spec["id"])
+        )
+    ).scalar_one()
+    assert abs(_utc(alert.fired_at) - (now - timedelta(minutes=25))) < _SHIFT_TOL
+    assert alert.resolved_at is None, "an active fixture alert stays active"
+
+
+async def test_rebaseline_leaves_organic_rows_untouched(
+    db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
+) -> None:
+    """Only stable() fixture ids are addressed — a live-traffic job with
+    a genuinely old created_at keeps it."""
+    seed = _seed_module()
+    old = datetime.now(UTC) - timedelta(days=3)
+    organic = Job(
+        tenant_id=default_tenant.id,
+        user_id=test_user.id,
+        type=JobType.CSV_UPLOAD.value,
+        status=JobStatus.DEAD_LETTER.value,
+        retry_count=3,
+        error_message="organic, not a fixture",
+        created_at=old,
+        updated_at=old,
+    )
+    db_session.add(organic)
+    await db_session.flush()
+
+    assert await seed._rebaseline_timestamps(db_session) == 0
+
+    await db_session.refresh(organic)
+    assert abs(_utc(organic.created_at) - old) < timedelta(seconds=1)
+    assert abs(_utc(organic.updated_at) - old) < timedelta(seconds=1)
+
+
+async def test_rebaseline_is_noop_when_already_fresh(
+    db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
+) -> None:
+    """Rows already at their now-relative offsets aren't rewritten, so
+    back-to-back resets keep the documented no-op idempotency."""
+    seed = _seed_module()
+    spec = seed._dlq_specs()[0]
+    created = datetime.now(UTC) - spec["created_offset"]
+    db_session.add(
+        Job(
+            id=spec["job_id"],
+            tenant_id=default_tenant.id,
+            user_id=test_user.id,
+            type=spec["type"],
+            status=JobStatus.DEAD_LETTER.value,
+            payload={"eval_fixture": True},
+            retry_count=spec["retry_count"],
+            error_message=spec["error_message"],
+            remediation_hint=spec.get("remediation_hint"),
+            trace_id=str(seed.stable(f"dlq-trace-{spec['job_id']}")),
+            created_at=created,
+            updated_at=created,
+        )
+    )
+    await db_session.flush()
+
+    assert await seed._rebaseline_timestamps(db_session) == 0
+
+
+# ---------------------------------------------------------------------------
 # _clear_chaos_keys — FIX_PLAN #79
 # ---------------------------------------------------------------------------
 

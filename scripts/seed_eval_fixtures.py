@@ -37,6 +37,9 @@ Env vars (optional):
     DATABASE_URL     postgres+asyncpg://...   (defaults to compose value)
     REDIS_URL        redis://redis:6379/0     (defaults to compose value)
     SEED_TENANT_SLUG default: default
+    EVAL_PINS_PATH   where `write_pins_json` lands the pin manifest
+                     (default: <tempdir>/eval-fixtures-pins.json — see
+                     `default_pins_path`)
 """
 
 from __future__ import annotations
@@ -493,6 +496,122 @@ async def _reset_dlq_state(session: AsyncSession) -> int:
     return reset_count
 
 
+# How much wall-clock drift a fixture timestamp may accumulate before a
+# reset re-anchors it. Non-zero so back-to-back resets stay no-ops (the
+# idempotency reset_eval_state documents), and far below the tightest
+# freshness window an eval asserts on: `since_hours=1` minus the largest
+# job offset (45 min) still leaves several minutes of headroom, and real
+# staleness is measured in hours-to-days.
+_REBASELINE_TOLERANCE = timedelta(seconds=60)
+
+
+def _as_utc(value: datetime | None) -> datetime | None:
+    """Normalise DB-returned datetimes for drift arithmetic. Postgres
+    (timestamptz) returns aware values; the SQLite unit harness returns
+    naive ones that are UTC by construction."""
+    if value is None or value.tzinfo is not None:
+        return value
+    return value.replace(tzinfo=UTC)
+
+
+def _drifted(actual: datetime | None, target: datetime | None) -> bool:
+    """Whether a stored timestamp sits more than `_REBASELINE_TOLERANCE`
+    from its now-relative target (or differs in NULL-ness)."""
+    actual = _as_utc(actual)
+    if actual is None or target is None:
+        return actual is not target
+    return abs(actual - target) > _REBASELINE_TOLERANCE
+
+
+async def _rebaseline_timestamps(session: AsyncSession) -> int:
+    """Re-anchor every time-anchored fixture column to its spec offset
+    from *now*, so a reset leaves the seeded world exactly as fresh as
+    it was at first boot (BUILD_PLAN 2.5 — time re-baselining).
+
+    The seeder computes offsets at seed time and check-then-insert never
+    updates them, so two days into a stack's life
+    `search_traces(since_hours=1)` found nothing and every age-sensitive
+    scenario graded against an apparently healthy system. Shift, don't
+    flatten: each row keeps its own spec offset, so the stories the
+    offsets encode (staging soak before the prod deploy, the v0.4.2
+    hotfix hours before the billing failures) keep their relative
+    spacing.
+
+    Scope — every seeded fixture field an eval can time-assert on:
+
+      * `jobs` (DLQ + failed-trace specs): `created_at` / `updated_at`
+        from each spec's `created_offset` — the column
+        `search_traces(since_hours=...)` filters on and
+        `list_dlq_messages` returns.
+      * `jobs` (DAG trio): `created_at` / `updated_at` to now — they
+        were server-defaulted to the seed instant at first boot.
+      * `alerts`: `fired_at` / `resolved_at` from `_alert_rows` —
+        `list_active_alerts` returns `fired_at`.
+      * `deploy_markers`: `deployed_at` from `_deploy_rows` —
+        `get_deploy_history` returns `deployed_at`.
+
+    Deliberately excluded: `audit_logs` (ground truth — no reset codepath
+    may touch it, ADR 0012 amendment) and `job_triages` (no timestamp
+    appears in any tool output). Only stable() IDs are addressed, so
+    organic rows created by live traffic are structurally unreachable.
+
+    Rows already within `_REBASELINE_TOLERANCE` of target are skipped.
+    Returns the number of rows shifted."""
+    now = datetime.now(UTC)
+    shifted = 0
+
+    for deploy_spec in _deploy_rows(None):
+        marker = (
+            await session.execute(
+                select(DeployMarker).where(DeployMarker.id == deploy_spec["id"])
+            )
+        ).scalar_one_or_none()
+        if marker is None:
+            continue
+        deployed_target = cast("datetime", deploy_spec["deployed_at"])
+        if _drifted(marker.deployed_at, deployed_target):
+            marker.deployed_at = deployed_target
+            shifted += 1
+
+    # The tenant argument only lands on inserted rows; ids are stable.
+    for alert_spec in _alert_rows(uuid.uuid4()):
+        alert = (
+            await session.execute(select(Alert).where(Alert.id == alert_spec["id"]))
+        ).scalar_one_or_none()
+        if alert is None:
+            continue
+        fired_target = cast("datetime", alert_spec["fired_at"])
+        resolved_target = cast("datetime | None", alert_spec["resolved_at"])
+        if _drifted(alert.fired_at, fired_target) or _drifted(
+            alert.resolved_at, resolved_target
+        ):
+            alert.fired_at = fired_target
+            alert.resolved_at = resolved_target
+            shifted += 1
+
+    job_targets: dict[uuid.UUID, datetime] = {}
+    for job_spec in (*_dlq_specs(), *_failed_trace_specs()):
+        offset = cast("timedelta", job_spec["created_offset"])
+        job_targets[cast("uuid.UUID", job_spec["job_id"])] = now - offset
+    for dag_name in ("dag-parent-job", "dag-seed-job", "dag-child-job"):
+        job_targets[stable(dag_name)] = now
+
+    for job_id, created_target in job_targets.items():
+        job = (
+            await session.execute(select(Job).where(Job.id == job_id))
+        ).scalar_one_or_none()
+        if job is None:
+            continue
+        if _drifted(job.created_at, created_target) or _drifted(
+            job.updated_at, created_target
+        ):
+            job.created_at = created_target
+            job.updated_at = created_target
+            shifted += 1
+
+    return shifted
+
+
 async def _seed_deploys(
     session: AsyncSession, tenant_id: uuid.UUID | None
 ) -> None:
@@ -735,17 +854,22 @@ async def seed(
     drift over the course of a live eval run (FIX_PLAN #7):
       * stable() DLQ jobs get status/retry_count/hint/error_message
         restored to their spec.
+      * every time-anchored fixture column is re-anchored to its
+        now-relative seed offset (`_rebaseline_timestamps`, BUILD_PLAN
+        2.5) so age-sensitive scenarios see a fresh world after reset.
       * Kafka consumer-lag keys re-written (a scenario that consumed
         or drove up lag has its cached value replaced).
       * `cache:jobs:worker-dispatcher:hot_set` re-populated (FIX_PLAN
         #19 — required for `remediate_stale_cache_success`).
 
-    Returns a small summary dict {'dlq_reset': N} for the caller to
+    Returns a small summary dict
+    {'dlq_reset': N, 'timestamps_rebaselined': N} for the caller to
     log / include in a reset-protocol audit trail."""
     engine = create_async_engine(database_url, echo=False)
     factory = async_sessionmaker(engine, expire_on_commit=False)
     redis = aioredis.from_url(redis_url, decode_responses=True)
     dlq_reset = 0
+    timestamps_rebaselined = 0
 
     try:
         async with factory() as session:
@@ -759,6 +883,11 @@ async def seed(
                 await _seed_dag(session, tenant, user)
                 if reset:
                     dlq_reset = await _reset_dlq_state(session)
+                    # After the DLQ restore, which stamps updated_at=now
+                    # on drifted rows — the re-anchor has the last word.
+                    timestamps_rebaselined = await _rebaseline_timestamps(
+                        session
+                    )
 
         await _seed_consumer_lag(redis)
         await _seed_hot_set(redis)
@@ -766,7 +895,10 @@ async def seed(
         await redis.aclose()
         await engine.dispose()
 
-    return {"dlq_reset": dlq_reset}
+    return {
+        "dlq_reset": dlq_reset,
+        "timestamps_rebaselined": timestamps_rebaselined,
+    }
 
 
 def collect_pins() -> dict[str, object]:
@@ -814,14 +946,45 @@ def collect_pins() -> dict[str, object]:
     }
 
 
-def write_pins_json(path: str = "/app/eval-fixtures-pins.json") -> str:
-    """Write the pin manifest to `path` (default a well-known location
-    inside the app container). Returns the path so the caller can log
-    or print it."""
+_PINS_BASENAME = "eval-fixtures-pins.json"
+
+
+def default_pins_path() -> str:
+    """Where the pin manifest lands when the caller doesn't say.
+
+    Resolution order:
+
+      1. `EVAL_PINS_PATH` — full destination path, for operators (or the
+         commander's compose) to point at a mount of their choosing.
+      2. `<tempdir>/eval-fixtures-pins.json` — `tempfile.gettempdir()`,
+         i.e. `/tmp/eval-fixtures-pins.json` in the shipped image, the
+         one location writable under any runtime user.
+
+    The previous default, `/app/eval-fixtures-pins.json`, was unwritable
+    in every released image: the Dockerfile COPYs `/app` as root and runs
+    as the non-root `appuser`, so the boot-time write died with EACCES —
+    on a manifest the old log line then reported as a *seed* failure.
+    """
+    import tempfile
+
+    return os.getenv("EVAL_PINS_PATH") or os.path.join(
+        tempfile.gettempdir(), _PINS_BASENAME
+    )
+
+
+def write_pins_json(path: str | None = None) -> str:
+    """Write the pin manifest to `path` (default `default_pins_path()`).
+    Returns the path written so the caller can log or print it.
+
+    Raises `OSError` when the destination is genuinely unwritable — the
+    caller decides how loud to be. Both callers (the api lifespan and
+    `main()` below) treat that as "pin manifest missing", explicitly
+    distinct from a seed failure: the fixtures are already committed by
+    the time this runs."""
     import json
     import pathlib
 
-    p = pathlib.Path(path)
+    p = pathlib.Path(path or default_pins_path())
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(collect_pins(), indent=2, sort_keys=True))
     return str(p)
@@ -842,8 +1005,10 @@ async def main() -> None:
         action="store_true",
         help=(
             "Re-baseline mutable fixture state: DLQ job status / "
-            "retry_count / remediation_hint; consumer-lag Redis keys; "
-            "the cache:jobs:worker-dispatcher:hot_set key. Safe to run "
+            "retry_count / remediation_hint; fixture timestamps "
+            "(created_at / fired_at / deployed_at re-anchored to their "
+            "now-relative seed offsets); consumer-lag Redis keys; the "
+            "cache:jobs:worker-dispatcher:hot_set key. Safe to run "
             "against a fresh compose stack (no-op) or between scenarios."
         ),
     )
@@ -857,7 +1022,10 @@ async def main() -> None:
     _print_pins()
     print(f"pins manifest: {pins_path}")
     if args.reset:
-        print(f"reset summary: dlq_reset={summary['dlq_reset']}")
+        print(
+            f"reset summary: dlq_reset={summary['dlq_reset']} "
+            f"timestamps_rebaselined={summary['timestamps_rebaselined']}"
+        )
     print("Done. All fixtures are idempotent — re-runs are safe.")
 
 

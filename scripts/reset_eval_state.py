@@ -13,7 +13,13 @@ What gets cleared/reset:
   2. **Eval fixtures** — delegates to `seed_eval_fixtures.seed(reset=True)`
      which restores DLQ job status/retry_count/hint, re-populates the
      consumer-lag keys, and seeds the `hot_set` fixture (FIX_PLAN #7,
-     #19).
+     #19). Since BUILD_PLAN 2.5 it also re-anchors every time-anchored
+     fixture column — `jobs.created_at`/`updated_at`, `alerts.fired_at`/
+     `resolved_at`, `deploy_markers.deployed_at` — to its seed-time
+     offset from *now*, so age-sensitive scenarios
+     (`search_traces(since_hours=...)` and friends) don't watch the
+     seeded world go stale as the stack ages. Only stable() fixture
+     rows are shifted; relative spacing between them is preserved.
   3. **Tier-1 action residue** — pending delayed-replay timers on the
      `jobs:dlq_replay_delayed` ZSET, and any `dag:paused:*` flag. Both
      are effects the *agent* left behind rather than chaos state, and
@@ -522,6 +528,7 @@ async def reset(
         "dag_pauses_cleared": pauses_cleared,
         "dlq_reset": seed_summary["dlq_reset"],
         "dlq_swept": dlq_swept,
+        "timestamps_rebaselined": seed_summary["timestamps_rebaselined"],
         "empty_dlq_baseline": _empty_dlq_baseline(),
         "seeded_dlq_deleted": seeded_dlq_deleted,
         "idempotency_purged": idempotency_purged,
