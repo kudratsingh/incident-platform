@@ -22,6 +22,7 @@ An archive listed as *transcript only* means the raw session data is on disk und
 | 2026-08-13 | *transcript only* | **Seeding bug found from the agent side.** `SEED_EVAL_FIXTURES` was set on the `platform` service, which overrides `command:` to run the standalone MCP process and so never executes the REST app's startup hook that reads the flag. Nothing had ever seeded the demo stack. |
 | 2026-08-16 | `2026-08-16-campaign-backfill.zip` | **This convention, plus a backfill.** `context/` added to both repos; the whole campaign's 175 transcripts packed. The archive is identical in both repos — transcripts are workspace-level, not repo-level, and it predates the convention. Future archives go in whichever repo the session worked in. No product code changed. |
 | 2026-08-21 | *transcript only* | **`get_cache_key_info` read tool.** Closes the readiness-sweep finding that `create_stale_cache` writes a Redis key no read tool can see. Exact-key existence / TTL / type / size (never the value), `telemetry:read`, allowlisted to the same four prefixes `invalidate_cache_key` may delete; subset relations tripwired in `test_cache_key_allowlist.py`. Chaos-enabled MCP surface 27 → 28 — the next re-pin's rebless diff gains `+get_cache_key_info`. |
+| 2026-08-21 | *transcript only* | **`create_stuck_dag` chaos hook.** `remediate_runaway_saga_success` could not run honestly live: the boot-seeded DAG auto-completes ~10s after boot, so a live run graded alert-credulity, not remediation. The hook manufactures `upstream (completed) → root (dead_letter) → N (waiting)` — stuck by the platform's own rules, since the resolver promotes only when every parent is `completed` and `dead_letter` is terminal. Observable via `get_dag_state`; compensators `replay_dlq_by_ids` (unsticks) and `pause_dag` (stabilizes) per the ADR 0008 pairing rule. Chaos-enabled MCP surface 28 → 29 — the rebless diff gains `+create_stuck_dag`. |
 
 ## Things a future session should not have to rediscover
 
@@ -52,6 +53,11 @@ An archive listed as *transcript only* means the raw session data is on disk und
   platform's Postgres, Redis, or Kafka. A capability the agent needs is a platform PR that adds a
   tool, never a bypass.
 - **Chaos hooks are env-gated** and must stay that way.
+- **In a git worktree, run pytest with `PYTHONPATH=<worktree>/backend`.** The venv installs the
+  backend editable via a `.pth` that hard-points at the *main* checkout, so a full-suite run from a
+  worktree root imports `app` from `master` instead of your branch. It looks like a test-ordering
+  bug — new tests pass when run from `backend/`, then fail or vanish on the full run — and it cost
+  one session its whole budget. CI is unaffected: it checks out a single tree.
 - **The demo stack is shared state.** `docker compose -f demo/compose.yml down` keeps volumes;
   only `make demo-destroy CONFIRM=1` deletes them. An agent trimming a Kafka topic here once
   crash-looped three consumer groups.
