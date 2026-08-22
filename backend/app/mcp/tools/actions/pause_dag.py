@@ -19,6 +19,14 @@ promotes any child left behind once the flag is gone, so a pause is
 temporary rather than terminal. Verify with `get_dag_state.paused`.
 
 `actions:execute` + idempotent.
+
+Compensator pairing (ADR 0008 amendment): this is the stabilization
+half of the `create_stuck_dag` chaos hook — pausing the manufactured
+chain's root reads back through `get_dag_state` as `paused=true` with
+descendants held in `waiting`, and the TTL self-clean means the pause
+can never outlive the incident. Observability test:
+`test_pause_dag_is_observable_on_the_manufactured_chain` in
+`tests/api/test_mcp_chaos_stuck_dag.py`.
 """
 
 import uuid
