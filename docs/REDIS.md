@@ -27,6 +27,8 @@ For the broader architectural context, see [`docs/ARCHITECTURE.md`](ARCHITECTURE
 
 These namespaces are written by the incident-commander MCP tools and the eval tooling, not by the platform's own request/worker paths. The `chaos:*` tools are registered only when `CHAOS_ENABLED=true` (ADR 0008); the rows marked **eval-only** are seeded by `scripts/seed_eval_fixtures.py` and never appear outside an eval stack. `scripts/reset_eval_state.py` clears residue between scenarios: a `chaos:*` scan-and-delete, the `jobs:dlq_replay_delayed` ZSET, every `dag:paused:*` flag, and a re-seed of the fixture keys.
 
+Any key under `cache:` / `jobs:cache:` / `kafka:consumer_lag:` / `read_model:` — the same prefixes `invalidate_cache_key` may delete — is additionally observable through the `get_cache_key_info` MCP read tool (`telemetry:read`), which reports existence, TTL, type and size but never the value. That is the read half of the stale-cache remediation loop: check the key before invalidating, confirm the delete after.
+
 | Key pattern | Type | Writer | Reader | TTL | Eviction-safe? | Cleared by eval reset? |
 |---|---|---|---|---|---|---|
 | `chaos:kill:{group}` | string flag | `kill_consumer` chaos tool (`kill_key_for`) | `kafka_consumer.py` `_check_chaos_kill` — top of every poll; consumer shuts down while set | `ttl_seconds` (default 300s) | Yes — chaos ends early | Yes (`chaos:*` scan) |
@@ -35,7 +37,7 @@ These namespaces are written by the incident-commander MCP tools and the eval to
 | `chaos:sat:{run_id}:{i}` | string (filler) | `saturate_redis` chaos tool (default 1000 keys × 1 KiB) | Nobody — exists purely for memory pressure | `ttl_seconds` (default 60s) | Yes — eviction is the point | Yes (`chaos:*` scan; usually already expired) |
 | `dag:paused:{root_job_id}` | string flag | `pause_dag` action tool (`pause_key_for` in `app/utils/dag_pause.py`) | Every dispatch path via `find_blocking_pause` — resolver promotion, resume sweep, delayed-retry promotion, `replay_job`, the scheduled DLQ-replay loop and `_run_job`'s pre-claim re-check, plus a create-time WAITING hold (ADR 0011 + its 2026-08-09 amendment); reported by `get_dag_state` | `ttl_seconds` (default 600s) | Yes — pause fails open, DAG resumes | Yes (`dag:paused:*` scan) |
 | `jobs:dlq_replay_delayed` | sorted set of job_ids by fire-at time | `replay_dlq_by_ids` / `replay_dlq_by_category` (`delay_seconds` path) | `dlq_replay_scheduler.py` via the worker's `_promote_dlq_replay_loop` | None | No — pending delayed replays disappear silently | Yes (ZSET deleted) |
-| `cache:jobs:worker-dispatcher:hot_set` (**eval-only**) | JSON array of seeded DLQ job ids | `seed_eval_fixtures.py` `_seed_hot_set`; also the `create_stale_cache` chaos tool | The stale-cache scenario observes it, then deletes it via `invalidate_cache_key` | 24h (seed) / `ttl_seconds` default 600s (tool) | Yes — re-seeded | Re-populated by reset |
+| `cache:jobs:worker-dispatcher:hot_set` (**eval-only**) | JSON array of seeded DLQ job ids | `seed_eval_fixtures.py` `_seed_hot_set`; also the `create_stale_cache` chaos tool | The stale-cache scenario observes it via `get_cache_key_info`, then deletes it via `invalidate_cache_key` | 24h (seed) / `ttl_seconds` default 600s (tool) | Yes — re-seeded | Re-populated by reset |
 | `kafka:consumer_lag:{group}` (**eval-only** except `worker-dispatcher`) | string (int) | Metrics loop writes only `worker-dispatcher` (row above); `seed_eval_fixtures.py` writes the 7 synthetic groups (`billing-consumer` … `healthy-consumer`) | `get_consumer_lag` MCP tool (any group); `check_backpressure` reads only `worker-dispatcher` | 24h on seeded groups (90s on the real one) | Yes | Re-seeded by reset |
 
 ---
@@ -92,7 +94,7 @@ Read-through cache for `GET /jobs/{id}`. JSON serialization of the `JobResponse`
 
 The invalidation site is the **service layer** — `JobService.replay_job` and `JobService.resolve_incident` (`app/services/job.py`) — not the REST handlers. That is what makes every write path coherent: `POST /admin/jobs/{id}/replay`, the MCP replay tools (`replay_dlq_messages` / `replay_dlq_by_ids` / `replay_dlq_by_category`), and the scheduled DLQ-replay loop in `app/workers/dispatcher.py` all funnel through `JobService` (E2-02 — previously only the REST wrappers invalidated, so an agent-driven replay left `GET /jobs/{id}` stale for a full TTL).
 
-The `cache:` namespace also makes this key reachable by the `invalidate_cache_key` MCP action, whose allowlist covers `cache:` — an agent can force-refresh a single job read without any change to that tool's contract.
+The `cache:` namespace also makes this key reachable by the `invalidate_cache_key` MCP action, whose allowlist covers `cache:` — an agent can force-refresh a single job read without any change to that tool's contract. Its read counterpart `get_cache_key_info` covers the same prefixes and reports existence / TTL / type / size only — never the cached `JobResponse` payload, which is tenant data.
 
 The key embeds the tenant (E2-01): a caller from another tenant computes a different key, structurally misses, and falls through to the tenant-scoped DB query. Isolation lives in the key, so the cached `JobResponse` payload never needs to carry `tenant_id`.
 
