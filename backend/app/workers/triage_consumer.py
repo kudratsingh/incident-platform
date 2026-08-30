@@ -35,6 +35,7 @@ from typing import Any
 import anthropic
 from app.config import get_settings
 from app.core.logging import get_logger
+from app.repositories.job import JobRepository
 from app.repositories.triage import TriageRepository
 from app.services import triage as triage_service
 from app.workers.kafka_consumer import BaseKafkaConsumer
@@ -155,6 +156,12 @@ class LlmTriageConsumer(BaseKafkaConsumer):
             )
             return
 
+        # The coarse category the DLQ tools filter on, derived from the same
+        # analysis (R2-24). None when triage cannot support a claim — see
+        # `remediation_hint_for`; NULL is what the tools already read as
+        # "unknown, not replay-safe".
+        hint = triage_service.remediation_hint_for(analysis)
+
         async with self.session_factory() as session:
             async with session.begin():
                 await TriageRepository(session).upsert(
@@ -168,12 +175,30 @@ class LlmTriageConsumer(BaseKafkaConsumer):
                     model_used=model_used,
                     usage=usage,
                 )
+                # Same transaction as the triage row, deliberately: the
+                # analysis and the category derived from it are one fact,
+                # and a crash between them would leave the DLQ tools
+                # filtering on a category with no analysis behind it (or
+                # the reverse — an analysis the agent's categorised-replay
+                # path cannot see).
+                hint_written = (
+                    await JobRepository(session).set_remediation_hint_if_unset(
+                        job_id=job_id, tenant_id=tenant_id, hint=hint
+                    )
+                    if hint is not None
+                    else False
+                )
 
         logger.info(
             "triage stored",
             extra={
                 "job_id": str(job_id),
                 "category": analysis.root_cause_category,
+                "remediation_hint": hint,
+                # False covers three different things — no hint derived, a
+                # category already present, or the job gone — so the log
+                # says which of "we had one" and "we wrote it" held.
+                "remediation_hint_written": hint_written,
                 "model": model_used,
                 "cache_read": usage.get("cache_read_input_tokens", 0),
             },

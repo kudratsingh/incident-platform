@@ -493,7 +493,7 @@ The project uses the **Anthropic Python SDK** to add four LLM-powered features. 
 
 ### The four features
 
-1. **DLQ triage** (PR #34) — `LlmTriageConsumer` subscribes to `job.dlq`; Claude classifies the failure. Persisted to `job_triages`; surfaced on the admin DLQ tab and `JobDetailPage`.
+1. **DLQ triage** (PR #34) — `LlmTriageConsumer` subscribes to `job.dlq`; Claude classifies the failure. Persisted to `job_triages`; surfaced on the admin DLQ tab and `JobDetailPage`. It also maps the analysis onto `jobs.remediation_hint` — the coarse category the agent's DLQ tools filter on — in the same transaction, and only into a NULL column so it cannot overwrite a `mark_dlq_permanent` fence (R2-24). Because triage is off by default, that column stays NULL for organically dead-lettered jobs on a stock deployment; the tool descriptions say so rather than implying coverage that isn't there.
 2. **LLM-guided retry policy** (PR #39) — after the first deterministic retry, the worker asks Claude retry-with-backoff vs dead-letter-now. Falls back to deterministic on any error; audit log records `dead_lettered_by: llm_retry_policy` + reasoning.
 3. **Natural-language admin queries** (PR #40) — `POST /admin/query` translates plain English into a Pydantic `JobFilterSpec` (enum/literal fields only → injection-safe by construction).
 4. **Periodic incident summaries** (PR #41) — the `_digest_loop` runs every `LLM_DIGEST_INTERVAL_HOURS` and writes a one-paragraph per-tenant digest to `incident_summaries`.
