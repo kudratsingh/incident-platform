@@ -8,6 +8,13 @@
 # writes the zip. If verification fails the zip is not written — a partially-scrubbed archive
 # is worse than none, because it looks safe.
 #
+# The redactor and the verifier deliberately use DIFFERENT pattern lists. A verifier built from
+# the redactor's own patterns can only ever report "the redactor did what the redactor does";
+# it cannot fail. Both bugs found on this script's first real run (see context/README.md) were
+# caught by scanning with different patterns than the ones that built the archive, and the
+# header-only private-key pattern below was a third: it matched the BEGIN line, left the key
+# body and the END line in place, and then reported the archive clean.
+#
 # Written for macOS's bash 3.2. No mapfile, no associative arrays.
 #
 set -euo pipefail
@@ -24,10 +31,25 @@ if [ -z "$SLUG" ]; then
 fi
 shift || true
 
-# Credential shapes, as Perl regexes. Used for BOTH redaction and the post-redaction check,
-# through the same engine, so the two halves can never drift apart. Add a shape here and both
-# learn it at once.
-PATTERNS=(
+# ---- redaction patterns ----------------------------------------------------
+# Credential shapes, as Perl regexes, applied to the whole file at once (perl -0777) so a
+# secret cannot hide by straddling a line boundary.
+#
+# Block shapes go first and are matched across newlines. They must stay first: each is
+# replaced wholesale, so the single-line shapes below only ever see what is left.
+REDACT_BLOCK_PATTERNS=(
+  # The whole PEM block, BEGIN line through END line. Matches across real newlines and across
+  # the literal \n escapes a key wears inside a JSONL transcript, which is how keys actually
+  # arrive here. The shipped pattern was the BEGIN line alone, so the key body — the only part
+  # that is worth anything to an attacker — survived redaction untouched.
+  '-----BEGIN[A-Z -]*PRIVATE KEY-----[\s\S]*?-----END[A-Z -]*PRIVATE KEY-----'
+  # A key whose END line never made it into the transcript: the header plus the base64 body
+  # that follows it. The 20-char run is required so that prose *mentioning* a PEM header does
+  # not swallow the sentence after it.
+  '-----BEGIN[A-Z -]*PRIVATE KEY-----(?:\\n|\s)*(?:[A-Za-z0-9+/=]{20,}(?:\\n|\s)*)+'
+)
+
+REDACT_PATTERNS=(
   'sk-ant-[A-Za-z0-9_-]{16,}'
   'sa_[A-Za-z0-9_-]{16,}'
   'gh[pousr]_[A-Za-z0-9]{20,}'
@@ -39,11 +61,42 @@ PATTERNS=(
   # `https://host:8080/p@th` from being mistaken for credentials.
   '(?<=://)[^:/@[:space:]"]+:[^@/[:space:]"]+(?=@)'
   '(?<=Bearer )[A-Za-z0-9._-]{20,}'
-  '-----BEGIN[A-Z ]*PRIVATE KEY-----'
+  # Three base64url segments. Written differently from the verifier's JWT shape on purpose —
+  # two independent spellings of one shape catch each other's mistakes.
+  'eyJ[A-Za-z0-9_=-]+\.[A-Za-z0-9_=-]+\.[A-Za-z0-9_=-]+'
+)
+
+# ---- verification patterns -------------------------------------------------
+# A SEPARATE list, and the load-bearing half of this script. These are not the shapes above
+# rearranged: they look for what a secret *is* (key material, userinfo, a labelled value)
+# rather than for the vendor prefixes the redactor knows. Some of them describe things the
+# redactor deliberately does not scrub — a hit is meant to stop the archive and send a human
+# to the redactor list, not to be quietly cleaned up.
+VERIFY_PATTERNS=(
+  # Key MATERIAL rather than key armour: an RSA/EC/PKCS#8 body base64-encodes a DER SEQUENCE,
+  # so it opens "MII". This is exactly what the header-only redaction used to leave behind, and
+  # exactly what a verifier sharing that pattern could never see. Not in the redactor list: a
+  # bare base64 blob has no self-describing end, so replacing it is not safe to automate — but
+  # its presence must stop the archive.
+  'MII[A-Za-z0-9+/]{40,}'
+  # The other half the header-only pattern left in place.
+  '-----END[A-Z -]*PRIVATE KEY-----'
+  # Structural: userinfo in a URL of any scheme, spelled without lookbehind.
+  '[A-Za-z][A-Za-z0-9+.-]*://[^:/@[:space:]"]+:[^@/[:space:]"]+@'
+  # A labelled secret with a quoted literal value. Catches shapes nobody has enumerated yet
+  # (vendor keys, internal tokens). The quotes and the 20-char minimum keep it from firing on
+  # prose or on code that merely names a key.
+  '(?i)(?:api[_-]?key|secret|token|password|passphrase|credential)"?\s*[:=]\s*"[A-Za-z0-9_+/=.-]{20,}"'
+  '(?i)aws_secret_access_key\s*[:=]\s*\S{20,}'
+  # JWT, spelled independently of the redactor's version: header AND payload must both be
+  # base64url JSON objects.
+  'eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.'
 )
 
 STAGE="$(mktemp -d "${TMPDIR:-/tmp}/ctxpack.XXXXXX")"
-trap 'rm -rf "$STAGE"' EXIT
+# Scratch files live OUTSIDE the stage: anything under $STAGE is archived.
+SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/ctxwork.XXXXXX")"
+trap 'rm -rf "$STAGE" "$SCRATCH"' EXIT
 
 # ---- collect ---------------------------------------------------------------
 # Claude Code stores transcripts under ~/.claude/projects/<workspace-path, slashes as dashes>/
@@ -68,59 +121,114 @@ else
   echo "staged $FOUND transcript(s)"
 fi
 
+COLLISIONS=0
 for extra in "$@"; do
   if [ ! -e "$extra" ]; then
     echo "warning: skipping missing $extra" >&2
     continue
   fi
   mkdir -p "$STAGE/artifacts"
-  cp -R "$extra" "$STAGE/artifacts/"
+  DEST="$STAGE/artifacts/$(basename "$extra")"
+  if [ -e "$DEST" ]; then
+    # Two extras sharing a basename used to be merged by `cp -R` into one directory, the later
+    # one silently overwriting same-named files inside an archive that is then locked
+    # immutable. Both survive now, and the renaming is announced.
+    COLLISIONS=$((COLLISIONS + 1))
+    DEST="$STAGE/artifacts/$COLLISIONS-$(basename "$extra")"
+    echo "note: basename collision — staging $extra as artifacts/$(basename "$DEST")" >&2
+  fi
+  # -L: resolve symlinks at stage time. A staged symlink is skipped by `find -type f` (so it is
+  # neither redacted nor verified) and then dereferenced into the zip by `zip`, which is how a
+  # symlinked secret used to be packed unredacted and unchecked. Resolving here means what is
+  # scanned and what is archived are the same bytes.
+  if ! cp -RL "$extra" "$DEST"; then
+    echo "REFUSING to write the archive: could not fully stage $extra (broken symlink?)." >&2
+    echo "A silently partial archive is worse than none — fix the path and re-run." >&2
+    exit 1
+  fi
 done
+
+# Nothing below walks symlinks, so there must not be any left. This is an assertion, not a
+# workaround: if it ever fires, something reached the stage without going through `cp -RL`.
+LINKS="$(find "$STAGE" -type l -print 2>/dev/null | head -5 || true)"
+if [ -n "$LINKS" ]; then
+  echo "REFUSING to write the archive: symlinks reached the stage and would be packed" >&2
+  echo "without being redacted or verified:" >&2
+  echo "$LINKS" | sed "s|^$STAGE/|  |" >&2
+  exit 1
+fi
 
 # ---- redact ----------------------------------------------------------------
 echo "redacting credentials..."
 # Escape the delimiter: patterns contain "://", which would otherwise close s/// early.
 SUBS=""
-for p in "${PATTERNS[@]}"; do
+for p in "${REDACT_BLOCK_PATTERNS[@]}" "${REDACT_PATTERNS[@]}"; do
   SUBS="${SUBS}s/${p//\//\\/}/[REDACTED]/g; "
 done
 
-# Preflight: compile the substitutions against empty input before touching any file, so a bad
-# pattern fails clean instead of half-rewriting the archive.
-if ! printf '' | perl -pe "$SUBS" >/dev/null 2>"$STAGE/.perr"; then
-  echo "pattern list does not compile:" >&2
-  sed 's/^/  /' "$STAGE/.perr" >&2
-  exit 1
-fi
-rm -f "$STAGE/.perr"
-
-# xargs (not a while-read subshell) so a perl failure propagates through pipefail to set -e.
-find "$STAGE" -type f -print0 | xargs -0 perl -i -pe "$SUBS"
-
-# ---- verify ----------------------------------------------------------------
-# The load-bearing step. Same engine, same patterns as the redaction above.
-echo "verifying..."
 CHECK=""
-for p in "${PATTERNS[@]}"; do
+for p in "${VERIFY_PATTERNS[@]}"; do
   CHECK="${CHECK}while (/${p//\//\\/}/g) { print \"\$&\\n\" } "
 done
 
-# The `|| true` matters: on a clean archive grep matches nothing and exits 1, which under
-# `set -e` + pipefail would abort the script on the success path.
-LEAKS="$(find "$STAGE" -type f -print0 \
-  | xargs -0 perl -ne "$CHECK" 2>/dev/null \
-  | { grep -v '^\[REDACTED\]$' || true; } | wc -l | tr -d ' ')"
-
-if [ "$LEAKS" -gt 0 ]; then
-  echo "" >&2
-  echo "REFUSING to write the archive: $LEAKS credential-shaped string(s) survived redaction." >&2
-  echo "Shapes that got through:" >&2
-  find "$STAGE" -type f -print0 | xargs -0 perl -ne "$CHECK" 2>/dev/null \
-    | grep -v '^\[REDACTED\]$' | sort -u | head -10 | cut -c1-12 | sed 's/^/  /' >&2
-  echo "Fix the PATTERNS list in $HERE/pack.sh, then re-run." >&2
+# Preflight: compile BOTH programs against empty input before touching any file. A bad pattern
+# then fails clean instead of half-rewriting the archive — and, on the verify side, instead of
+# reporting a clean archive because every scan died before it could match anything.
+if ! printf '' | perl -0777 -pe "$SUBS" >/dev/null 2>"$SCRATCH/perr"; then
+  echo "redaction pattern list does not compile:" >&2
+  sed 's/^/  /' "$SCRATCH/perr" >&2
   exit 1
 fi
-echo "  clean — no credential shapes survived."
+if ! printf '' | perl -0777 -ne "$CHECK" >/dev/null 2>"$SCRATCH/perr"; then
+  echo "verification pattern list does not compile:" >&2
+  sed 's/^/  /' "$SCRATCH/perr" >&2
+  exit 1
+fi
+rm -f "$SCRATCH/perr"
+
+# -0777: slurp each file whole, so a PEM block spanning many lines is one match. xargs (not a
+# while-read subshell) so a perl failure propagates through pipefail to set -e.
+find "$STAGE" -type f -print0 | xargs -0 perl -0777 -i -pe "$SUBS"
+
+# ---- verify ----------------------------------------------------------------
+# The load-bearing step: same engine, deliberately different patterns.
+echo "verifying..."
+
+SCAN_STATUS=0
+find "$STAGE" -type f -print0 \
+  | xargs -0 perl -0777 -ne "$CHECK" >"$SCRATCH/raw" 2>"$SCRATCH/scanerr" || SCAN_STATUS=$?
+
+# A scan that died reports zero matches, which reads exactly like a clean archive. It is not:
+# it is an unknown archive, and the honest answer to unknown is to refuse.
+if [ "$SCAN_STATUS" -ne 0 ]; then
+  echo "REFUSING to write the archive: the verification scan itself failed (exit $SCAN_STATUS)." >&2
+  sed 's/^/  /' "$SCRATCH/scanerr" >&2
+  echo "No claim can be made about this archive, so none is made." >&2
+  exit 1
+fi
+
+# The `|| true` matters: on a clean archive grep matches nothing and exits 1, which under
+# `set -e` + pipefail would abort the script on the success path.
+grep -v '^\[REDACTED\]$' "$SCRATCH/raw" | sort -u >"$SCRATCH/leaks" || true
+LEAKS="$(wc -l <"$SCRATCH/leaks" | tr -d ' ')"
+
+if [ "$LEAKS" -gt 0 ]; then
+  # Reported from a FILE, with no early-exit consumer in the pipeline. The `head -10` that used
+  # to truncate this could SIGPIPE the whole pipeline, and under `set -euo pipefail` that killed
+  # the script mid-report — before the remediation guidance and before its documented exit 1.
+  {
+    echo ""
+    echo "REFUSING to write the archive: $LEAKS distinct credential-shaped string(s) survived redaction."
+    echo "Shapes that got through (first 10, truncated):"
+    sed -n '1,10p' "$SCRATCH/leaks" | cut -c1-12 | sed 's/^/  /'
+    echo ""
+    echo "The verifier knows shapes the redactor does not, on purpose, so a hit here usually"
+    echo "means a shape is missing from REDACT_PATTERNS in $HERE/pack.sh. Add it and re-run."
+    echo "Nothing was written."
+  } >&2 || true
+  exit 1
+fi
+echo "  clean — no credential shapes survived (checked with patterns the redactor does not use)."
 
 # ---- summary stub ----------------------------------------------------------
 DATE="$(date +%Y-%m-%d)"
@@ -148,7 +256,10 @@ if [ -e "$OUT" ]; then
   echo "refusing to overwrite $OUT" >&2
   exit 1
 fi
-( cd "$STAGE" && zip -qr "$OUT" . )
+# -y: store symlinks as symlinks instead of following them. The stage is asserted symlink-free
+# above, so this is belt and braces — but it is the belt that keeps `zip` from ever archiving
+# bytes that the redaction and verification passes never saw.
+( cd "$STAGE" && zip -qry "$OUT" . )
 
 # ---- lock -------------------------------------------------------------------
 # Archives are append-only in the same sense as eval artifacts (CLAUDE.md invariant 9): a new

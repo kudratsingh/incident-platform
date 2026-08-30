@@ -651,7 +651,8 @@ Deferred until the incident-commander agent is wired up and driving eval scenari
 ├── context/                        # session history; INDEX.md is the map, archives/ is gitignored
 │   ├── INDEX.md                    # one line per session — read first
 │   ├── README.md                   # the convention: packing, redaction, immutability
-│   ├── pack.sh                     # scrub → verify → zip a session's transcripts
+│   ├── pack.sh                     # scrub → verify (independent patterns) → zip
+│   ├── pack-selftest.sh            # proves pack.sh still scrubs, and still catches
 │   └── archives/                   # gitignored + immutable; absent from a fresh clone
 │
 ├── runbooks/                       # machine-readable runbooks (one per alarm + SLO)
