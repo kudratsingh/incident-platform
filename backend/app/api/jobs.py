@@ -10,9 +10,8 @@ from app.repositories.outbox import OutboxRepository
 from app.schemas.common import PaginatedResponse
 from app.schemas.job import JobCreate, JobListParams, JobResponse
 from app.services.job import JobService
-from app.utils.backpressure import check_backpressure
+from app.utils.admission import JOB_CREATE_RATE_BUCKET, check_job_admission
 from app.utils.cache import JobCache
-from app.utils.quota import check_tenant_limits
 from app.utils.rate_limit import rate_limiter
 from fastapi import APIRouter, Depends, Request
 from redis.asyncio import Redis
@@ -38,10 +37,13 @@ async def create_job(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
     redis: Redis = Depends(get_redis),
-    _rl: None = Depends(rate_limiter(limit=30, window=60, key_prefix="jobs:create")),
+    _rl: None = Depends(
+        rate_limiter(limit=30, window=60, key_prefix=JOB_CREATE_RATE_BUCKET)
+    ),
 ) -> JobResponse:
-    await check_backpressure(redis)
-    await check_tenant_limits(db, redis, current_user.tenant_id)
+    # One job row, so job_count defaults to 1. POST /sagas runs the same guard
+    # with job_count=len(steps) — see utils/admission.py.
+    await check_job_admission(db, redis, current_user.tenant_id)
     svc = _job_service(db, redis)
     job = await svc.create_job(
         user_id=current_user.id,

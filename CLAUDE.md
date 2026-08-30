@@ -312,7 +312,7 @@ The actual runtime topology after Phase 7:
 - Event-sourced **job timeline** on `JobDetailPage` (admin only) hits `/admin/jobs/{id}/timeline` and renders every Kafka event for that job in offset order with topic/partition/offset metadata.
 
 ### 5. Sagas — Multi-Step Workflows
-- `POST /sagas` creates a saga + an ordered chain of jobs, each depending on the previous.
+- `POST /sagas` creates a saga + an ordered chain of jobs, each depending on the previous. It runs the same admission control as `POST /jobs` — per-IP rate limit (same bucket), backpressure, per-tenant quota — through the shared `check_job_admission` guard, counting the saga as its `len(steps)` jobs. Anything that creates `jobs` rows must go through that guard or the per-tenant caps stop being enforceable; `steps` is capped at `MAX_SAGA_STEPS`.
 - `SagaDetailPage` polls every 2s and shows the step chain as a vertical timeline with status dots that go green as each step completes.
 - On dead-letter of any step: saga goes `COMPENSATING`, downstream waiting jobs are cancelled, and `{type}.compensate` jobs are created (real `jobs` rows) for already-completed prior steps in reverse order. Once every compensation step is terminal the saga settles: all `completed` → `COMPENSATED`, any `dead_letter`/`cancelled` → `FAILED` (ADR 0017).
 

@@ -48,8 +48,8 @@ Any key under `cache:` / `jobs:cache:` / `kafka:consumer_lag:` / `read_model:` �
 
 Sliding-window counters. Two scopes:
 
-- **Per-client (IP + endpoint)** — defends against a single noisy client. Defined in `app/utils/rate_limit.py`. Used as a FastAPI dependency on every mutating endpoint (login, register, job create, etc.). The client identity is the rightmost `X-Forwarded-For` hop — the one the trusted ALB appends — so rotating the caller-supplied part of the header cannot mint fresh buckets.
-- **Per-tenant** — defends against a noisy *tenant* (multiple users / multiple processes from the same customer). Defined in `app/utils/quota.py` as `_check_tenant_rate`. Checked at the top of `POST /jobs` after the per-client check.
+- **Per-client (IP + endpoint)** — defends against a single noisy client. Defined in `app/utils/rate_limit.py`. Used as a FastAPI dependency on every mutating endpoint (login, register, job create, etc.). `POST /jobs` and `POST /sagas` deliberately share ONE bucket (`JOB_CREATE_RATE_BUCKET` in `app/utils/admission.py`): separate buckets would let a caller refused by one keep creating job rows through the other. The client identity is the rightmost `X-Forwarded-For` hop — the one the trusted ALB appends — so rotating the caller-supplied part of the header cannot mint fresh buckets.
+- **Per-tenant** — defends against a noisy *tenant* (multiple users / multiple processes from the same customer). Defined in `app/utils/quota.py` as `_check_tenant_rate`. Checked after the per-client check by `check_job_admission`, which every job-creating endpoint runs. Counted in *requests*: one saga is one request no matter how many steps it has — its step count is weighed against the monthly job quota instead, whose unit is jobs.
 
 Both fail open if Redis is unreachable: `logger.warning` and let the request through. The rationale: a Redis outage is bad enough; turning it into a 100% outage by blocking all traffic makes it worse.
 
@@ -228,6 +228,7 @@ The platform is designed so that Redis is a **performance + UX** dependency, not
 ## Pointers
 
 - `backend/app/utils/rate_limit.py` — per-client rate limiting
+- `backend/app/utils/admission.py` — `check_job_admission`, the shared guard every job-creating endpoint runs
 - `backend/app/utils/quota.py` — per-tenant rate limit + monthly quota
 - `backend/app/utils/cache.py` — `JobCache`
 - `backend/app/utils/backpressure.py` — `check_backpressure`
