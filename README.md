@@ -175,6 +175,40 @@ npm run dev
 
 App: `http://localhost:3000`
 
+#### How list pages report loading, failure and emptiness
+
+Every list view — Jobs, Sagas, and each Admin Console tab — loads through
+`useAsyncData` (`frontend/src/hooks/useAsyncData.ts`), which owns data,
+loading and error together. Pages render exactly one of four states, in this
+order:
+
+| State | What the operator sees |
+|---|---|
+| loading | Row skeletons |
+| error | A red message with the server's own text and a **Retry** button (`components/ErrorState.tsx`) |
+| empty | The page's empty copy — *only ever* after a 2xx response with zero rows |
+| rows | The table |
+
+The ordering is the point: an empty state is a claim about the data ("Dead
+letter queue is empty", "No sagas yet"), and a failed request cannot support
+it. A request that fails while rows are already on screen keeps those rows and
+adds a banner saying they are the last successful result, rather than blanking
+the table.
+
+#### Admin Console list state is per tab
+
+Each Admin tab owns its own rows, total, page number and page size. The pager
+is driven by the active tab's own values and renders only on tabs whose
+endpoint is paginated and reported a total — Runbooks and Digests return
+everything, so they show no pager. Page size differs by tab (Jobs and DLQ 20,
+Users and Tenants 50), and each tab remembers the page its operator was on.
+Actions refresh the tab they were invoked from: resolving an incident from the
+DLQ tab refreshes the DLQ, not Jobs.
+
+A natural-language query on the Jobs tab is its own result set. While one is
+applied, the structured status/trace filters are shown disabled and left
+exactly as they were; clearing the query re-enables them and refetches.
+
 ### Environment variables
 
 Backend reads from environment directly. Key variables:

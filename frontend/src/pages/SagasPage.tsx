@@ -1,31 +1,25 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useState } from 'react'
 import { Link } from 'react-router-dom'
 import Layout from '../components/Layout'
 import StatusBadge from '../components/StatusBadge'
+import ErrorState from '../components/ErrorState'
 import { TableRowSkeleton } from '../components/Skeleton'
-import { sagasApi, type SagaListItem } from '../api/sagas'
+import { sagasApi } from '../api/sagas'
+import { useAsyncData } from '../hooks/useAsyncData'
 import { formatDate } from '../utils/format'
 
+const PAGE_SIZE = 20
+
 export default function SagasPage() {
-  const [items, setItems] = useState<SagaListItem[]>([])
-  const [total, setTotal] = useState(0)
   const [page, setPage] = useState(1)
-  const [loading, setLoading] = useState(true)
 
-  const load = useCallback(async () => {
-    setLoading(true)
-    try {
-      const res = await sagasApi.list(page, 20)
-      setItems(res.items)
-      setTotal(res.total)
-    } finally {
-      setLoading(false)
-    }
-  }, [page])
+  const load = useCallback(() => sagasApi.list(page, PAGE_SIZE), [page])
+  const { data, loading, error, reload } = useAsyncData(load, {
+    errorMessage: 'Could not load sagas.',
+  })
 
-  useEffect(() => {
-    void load()
-  }, [load])
+  const items = data?.items ?? []
+  const total = data?.total ?? 0
 
   return (
     <Layout>
@@ -33,7 +27,8 @@ export default function SagasPage() {
         <div>
           <h1 className="text-lg font-semibold text-white">Sagas</h1>
           <p className="text-sm text-gray-500">
-            Multi-step workflows coordinated through Kafka. {total} total.
+            Multi-step workflows coordinated through Kafka.
+            {data ? ` ${total} total.` : ''}
           </p>
         </div>
         <Link
@@ -53,6 +48,10 @@ export default function SagasPage() {
               ))}
             </tbody>
           </table>
+        ) : error ? (
+          // Before the empty state, never instead of it: "No sagas yet" is a
+          // claim about the platform, and a failed GET /sagas cannot make it.
+          <ErrorState message={error} onRetry={reload} />
         ) : items.length === 0 ? (
           <div className="px-6 py-12 text-center text-sm text-gray-500">
             No sagas yet — start one to see it appear here.
@@ -104,7 +103,8 @@ export default function SagasPage() {
         )}
       </div>
 
-      {total > 20 && (
+      {/* Only a successful response knows how many pages exist. */}
+      {data && total > PAGE_SIZE && (
         <div className="flex justify-center gap-2 mt-4">
           <button
             disabled={page === 1}
@@ -113,9 +113,11 @@ export default function SagasPage() {
           >
             ← Prev
           </button>
-          <span className="px-3 py-1 text-sm text-gray-500">Page {page}</span>
+          <span className="px-3 py-1 text-sm text-gray-500">
+            Page {page} of {Math.ceil(total / PAGE_SIZE)}
+          </span>
           <button
-            disabled={page * 20 >= total}
+            disabled={page * PAGE_SIZE >= total}
             onClick={() => setPage((p) => p + 1)}
             className="px-3 py-1 rounded text-sm text-gray-400 hover:text-white disabled:opacity-30"
           >

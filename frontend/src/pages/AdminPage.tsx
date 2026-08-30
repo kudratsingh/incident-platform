@@ -2,21 +2,23 @@ import { useCallback, useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 import Layout from '../components/Layout'
 import StatusBadge from '../components/StatusBadge'
+import ErrorState from '../components/ErrorState'
 import { TableRowSkeleton } from '../components/Skeleton'
 import { useToast } from '../components/Toast'
 import type {
   AuditLog,
-  IncidentDigest,
   Job,
   Runbook,
   SLOState,
   SystemStats,
   Tenant,
+  TenantSummary,
   User,
 } from '../types'
 import { adminApi } from '../api/admin'
 import { AppError } from '../api/client'
 import { useAuth } from '../hooks/useAuth'
+import { useAsyncData } from '../hooks/useAsyncData'
 import { formatDate, JOB_TYPE_LABELS } from '../utils/format'
 
 type Tab =
@@ -28,6 +30,43 @@ type Tab =
   | 'tenants'
   | 'digests'
   | 'audit'
+
+/**
+ * How many rows each tab asks for — `null` means the tab's endpoint is not
+ * paginated at all, so it must never render a pager.
+ *
+ * The pager used to hardcode 20 for every tab. Users and Tenants request 50
+ * (see adminApi.listUsers / listTenants), so on those tabs it offered pages
+ * that do not exist and landed the operator on an empty table; Runbooks and
+ * Digests return everything and have no `total` at all, so their pager was
+ * driven by whichever tab was visited before.
+ */
+const JOBS_PAGE_SIZE = 20
+const USERS_PAGE_SIZE = 50 // mirrors adminApi.listUsers
+const TENANTS_PAGE_SIZE = 50 // mirrors adminApi.listTenants
+const AUDIT_PAGE_SIZE = 20 // the API's PaginationParams default
+
+const PAGE_SIZE: Record<Tab, number | null> = {
+  overview: null,
+  jobs: JOBS_PAGE_SIZE,
+  dlq: JOBS_PAGE_SIZE,
+  runbooks: null,
+  users: USERS_PAGE_SIZE,
+  tenants: TENANTS_PAGE_SIZE,
+  digests: null,
+  audit: AUDIT_PAGE_SIZE,
+}
+
+const INITIAL_PAGES: Record<Tab, number> = {
+  overview: 1,
+  jobs: 1,
+  dlq: 1,
+  runbooks: 1,
+  users: 1,
+  tenants: 1,
+  digests: 1,
+  audit: 1,
+}
 
 function AuditLogModal({ log, onClose }: { log: AuditLog; onClose: () => void }) {
   return (
@@ -77,7 +116,7 @@ function CreateTenantModal({
   onCreated,
 }: {
   onClose: () => void
-  onCreated: (tenant: Tenant) => void
+  onCreated: (tenant: TenantSummary) => void
 }) {
   const [slug, setSlug] = useState('')
   const [name, setName] = useState('')
@@ -340,119 +379,187 @@ export default function AdminPage() {
   const isPlatformAdmin = currentUser?.is_platform_admin === true
   const [tab, setTab] = useState<Tab>('overview')
   const [showCreateTenant, setShowCreateTenant] = useState(false)
-  const [stats, setStats] = useState<SystemStats | null>(null)
-  const [slos, setSlos] = useState<SLOState[] | null>(null)
-  const [runbooks, setRunbooks] = useState<Runbook[]>([])
   const [selectedRunbook, setSelectedRunbook] = useState<Runbook | null>(null)
-  const [jobs, setJobs] = useState<Job[]>([])
-  const [users, setUsers] = useState<User[]>([])
-  const [logs, setLogs] = useState<AuditLog[]>([])
-  const [total, setTotal] = useState(0)
-  const [page, setPage] = useState(1)
   const [statusFilter, setStatusFilter] = useState('')
   const [traceFilter, setTraceFilter] = useState('')
-  const [loading, setLoading] = useState(true)
   const [selectedLog, setSelectedLog] = useState<AuditLog | null>(null)
   const [principalFilter, setPrincipalFilter] = useState<
     'all' | 'user' | 'service_account'
   >('all')
   const [selectedUser, setSelectedUser] = useState<User | null>(null)
   const [dlqStats, setDlqStats] = useState<{ total: number; by_type: Record<string, number> } | null>(null)
-  const [dlqJobs, setDlqJobs] = useState<Job[]>([])
-  const [tenants, setTenants] = useState<Tenant[]>([])
   const [nlQuestion, setNlQuestion] = useState('')
   const [nlBusy, setNlBusy] = useState(false)
   const [nlSpec, setNlSpec] = useState<Record<string, unknown> | null>(null)
+  const [nlResult, setNlResult] = useState<{ items: Job[]; total: number } | null>(null)
   const [nlError, setNlError] = useState<string | null>(null)
-  const [digests, setDigests] = useState<IncidentDigest[]>([])
   const [digestBusy, setDigestBusy] = useState(false)
   const [digestError, setDigestError] = useState<string | null>(null)
 
-  const loadJobs = useCallback(async () => {
-    setLoading(true)
-    try {
-      const res = await adminApi.listJobs({
-        page,
-        page_size: 20,
+  /**
+   * One page number per tab. It used to be a single shared `page`, so paging
+   * on Users changed the query the Jobs tab would next run, and every tab
+   * switch reset it. Each tab now remembers where its own operator was.
+   */
+  const [pageByTab, setPageByTab] = useState<Record<Tab, number>>(INITIAL_PAGES)
+  const activePage = pageByTab[tab]
+  const setActivePage = useCallback(
+    (next: (current: number) => number) =>
+      setPageByTab((prev) => ({ ...prev, [tab]: Math.max(1, next(prev[tab])) })),
+    [tab],
+  )
+  const resetPage = useCallback(
+    (which: Tab) => setPageByTab((prev) => ({ ...prev, [which]: 1 })),
+    [],
+  )
+
+  // Each tab's loader depends only on ITS OWN page, so paging or filtering one
+  // tab cannot re-fire another's request.
+  const { jobs: jobsPage, dlq: dlqPage, users: usersPage, tenants: tenantsPage, audit: auditPage } =
+    pageByTab
+
+  // A natural-language answer is its own result set, not the Jobs tab's query.
+  // While one is applied the structured loader is parked, so it can no longer
+  // race in behind the LLM-filtered rows and replace them with unfiltered ones
+  // while the purple chip still claims the spec is in force.
+  const nlActive = nlSpec !== null
+
+  const loadJobs = useCallback(
+    () =>
+      adminApi.listJobs({
+        page: jobsPage,
+        page_size: JOBS_PAGE_SIZE,
         status: statusFilter || undefined,
         trace_id: traceFilter || undefined,
-      })
-      setJobs(res.items)
-      setTotal(res.total)
-    } finally {
-      setLoading(false)
-    }
-  }, [page, statusFilter, traceFilter])
+      }),
+    [jobsPage, statusFilter, traceFilter],
+  )
+  const jobsList = useAsyncData(loadJobs, {
+    enabled: tab === 'jobs' && !nlActive,
+    errorMessage: 'Could not load jobs.',
+  })
 
-  const loadUsers = useCallback(async () => {
-    setLoading(true)
-    try {
-      const res = await adminApi.listUsers(page)
-      setUsers(res.items)
-      setTotal(res.total)
-    } finally {
-      setLoading(false)
-    }
-  }, [page])
+  const loadDlq = useCallback(
+    () =>
+      adminApi.listJobs({ page: dlqPage, page_size: JOBS_PAGE_SIZE, status: 'dead_letter' }),
+    [dlqPage],
+  )
+  const dlqList = useAsyncData(loadDlq, {
+    enabled: tab === 'dlq',
+    errorMessage: 'Could not load the dead letter queue.',
+  })
 
-  const loadLogs = useCallback(async () => {
-    setLoading(true)
-    try {
-      const res = await adminApi.listAuditLogs({
-        page,
+  const loadUsers = useCallback(() => adminApi.listUsers(usersPage), [usersPage])
+  const usersList = useAsyncData(loadUsers, {
+    enabled: tab === 'users',
+    errorMessage: 'Could not load users.',
+  })
+
+  const loadTenants = useCallback(() => adminApi.listTenants(tenantsPage), [tenantsPage])
+  const tenantsList = useAsyncData(loadTenants, {
+    enabled: tab === 'tenants',
+    errorMessage: 'Could not load tenants.',
+  })
+
+  const loadLogs = useCallback(
+    () =>
+      adminApi.listAuditLogs({
+        page: auditPage,
         principal_type: principalFilter === 'all' ? undefined : principalFilter,
-      })
-      setLogs(res.items)
-      setTotal(res.total)
-    } finally {
-      setLoading(false)
-    }
-  }, [page, principalFilter])
+      }),
+    [auditPage, principalFilter],
+  )
+  const logsList = useAsyncData(loadLogs, {
+    enabled: tab === 'audit',
+    errorMessage: 'Could not load the audit log.',
+  })
 
-  const loadDlq = useCallback(async () => {
-    setLoading(true)
-    try {
-      const [stats, jobsRes] = await Promise.all([
-        adminApi.dlqStats(),
-        adminApi.listJobs({ page, page_size: 20, status: 'dead_letter' }),
-      ])
-      setDlqStats(stats)
-      setDlqJobs(jobsRes.items)
-      setTotal(jobsRes.total)
-    } finally {
-      setLoading(false)
-    }
-  }, [page])
+  const loadRunbooks = useCallback(() => adminApi.runbooks(), [])
+  const runbooksList = useAsyncData(loadRunbooks, {
+    enabled: tab === 'runbooks',
+    errorMessage: 'Could not load runbooks.',
+  })
 
-  // Keep the badge fresh on every tab switch so admins see the current count.
-  useEffect(() => {
-    void adminApi.dlqStats().then(setDlqStats).catch(() => {})
-  }, [tab])
+  const loadDigests = useCallback(() => adminApi.listDigests(), [])
+  const digestsList = useAsyncData(loadDigests, {
+    enabled: tab === 'digests',
+    errorMessage: 'Could not load digests.',
+  })
 
-  const loadOverview = useCallback(async () => {
-    setLoading(true)
-    try {
+  const loadOverview = useCallback(
+    async (): Promise<{ stats: SystemStats; slos: SLOState[] }> => {
       const [s, sloResp] = await Promise.all([
         adminApi.systemStats(),
-        adminApi.slos().catch(() => ({ slos: [] })),
+        // SLOs are a bonus panel: their absence hides the panel, it does not
+        // make the overview a failure.
+        adminApi.slos().catch(() => ({ slos: [] as SLOState[] })),
       ])
-      setStats(s)
-      setSlos(sloResp.slos)
-    } finally {
-      setLoading(false)
-    }
-  }, [])
+      return { stats: s, slos: sloResp.slos }
+    },
+    [],
+  )
+  const overviewData = useAsyncData(loadOverview, {
+    enabled: tab === 'overview',
+    errorMessage: 'Could not load system stats.',
+  })
+  const reloadOverview = overviewData.reload
+  const stats = overviewData.data?.stats ?? null
+  const slos = overviewData.data?.slos ?? null
 
-  const loadTenants = useCallback(async () => {
-    setLoading(true)
-    try {
-      const r = await adminApi.listTenants(page)
-      setTenants(r.items)
-      setTotal(r.total)
-    } finally {
-      setLoading(false)
+  // Auto-refresh the overview every 5s so the CQRS read-model lag is visible.
+  useEffect(() => {
+    if (tab !== 'overview') return
+    const t = setInterval(reloadOverview, 5000)
+    return () => clearInterval(t)
+  }, [tab, reloadOverview])
+
+  // The DLQ badge is decorative and lives outside every tab, so it keeps its
+  // own silent fetch; a failure just hides the count.
+  const refreshDlqBadge = useCallback(() => {
+    void adminApi.dlqStats().then(setDlqStats).catch(() => {})
+  }, [])
+  useEffect(() => {
+    refreshDlqBadge()
+  }, [tab, refreshDlqBadge])
+
+  const jobRows = nlActive ? nlResult?.items ?? [] : jobsList.data?.items ?? []
+  const dlqRows = dlqList.data?.items ?? []
+  const userRows = usersList.data?.items ?? []
+  const tenantRows = tenantsList.data?.items ?? []
+  const logRows = logsList.data?.items ?? []
+  const runbooks = runbooksList.data?.items ?? []
+  const digests = digestsList.data?.items ?? []
+
+  /**
+   * The record count in the header and the pager both read the ACTIVE tab's
+   * own total. Previously a single `total` was written by whichever loader ran
+   * last, so Runbooks and Digests — which never set one — rendered the
+   * previously visited tab's count and a pager to match.
+   */
+  const activeTotal: number | null = (() => {
+    switch (tab) {
+      case 'jobs':
+        return nlActive ? nlResult?.total ?? null : jobsList.data?.total ?? null
+      case 'dlq':
+        return dlqList.data?.total ?? null
+      case 'users':
+        return usersList.data?.total ?? null
+      case 'tenants':
+        return tenantsList.data?.total ?? null
+      case 'audit':
+        return logsList.data?.total ?? null
+      case 'runbooks':
+        return runbooksList.data ? runbooks.length : null
+      case 'digests':
+        return digestsList.data ? digests.length : null
+      default:
+        return null
     }
-  }, [page])
+  })()
+
+  // An NL answer is a single unpaginated result set — no pager for it either.
+  const activePageSize = tab === 'jobs' && nlActive ? null : PAGE_SIZE[tab]
+  const pagerTotal = activePageSize === null ? null : activeTotal
 
   async function runNlQuery(question: string): Promise<void> {
     const trimmed = question.trim()
@@ -461,14 +568,11 @@ export default function AdminPage() {
     setNlError(null)
     try {
       const resp = await adminApi.nlQuery(trimmed)
-      setJobs(resp.items)
-      setTotal(resp.total)
+      // The structured filters are left exactly as the operator set them and
+      // shown as disabled while the spec is applied — clearing them used to
+      // change the jobs loader's identity and re-fire it over these results.
+      setNlResult({ items: resp.items, total: resp.total })
       setNlSpec(resp.spec)
-      // Clear the structured filters so the user sees that the NL spec is
-      // what's currently applied — otherwise it looks ambiguous.
-      setStatusFilter('')
-      setTraceFilter('')
-      setPage(1)
     } catch (err) {
       setNlError(
         err instanceof AppError
@@ -481,21 +585,12 @@ export default function AdminPage() {
   }
 
   function clearNl(): void {
+    // Re-enables the structured loader, which refetches on its own.
     setNlQuestion('')
     setNlSpec(null)
+    setNlResult(null)
     setNlError(null)
-    void loadJobs()
   }
-
-  const loadDigests = useCallback(async () => {
-    setLoading(true)
-    try {
-      const r = await adminApi.listDigests()
-      setDigests(r.items)
-    } finally {
-      setLoading(false)
-    }
-  }, [])
 
   async function generateDigestNow(): Promise<void> {
     setDigestBusy(true)
@@ -507,7 +602,7 @@ export default function AdminPage() {
           'No jobs in the last window — nothing to summarize. Try a wider hours range.',
         )
       } else {
-        await loadDigests()
+        digestsList.reload()
       }
     } catch (err) {
       setDigestError(
@@ -530,8 +625,10 @@ export default function AdminPage() {
         rate_limit_per_minute: rate,
         quota_jobs_per_month: quota,
       })
-      setTenants((prev) =>
-        prev.map((t) => (t.id === id ? { ...t, ...updated } : t)),
+      tenantsList.setData((prev) =>
+        prev
+          ? { ...prev, items: prev.items.map((t) => (t.id === id ? { ...t, ...updated } : t)) }
+          : prev,
       )
       toast.success(`Limits saved for ${updated.slug}`)
     } catch (err) {
@@ -539,41 +636,20 @@ export default function AdminPage() {
     }
   }
 
-  const loadRunbooks = useCallback(async () => {
-    setLoading(true)
-    try {
-      const r = await adminApi.runbooks()
-      setRunbooks(r.items)
-    } finally {
-      setLoading(false)
-    }
-  }, [])
-
-  // Auto-refresh the overview every 5s so the CQRS read-model lag is visible.
-  useEffect(() => {
-    if (tab !== 'overview') return
-    void loadOverview()
-    const t = setInterval(() => void loadOverview(), 5000)
-    return () => clearInterval(t)
-  }, [tab, loadOverview])
-
-  useEffect(() => {
-    if (tab === 'overview') return  // handled by its own polling effect above
-    if (tab === 'jobs') void loadJobs()
-    else if (tab === 'dlq') void loadDlq()
-    else if (tab === 'runbooks') void loadRunbooks()
-    else if (tab === 'users') void loadUsers()
-    else if (tab === 'tenants') void loadTenants()
-    else if (tab === 'digests') void loadDigests()
-    else void loadLogs()
-  }, [tab, loadJobs, loadDlq, loadRunbooks, loadUsers, loadTenants, loadDigests, loadLogs])
+  // Both actions refresh the tab they were invoked FROM. `resolve` always
+  // refreshed Jobs, so resolving from the DLQ tab left the resolved row in the
+  // DLQ table and replaced the header count with the jobs total.
+  function reloadActiveJobList(): void {
+    if (tab === 'dlq') dlqList.reload()
+    else jobsList.reload()
+    refreshDlqBadge()
+  }
 
   async function replay(jobId: string) {
     try {
       await adminApi.replayJob(jobId)
       toast.success(`Job ${jobId.slice(0, 8)}… queued for replay`)
-      if (tab === 'dlq') void loadDlq()
-      else void loadJobs()
+      reloadActiveJobList()
     } catch (err) {
       toast.error(err instanceof AppError ? err.message : 'Replay failed')
     }
@@ -583,7 +659,7 @@ export default function AdminPage() {
     try {
       await adminApi.resolveIncident(jobId)
       toast.success(`Incident ${jobId.slice(0, 8)}… marked resolved`)
-      void loadJobs()
+      reloadActiveJobList()
     } catch (err) {
       toast.error(err instanceof AppError ? err.message : 'Resolve failed')
     }
@@ -594,7 +670,9 @@ export default function AdminPage() {
       <div className="flex items-center justify-between mb-6">
         <div>
           <h1 className="text-lg font-semibold text-white">Admin Console</h1>
-          <p className="text-sm text-gray-500">{total} records</p>
+          <p className="text-sm text-gray-500">
+            {activeTotal === null ? '—' : `${activeTotal} records`}
+          </p>
         </div>
         <div className="flex gap-1 bg-gray-800/60 rounded-lg p-1">
           {(
@@ -611,7 +689,7 @@ export default function AdminPage() {
           ).map((t) => (
             <button
               key={t}
-              onClick={() => { setTab(t); setPage(1) }}
+              onClick={() => setTab(t)}
               className={`px-4 py-1.5 rounded text-sm font-medium transition-colors capitalize inline-flex items-center gap-2 ${
                 tab === t ? 'bg-gray-700 text-white' : 'text-gray-400 hover:text-white'
               }`}
@@ -639,6 +717,14 @@ export default function AdminPage() {
             </span>
           </div>
 
+          {overviewData.error && stats === null && (
+            <ErrorState
+              message={overviewData.error}
+              onRetry={reloadOverview}
+              className="bg-gray-900 border border-gray-800 rounded-lg mb-6"
+            />
+          )}
+
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-6">
             {(['running', 'completed', 'failed', 'dead_letter'] as const).map(
               (st) => (
@@ -646,7 +732,7 @@ export default function AdminPage() {
                   key={st}
                   label={st.replace('_', ' ')}
                   value={stats?.by_status?.[st] ?? 0}
-                  loading={loading && stats === null}
+                  loading={overviewData.loading && stats === null}
                   color={
                     st === 'completed'
                       ? 'green'
@@ -699,8 +785,10 @@ export default function AdminPage() {
 
       {tab === 'runbooks' && (
         <div className="bg-gray-900 border border-gray-800 rounded-lg overflow-hidden">
-          {loading ? (
+          {runbooksList.loading ? (
             <div className="px-6 py-12 text-center text-sm text-gray-500">Loading…</div>
+          ) : runbooksList.error ? (
+            <ErrorState message={runbooksList.error} onRetry={runbooksList.reload} />
           ) : runbooks.length === 0 ? (
             <div className="px-6 py-12 text-center text-sm text-gray-500">
               No runbooks found.
@@ -792,6 +880,9 @@ export default function AdminPage() {
             <div className="mb-3 text-xs text-gray-400 bg-purple-900/15 border border-purple-800/40 rounded px-3 py-2">
               <span className="text-purple-300 font-mono mr-2">filter</span>
               <code className="font-mono text-gray-300">{JSON.stringify(nlSpec)}</code>
+              <span className="text-gray-500 ml-2">
+                — the filters below are paused while this is applied.
+              </span>
             </div>
           )}
 
@@ -801,13 +892,15 @@ export default function AdminPage() {
               type="text"
               placeholder="Filter by trace ID…"
               value={traceFilter}
-              onChange={(e) => { setTraceFilter(e.target.value); setPage(1) }}
-              className="bg-gray-800/60 border border-gray-700/50 rounded px-3 py-1.5 text-sm text-gray-200 placeholder-gray-600 focus:outline-none focus:border-blue-500/50 w-64 font-mono"
+              disabled={nlActive}
+              onChange={(e) => { setTraceFilter(e.target.value); resetPage('jobs') }}
+              className="bg-gray-800/60 border border-gray-700/50 rounded px-3 py-1.5 text-sm text-gray-200 placeholder-gray-600 focus:outline-none focus:border-blue-500/50 w-64 font-mono disabled:opacity-40"
             />
             <select
               value={statusFilter}
-              onChange={(e) => { setStatusFilter(e.target.value); setPage(1) }}
-              className="bg-gray-800/60 border border-gray-700/50 rounded px-3 py-1.5 text-sm text-gray-200 focus:outline-none focus:border-blue-500/50"
+              disabled={nlActive}
+              onChange={(e) => { setStatusFilter(e.target.value); resetPage('jobs') }}
+              className="bg-gray-800/60 border border-gray-700/50 rounded px-3 py-1.5 text-sm text-gray-200 focus:outline-none focus:border-blue-500/50 disabled:opacity-40"
             >
               <option value="">All statuses</option>
               {['pending','running','completed','failed','dead_letter'].map((s) => (
@@ -817,12 +910,18 @@ export default function AdminPage() {
           </div>
 
           <div className="bg-gray-900 border border-gray-800 rounded-lg overflow-hidden">
-            {loading ? (
+            {jobsList.loading && !nlActive ? (
               <table className="w-full text-sm">
                 <tbody className="divide-y divide-gray-800/60">
                   {Array.from({ length: 8 }).map((_, i) => <TableRowSkeleton key={i} />)}
                 </tbody>
               </table>
+            ) : jobsList.error && !nlActive ? (
+              <ErrorState message={jobsList.error} onRetry={jobsList.reload} />
+            ) : jobRows.length === 0 ? (
+              <div className="px-6 py-12 text-center text-sm text-gray-500">
+                No jobs match this filter.
+              </div>
             ) : (
               <table className="w-full text-sm">
                 <thead>
@@ -835,7 +934,7 @@ export default function AdminPage() {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-gray-800/60">
-                  {jobs.map((job) => (
+                  {jobRows.map((job) => (
                     <tr key={job.id} className="hover:bg-gray-800/30 transition-colors">
                       <td className="px-4 py-3">
                         <Link to={`/jobs/${job.id}`} className="text-gray-200 hover:text-white">
@@ -897,13 +996,17 @@ export default function AdminPage() {
           )}
 
           <div className="bg-gray-900 border border-gray-800 rounded-lg overflow-hidden">
-            {loading ? (
+            {dlqList.loading ? (
               <table className="w-full text-sm">
                 <tbody className="divide-y divide-gray-800/60">
                   {Array.from({ length: 8 }).map((_, i) => <TableRowSkeleton key={i} />)}
                 </tbody>
               </table>
-            ) : dlqJobs.length === 0 ? (
+            ) : dlqList.error ? (
+              // "Dead letter queue is empty" is the best news an operator can
+              // get; a failed request must never be able to deliver it.
+              <ErrorState message={dlqList.error} onRetry={dlqList.reload} />
+            ) : dlqRows.length === 0 ? (
               <div className="px-6 py-12 text-center text-sm text-gray-500">
                 Dead letter queue is empty.
               </div>
@@ -919,7 +1022,7 @@ export default function AdminPage() {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-gray-800/60">
-                  {dlqJobs.map((job) => (
+                  {dlqRows.map((job) => (
                     <tr key={job.id} className="hover:bg-gray-800/30 transition-colors">
                       <td className="px-4 py-3 align-top">
                         <Link to={`/jobs/${job.id}`} className="text-gray-200 hover:text-white">
@@ -975,12 +1078,18 @@ export default function AdminPage() {
 
       {tab === 'users' && (
         <div className="bg-gray-900 border border-gray-800 rounded-lg overflow-hidden">
-          {loading ? (
+          {usersList.loading ? (
             <table className="w-full text-sm">
               <tbody className="divide-y divide-gray-800/60">
                 {Array.from({ length: 8 }).map((_, i) => <TableRowSkeleton key={i} />)}
               </tbody>
             </table>
+          ) : usersList.error ? (
+            <ErrorState message={usersList.error} onRetry={usersList.reload} />
+          ) : userRows.length === 0 ? (
+            <div className="px-6 py-12 text-center text-sm text-gray-500">
+              No users on this page.
+            </div>
           ) : (
             <table className="w-full text-sm">
               <thead>
@@ -993,7 +1102,7 @@ export default function AdminPage() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-gray-800/60">
-                {users.map((u) => (
+                {userRows.map((u) => (
                   <tr
                     key={u.id}
                     onClick={() => setSelectedUser(u)}
@@ -1035,12 +1144,18 @@ export default function AdminPage() {
             </button>
           </div>
           <div className="bg-gray-900 border border-gray-800 rounded-lg overflow-hidden">
-            {loading ? (
+            {tenantsList.loading ? (
               <table className="w-full text-sm">
                 <tbody className="divide-y divide-gray-800/60">
                   {Array.from({ length: 6 }).map((_, i) => <TableRowSkeleton key={i} />)}
                 </tbody>
               </table>
+            ) : tenantsList.error ? (
+              <ErrorState message={tenantsList.error} onRetry={tenantsList.reload} />
+            ) : tenantRows.length === 0 ? (
+              <div className="px-6 py-12 text-center text-sm text-gray-500">
+                No tenants on this page.
+              </div>
             ) : (
               <table className="w-full text-sm">
                 <thead>
@@ -1054,7 +1169,7 @@ export default function AdminPage() {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-gray-800/60">
-                  {tenants.map((t) => (
+                  {tenantRows.map((t) => (
                     <TenantRow key={t.id} tenant={t} onSave={saveTenantLimits} />
                   ))}
                 </tbody>
@@ -1065,8 +1180,12 @@ export default function AdminPage() {
             <CreateTenantModal
               onClose={() => setShowCreateTenant(false)}
               onCreated={(created) => {
-                setTenants((prev) => [created, ...prev])
+                // POST /admin/tenants answers with the row only — no user/job
+                // rollups and no limits. Splicing that into the list rendered
+                // blank counts and blank limit inputs, so refetch the page and
+                // let the list endpoint supply the whole row.
                 setShowCreateTenant(false)
+                tenantsList.reload()
                 toast.success(`Tenant ${created.slug} created`)
               }}
             />
@@ -1093,7 +1212,7 @@ export default function AdminPage() {
               {digestError}
             </div>
           )}
-          {loading ? (
+          {digestsList.loading ? (
             <div className="space-y-3">
               {Array.from({ length: 3 }).map((_, i) => (
                 <div
@@ -1102,6 +1221,12 @@ export default function AdminPage() {
                 />
               ))}
             </div>
+          ) : digestsList.error ? (
+            <ErrorState
+              message={digestsList.error}
+              onRetry={digestsList.reload}
+              className="bg-gray-900 border border-gray-800 rounded-lg"
+            />
           ) : digests.length === 0 ? (
             <div className="bg-gray-900 border border-gray-800 rounded-lg p-8 text-sm text-gray-500 text-center">
               No digests yet. Click "Generate now" to write one for the last 24 hours.
@@ -1164,7 +1289,7 @@ export default function AdminPage() {
               key={v}
               onClick={() => {
                 setPrincipalFilter(v)
-                setPage(1)
+                resetPage('audit')
               }}
               className={`px-2 py-1 rounded text-xs transition-colors ${
                 principalFilter === v
@@ -1177,12 +1302,18 @@ export default function AdminPage() {
           ))}
         </div>
         <div className="bg-gray-900 border border-gray-800 rounded-lg overflow-hidden">
-          {loading ? (
+          {logsList.loading ? (
             <table className="w-full text-sm">
               <tbody className="divide-y divide-gray-800/60">
                 {Array.from({ length: 8 }).map((_, i) => <TableRowSkeleton key={i} />)}
               </tbody>
             </table>
+          ) : logsList.error ? (
+            <ErrorState message={logsList.error} onRetry={logsList.reload} />
+          ) : logRows.length === 0 ? (
+            <div className="px-6 py-12 text-center text-sm text-gray-500">
+              No audit entries for this filter.
+            </div>
           ) : (
             <table className="w-full text-sm">
               <thead>
@@ -1194,7 +1325,7 @@ export default function AdminPage() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-gray-800/60">
-                {logs.map((log) => (
+                {logRows.map((log) => (
                   <tr
                     key={log.id}
                     className="hover:bg-gray-800/30 cursor-pointer transition-colors"
@@ -1233,15 +1364,21 @@ export default function AdminPage() {
         </>
       )}
 
-      {/* Pagination */}
-      {total > 20 && (
+      {/* Pagination — driven entirely by the ACTIVE tab: its own page number,
+          its own page size, and a total it actually reported. A tab with no
+          total (Runbooks, Digests) renders no pager at all. */}
+      {activePageSize !== null && pagerTotal !== null && pagerTotal > activePageSize && (
         <div className="flex justify-center gap-2 mt-4">
-          <button disabled={page === 1} onClick={() => setPage((p) => p - 1)}
+          <button disabled={activePage === 1} onClick={() => setActivePage((p) => p - 1)}
             className="px-3 py-1 rounded text-sm text-gray-400 hover:text-white disabled:opacity-30">
             ← Prev
           </button>
-          <span className="px-3 py-1 text-sm text-gray-500">Page {page}</span>
-          <button disabled={page * 20 >= total} onClick={() => setPage((p) => p + 1)}
+          <span className="px-3 py-1 text-sm text-gray-500">
+            Page {activePage} of {Math.ceil(pagerTotal / activePageSize)}
+          </span>
+          <button
+            disabled={activePage * activePageSize >= pagerTotal}
+            onClick={() => setActivePage((p) => p + 1)}
             className="px-3 py-1 rounded text-sm text-gray-400 hover:text-white disabled:opacity-30">
             Next →
           </button>

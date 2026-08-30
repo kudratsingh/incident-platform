@@ -3,9 +3,11 @@ import { Link } from 'react-router-dom'
 import Layout from '../components/Layout'
 import JobForm from '../components/JobForm'
 import StatusBadge from '../components/StatusBadge'
+import ErrorState from '../components/ErrorState'
 import { TableRowSkeleton } from '../components/Skeleton'
 import type { Job } from '../types'
 import { jobsApi } from '../api/jobs'
+import { useAsyncData } from '../hooks/useAsyncData'
 import { formatDate, JOB_TYPE_LABELS } from '../utils/format'
 
 const STATUS_OPTIONS: { value: string; label: string }[] = [
@@ -17,43 +19,53 @@ const STATUS_OPTIONS: { value: string; label: string }[] = [
   { value: 'dead_letter', label: 'Dead Letter' },
 ]
 
+const PAGE_SIZE = 15
+
 export default function DashboardPage() {
-  const [jobs, setJobs] = useState<Job[]>([])
-  const [total, setTotal] = useState(0)
   const [page, setPage] = useState(1)
   const [statusFilter, setStatusFilter] = useState('')
-  const [loading, setLoading] = useState(true)
   const [showForm, setShowForm] = useState(false)
 
-  const load = useCallback(async () => {
-    setLoading(true)
-    try {
-      const res = await jobsApi.list({
+  const load = useCallback(
+    () =>
+      jobsApi.list({
         page,
-        page_size: 15,
+        page_size: PAGE_SIZE,
         status: statusFilter || undefined,
-      })
-      setJobs(res.items)
-      setTotal(res.total)
-    } finally {
-      setLoading(false)
-    }
-  }, [page, statusFilter])
+      }),
+    [page, statusFilter],
+  )
+  const { data, loading, error, reload, setData } = useAsyncData(load, {
+    errorMessage: 'Could not load jobs.',
+  })
 
-  useEffect(() => { void load() }, [load])
+  const jobs = data?.items ?? []
+  const total = data?.total ?? 0
 
-  // Auto-refresh while any job is running or pending
+  // Auto-refresh while any job is running or pending. Keyed on the boolean,
+  // not the array: the array is a fresh reference every render, which would
+  // tear down and re-arm the interval on each one.
+  const hasActiveJob = jobs.some((j) => j.status === 'running' || j.status === 'pending')
   useEffect(() => {
-    const hasActive = jobs.some((j) => j.status === 'running' || j.status === 'pending')
-    if (!hasActive) return
-    const id = setInterval(() => void load(), 3000)
+    if (!hasActiveJob) return
+    const id = setInterval(reload, 3000)
     return () => clearInterval(id)
-  }, [jobs, load])
+  }, [hasActiveJob, reload])
 
   function handleCreated(job: Job) {
     setShowForm(false)
-    setJobs((prev) => [job, ...prev])
-    setTotal((t) => t + 1)
+    // A new job is `pending`. It only belongs in the list actually on screen
+    // when this page and filter would have returned it; anywhere else,
+    // prepending it puts a row in a table that claims to exclude it. Refetch
+    // instead, so what is shown keeps matching the filter it advertises.
+    const belongsHere = page === 1 && (statusFilter === '' || statusFilter === job.status)
+    if (belongsHere && data) {
+      setData((prev) =>
+        prev ? { ...prev, items: [job, ...prev.items], total: prev.total + 1 } : prev,
+      )
+    } else {
+      reload()
+    }
   }
 
   return (
@@ -61,7 +73,7 @@ export default function DashboardPage() {
       <div className="flex items-center justify-between mb-6">
         <div>
           <h1 className="text-lg font-semibold text-white">Jobs</h1>
-          <p className="text-sm text-gray-500">{total} total</p>
+          <p className="text-sm text-gray-500">{data ? `${total} total` : '—'}</p>
         </div>
         <button
           onClick={() => setShowForm((v) => !v)}
@@ -96,6 +108,21 @@ export default function DashboardPage() {
         ))}
       </div>
 
+      {/* A failed auto-refresh keeps the rows we already have — they are still
+          the last thing the server told us — but says so rather than letting
+          the table quietly go stale. */}
+      {error && jobs.length > 0 && (
+        <div
+          role="alert"
+          className="mb-3 flex items-center gap-3 text-xs text-red-400 bg-red-900/20 border border-red-800/30 rounded px-3 py-2"
+        >
+          <span>{error} Showing the last successful result.</span>
+          <button onClick={reload} className="ml-auto underline hover:text-red-300">
+            Retry
+          </button>
+        </div>
+      )}
+
       {/* Table */}
       <div className="bg-gray-900 border border-gray-800 rounded-lg overflow-hidden">
         {loading && jobs.length === 0 ? (
@@ -104,6 +131,10 @@ export default function DashboardPage() {
               {Array.from({ length: 8 }).map((_, i) => <TableRowSkeleton key={i} />)}
             </tbody>
           </table>
+        ) : error && jobs.length === 0 ? (
+          // "No jobs found" is a statement about the account, so it must not
+          // be what a failed GET /jobs produces.
+          <ErrorState message={error} onRetry={reload} />
         ) : jobs.length === 0 ? (
           <div className="py-12 text-center text-gray-600 text-sm">No jobs found</div>
         ) : (
@@ -160,8 +191,8 @@ export default function DashboardPage() {
         )}
       </div>
 
-      {/* Pagination */}
-      {total > 15 && (
+      {/* Pagination — only a successful response knows how many pages exist. */}
+      {data && total > PAGE_SIZE && (
         <div className="flex justify-center gap-2 mt-4">
           <button
             disabled={page === 1}
@@ -171,10 +202,10 @@ export default function DashboardPage() {
             ← Prev
           </button>
           <span className="px-3 py-1 text-sm text-gray-500">
-            Page {page} of {Math.ceil(total / 15)}
+            Page {page} of {Math.ceil(total / PAGE_SIZE)}
           </span>
           <button
-            disabled={page * 15 >= total}
+            disabled={page * PAGE_SIZE >= total}
             onClick={() => setPage((p) => p + 1)}
             className="px-3 py-1 rounded text-sm text-gray-400 hover:text-white disabled:opacity-30 disabled:cursor-not-allowed"
           >
