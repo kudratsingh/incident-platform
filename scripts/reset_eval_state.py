@@ -168,10 +168,11 @@ _JOB_CACHE_PATTERN = "cache:job:*"
 
 # Tier-1 *action* residue, as opposed to chaos residue above. These are
 # effects the agent itself creates during a scenario; left in place they
-# fire or apply during the next one. Mirrors
-# `dlq_replay_scheduler.SCHEDULED_KEY` — kept as a literal so this
-# script has no import dependency on the worker package.
+# fire or apply during the next one. Mirror
+# `dlq_replay_scheduler.SCHEDULED_KEY` / `.INFLIGHT_KEY` — kept as
+# literals so this script has no import dependency on the worker package.
 _SCHEDULED_REPLAY_KEY = "jobs:dlq_replay_delayed"
+_INFLIGHT_REPLAY_KEY = "jobs:dlq_replay_inflight"
 
 
 def _empty_dlq_baseline() -> bool:
@@ -217,7 +218,7 @@ async def _clear_job_read_cache(redis: aioredis.Redis) -> int:
 
 
 async def _clear_scheduled_replays(redis: aioredis.Redis) -> int:
-    """Drop every pending delayed-DLQ-replay timer.
+    """Drop every pending delayed-DLQ-replay timer, armed or claimed.
 
     `replay_dlq_by_ids/-by_category(delay_seconds=...)` pushes onto the
     `jobs:dlq_replay_delayed` ZSET and a worker loop fires it when the
@@ -226,10 +227,18 @@ async def _clear_scheduled_replays(redis: aioredis.Redis) -> int:
     mid-*next*-scenario, replays a DLQ entry nobody asked about, and
     the DLQ shrinks under the next agent's feet.
 
-    Returns the number of timers removed."""
-    pending = int(await redis.zcard(_SCHEDULED_REPLAY_KEY) or 0)
-    if pending:
-        await redis.delete(_SCHEDULED_REPLAY_KEY)
+    The in-flight set is swept for the same reason (R2-21). A timer the
+    worker has claimed but not yet acked is still a pending replay — and
+    an un-acked claim is *designed* to be recovered on a later tick, so
+    leaving it behind would resurrect exactly the bleed this clears.
+
+    Returns the number of timers removed across both sets."""
+    pending = 0
+    for key in (_SCHEDULED_REPLAY_KEY, _INFLIGHT_REPLAY_KEY):
+        held = int(await redis.zcard(key) or 0)
+        if held:
+            await redis.delete(key)
+            pending += held
     return pending
 
 

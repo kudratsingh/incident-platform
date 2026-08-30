@@ -24,16 +24,16 @@ before retrying en masse.
 """
 
 from app.core.exceptions import AppError
-from app.core.logging import get_logger, request_id_var
+from app.core.logging import get_logger
 from app.core.scopes import Scope
 from app.mcp.registry import ToolContext, tool
+from app.mcp.tools.actions._scheduled_replay import schedule_one_audited
 from app.models.enums import JobStatus, RemediationHint
 from app.repositories.audit import AuditRepository
 from app.repositories.job import JobRepository
 from app.repositories.job_dependency import JobDependencyRepository
 from app.repositories.outbox import OutboxRepository
 from app.services.job import JobService
-from app.workers import dlq_replay_scheduler
 from pydantic import BaseModel, ConfigDict, Field
 
 logger = get_logger(__name__)
@@ -172,33 +172,18 @@ async def replay_dlq_by_category(
                 )
             continue
 
+        # Scheduled branch — audit-then-arm inside a savepoint, shared
+        # with `replay_dlq_by_ids` (`_scheduled_replay`). Both excepts
+        # are load-bearing: catching only AppError, as this branch used
+        # to, let any other mid-loop error abort the whole tool and
+        # discard the audit rows for replays already armed.
         try:
-            execute_at = await dlq_replay_scheduler.schedule_replay(
-                ctx.redis,
-                tenant_id=ctx.principal.tenant_id,
-                principal_id=ctx.principal.id,
+            execute_at = await schedule_one_audited(
+                ctx=ctx,
+                audit_repo=audit_repo,
                 job_id=job.id,
                 delay_seconds=inp.delay_seconds,
-            )
-            await audit_repo.log(
-                "job.replay_scheduled",
-                tenant_id=ctx.principal.tenant_id,
-                user_id=(
-                    ctx.principal.user.id
-                    if ctx.principal.user is not None
-                    else None
-                ),
-                principal_type=ctx.principal.kind,
-                principal_id=ctx.principal.id,
-                job_id=job.id,
-                resource_type="job",
-                resource_id=str(job.id),
-                request_id=request_id_var.get("") or None,
-                extra_data={
-                    "delay_seconds": inp.delay_seconds,
-                    "execute_at": execute_at,
-                    "category": inp.category,
-                },
+                extra_data={"category": inp.category},
             )
             scheduled_ids.append(str(job.id))
             last_execute_at = execute_at
@@ -207,6 +192,12 @@ async def replay_dlq_by_category(
             logger.warning(
                 "replay_dlq_by_category scheduled per-job failure",
                 extra={"job_id": str(job.id), "error": exc.message},
+            )
+        except Exception as exc:
+            failed += 1
+            logger.exception(
+                "replay_dlq_by_category scheduled per-job crashed",
+                extra={"job_id": str(job.id), "error": str(exc)},
             )
 
     return ReplayDlqByCategoryOutput(

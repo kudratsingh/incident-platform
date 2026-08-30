@@ -10,10 +10,14 @@ Covers:
 
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 import uuid
 from typing import Any
+from unittest.mock import AsyncMock, patch
 
+import pytest
 import pytest_asyncio
 from app.core.scopes import Scope
 from app.dependencies import get_db, get_redis
@@ -28,6 +32,7 @@ from app.repositories.service_account import (
     ServiceAccountTokenRepository,
 )
 from app.services.service_account import ServiceAccountService
+from app.workers import dispatcher, dlq_replay_scheduler
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -35,8 +40,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 class _RedisStub:
     """In-memory stand-in that supports the KV + ZSET ops the DLQ
-    tools touch (`get/set/delete` for idempotency; `zadd/zrangebyscore`
-    for scheduled replays). Extend as new op families show up."""
+    tools touch (`get/set/delete` for idempotency; `zadd/zrem/eval` for
+    scheduled replays). Extend as new op families show up."""
 
     def __init__(self) -> None:
         self._store: dict[str, bytes | str] = {}
@@ -68,48 +73,55 @@ class _RedisStub:
             zset[member] = score
         return added
 
-    async def zrangebyscore(
-        self,
-        key: str,
-        min_score: float | str,
-        max_score: float | str,
-        withscores: bool = False,
-    ) -> list[Any]:
+    async def zrem(self, key: str, *members: str) -> int:
         zset = self._zsets.get(key, {})
-        lo = float("-inf") if min_score == "-inf" else float(min_score)
-        hi = float("inf") if max_score == "inf" else float(max_score)
-        picked = sorted(
-            [(m, s) for m, s in zset.items() if lo <= s <= hi],
-            key=lambda x: x[1],
-        )
-        return picked if withscores else [m for m, _ in picked]
-
-    def pipeline(self) -> _ZsetPipe:
-        return _ZsetPipe(self._zsets)
+        removed = 0
+        for member in members:
+            if member in zset:
+                del zset[member]
+                removed += 1
+        return removed
 
     async def zcard(self, key: str) -> int:
         return len(self._zsets.get(key, {}))
 
+    async def eval(self, script: str, numkeys: int, *args: Any) -> list[str]:
+        """Python transcription of `_CLAIM_READY_LUA`.
 
-class _ZsetPipe:
-    def __init__(self, zsets: dict[str, dict[str, float]]) -> None:
-        self._zsets = zsets
-        self._ops: list[tuple[str, str, str]] = []  # (op, key, member)
+        The unit tests mock `redis.eval` outright, which is why the
+        pre-R2-21 `_ZsetPipe`/`zrangebyscore` stubs went dead the moment
+        the drain moved to Lua: nothing in this file could serve an EVAL,
+        so nothing covered the drain. Emulating the one script the DLQ
+        path uses buys back the behavioural coverage — claim, ack, and
+        the expired-claim reclaim that makes a worker crash survivable.
 
-    def zrem(self, key: str, member: str) -> _ZsetPipe:
-        self._ops.append(("zrem", key, member))
-        return self
+        Scope note, same as `test_queue.py`'s: this is a transcription,
+        not the interpreter. The real script's boundedness and reclaim
+        markers are pinned by
+        `test_claim_lua_reclaims_expired_claims_and_stays_bounded`.
+        """
+        if script != dlq_replay_scheduler._CLAIM_READY_LUA:
+            raise NotImplementedError("stub serves only the claim script")
+        assert numkeys == 2
+        scheduled_key, inflight_key = str(args[0]), str(args[1])
+        now, deadline = float(args[2]), float(args[3])
+        scheduled = self._zsets.setdefault(scheduled_key, {})
+        inflight = self._zsets.setdefault(inflight_key, {})
 
-    async def execute(self) -> list[int]:
-        results: list[int] = []
-        for op, key, member in self._ops:
-            zset = self._zsets.get(key, {})
-            if op == "zrem" and member in zset:
-                del zset[member]
-                results.append(1)
-            else:
-                results.append(0)
-        return results
+        def _due(zset: dict[str, float]) -> list[str]:
+            return [
+                m
+                for m, s in sorted(zset.items(), key=lambda kv: kv[1])
+                if s <= now
+            ]
+
+        claimed = _due(inflight)[:1000]
+        for member in _due(scheduled)[: max(0, 1000 - len(claimed))]:
+            del scheduled[member]
+            claimed.append(member)
+        for member in claimed:
+            inflight[member] = deadline
+        return claimed
 
 
 @pytest_asyncio.fixture
@@ -620,3 +632,312 @@ async def test_replay_dlq_by_category_with_delay_schedules_all_matched(
 
     stub = await _redis_stub_from_mcp_client(mcp_client)
     assert len(stub._zsets.get("jobs:dlq_replay_delayed", {})) == 2
+
+
+# ---------------------------------------------------------------------------
+# R2-21 — scheduled replays are durable and always audited
+#
+# Three failure shapes, one root cause: the scheduled path was neither
+# transactional (audit row written after the zadd, no savepoint, no
+# compensation) nor recoverable (the promote loop popped the whole due
+# batch destructively before attempting any replay).
+# ---------------------------------------------------------------------------
+
+
+def _armed(stub: _RedisStub) -> set[str]:
+    return set(stub._zsets.get(dlq_replay_scheduler.SCHEDULED_KEY, {}))
+
+
+def _claimed(stub: _RedisStub) -> set[str]:
+    return set(stub._zsets.get(dlq_replay_scheduler.INFLIGHT_KEY, {}))
+
+
+async def _scheduled_audit_resource_ids(db_session: AsyncSession) -> set[str]:
+    rows = (
+        await db_session.execute(
+            select(AuditLog).where(AuditLog.action == "job.replay_scheduled")
+        )
+    ).scalars().all()
+    return {row.resource_id for row in rows if row.resource_id is not None}
+
+
+class _SessionProxy:
+    """Lets the dispatcher's `async with session.begin()` run against the
+    test's already-open session by mapping it onto a SAVEPOINT."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._session, name)
+
+    def begin(self) -> Any:
+        return self._session.begin_nested()
+
+    async def __aenter__(self) -> _SessionProxy:
+        return self
+
+    async def __aexit__(self, *exc: Any) -> bool:
+        return False
+
+
+def _factory_for(session: AsyncSession) -> Any:
+    return lambda: _SessionProxy(session)
+
+
+async def test_scheduled_branch_survives_a_non_app_error_mid_loop(
+    mcp_client, db_session, default_tenant, test_user  # type: ignore[no-untyped-def]
+) -> None:
+    """The scheduled branch caught only `AppError`, unlike the immediate
+    branch directly above it. A non-AppError on the second id aborted the
+    whole tool, so the first id stayed armed on the ZSET while its audit
+    row died with the request transaction — an agent remediation that
+    fires with no audit evidence.
+
+    Post-fix: the loop survives, the first id is armed AND audited, the
+    second is neither."""
+    ids = await _seed_categorized_dlq(db_session, default_tenant, test_user)
+    first = ids[RemediationHint.REPLAY_SAFE.value]
+    second = ids[RemediationHint.WAIT_AND_REPLAY.value]
+    token = await _token(
+        db_session, default_tenant.id, [Scope.ACTIONS_EXECUTE.value]
+    )
+
+    real_log = AuditRepository.log
+    seen = {"n": 0}
+
+    async def _flaky_log(self, action, **kwargs):  # type: ignore[no-untyped-def]
+        if action == "job.replay_scheduled":
+            seen["n"] += 1
+            if seen["n"] == 2:
+                raise RuntimeError("audit sink unavailable")
+        return await real_log(self, action, **kwargs)
+
+    with patch.object(AuditRepository, "log", _flaky_log):
+        body = await _call(
+            mcp_client,
+            token,
+            "replay_dlq_by_ids",
+            {
+                "job_ids": [str(first), str(second)],
+                "delay_seconds": 60,
+                "idempotency_key": "sched-midloop-crash",
+            },
+        )
+
+    assert "error" not in body, body
+    payload = _content(body)
+    assert payload["scheduled"] == 1
+    assert payload["failed"] == 1
+
+    stub = await _redis_stub_from_mcp_client(mcp_client)
+    audited = await _scheduled_audit_resource_ids(db_session)
+    assert audited == {str(first)}
+    assert {m.rsplit(":", 1)[-1] for m in _armed(stub)} == {str(first)}
+
+
+async def test_scheduled_entry_is_disarmed_when_its_audit_row_is_rolled_back(
+    mcp_client, db_session, default_tenant, test_user  # type: ignore[no-untyped-def]
+) -> None:
+    """`_schedule_one` wrote the durable ZSET entry BEFORE the audit row
+    and never compensated it. Any later failure left a replay that would
+    fire with no audit evidence at all.
+
+    Modelled here as a failure that lands after the zadd — the residual
+    window once the audit write is moved first (a savepoint release can
+    still raise). The savepoint rolls the audit row back, so the entry
+    must be zrem'd too: armed-without-audit is the one state that is
+    never allowed."""
+    ids = await _seed_categorized_dlq(db_session, default_tenant, test_user)
+    job_id = ids[RemediationHint.WAIT_AND_REPLAY.value]
+    token = await _token(
+        db_session, default_tenant.id, [Scope.ACTIONS_EXECUTE.value]
+    )
+
+    real_arm = dlq_replay_scheduler.arm_replay
+
+    async def _zadd_then_die(redis, **kwargs):  # type: ignore[no-untyped-def]
+        await real_arm(redis, **kwargs)
+        raise RuntimeError("connection reset after the zadd landed")
+
+    with patch.object(dlq_replay_scheduler, "arm_replay", _zadd_then_die):
+        body = await _call(
+            mcp_client,
+            token,
+            "replay_dlq_by_ids",
+            {
+                "job_ids": [str(job_id)],
+                "delay_seconds": 60,
+                "idempotency_key": "sched-compensate-0001",
+            },
+        )
+
+    assert "error" not in body, body
+    payload = _content(body)
+    assert payload["scheduled"] == 0
+    assert payload["failed"] == 1
+
+    stub = await _redis_stub_from_mcp_client(mcp_client)
+    assert _armed(stub) == set(), "armed replay survived its rolled-back audit row"
+    assert await _scheduled_audit_resource_ids(db_session) == set()
+
+
+async def test_category_scheduled_branch_matches_the_by_ids_shape(
+    mcp_client, db_session, default_tenant, test_user  # type: ignore[no-untyped-def]
+) -> None:
+    """The two tools' scheduled branches diverged: `by_category` caught
+    only AppError and aborted the whole loop. Same seed, same failure
+    injection, same expected outcome as the `by_ids` test above."""
+    for i in range(2):
+        db_session.add(
+            Job(
+                tenant_id=default_tenant.id,
+                user_id=test_user.id,
+                type=JobType.BULK_API_SYNC.value,
+                status=JobStatus.DEAD_LETTER.value,
+                error_message=f"transient {i}",
+                retry_count=3,
+                remediation_hint=RemediationHint.WAIT_AND_REPLAY.value,
+            )
+        )
+    await db_session.flush()
+    token = await _token(
+        db_session, default_tenant.id, [Scope.ACTIONS_EXECUTE.value]
+    )
+
+    real_log = AuditRepository.log
+    seen = {"n": 0}
+
+    async def _flaky_log(self, action, **kwargs):  # type: ignore[no-untyped-def]
+        if action == "job.replay_scheduled":
+            seen["n"] += 1
+            if seen["n"] == 2:
+                raise RuntimeError("audit sink unavailable")
+        return await real_log(self, action, **kwargs)
+
+    with patch.object(AuditRepository, "log", _flaky_log):
+        body = await _call(
+            mcp_client,
+            token,
+            "replay_dlq_by_category",
+            {
+                "category": RemediationHint.WAIT_AND_REPLAY.value,
+                "delay_seconds": 120,
+                "idempotency_key": "cat-midloop-crash",
+            },
+        )
+
+    assert "error" not in body, body
+    payload = _content(body)
+    assert payload["matched"] == 2
+    assert payload["scheduled"] == 1
+    assert payload["failed"] == 1
+
+    stub = await _redis_stub_from_mcp_client(mcp_client)
+    audited = await _scheduled_audit_resource_ids(db_session)
+    assert len(audited) == 1
+    assert {m.rsplit(":", 1)[-1] for m in _armed(stub)} == audited
+
+
+async def test_scheduled_replay_drains_through_the_claim_and_is_acked(
+    mcp_client, db_session, default_tenant, test_user  # type: ignore[no-untyped-def]
+) -> None:
+    """First test in this file to exercise the drain at all. Schedules
+    through the real tool, rewinds the score, and runs one promote pass:
+    the job flips to PENDING, the canonical `job.replayed` row is written
+    and the claim is released."""
+    ids = await _seed_categorized_dlq(db_session, default_tenant, test_user)
+    job_id = ids[RemediationHint.WAIT_AND_REPLAY.value]
+    token = await _token(
+        db_session, default_tenant.id, [Scope.ACTIONS_EXECUTE.value]
+    )
+    await _call(
+        mcp_client,
+        token,
+        "replay_dlq_by_ids",
+        {
+            "job_ids": [str(job_id)],
+            "delay_seconds": 60,
+            "idempotency_key": "drain-happy-0001",
+        },
+    )
+    stub = await _redis_stub_from_mcp_client(mcp_client)
+    (member,) = _armed(stub)
+    stub._zsets[dlq_replay_scheduler.SCHEDULED_KEY][member] = time.time() - 1
+
+    await dispatcher._promote_dlq_replay_once(_factory_for(db_session), stub)
+
+    assert _armed(stub) == set()
+    assert _claimed(stub) == set(), "claim was never released"
+    replayed = (
+        await db_session.execute(select(Job).where(Job.id == job_id))
+    ).scalar_one()
+    assert replayed.status == JobStatus.PENDING.value
+    actions = {
+        row.action
+        for row in (
+            await db_session.execute(
+                select(AuditLog).where(AuditLog.job_id == job_id)
+            )
+        ).scalars().all()
+    }
+    assert {"job.replay_scheduled", "job.replayed"} <= actions
+
+
+async def test_scheduled_replay_survives_a_worker_crash_between_claim_and_replay(
+    mcp_client, db_session, default_tenant, test_user  # type: ignore[no-untyped-def]
+) -> None:
+    """`pop_ready` ZREM'd the whole due batch before any replay was
+    attempted, so a crash or redeploy in that window silently discarded
+    operator/agent-scheduled replays with no record of the loss.
+
+    Pass 1 dies mid-replay: the entry has left the scheduled set but is
+    held as a claim, not lost. Pass 2, after the claim TTL lapses,
+    reclaims and fires it."""
+    ids = await _seed_categorized_dlq(db_session, default_tenant, test_user)
+    job_id = ids[RemediationHint.WAIT_AND_REPLAY.value]
+    token = await _token(
+        db_session, default_tenant.id, [Scope.ACTIONS_EXECUTE.value]
+    )
+    await _call(
+        mcp_client,
+        token,
+        "replay_dlq_by_ids",
+        {
+            "job_ids": [str(job_id)],
+            "delay_seconds": 60,
+            "idempotency_key": "drain-crash-0001",
+        },
+    )
+    stub = await _redis_stub_from_mcp_client(mcp_client)
+    (member,) = _armed(stub)
+    stub._zsets[dlq_replay_scheduler.SCHEDULED_KEY][member] = time.time() - 1
+
+    # Pass 1 — worker dies between the claim and the replay.
+    with patch(
+        "app.services.job.JobService.replay_job",
+        new=AsyncMock(side_effect=asyncio.CancelledError()),
+    ):
+        with pytest.raises(asyncio.CancelledError):
+            await dispatcher._promote_dlq_replay_once(
+                _factory_for(db_session), stub
+            )
+
+    assert _armed(stub) == set()
+    assert _claimed(stub) == {member}, "replay was discarded by the crash"
+    still = (
+        await db_session.execute(select(Job).where(Job.id == job_id))
+    ).scalar_one()
+    assert still.status == JobStatus.DEAD_LETTER.value
+
+    # The claim TTL lapses (the worker never came back to ack it).
+    stub._zsets[dlq_replay_scheduler.INFLIGHT_KEY][member] = time.time() - 1
+
+    # Pass 2 — a healthy worker reclaims and fires it.
+    await dispatcher._promote_dlq_replay_once(_factory_for(db_session), stub)
+
+    assert _claimed(stub) == set()
+    recovered = (
+        await db_session.execute(select(Job).where(Job.id == job_id))
+    ).scalar_one()
+    assert recovered.status == JobStatus.PENDING.value

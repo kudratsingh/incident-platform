@@ -457,15 +457,22 @@ async def test_clear_chaos_keys_scans_and_deletes_matching_patterns() -> None:
 
 async def test_clear_scheduled_replays_drops_pending_timers() -> None:
     """A 5-minute replay scheduled by one scenario used to survive the
-    reset and fire during the next one."""
+    reset and fire during the next one.
+
+    Both sets are swept (R2-21): an un-acked claim on the in-flight set
+    is a pending replay that a later tick is *designed* to recover, so
+    leaving it would restore the bleed."""
     reset = _reset_module()
     redis = AsyncMock()
-    redis.zcard.return_value = 3
+    redis.zcard.side_effect = [3, 2]
 
     cleared = await reset._clear_scheduled_replays(redis)
 
-    assert cleared == 3
-    redis.delete.assert_awaited_once_with("jobs:dlq_replay_delayed")
+    assert cleared == 5
+    assert [c.args[0] for c in redis.delete.await_args_list] == [
+        "jobs:dlq_replay_delayed",
+        "jobs:dlq_replay_inflight",
+    ]
 
 
 async def test_clear_scheduled_replays_noop_when_empty() -> None:
