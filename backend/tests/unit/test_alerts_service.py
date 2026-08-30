@@ -146,13 +146,36 @@ async def test_create_rejects_empty_title() -> None:
     repo.create.assert_not_called()
 
 
-async def test_create_persists_row_and_skips_webhook_when_unset() -> None:
+@pytest.mark.parametrize(
+    ("url", "secret"),
+    [
+        (None, None),
+        ("https://hooks.example.com/alerts", None),
+        (None, "s3cr3t"),
+    ],
+    ids=["neither", "url-without-secret", "secret-without-url"],
+)
+async def test_create_persists_row_and_skips_webhook_when_unset(
+    url: str | None, secret: str | None
+) -> None:
+    """The row is persisted and *no delivery is attempted*.
+
+    The skip has to be asserted, not assumed: `deliver_webhook` swallows
+    every exception it can reach, so an attempted-and-failed delivery is
+    indistinguishable from a skipped one at the return value. Patching
+    the client constructor and asserting it was never entered is the
+    only observable difference between the two.
+
+    Half-configured is covered as well as unconfigured — a URL with no
+    signing secret must not ship unsigned alerts to it.
+    """
     svc, repo = _make_repo()
     repo.create.return_value = _fake_alert()
+    client_ctor = MagicMock()
     with patch(
         "app.services.alerts.get_settings",
-        return_value=Settings(alert_webhook_url=None, alert_webhook_secret=None),
-    ):
+        return_value=Settings(alert_webhook_url=url, alert_webhook_secret=secret),
+    ), patch("app.services.alerts.httpx.AsyncClient", client_ctor):
         alert = await svc.create_alert(
             tenant_id=uuid.uuid4(),
             severity="warning",
@@ -161,6 +184,7 @@ async def test_create_persists_row_and_skips_webhook_when_unset() -> None:
         )
     assert alert is not None
     repo.create.assert_awaited_once()
+    client_ctor.assert_not_called()
 
 
 async def test_hmac_signature_covers_timestamp_nonce_and_body() -> None:

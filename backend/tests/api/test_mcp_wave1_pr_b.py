@@ -34,6 +34,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 class _RedisStub:
     def __init__(self) -> None:
         self._store: dict[str, bytes | str] = {}
+        # Expiries, recorded per key. The kill flag's whole safety story is
+        # that it expires — a `set` without a TTL leaves a consumer dead
+        # until someone deletes the key by hand — so the stub has to keep
+        # `ex` for tests to assert on. It used to be dropped on the floor
+        # under a comment claiming it was captured.
+        self._ttls: dict[str, int | None] = {}
 
     async def get(self, key: str) -> bytes | str | None:
         return self._store.get(key)
@@ -41,8 +47,8 @@ class _RedisStub:
     async def set(
         self, key: str, value: bytes | str, ex: int | None = None
     ) -> bool:
-        # ex is captured just so callers can assert on it via mocks
         self._store[key] = value
+        self._ttls[key] = ex
         return True
 
 
@@ -319,6 +325,51 @@ async def test_kill_consumer_sets_redis_key_when_chaos_enabled(
         assert payload["accepted"] is True
         assert payload["kill_key"] == "chaos:kill:worker-dispatcher"
         assert redis_stub._store["chaos:kill:worker-dispatcher"] == "killed"
+        # The requested TTL reached Redis. Without it the flag never
+        # expires and the consumer group stays dead until a human deletes
+        # the key — the opposite of a bounded chaos experiment.
+        assert redis_stub._ttls["chaos:kill:worker-dispatcher"] == 30
+        assert payload["ttl_seconds"] == 30
+    finally:
+        teardown()
+
+
+async def test_kill_consumer_default_ttl_reaches_redis(
+    db_session: AsyncSession, default_tenant
+) -> None:
+    """The documented 300s default is what actually gets set, not None.
+
+    `ttl_seconds` defaults in the input model, so a caller that omits it
+    still has to end up with a bounded flag.
+    """
+    redis_stub = _RedisStub()
+    app, teardown = _mcp_app_with_chaos_enabled(db_session, redis_stub)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app, raise_app_exceptions=False),
+            base_url="http://test",
+        ) as ac:
+            token = await _mint_token(
+                db_session,
+                default_tenant.id,
+                [Scope.CHAOS_INVOKE.value],
+            )
+            resp = await ac.post(
+                "/mcp",
+                json=_rpc(
+                    "tools/call",
+                    {
+                        "name": "kill_consumer",
+                        "arguments": {"consumer_group": "audit-writer"},
+                    },
+                ),
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        body = resp.json()
+        assert "result" in body, body
+        payload = json.loads(body["result"]["content"][0]["text"])
+        assert payload["ttl_seconds"] == 300
+        assert redis_stub._ttls["chaos:kill:audit-writer"] == 300
     finally:
         teardown()
 

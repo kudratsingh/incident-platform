@@ -106,24 +106,52 @@ async def test_generate_digest_round_trips_when_enabled(
     assert body["model_used"] == "claude-opus-4-7"
 
 
+@pytest.mark.parametrize(
+    ("requested", "expected_hours"),
+    [
+        ("garbage", 24),  # unparseable -> settings.llm_digest_window_hours
+        (None, 24),  # omitted -> same default
+        (0, 1),  # below the floor -> clamped up
+        (-5, 1),
+        (10_000, 168),  # above the ceiling -> clamped down
+        (169, 168),
+        (1, 1),  # the bounds themselves pass through
+        (168, 168),
+        (72, 72),  # an in-range value is honoured, not silently defaulted
+    ],
+)
 async def test_generate_digest_clamps_hours(
     client: AsyncClient,
     admin_headers: dict[str, str],
     monkeypatch: pytest.MonkeyPatch,
+    requested: object,
+    expected_hours: int,
 ) -> None:
-    """A junk `hours` value falls back to the default rather than 500'ing."""
+    """`hours` is clamped to 1..168, junk falls back to the default.
+
+    The clamp is only observable in the *window* handed to
+    `run_digest_for_tenant`, so this inspects the arguments the stub was
+    actually called with. Stubbing the function and asserting only that
+    it was awaited — which is what this test used to do, with a single
+    unparseable input — passes with the clamp deleted outright.
+
+    `run_digest_for_tenant` is still stubbed: it is the paid LLM call.
+    """
+    from datetime import timedelta
+
     monkeypatch.setenv("LLM_DIGEST_ENABLED", "true")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     get_settings.cache_clear()
 
     fake = AsyncMock(return_value=None)
+    body: dict[str, object] = {} if requested is None else {"hours": requested}
     try:
         with patch(
             "app.services.incident_digest.run_digest_for_tenant", new=fake
         ):
             resp = await client.post(
                 "/api/v1/admin/digests/generate",
-                json={"hours": "garbage"},
+                json=body,
                 headers=admin_headers,
             )
     finally:
@@ -131,6 +159,14 @@ async def test_generate_digest_clamps_hours(
 
     assert resp.status_code == 201
     fake.assert_awaited_once()
+    _db, _tenant, window_start, window_end = fake.await_args.args
+    assert window_end - window_start == timedelta(hours=expected_hours)
+
+    # The same window is what the caller is told it got, so a clamp that
+    # only fixed up the reported window would not pass either.
+    payload = resp.json()
+    assert payload["window_start"] == window_start.isoformat()
+    assert payload["window_end"] == window_end.isoformat()
 
 
 async def test_cross_tenant_get_denied_without_platform_flag(

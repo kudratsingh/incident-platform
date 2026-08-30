@@ -15,11 +15,17 @@ Run locally against a live stack (docker-compose up):
 
 Or open the web UI (omit --headless) and drive it interactively.
 
+`--host` is the origin only. Every path below is built from `ROUTES`
+under `API_PREFIX` (`/api/v1`), which is where all routers are mounted;
+backend/tests/api/test_locustfile_paths.py sends each one at the real app
+so the suite cannot go back to 404ing every request unnoticed.
+
 Environment variables (optional overrides):
     LOAD_USER_EMAIL    default: loadtest@example.com
     LOAD_USER_PASSWORD default: LoadTest123!
     LOAD_ADMIN_EMAIL   default: loadtest-admin@example.com
     LOAD_ADMIN_PASSWORD default: LoadTest123!
+    LOAD_API_PREFIX    default: /api/v1
 """
 
 from __future__ import annotations
@@ -49,14 +55,47 @@ _DEFAULT_PAYLOAD = {"filename": "data.csv", "rows": 100}
 # backend/tests/unit/test_locustfile_job_types.py.
 _JOB_TYPES = [t.value for t in JobType]
 
+# Every router is mounted under `Settings.api_v1_prefix`. Without this the
+# documented `--host http://localhost:8000` sends every simulated request to
+# a path that does not exist, so a "successful" run measures nothing but the
+# 404 handler. Overridable for a stack mounted somewhere else.
+API_PREFIX = os.getenv("LOAD_API_PREFIX", "/api/v1")
+
+# The route templates this suite exercises, as name -> (method, path). The
+# tasks build their URLs from here and nowhere else, and
+# backend/tests/unit/test_locustfile_paths.py resolves every entry against
+# the real FastAPI route table — so a dropped prefix, a renamed route or a
+# remounted router fails a test instead of silently 404ing the whole run.
+ROUTES: dict[str, tuple[str, str]] = {
+    "login": ("POST", "/auth/login"),
+    "create_job": ("POST", "/jobs"),
+    "list_jobs": ("GET", "/jobs"),
+    "get_job": ("GET", "/jobs/{job_id}"),
+    "admin_list_jobs": ("GET", "/admin/jobs"),
+    "admin_get_job": ("GET", "/admin/jobs/{job_id}"),
+    "admin_list_users": ("GET", "/admin/users"),
+}
+
+
+def url(route: str, **params: object) -> str:
+    """The absolute request path for a named route."""
+    return API_PREFIX + ROUTES[route][1].format(**params)
+
+
+def label(route: str, suffix: str = "") -> str:
+    """The Locust stat label: the un-substituted template, so every id
+    collapses into one row instead of one row per job."""
+    text = API_PREFIX + ROUTES[route][1]
+    return f"{text} {suffix}".strip()
+
 
 def _login(client, email: str, password: str) -> str | None:
     """Return a Bearer token or None on failure."""
     with client.post(
-        "/auth/login",
+        url("login"),
         json={"email": email, "password": password},
         catch_response=True,
-        name="/auth/login",
+        name=label("login"),
     ) as resp:
         if resp.status_code == 200:
             token = resp.json().get("access_token")
@@ -91,7 +130,7 @@ class RegularUser(HttpUser):
     def create_job(self) -> None:
         job_type = random.choice(_JOB_TYPES)
         resp = self.client.post(
-            "/jobs",
+            url("create_job"),
             json={
                 "type": job_type,
                 "payload": _DEFAULT_PAYLOAD,
@@ -99,7 +138,7 @@ class RegularUser(HttpUser):
                 "priority": random.randint(1, 5),
             },
             headers=self._auth(),
-            name="/jobs [POST]",
+            name=label("create_job", "[POST]"),
         )
         if resp.status_code == 201:
             job_id = resp.json().get("id")
@@ -115,28 +154,28 @@ class RegularUser(HttpUser):
             return
         job_id = random.choice(self._job_ids)
         self.client.get(
-            f"/jobs/{job_id}",
+            url("get_job", job_id=job_id),
             headers=self._auth(),
-            name="/jobs/{id} [GET]",
+            name=label("get_job", "[GET]"),
         )
 
     @task(2)
     def list_jobs(self) -> None:
         page = random.randint(1, 3)
         self.client.get(
-            f"/jobs?page={page}&page_size=20",
+            f"{url('list_jobs')}?page={page}&page_size=20",
             headers=self._auth(),
-            name="/jobs [GET]",
+            name=label("list_jobs", "[GET]"),
         )
 
     @task(1)
     def get_nonexistent_job(self) -> None:
         """Deliberately hits a 404 — exercises error-path latency."""
         with self.client.get(
-            f"/jobs/{uuid.uuid4()}",
+            url("get_job", job_id=uuid.uuid4()),
             headers=self._auth(),
             catch_response=True,
-            name="/jobs/{id} [GET 404]",
+            name=label("get_job", "[GET 404]"),
         ) as resp:
             if resp.status_code == 404:
                 resp.success()  # expected — don't count as failure
@@ -162,17 +201,17 @@ class AdminUser(HttpUser):
     def admin_list_jobs(self) -> None:
         page = random.randint(1, 5)
         self.client.get(
-            f"/admin/jobs?page={page}&page_size=20",
+            f"{url('admin_list_jobs')}?page={page}&page_size=20",
             headers=self._auth(),
-            name="/admin/jobs [GET]",
+            name=label("admin_list_jobs", "[GET]"),
         )
 
     @task(2)
     def admin_list_users(self) -> None:
         self.client.get(
-            "/admin/users",
+            url("admin_list_users"),
             headers=self._auth(),
-            name="/admin/users [GET]",
+            name=label("admin_list_users", "[GET]"),
         )
 
     @task(1)
@@ -180,9 +219,9 @@ class AdminUser(HttpUser):
         if not self._job_ids:
             # seed from a list request
             resp = self.client.get(
-                "/admin/jobs?page=1&page_size=10",
+                f"{url('admin_list_jobs')}?page=1&page_size=10",
                 headers=self._auth(),
-                name="/admin/jobs [GET]",
+                name=label("admin_list_jobs", "[GET]"),
             )
             if resp.status_code == 200:
                 items = resp.json().get("items", [])
@@ -190,9 +229,9 @@ class AdminUser(HttpUser):
             return
         job_id = random.choice(self._job_ids)
         self.client.get(
-            f"/admin/jobs/{job_id}",
+            url("admin_get_job", job_id=job_id),
             headers=self._auth(),
-            name="/admin/jobs/{id} [GET]",
+            name=label("admin_get_job", "[GET]"),
         )
 
 
@@ -218,9 +257,9 @@ class ReadHeavyUser(HttpUser):
         # Seed hot job IDs once (only first instance does real work)
         if not ReadHeavyUser._hot_job_ids:
             resp = self.client.get(
-                "/jobs?page=1&page_size=20",
+                f"{url('list_jobs')}?page=1&page_size=20",
                 headers={"Authorization": f"Bearer {self._token}"},
-                name="/jobs [GET]",
+                name=label("list_jobs", "[GET]"),
             )
             if resp.status_code == 200:
                 items = resp.json().get("items", [])
@@ -235,7 +274,7 @@ class ReadHeavyUser(HttpUser):
             return
         job_id = random.choice(ReadHeavyUser._hot_job_ids)
         self.client.get(
-            f"/jobs/{job_id}",
+            url("get_job", job_id=job_id),
             headers=self._auth(),
-            name="/jobs/{id} [GET cache]",
+            name=label("get_job", "[GET cache]"),
         )

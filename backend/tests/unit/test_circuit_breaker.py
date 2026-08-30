@@ -141,7 +141,9 @@ async def test_half_open_admits_only_one_probe(breaker: CircuitBreaker) -> None:
     assert calls == 2
 
 
-async def test_half_open_probe_failure_clears_flag(breaker: CircuitBreaker) -> None:
+async def test_half_open_probe_failure_reopens_and_frees_the_probe_slot(
+    breaker: CircuitBreaker,
+) -> None:
     await _open_and_expire(breaker)
 
     gate = asyncio.Event()
@@ -170,11 +172,20 @@ async def test_half_open_probe_failure_clears_flag(breaker: CircuitBreaker) -> N
         await probe
 
     assert breaker.state == CircuitState.OPEN
-    assert breaker._probe_in_flight is False
 
-    # The flag did not leak: a later expired call may probe again.
+    # Still inside the fresh recovery window, so arrivals are rejected
+    # rather than admitted as a second probe.
+    with pytest.raises(CircuitOpenError):
+        await breaker.call(_ok)
+
+    # The probe slot did not leak. Asserted on what a caller can observe —
+    # the next expired arrival is admitted and closes the circuit — not on
+    # `_probe_in_flight`, which production writes on every exit path and
+    # never reads: `call()` gates on `_state == HALF_OPEN` alone, so an
+    # assertion on that field cannot fail for the reason it names.
     breaker._opened_at = breaker._opened_at - (breaker.recovery_timeout + 1)  # type: ignore[operator]
     assert await breaker.call(_ok) == "ok"
+    assert breaker.state == CircuitState.CLOSED
 
 
 async def test_probe_raising_circuit_open_error_does_not_deadlock(
@@ -196,10 +207,12 @@ async def test_probe_raising_circuit_open_error_does_not_deadlock(
         await breaker.call(_nested_rejected)
 
     assert breaker.state == CircuitState.OPEN
-    assert breaker._probe_in_flight is False
     # _opened_at is untouched, so the next caller may re-probe immediately
     # instead of waiting out another full recovery_timeout.
     assert breaker._opened_at == opened_at_before
 
+    # The observable consequence, and the one this test exists for: the
+    # very next caller is admitted rather than stranded behind a
+    # HALF_OPEN the aborted probe never left.
     assert await breaker.call(_ok) == "ok"
     assert breaker.state == CircuitState.CLOSED
