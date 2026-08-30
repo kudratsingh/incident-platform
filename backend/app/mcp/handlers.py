@@ -33,8 +33,11 @@ from app.mcp.registry import ToolContext, get_tool, list_tools
 from app.repositories.audit import AuditRepository
 from app.repositories.idempotency import IdempotencyRepository
 from app.services.idempotency import (
+    Claim,
+    IdempotencyKeyInFlightError,
     IdempotencyKeyReusedError,
     IdempotencyService,
+    Replay,
 )
 from app.services.operator_audit import (
     OUTCOME_ERROR,
@@ -44,7 +47,6 @@ from app.services.operator_audit import (
 )
 from pydantic import BaseModel, ValidationError
 from redis.asyncio import Redis
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 logger = get_logger(__name__)
@@ -272,6 +274,7 @@ async def _run_tool_call(
     # different args refuses with IdempotencyKeyReusedError (409).
     idempotency_key: str | None = None
     idempotency_service: IdempotencyService | None = None
+    claim: Claim | None = None
     if tool_def.is_idempotent:
         idempotency_service = IdempotencyService(IdempotencyRepository(ctx.db))
         idempotency_key = _extract_idempotency_key(call_params.arguments)
@@ -293,14 +296,23 @@ async def _run_tool_call(
                 p.JSONRPC_INVALID_PARAMS,
                 "idempotency_key is required for this tool",
             )
+        # Claim the key BEFORE executing, in one atomic INSERT ... ON
+        # CONFLICT DO NOTHING. The lookup this replaces sat in the same
+        # READ COMMITTED transaction as the insert that claimed the key,
+        # with the whole action in between: two concurrent calls on one
+        # key both missed the cache, both ran the action, and the loser
+        # then died on the unique constraint with its side effect already
+        # landed. Winning the insert is now what authorises execution, so
+        # the second caller never gets that far.
         try:
-            hit = await idempotency_service.lookup(
+            acquired = await idempotency_service.acquire(
                 principal=ctx.principal,
                 tool_name=tool_def.name,
                 idempotency_key=idempotency_key,
                 arguments=call_params.arguments,
+                ttl=_IDEMPOTENCY_TTL,
             )
-        except IdempotencyKeyReusedError as exc:
+        except (IdempotencyKeyReusedError, IdempotencyKeyInFlightError) as exc:
             await record_tool_invocation(
                 audit_repo,
                 principal=ctx.principal,
@@ -319,7 +331,8 @@ async def _run_tool_call(
                 exc.message,
                 {"error_code": exc.error_code},
             )
-        if hit is not None:
+        if isinstance(acquired, Replay):
+            hit = acquired.hit
             await record_tool_invocation(
                 audit_repo,
                 principal=ctx.principal,
@@ -339,6 +352,7 @@ async def _run_tool_call(
                 ]
             )
             return _ok(request_id, result.model_dump())
+        claim = acquired
 
     # SAVEPOINT around the handler. A tool that fails for any reason
     # rolls back its own partial writes and nothing else: the request
@@ -348,10 +362,12 @@ async def _run_tool_call(
     # the class that sank #70) has to surface while there is still a
     # savepoint to roll back to, not at the outer commit where the
     # response has already been decided.
+    executed = False
     try:
         async with ctx.db.begin_nested():
             output = await tool_def.handler(parsed_input, ctx)
             await ctx.db.flush()
+        executed = True
     except AuthenticationError as exc:
         latency_ms = (time.perf_counter() - start) * 1000
         await record_tool_invocation(
@@ -428,6 +444,24 @@ async def _run_tool_call(
         return _error(
             request_id, p.JSONRPC_INTERNAL_ERROR, "internal tool error"
         )
+    finally:
+        # Release the claim on every path that will not go on to record a
+        # response. The envelope deliberately commits the request
+        # transaction even when the tool failed, so that the
+        # `outcome=error` audit row survives (#154) — which means a claim
+        # left behind commits with it and wedges the key for its whole
+        # 24h TTL, turning one failed call into a permanently unusable
+        # key. A retry has to be able to re-execute.
+        #
+        # `executed` is set at the end of the try body, so the success
+        # path reaches `complete` below instead of releasing here.
+        if claim is not None and idempotency_service is not None and not executed:
+            await _release_claim(
+                ctx=ctx,
+                service=idempotency_service,
+                claim=claim,
+                tool_name=tool_def.name,
+            )
 
     latency_ms = (time.perf_counter() - start) * 1000
     await record_tool_invocation(
@@ -442,22 +476,19 @@ async def _run_tool_call(
         is_chaos=is_chaos,
     )
 
-    # Persist the response under the idempotency key so a repeat call
-    # with the same key returns the same result verbatim. The write can
-    # lose a race for the key, in which case the recorded outcome — not
-    # ours — is what this call answers with.
-    if idempotency_service is not None and idempotency_key is not None:
-        duplicate = await _store_response(
+    # Attach the response to the claim we already hold, so a repeat call
+    # with the same key returns this result verbatim. An UPDATE by id on
+    # a row this call inserted, so unlike the insert-after-execution it
+    # replaces, it cannot lose a race for the key — there is no race left
+    # to lose.
+    if idempotency_service is not None and claim is not None:
+        await _complete_claim(
             ctx=ctx,
-            request_id=request_id,
             service=idempotency_service,
+            claim=claim,
             tool_name=tool_def.name,
-            idempotency_key=idempotency_key,
-            arguments=call_params.arguments,
             output=output,
         )
-        if duplicate is not None:
-            return duplicate
 
     # Emit the tool result as a single text content block whose body is
     # the JSON-serialized output model. Structured content is the norm
@@ -469,85 +500,69 @@ async def _run_tool_call(
     return _ok(request_id, result.model_dump())
 
 
-async def _store_response(
+async def _complete_claim(
     *,
     ctx: ToolContext,
-    request_id: str | int | None,
     service: IdempotencyService,
+    claim: Claim,
     tool_name: str,
-    idempotency_key: str,
-    arguments: dict[str, Any],
     output: BaseModel,
-) -> p.JsonRpcResponse | None:
-    """Record this call's response under its idempotency key.
+) -> None:
+    """Attach this call's response to the claim it already holds.
 
-    Returns `None` when the record was written and the caller should
-    answer with its own fresh result. Returns a response to send when
-    the key turned out to be taken — a duplicate call — because then the
-    recorded outcome is the one answer for that key and ours is not.
+    An UPDATE by primary key on a row this call inserted, so the
+    duplicate-key error that used to land here — a concurrent caller, or
+    an expired-but-unreaped record still occupying the unique index —
+    cannot happen: both are settled before the action runs now.
 
-    The insert runs in its own SAVEPOINT. A collision (a concurrent call
-    with the same key, or an expired-but-unreaped record still occupying
-    the unique index) raises `IntegrityError`, which on Postgres poisons
-    the whole transaction unless there is a savepoint to roll back to —
-    and the transaction at that point already holds the audit row for a
-    Tier-1 action that really did execute. That row is the agent's
-    safety grade (`evals/guards.py` reads `agent.tool_invoked`), so it
-    outranks the cache write: the store may fail, the audit may not.
+    Still savepoint-wrapped, for the same reason #154 wrapped the insert.
+    The transaction at this point already holds the audit row for a
+    Tier-1 action that really did execute; that row is the agent's safety
+    grade (`evals/guards.py` reads `agent.tool_invoked`), so it outranks
+    the cache write. If the update somehow fails, Postgres would poison
+    the transaction and take the audit row down with it unless there is a
+    savepoint to roll back to. The response goes uncached and a retry
+    re-executes — the honest outcome, and strictly better than losing the
+    evidence that the first attempt ran.
     """
     try:
         async with ctx.db.begin_nested():
-            await service.store(
-                principal=ctx.principal,
-                tool_name=tool_name,
-                idempotency_key=idempotency_key,
-                arguments=arguments,
+            await service.complete(
+                claim,
                 response=output.model_dump(mode="json"),
                 ttl=_IDEMPOTENCY_TTL,
             )
-        return None
-    except IntegrityError:
+    except Exception as exc:
         logger.warning(
-            "idempotency key taken between lookup and store",
-            extra={"tool": tool_name, "idempotency_key": idempotency_key},
+            "tool response not cached; claim completion failed",
+            extra={"tool": tool_name, "error": str(exc)},
         )
 
-    # Savepoint rolled back, transaction intact. Whoever holds the key
-    # holds the answer, so read it back and hand that to the caller.
+
+async def _release_claim(
+    *,
+    ctx: ToolContext,
+    service: IdempotencyService,
+    claim: Claim,
+    tool_name: str,
+) -> None:
+    """Drop an unfinished claim so a retry can re-execute.
+
+    Savepoint-wrapped and never raising: this runs in a `finally` on
+    paths that are already returning an error response, and the audit row
+    for that error still has to be committable afterwards. A release that
+    cannot be written leaves the key claimed until its TTL — logged
+    loudly, because that is the one state where a retry gets
+    `idempotency_key_in_flight` for a call nobody is running.
+    """
     try:
-        hit = await service.lookup(
-            principal=ctx.principal,
-            tool_name=tool_name,
-            idempotency_key=idempotency_key,
-            arguments=arguments,
+        async with ctx.db.begin_nested():
+            await service.release(claim)
+    except Exception as exc:
+        logger.error(
+            "idempotency claim not released; key stays held until its TTL",
+            extra={"tool": tool_name, "error": str(exc)},
         )
-    except IdempotencyKeyReusedError as exc:
-        # The winner used this key for different arguments. Same refusal
-        # the pre-execution lookup would have given, and a retry now hits
-        # it there instead — without re-running the tool.
-        return _error(
-            request_id,
-            p.MCP_TOOL_ERROR,
-            exc.message,
-            {"error_code": exc.error_code},
-        )
-
-    if hit is not None:
-        result = p.ToolCallResult(
-            content=[p.ToolCallContent(text=_serialize_cached_response(hit.response))]
-        )
-        return _ok(request_id, result.model_dump())
-
-    # No live record to defer to: the key is held by an expired one that
-    # `lookup` reads as absent. The action ran and is audited, so the
-    # honest answer is our own result — uncached, which means a retry
-    # re-executes. That window is a property of expiry-without-reaping,
-    # not of this call; see ADR 0010's addendum.
-    logger.warning(
-        "tool response not cached; idempotency key held by an expired record",
-        extra={"tool": tool_name, "idempotency_key": idempotency_key},
-    )
-    return None
 
 
 def _extract_idempotency_key(arguments: dict[str, Any]) -> str | None:

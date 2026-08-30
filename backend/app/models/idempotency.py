@@ -3,8 +3,9 @@ Idempotency records for machine-principal actions.
 
 Rows are keyed by (tenant, principal, key). Same tenant+principal+key
 with matching `arguments_hash` returns the cached `response_json`;
-mismatched hash refuses the request. See ADR-forthcoming; this is
-standard idempotency-key semantics (Stripe-shape).
+mismatched hash refuses the request. This is standard idempotency-key
+semantics (Stripe-shape); the lifecycle, including the claim-before-
+execute ordering, is ADR 0010.
 """
 
 import uuid
@@ -46,8 +47,12 @@ class IdempotencyRecord(Base):
     tool_name: Mapped[str] = mapped_column(String(128), nullable=False)
     idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False)
     arguments_hash: Mapped[str] = mapped_column(String(64), nullable=False)
-    response_json: Mapped[dict[str, Any]] = mapped_column(
-        PortableJSON, nullable=False
+    # NULL means "claimed, not yet answered": the row was inserted to
+    # reserve the key before the action ran, and the response is attached
+    # when it returns (R2-27). Both commit together, so a NULL is
+    # normally invisible to other callers — see IdempotencyService.
+    response_json: Mapped[dict[str, Any] | None] = mapped_column(
+        PortableJSON, nullable=True
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

@@ -325,16 +325,21 @@ async def _insert_record(
             )
 
 
-async def test_store_collision_on_expired_key_returns_envelope(
+async def test_expired_key_re_executes_and_returns_an_envelope(
     env: _Env,
 ) -> None:
-    """An expired record is treated as absent by `lookup`, so the tool
-    re-executes — and then `store()` hits `uq_idempotency_scope`, which
-    the expired row still occupies. No mocked repository here: the
-    IntegrityError comes from the database.
+    """An expired record must not stop the tool from running, and must
+    not blow up the call either.
 
-    The action executed, so the caller must get a JSON-RPC envelope
-    describing that, and the success audit row must be committed.
+    This used to be the collision case: `lookup` read past the expired
+    row while `uq_idempotency_scope` went on holding it, so the
+    re-execution's `store()` raised `IntegrityError` from the real
+    database, and #154's savepoint was what kept the response an
+    envelope. Since R2-27 the claim evicts the expired holder up front,
+    so there is no collision left to survive — but the caller-visible
+    contract is unchanged and still worth pinning: the action executes,
+    the answer is a JSON-RPC envelope, and the success audit row is
+    committed.
     """
     args = {"idempotency_key": "expired-k-1"}
     await _insert_record(
@@ -358,15 +363,20 @@ async def test_store_collision_on_expired_key_returns_envelope(
     assert rows[0].extra_data["outcome"] == "success"
 
 
-async def test_store_collision_with_live_record_returns_recorded_outcome(
-    env: _Env, monkeypatch  # type: ignore[no-untyped-def]
+async def test_duplicate_call_returns_the_recorded_outcome(
+    env: _Env,
 ) -> None:
-    """Duplicate call in flight: a concurrent request stored the record
-    after our `lookup` missed and before our `store()`. The loser must
-    return the winner's recorded response — one answer per key — not
-    crash and not its own freshly computed one."""
-    from app.services.idempotency import IdempotencyService
+    """One answer per key: a duplicate call returns the recorded response
+    rather than its own freshly computed one.
 
+    The intent is #154's; the mechanism moved. That test had to
+    monkeypatch `lookup` into missing once, because the loser was only
+    stopped at `store()` — after it had already run the action. R2-27
+    stops it at the claim instead, so the race no longer needs
+    simulating: a live record simply means the key is taken, and the
+    caller never reaches the handler. That the assertion now holds
+    without the mock is the fix.
+    """
     args = {"idempotency_key": "inflight-k-1"}
     await _insert_record(
         env,
@@ -376,20 +386,6 @@ async def test_store_collision_with_live_record_returns_recorded_outcome(
         expires_at=datetime.now(UTC) + timedelta(hours=24),
     )
 
-    # Simulate the race: our lookup runs before the winner commits, so it
-    # sees nothing. Every later lookup (including the one the collision
-    # handler makes) sees the committed row.
-    real_lookup = IdempotencyService.lookup
-    calls = {"n": 0}
-
-    async def _miss_once(self, **kwargs):  # type: ignore[no-untyped-def]
-        calls["n"] += 1
-        if calls["n"] == 1:
-            return None
-        return await real_lookup(self, **kwargs)
-
-    monkeypatch.setattr(IdempotencyService, "lookup", _miss_once)
-
     resp = await env.call("envelope_probe_action", args)
     body = _envelope(resp)
 
@@ -398,7 +394,6 @@ async def test_store_collision_with_live_record_returns_recorded_outcome(
     assert payload["marker"] == "winner-response", (
         "duplicate call returned its own result instead of the recorded one"
     )
-    assert calls["n"] >= 2, "collision handler never re-read the record"
 
     rows = await env.audit_rows("agent.tool_invoked")
     assert len(rows) == 1

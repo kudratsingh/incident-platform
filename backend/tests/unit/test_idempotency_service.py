@@ -3,14 +3,17 @@ hit/miss/mismatch semantics."""
 
 import uuid
 from datetime import UTC, datetime, timedelta
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 from app.dependencies import Principal
 from app.models.idempotency import IdempotencyRecord
 from app.services.idempotency import (
+    Claim,
+    IdempotencyKeyInFlightError,
     IdempotencyKeyReusedError,
     IdempotencyService,
+    Replay,
     _hash_arguments,
 )
 
@@ -164,33 +167,188 @@ async def test_expired_record_returns_none() -> None:
     assert hit is None
 
 
-async def test_store_persists_hash_and_response() -> None:
+async def test_acquire_claims_the_key_with_the_hash_and_no_response_yet() -> None:
+    """R2-27: the key is reserved BEFORE the action runs, so the claiming
+    row carries the arguments hash but no response — that arrives at
+    `complete`. The pair replaces `store()`, which inserted the whole
+    record after execution and could therefore lose the key to a
+    concurrent caller that had already done the same thing."""
     principal = _sa_principal()
     repo = AsyncMock()
-
-    def _create(**kwargs):  # type: ignore[no-untyped-def]
-        m = MagicMock()
-        for k, v in kwargs.items():
-            setattr(m, k, v)
-        return m
-
-    repo.create.side_effect = lambda **kw: _create(**kw)
+    record_id = uuid.uuid4()
+    repo.insert_claim.return_value = record_id
     args = {"key": "cache:x", "idempotency_key": "k-new"}
-    resp = {"key": "cache:x", "deleted": True}
 
-    await IdempotencyService(repo).store(
+    claim = await IdempotencyService(repo).acquire(
         principal=principal,
         tool_name="invalidate_cache_key",
         idempotency_key="k-new",
         arguments=args,
-        response=resp,
         ttl=timedelta(hours=1),
     )
-    repo.create.assert_awaited_once()
-    _, kwargs = repo.create.call_args
+
+    assert isinstance(claim, Claim)
+    assert claim.record_id == record_id
+    repo.insert_claim.assert_awaited_once()
+    _, kwargs = repo.insert_claim.call_args
     assert kwargs["arguments_hash"] == _hash_arguments(args)
+    assert kwargs["expires_at"] is not None
+    # Nothing was read to decide the key was free — winning the insert is
+    # the decision. A lookup here would reopen the window.
+    repo.get_by_key.assert_not_awaited()
+
+
+async def test_complete_attaches_the_response_to_the_claim() -> None:
+    principal = _sa_principal()
+    repo = AsyncMock()
+    record_id = uuid.uuid4()
+    repo.insert_claim.return_value = record_id
+    resp = {"key": "cache:x", "deleted": True}
+
+    svc = IdempotencyService(repo)
+    claim = await svc.acquire(
+        principal=principal,
+        tool_name="invalidate_cache_key",
+        idempotency_key="k-new",
+        arguments={"key": "cache:x", "idempotency_key": "k-new"},
+        ttl=timedelta(hours=1),
+    )
+    assert isinstance(claim, Claim)
+    await svc.complete(claim, response=resp, ttl=timedelta(hours=1))
+
+    repo.complete_claim.assert_awaited_once()
+    _, kwargs = repo.complete_claim.call_args
+    assert kwargs["record_id"] == record_id
     assert kwargs["response_json"] == resp
     assert kwargs["expires_at"] is not None
+
+
+async def test_acquire_replays_when_the_key_is_already_answered() -> None:
+    """Lost the insert, and the holder has a response: that response is
+    the answer for the key, so the caller must not execute."""
+    principal = _sa_principal()
+    args = {"key": "cache:x", "idempotency_key": "k-taken"}
+    holder = _make_record(
+        tool_name="invalidate_cache_key",
+        arguments_hash=_hash_arguments(args),
+        response_json={"deleted": True},
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
+    )
+    repo = AsyncMock()
+    repo.insert_claim.return_value = None
+    repo.get_by_key.return_value = holder
+
+    outcome = await IdempotencyService(repo).acquire(
+        principal=principal,
+        tool_name="invalidate_cache_key",
+        idempotency_key="k-taken",
+        arguments=args,
+    )
+
+    assert isinstance(outcome, Replay)
+    assert outcome.hit.response == {"deleted": True}
+
+
+async def test_acquire_evicts_an_expired_holder_and_retries_once() -> None:
+    """The expired-but-unreaped record was finding #2: `lookup` read past
+    it while the unique index kept holding it, so the re-execution's
+    insert collided after the action had taken effect. The claim evicts
+    it and takes the key."""
+    principal = _sa_principal()
+    args = {"key": "cache:x", "idempotency_key": "k-stale"}
+    stale = _make_record(
+        tool_name="invalidate_cache_key",
+        arguments_hash=_hash_arguments(args),
+        response_json={"deleted": False},
+        expires_at=datetime.now(UTC) - timedelta(hours=1),
+    )
+    record_id = uuid.uuid4()
+    repo = AsyncMock()
+    repo.insert_claim.side_effect = [None, record_id]
+    repo.get_by_key.return_value = stale
+
+    outcome = await IdempotencyService(repo).acquire(
+        principal=principal,
+        tool_name="invalidate_cache_key",
+        idempotency_key="k-stale",
+        arguments=args,
+    )
+
+    assert isinstance(outcome, Claim)
+    assert outcome.record_id == record_id
+    repo.delete_by_id.assert_awaited_once_with(record_id=stale.id)
+    assert repo.insert_claim.await_count == 2
+
+
+async def test_acquire_refuses_a_key_held_for_different_arguments() -> None:
+    principal = _sa_principal()
+    holder = _make_record(
+        tool_name="invalidate_cache_key",
+        arguments_hash=_hash_arguments({"key": "cache:other"}),
+        response_json={"deleted": True},
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
+    )
+    repo = AsyncMock()
+    repo.insert_claim.return_value = None
+    repo.get_by_key.return_value = holder
+
+    with pytest.raises(IdempotencyKeyReusedError):
+        await IdempotencyService(repo).acquire(
+            principal=principal,
+            tool_name="invalidate_cache_key",
+            idempotency_key="k-reused",
+            arguments={"key": "cache:mine"},
+        )
+
+
+async def test_acquire_reports_a_key_held_by_an_unfinished_claim() -> None:
+    """A holder with no response is another call mid-execution. Distinct
+    from key-reuse: that one is the caller's mistake and never succeeds,
+    this one is a race and clears on its own, so it gets its own error
+    code."""
+    principal = _sa_principal()
+    args = {"key": "cache:x", "idempotency_key": "k-flight"}
+    holder = _make_record(
+        tool_name="invalidate_cache_key",
+        arguments_hash=_hash_arguments(args),
+        response_json=None,
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
+    )
+    repo = AsyncMock()
+    repo.insert_claim.return_value = None
+    repo.get_by_key.return_value = holder
+
+    with pytest.raises(IdempotencyKeyInFlightError):
+        await IdempotencyService(repo).acquire(
+            principal=principal,
+            tool_name="invalidate_cache_key",
+            idempotency_key="k-flight",
+            arguments=args,
+        )
+
+
+async def test_lookup_evicts_an_expired_record_rather_than_reading_past_it() -> None:
+    """Reading past it was the bug: the row stayed on the unique index
+    and collided with the very insert the miss invited."""
+    principal = _sa_principal()
+    stale = _make_record(
+        tool_name="invalidate_cache_key",
+        arguments_hash="whatever",
+        response_json={"deleted": True},
+        expires_at=datetime.now(UTC) - timedelta(hours=1),
+    )
+    repo = AsyncMock()
+    repo.get_by_key.return_value = stale
+
+    hit = await IdempotencyService(repo).lookup(
+        principal=principal,
+        tool_name="invalidate_cache_key",
+        idempotency_key="old",
+        arguments={"key": "cache:x"},
+    )
+
+    assert hit is None
+    repo.delete_by_id.assert_awaited_once_with(record_id=stale.id)
 
 
 # ---------------------------------------------------------------------------

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest_asyncio
@@ -20,21 +21,29 @@ from app.dependencies import get_db, get_redis
 from app.mcp import protocol
 from app.mcp.standalone import create_mcp_app
 from app.models.enums import JobStatus, JobType
+from app.models.idempotency import IdempotencyRecord
 from app.models.job import Job
+from app.models.service_account import ServiceAccount
 from app.repositories.audit import AuditRepository
 from app.repositories.service_account import (
     ServiceAccountRepository,
     ServiceAccountTokenRepository,
 )
+from app.services.idempotency import _hash_arguments
 from app.services.service_account import ServiceAccountService
 from app.workers.kafka_consumer import kill_key_for, latency_key_for
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 
 class _RedisStub:
     def __init__(self) -> None:
         self._store: dict[str, bytes | str] = {}
+        # R2-27: a cached replay and a genuine re-execution produce the
+        # same payload, so the payload alone cannot tell them apart. The
+        # side effect can — count the calls that actually reached Redis.
+        self.delete_calls: list[tuple[str, ...]] = []
 
     async def get(self, key: str) -> bytes | str | None:
         return self._store.get(key)
@@ -49,6 +58,7 @@ class _RedisStub:
         return [self._store.get(k) for k in keys]
 
     async def delete(self, *keys: str) -> int:
+        self.delete_calls.append(keys)
         removed = 0
         for k in keys:
             if k in self._store:
@@ -120,6 +130,20 @@ async def _call(
 
 def _content(body: dict[str, Any]) -> dict[str, Any]:
     return json.loads(body["result"]["content"][0]["text"])
+
+
+async def _principal_id(db_session: AsyncSession, token: str) -> uuid.UUID:
+    """The service-account id `_token` just minted for. Idempotency
+    records are scoped by (tenant, principal, key), so a test that seeds
+    one by hand has to seed it under the caller's own principal."""
+    prefix = token.split(".", 1)[0]
+    sa = (
+        await db_session.execute(
+            select(ServiceAccount).order_by(ServiceAccount.created_at.desc())
+        )
+    ).scalars().first()
+    assert sa is not None, f"no service account minted (token prefix {prefix})"
+    return sa.id
 
 
 # ---------------------------------------------------------------------------
@@ -408,9 +432,16 @@ async def test_invalidate_cache_key_refuses_disallowed_prefix(
 async def test_invalidate_cache_key_idempotent_on_missing_key(
     mcp_client, db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
 ) -> None:
-    """First call finds no key → deleted=False; second call is
-    served from the idempotency cache → same payload."""
-    ac, _ = mcp_client
+    """First call finds no key -> deleted=False; second call is served
+    from the idempotency cache.
+
+    The payload assertion alone could not prove that. A cached replay and
+    a genuine re-execution both produce `deleted=False` on a missing key,
+    so `second == first` held either way and the test would have passed
+    against a completely broken cache. Counting the invocations that
+    reached Redis is what distinguishes them: exactly one, from the call
+    that actually executed."""
+    ac, redis_stub = mcp_client
     token = await _token(
         db_session, default_tenant.id, [Scope.ACTIONS_EXECUTE.value]
     )
@@ -419,6 +450,92 @@ async def test_invalidate_cache_key_idempotent_on_missing_key(
     second = _content(await _call(ac, token, "invalidate_cache_key", args))
     assert first["deleted"] is False
     assert second == first
+    assert redis_stub.delete_calls == [("cache:nope",)], (
+        "the second call re-executed instead of replaying from the cache"
+    )
+
+
+async def test_same_key_different_args_refuses_without_re_executing(
+    mcp_client, db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
+) -> None:
+    """The other half of the same distinction: reusing a key with
+    different arguments must refuse (409-shaped) and must not reach the
+    side effect a second time."""
+    ac, redis_stub = mcp_client
+    token = await _token(
+        db_session, default_tenant.id, [Scope.ACTIONS_EXECUTE.value]
+    )
+    key = "reuse-distinct-k-1"
+    await _call(
+        ac, token, "invalidate_cache_key", {"key": "cache:a", "idempotency_key": key}
+    )
+    body = await _call(
+        ac, token, "invalidate_cache_key", {"key": "cache:b", "idempotency_key": key}
+    )
+
+    assert body["error"]["code"] == protocol.MCP_TOOL_ERROR
+    assert body["error"]["data"]["error_code"] == "idempotency_key_reused"
+    assert redis_stub.delete_calls == [("cache:a",)], (
+        "the refused call still reached Redis"
+    )
+
+
+async def test_expired_but_unreaped_record_is_replaced_not_collided_with(
+    mcp_client, db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
+) -> None:
+    """R2-27. `lookup` treated an expired record as absent while the
+    UNIQUE (tenant, principal, key) index went on holding it, so the
+    re-execution's insert collided *after* the action had taken effect.
+    #154 stopped that from being a 500; the action still ran uncached,
+    which meant the next retry re-ran the side effect too.
+
+    The claim takes the expired record over: the call succeeds, the side
+    effect happens exactly once, and the record now holds the fresh
+    response rather than the stale one — so a retry replays instead of
+    re-executing."""
+    ac, redis_stub = mcp_client
+    token = await _token(
+        db_session, default_tenant.id, [Scope.ACTIONS_EXECUTE.value]
+    )
+    sa_id = await _principal_id(db_session, token)
+    args = {"key": "cache:stale-holder", "idempotency_key": "expired-k-1"}
+    db_session.add(
+        IdempotencyRecord(
+            id=uuid.uuid4(),
+            tenant_id=default_tenant.id,
+            principal_id=sa_id,
+            tool_name="invalidate_cache_key",
+            idempotency_key="expired-k-1",
+            arguments_hash=_hash_arguments(args),
+            response_json={"deleted": True, "key": "cache:stale-holder"},
+            expires_at=datetime.now(UTC) - timedelta(hours=1),
+        )
+    )
+    await db_session.flush()
+
+    body = await _call(ac, token, "invalidate_cache_key", args)
+
+    assert "error" not in body, body
+    assert len(redis_stub.delete_calls) == 1
+
+    record = (
+        await db_session.execute(
+            select(IdempotencyRecord).where(
+                IdempotencyRecord.idempotency_key == "expired-k-1"
+            )
+        )
+    ).scalar_one()
+    assert record.expires_at is not None
+    expires_at = record.expires_at
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=UTC)
+    assert expires_at > datetime.now(UTC), (
+        "the expired record still squats on the unique key"
+    )
+
+    # A retry now replays rather than re-executing.
+    await _call(ac, token, "invalidate_cache_key", args)
+    assert len(redis_stub.delete_calls) == 1
 
 
 # ---------------------------------------------------------------------------

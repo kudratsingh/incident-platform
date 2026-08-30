@@ -99,6 +99,8 @@ What's actually shipped (as of the most recent merge):
   - **Digest loop** (Phase 10) — every `LLM_DIGEST_INTERVAL_HOURS` (default 24), generates a per-tenant incident summary via Claude and persists it to `incident_summaries`
   - **Idempotency reaper** — hourly DELETE of expired `idempotency_records` rows (closes ADR 0010's "no reaper" follow-up)
 
+**MCP idempotency is a claim, not a receipt** (WO-R2-27). `tools/call` reserves the key *before* running the action — one `INSERT ... ON CONFLICT DO NOTHING`, and winning it is what authorises execution — then attaches the response with an UPDATE it cannot lose. The old lookup-then-store shape let two concurrent calls on one key both execute, with the loser dying on `uq_idempotency_scope` after its Tier-1 effect had landed. Consequences worth knowing before touching `app/mcp/handlers.py`: `response_json` is nullable and NULL means "claimed, not yet answered"; on Postgres the second caller *blocks* on the first's uncommitted row rather than failing, which is the serialisation; and every path that does not complete a claim must release it, because the envelope commits the request transaction even on tool errors. See [ADR 0010](docs/ADR/0010-idempotency-record-lifecycle.md)'s 2026-08-30 addendum.
+
 See [`docs/KAFKA.md`](docs/KAFKA.md) for the full consumer-group catalog (failure isolation, partition strategy, schema-evolution rules) and [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#per-task-responsibilities) for the worker-loop responsibilities table.
 
 Per-PR breakdown of Phase 7 specifically (for reference when reading the code):
