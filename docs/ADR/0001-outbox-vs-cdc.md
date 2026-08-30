@@ -74,6 +74,32 @@ If we ever outgrow polling latency or want to eliminate the write amplification,
 ## Pointers
 
 - `backend/app/repositories/outbox.py` — outbox row insertion
+- `backend/app/repositories/job.py` — `update_status`, the single producer of terminal events (see the addendum below)
+- `backend/app/schemas/job_events.py` — the terminal event payload shapes
 - `backend/app/workers/dispatcher.py` — `_outbox_relay_loop`
 - `backend/app/workers/kafka_producer.py` — `publish_raw` (propagates errors)
 - `backend/alembic/versions/b2a8f9c7e103_outbox_events.py` — table + partial index
+
+---
+
+## Addendum (2026 Q3) — terminal events are emitted by the repository, not by each caller
+
+*The decision above is unchanged and remains accepted. This section records how it is now enforced, because the original wording left a gap that four call sites fell into.*
+
+The **Alternatives considered** section argues for outbox over CDC partly on the grounds that "with outbox, the application chooses *what* to publish and *when* (e.g. skip emitting on a no-op status update)". That is a real advantage, but it was read as licence: emission was elective, done by hand at each call site, and nothing failed when a site forgot. Four did.
+
+- `JobDispatcherConsumer._force_dead_letter` wrote `DEAD_LETTER` and an audit row and no event at all. Jobs died silently: the saga stayed `RUNNING` forever, the CQRS read model kept the id pinned in its previous status set, LLM triage never saw the failure and the SSE stream never closed.
+- `JobService.resolve_incident` had the identical shape on the `COMPLETED` side — an operator resolving an incident in the admin console changed Postgres and told nobody.
+- The retry branch's `queue.push_delayed` was the one call site of four with no `try/except`, so a transient Redis error escaped `_run_job` into the force-dead-letter net above — which is how a job with retries remaining reached the silent path.
+- The dispatcher's own guard on that net checked only `DEAD_LETTER`, so a job `_run_job` had already settled `COMPLETED` could be overwritten.
+
+Fixing call sites one at a time invites the fifth occurrence, so the emission moved into the single writer. **`JobRepository.update_status` now writes the matching `outbox_events` row whenever the target status is terminal, in the same session and therefore the same transaction as the status write.** The four sites that already did it correctly no longer hand-write anything; the two that never did are correct for free. The payload is derived from the freshly-read `jobs` row (`app/schemas/job_events.py`), so the event always describes the state that was actually committed, and the sites cannot drift apart from each other again. The one field a caller may still colour is the dead-letter event's human-readable `message`, passed as `event_message=`.
+
+Two deliberate limits:
+
+- **`CANCELLED` is exempt.** It is terminal, but the platform has no `job.cancelled` topic to announce it on, so there is no event to write in the transaction. Its single writer (`SagaCoordinator._handle_failure`) cancels steps of a saga it is already settling, so the saga side stays coherent — but the read model does keep those ids in their previous status set. Adding the topic is a schema-registry entry plus four consumers; tracked in [`docs/ROADMAP.md`](../ROADMAP.md), not smuggled in here.
+- **Emission is unconditional, not transition-gated.** Detecting "was this row already terminal?" would need a pre-read `update_status` does not do. A duplicate event is cheap — every consumer is idempotent under the at-least-once delivery this ADR already promises, backed by the `job_events` unique constraint on `(topic, partition, offset)` and `job_id`-keyed read-model sets. A missing event is the expensive one, and it is what this addendum exists to prevent.
+
+The escape hatch the original text described — choosing not to emit — still exists for non-terminal statuses, which is where it was actually useful (a retry writes `PENDING` and its own "retrying" `job.failed` event). It no longer exists for the terminal ones, where every use of it was a bug.
+
+Verification: `backend/tests/unit/test_terminal_event_single_write.py` asserts, against real rows, that each terminal write lands with its event in one transaction — and that both roll back together.

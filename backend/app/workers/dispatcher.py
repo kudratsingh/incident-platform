@@ -21,7 +21,6 @@ Concurrency model selection (this is the core design decision):
 """
 
 import asyncio
-import json
 import uuid
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
@@ -33,7 +32,7 @@ from app.core import metrics
 from app.core.leader_lock import OUTBOX_RELAY_LOCK_KEY, advisory_leader_lock
 from app.core.logging import get_logger, job_id_var, trace_id_var
 from app.core.tracing import extract_context, get_tracer
-from app.models.enums import JobStatus, JobType
+from app.models.enums import TERMINAL_JOB_STATUSES, JobStatus, JobType
 from app.models.job import Job
 from app.repositories.audit import AuditRepository
 from app.repositories.job import JobRepository
@@ -117,56 +116,10 @@ _PROCESSORS = {
     JobType.REPORT_GEN: cpu_processors.process_report_gen,
 }
 
-# Ceiling on the serialized job payload copied onto a `job.dlq` event.
-# Job payloads are numerically bounded at the creation surfaces but can still
-# carry arbitrary user keys up to the request size limit, and this event fans
-# out to four consumer groups *and* is appended verbatim to `job_events` by
-# the event-log consumer. Anything larger is replaced by a marker so triage
-# still learns the payload existed without bloating every downstream row.
-DLQ_PAYLOAD_MAX_BYTES = 4096
-
-# The exact key set every `job.dlq` outbox payload below carries. It is the
-# producer half of a contract whose consumer half is
-# `LlmTriageConsumer.handle_message` (plus the saga coordinator and the event
-# log); `tests/unit/test_triage_consumer.py` asserts this stays a superset of
-# what triage reads, because a key triage reads and the producer never writes
-# degrades silently (max_retries → 0, payload/trace_id → None) instead of
-# failing. Keep it in step with both dlq payload dicts in `_run_job`.
-DLQ_EVENT_KEYS: frozenset[str] = frozenset(
-    {
-        "event",
-        "tenant_id",
-        "job_id",
-        "user_id",
-        "job_type",
-        "error",
-        "message",
-        "retry_count",
-        "max_retries",
-        "payload",
-        "trace_id",
-        "dead_lettered",
-    }
-)
-
-
-def _payload_for_event(payload: dict[str, Any]) -> dict[str, Any] | None:
-    """Bounded copy of a job payload for embedding in a `job.dlq` event.
-
-    Returns the payload unchanged when it serializes to at most
-    `DLQ_PAYLOAD_MAX_BYTES`, a `{"_truncated": True, "_original_bytes": n}`
-    marker when it doesn't, and `None` when it can't be serialized at all
-    (a payload that would break the outbox row must not take the DLQ event
-    down with it — triage degrades to "no payload", which is the pre-fix
-    behaviour and strictly better than losing the event).
-    """
-    try:
-        size = len(json.dumps(payload).encode("utf-8"))
-    except (TypeError, ValueError):
-        return None
-    if size <= DLQ_PAYLOAD_MAX_BYTES:
-        return payload
-    return {"_truncated": True, "_original_bytes": size}
+# The DLQ event's payload shape moved to `app/schemas/job_events.py` when
+# `JobRepository.update_status` became the single producer of terminal events
+# (ADR 0001 addendum). Nothing in this module builds a terminal payload by hand
+# any more — writing the status IS emitting the event.
 
 
 async def _run_job(
@@ -208,12 +161,6 @@ async def _run_job(
             retry_count = job.retry_count
             max_retries = job.max_retries
             prior_error = job.error_message  # filled when this is a retry
-            # The raw column, not `trace_id_var`: that var falls back to the
-            # job id when the column is NULL, and a job id masquerading as a
-            # trace id sends triage (and anyone following the link) to a
-            # trace that doesn't exist.
-            job_trace_id = job.trace_id
-
             # E1-04: the status check above is only a cheap pre-filter (and
             # a distinct log line) — under at-least-once delivery a second
             # delivery of this job can pass it concurrently. The atomic
@@ -315,6 +262,8 @@ async def _run_job(
             async with session.begin():
                 repo = JobRepository(session)
                 audit = AuditRepository(session)
+                # The `job.dlq` outbox row is written by `update_status` in
+                # this same transaction — see ADR 0001's addendum.
                 await repo.update_status(
                     job_id, JobStatus.DEAD_LETTER,
                     extra={"retry_count": retry_count, "error_message": error},
@@ -324,28 +273,6 @@ async def _run_job(
                     tenant_id=tenant_id,
                     job_id=job_id,
                     extra_data={"error": error, "reason": "unregistered_type"},
-                )
-                await OutboxRepository(session).add(
-                    tenant_id=tenant_id,
-                    topic=settings.kafka_topic_job_dlq,
-                    key=f"{tenant_id}:{user_id}",
-                    payload={
-                        "event": "job.failed",
-                        "tenant_id": str(tenant_id),
-                        "job_id": job_id_str,
-                        "user_id": str(user_id),
-                        "job_type": job_type,
-                        "error": error,
-                        "message": error,
-                        "retry_count": retry_count,
-                        # Triage context (E1-14). `payload` already has the
-                        # OTel carrier popped, so no tracing plumbing leaks
-                        # into the event or the job_events row.
-                        "max_retries": max_retries,
-                        "payload": _payload_for_event(payload),
-                        "trace_id": job_trace_id,
-                        "dead_lettered": True,
-                    },
                 )
         logger.error("job dead-lettered — unregistered type", extra={"job_type": job_type})
         await metrics.emit_count("JobDeadLettered", dimensions={"JobType": str(job_type)})
@@ -455,7 +382,23 @@ async def _run_job(
                                 "dead_lettered": False,
                             },
                         )
-                await queue.push_delayed(redis, job_id_str, delay)
+                # Guarded like the other three `push_delayed` call sites. The
+                # transaction above has already committed status=PENDING and
+                # the `job.failed` "retrying" event; if Redis is down, the
+                # correct outcome is a job sitting in PENDING with no timer,
+                # which `_requeue_stale_pending_once` re-publishes. Letting
+                # the error escape instead sent it to `_run_and_release`'s
+                # safety net, which terminally dead-lettered a job that still
+                # had retries left — Redis is a performance dependency here,
+                # never a correctness one.
+                try:
+                    await queue.push_delayed(redis, job_id_str, delay)
+                except Exception as push_exc:
+                    logger.error(
+                        "retry re-queue failed — job left PENDING; "
+                        "stale-PENDING backstop will re-publish it",
+                        extra={"job_id": job_id_str, "error": str(push_exc)},
+                    )
                 logger.info("job scheduled for retry", extra={"delay_seconds": delay})
                 await metrics.emit_count("JobFailed", dimensions={"JobType": str(job_type)})
             else:
@@ -475,8 +418,20 @@ async def _run_job(
                             # exhausting is the default mechanism and claims
                             # no attribution.
                             job_extra["dead_lettered_by"] = "llm_retry_policy"
+                        # `message` is the one field of the DLQ event a call
+                        # site still colours; everything else is derived from
+                        # the row inside `update_status`, which writes the
+                        # `job.dlq` outbox row in this transaction.
+                        dlq_message = (
+                            f"LLM dead-lettered: {llm_reasoning}"
+                            if llm_dead_lettered
+                            else f"Job exhausted after {new_retry_count} attempts: {exc}"
+                        )
                         await repo.update_status(
-                            job_id, JobStatus.DEAD_LETTER, extra=job_extra,
+                            job_id,
+                            JobStatus.DEAD_LETTER,
+                            extra=job_extra,
+                            event_message=dlq_message,
                         )
                         dlq_extra: dict[str, Any] = {
                             "error": str(exc),
@@ -491,32 +446,6 @@ async def _run_job(
                             job_id=job_id,
                             extra_data=dlq_extra,
                         )
-                        dlq_message = (
-                            f"LLM dead-lettered: {llm_reasoning}"
-                            if llm_dead_lettered
-                            else f"Job exhausted after {new_retry_count} attempts: {exc}"
-                        )
-                        await OutboxRepository(session).add(
-                            tenant_id=tenant_id,
-                            topic=settings.kafka_topic_job_dlq,
-                            key=f"{tenant_id}:{user_id}",
-                            payload={
-                                "event": "job.failed",
-                                "tenant_id": str(tenant_id),
-                                "job_id": job_id_str,
-                                "user_id": str(user_id),
-                                "job_type": job_type,
-                                "error": str(exc),
-                                "message": dlq_message,
-                                "retry_count": new_retry_count,
-                                # Triage context (E1-14) — see the
-                                # unregistered-type branch above.
-                                "max_retries": max_retries,
-                                "payload": _payload_for_event(payload),
-                                "trace_id": job_trace_id,
-                                "dead_lettered": True,
-                            },
-                        )
                 logger.error("job dead-lettered", extra={"error": str(exc)})
                 await metrics.emit_count("JobDeadLettered", dimensions={"JobType": str(job_type)})
 
@@ -530,6 +459,9 @@ async def _run_job(
             async with session.begin():
                 repo = JobRepository(session)
                 audit = AuditRepository(session)
+                # `update_status` writes the `job.completed` outbox row in
+                # this same transaction — the dependency resolver and the
+                # saga coordinator both key off that event.
                 await repo.update_status(
                     job_id, JobStatus.COMPLETED,
                     extra={"result": result},
@@ -539,20 +471,6 @@ async def _run_job(
                     tenant_id=tenant_id,
                     job_id=job_id,
                     extra_data={"type": job_type, "retry_count": retry_count},
-                )
-                await OutboxRepository(session).add(
-                    tenant_id=tenant_id,
-                    topic=settings.kafka_topic_job_completed,
-                    key=f"{tenant_id}:{user_id}",
-                    payload={
-                        "event": "job.completed",
-                        "tenant_id": str(tenant_id),
-                        "job_id": job_id_str,
-                        "user_id": str(user_id),
-                        "job_type": job_type,
-                        "result": result,
-                        "retry_count": retry_count,
-                    },
                 )
 
         span.set_status(trace.StatusCode.OK)
@@ -663,7 +581,15 @@ class JobDispatcherConsumer(BaseKafkaConsumer):
 
     async def _force_dead_letter(self, job_id_str: str, error: str) -> None:
         """Best-effort: mark a job DEAD_LETTER when _run_job escapes with an
-        unhandled exception. Used only from the _run_and_release safety net."""
+        unhandled exception. Used only from the _run_and_release safety net.
+
+        The DEAD_LETTER write and its `job.dlq` outbox row are one
+        transactional write inside `update_status` (ADR 0001 addendum). Before
+        that, this path wrote the status and an audit row and nothing else, so
+        the job died in Postgres and no consumer ever heard: the saga stayed
+        RUNNING, the read model kept the id in its old status set, triage never
+        ran, and the SSE stream never closed.
+        """
         try:
             job_id = uuid.UUID(job_id_str)
         except ValueError:
@@ -672,7 +598,12 @@ class JobDispatcherConsumer(BaseKafkaConsumer):
             async with session.begin():
                 repo = JobRepository(session)
                 job = await repo.get_by_id(job_id)
-                if job is None or job.status == JobStatus.DEAD_LETTER:
+                # Any terminal state, not just DEAD_LETTER. `_run_job` can
+                # settle a job COMPLETED and *then* escape (the metrics emit
+                # and contextvar reset run after the commit), and overwriting
+                # a completed job with DEAD_LETTER now also mints a `job.dlq`
+                # event — turning a silent row-level lie into a broadcast one.
+                if job is None or job.status in TERMINAL_JOB_STATUSES:
                     return
                 await repo.update_status(
                     job_id,
@@ -1090,7 +1021,6 @@ async def _sweep_stale_running_once(
     recover must not roll back the recoveries beside it (the E1-03
     antipattern). Returns the number of jobs dead-lettered.
     """
-    settings = get_settings()
     cutoff = datetime.now(UTC) - timedelta(seconds=threshold_seconds)
 
     # Scan in its own read-only session; the recoveries below each open
@@ -1149,6 +1079,13 @@ async def _sweep_stale_running_once(
                     # it on purpose; a crash recovery is not a replay, and
                     # zeroing it here would erase the attempt history triage
                     # and the DLQ tab reason about.
+                    # The `job.dlq` outbox row lands in this same transaction,
+                    # written by `update_status` from the row it just wrote.
+                    # It carries the full `DLQ_EVENT_KEYS` set, not just the
+                    # schema's required fields: this event fans out to triage,
+                    # the saga coordinator and the event log exactly like a
+                    # `_run_job` dead-letter, and a key the producer omits
+                    # degrades those consumers silently.
                     await repo.update_status(
                         row.id,
                         JobStatus.DEAD_LETTER,
@@ -1163,37 +1100,6 @@ async def _sweep_stale_running_once(
                             "reason": "worker_crash_recovery",
                             "stale_seconds": stale_seconds,
                             "started_at": started_at.isoformat(),
-                        },
-                    )
-                    # The full `DLQ_EVENT_KEYS` set, not just the schema's
-                    # required fields: this event fans out to triage, the
-                    # saga coordinator and the event log exactly like a
-                    # `_run_job` dead-letter, and a key the producer omits
-                    # degrades those consumers silently.
-                    event_payload = _payload_for_event(
-                        {
-                            k: v
-                            for k, v in (row.payload or {}).items()
-                            if k != "__traceparent"
-                        }
-                    )
-                    await OutboxRepository(session).add(
-                        tenant_id=row.tenant_id,
-                        topic=settings.kafka_topic_job_dlq,
-                        key=f"{row.tenant_id}:{row.user_id}",
-                        payload={
-                            "event": "job.failed",
-                            "tenant_id": str(row.tenant_id),
-                            "job_id": job_id_str,
-                            "user_id": str(row.user_id),
-                            "job_type": row.type,
-                            "error": error,
-                            "message": error,
-                            "retry_count": row.retry_count,
-                            "max_retries": row.max_retries,
-                            "payload": event_payload,
-                            "trace_id": row.trace_id,
-                            "dead_lettered": True,
                         },
                     )
         except Exception as exc:

@@ -6,7 +6,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.models.enums import JobStatus, JobType
 from app.models.job import Job
+from app.schemas import job_events
 from app.workers import dispatcher
+from redis.exceptions import ConnectionError as RedisConnectionError
 
 # A well-formed W3C traceparent, so `extract_context` gets something real to
 # parse when a test exercises the carrier-popping path.
@@ -139,6 +141,49 @@ async def test_run_job_retries_on_failure() -> None:
     assert JobStatus.PENDING in calls
 
 
+async def test_retry_branch_survives_a_redis_outage_instead_of_dead_lettering() -> None:
+    """The retry branch's `push_delayed` was the one call site of the four in
+    this module with no try/except. The transaction before it has already
+    committed status=PENDING and the "retrying" `job.failed` event, so a
+    transient Redis error there escaped `_run_job`, hit `_run_and_release`'s
+    safety net, and force-dead-lettered a job that still had 2 of 3 retries
+    left — turning a Redis blip into permanent data loss.
+
+    Redis is a performance dependency on this path, never a correctness one:
+    the job must be left PENDING with its retry counted, for the
+    stale-PENDING backstop to re-publish.
+    """
+    job = _make_job(type=JobType.BULK_API_SYNC, retry_count=0, max_retries=3)
+    factory, job_repo, audit_repo = _make_session_factory(job)
+    redis = AsyncMock()
+    consumer = dispatcher.JobDispatcherConsumer(factory, redis)
+
+    processor = AsyncMock(side_effect=RuntimeError("boom"))
+    with patch("app.workers.dispatcher.JobRepository", return_value=job_repo), \
+         patch("app.workers.dispatcher.AuditRepository", return_value=audit_repo), \
+         patch(
+             "app.workers.dispatcher.OutboxRepository",
+             new=MagicMock(return_value=AsyncMock()),
+         ), \
+         patch.dict(dispatcher._PROCESSORS, {JobType.BULK_API_SYNC: processor}), \
+         patch(
+             "app.workers.dispatcher.queue.push_delayed",
+             new=AsyncMock(side_effect=RedisConnectionError("redis is down")),
+         ):
+        # Must not re-raise, and must not reach the force-dead-letter net.
+        await consumer._run_and_release(str(job.id))
+
+    calls = [c.args[1] for c in job_repo.update_status.call_args_list]
+    assert JobStatus.PENDING in calls
+    assert JobStatus.DEAD_LETTER not in calls
+
+    pending_call = next(
+        c for c in job_repo.update_status.call_args_list
+        if c.args[1] == JobStatus.PENDING
+    )
+    assert pending_call.kwargs["extra"]["retry_count"] == 1
+
+
 async def test_run_job_dead_letters_after_exhaustion() -> None:
     job = _make_job(
         type=JobType.BULK_API_SYNC,
@@ -166,16 +211,21 @@ async def test_run_job_dead_letters_after_exhaustion() -> None:
     calls = [c.args[1] for c in job_repo.update_status.call_args_list]
     assert JobStatus.DEAD_LETTER in calls
 
-    # E1-14: the DLQ event has to carry the triage context the LLM triage
-    # consumer reads. Without it every triage ran with max_retries=0,
-    # payload=None and trace_id=None — "retry 3 of 0" with no evidence.
-    dlq_payload = outbox_mock.add.await_args.kwargs["payload"]
-    assert {"max_retries", "payload", "trace_id"}.issubset(dlq_payload.keys())
-    assert dlq_payload["max_retries"] == job.max_retries
-    assert dlq_payload["trace_id"] == "trace-exhausted"
-    # The OTel carrier is popped before execution and must not ride along.
-    assert dlq_payload["payload"] == {"file": "x.csv"}
-    assert set(dlq_payload) == dispatcher.DLQ_EVENT_KEYS
+    # The `job.dlq` event is written by `update_status` in the same
+    # transaction as the status, so this branch no longer builds a payload —
+    # the shape assertions live at the producer, in `test_job_repository.py`.
+    # What this branch still owns is the exhaustion wording, passed as the one
+    # field a call site may colour.
+    dead_letter_call = next(
+        c for c in job_repo.update_status.call_args_list
+        if c.args[1] == JobStatus.DEAD_LETTER
+    )
+    assert dead_letter_call.kwargs["event_message"] == (
+        "Job exhausted after 3 attempts: boom"
+    )
+    # And it does NOT hand-write an outbox row of its own — a second `job.dlq`
+    # for one death would double-trigger triage and the saga coordinator.
+    outbox_mock.add.assert_not_awaited()
 
 
 async def test_run_job_llm_policy_forces_dead_letter_before_exhaustion() -> None:
@@ -383,20 +433,19 @@ async def test_run_job_dead_letters_compensation_when_no_processor() -> None:
     assert JobStatus.DEAD_LETTER in calls
     assert JobStatus.FAILED not in calls
 
-    # An outbox row was enqueued on the DLQ topic with dead_lettered=True
-    # so the saga coordinator can settle the saga.
-    outbox_mock.add.assert_awaited()
-    outbox_payload = outbox_mock.add.await_args.kwargs["payload"]
-    assert outbox_payload["dead_lettered"] is True
-    assert outbox_payload["job_type"] == "csv_upload.compensate"
-
-    # E1-14: the unregistered-type branch is a DLQ producer too, so it owes
-    # triage the same context as the exhaustion branch.
-    assert {"max_retries", "payload", "trace_id"}.issubset(outbox_payload.keys())
-    assert outbox_payload["max_retries"] == job.max_retries
-    assert outbox_payload["payload"] == {"parent_job_id": "abc"}
-    assert outbox_payload["trace_id"] == "trace-compensate"
-    assert set(outbox_payload) == dispatcher.DLQ_EVENT_KEYS
+    # The DLQ event rides on that DEAD_LETTER write (`update_status` emits it
+    # in the same transaction), so the saga coordinator still learns the
+    # compensation step died. This branch adds no message of its own — the
+    # error IS the message — and writes no second outbox row.
+    dead_letter_call = next(
+        c for c in job_repo.update_status.call_args_list
+        if c.args[1] == JobStatus.DEAD_LETTER
+    )
+    assert dead_letter_call.kwargs.get("event_message") is None
+    assert dead_letter_call.kwargs["extra"]["error_message"] == (
+        "No processor for type: csv_upload.compensate"
+    )
+    outbox_mock.add.assert_not_awaited()
 
     # And an audit row was written so the incident is visible in /audit/logs.
     audit_repo.log.assert_awaited()
@@ -406,18 +455,18 @@ async def test_run_job_dead_letters_compensation_when_no_processor() -> None:
 
 def test_payload_for_event_passes_small_payloads_through() -> None:
     payload = {"file": "x.csv", "rows": 10}
-    assert dispatcher._payload_for_event(payload) == payload
+    assert job_events.payload_for_event(payload) == payload
 
 
 def test_payload_for_event_truncates_oversized_payloads() -> None:
     """The DLQ event fans out to four consumer groups and is appended to
     `job_events`, so a user-controlled payload can't ride along unbounded."""
-    payload = {"blob": "x" * (dispatcher.DLQ_PAYLOAD_MAX_BYTES * 2)}
-    result = dispatcher._payload_for_event(payload)
+    payload = {"blob": "x" * (job_events.DLQ_PAYLOAD_MAX_BYTES * 2)}
+    result = job_events.payload_for_event(payload)
 
     assert result is not None
     assert result["_truncated"] is True
-    assert result["_original_bytes"] > dispatcher.DLQ_PAYLOAD_MAX_BYTES
+    assert result["_original_bytes"] > job_events.DLQ_PAYLOAD_MAX_BYTES
     assert "blob" not in result
 
 
@@ -443,6 +492,13 @@ async def test_run_and_release_force_dead_letters_on_unhandled_exception() -> No
     exception (a future bug), the safety net must mark the job DEAD_LETTER
     and log loudly rather than silently swallowing the error and stranding
     the job in RUNNING.
+
+    The DEAD_LETTER write now carries the `job.dlq` outbox row with it —
+    asserted against real rows in
+    `test_terminal_event_single_write.py::test_force_dead_letter_writes_status_and_dlq_event_together`,
+    because this suite mocks the repository that emits it. What this test
+    still owns is that the net writes through that emitting path and does not
+    hand-roll an outbox row beside it.
     """
     factory, job_repo, audit_repo = _make_session_factory(_make_job())
     redis = AsyncMock()
@@ -451,11 +507,16 @@ async def test_run_and_release_force_dead_letters_on_unhandled_exception() -> No
     consumer.redis = redis
 
     job_id = str(uuid.uuid4())
+    outbox_mock = AsyncMock()
 
     with patch(
         "app.workers.dispatcher._run_job",
         new=AsyncMock(side_effect=RuntimeError("boom past guards")),
     ), patch("app.workers.dispatcher.JobRepository", return_value=job_repo), \
+       patch(
+           "app.workers.dispatcher.OutboxRepository",
+           new=MagicMock(return_value=outbox_mock),
+       ), \
        patch("app.workers.dispatcher.AuditRepository", return_value=audit_repo):
         # Must NOT re-raise.
         await consumer._run_and_release(job_id)
@@ -463,6 +524,7 @@ async def test_run_and_release_force_dead_letters_on_unhandled_exception() -> No
     # The safety net force-dead-lettered the job.
     calls = [c.args[1] for c in job_repo.update_status.call_args_list]
     assert JobStatus.DEAD_LETTER in calls
+    outbox_mock.add.assert_not_awaited()
 
 
 async def test_run_job_skips_unknown_job() -> None:

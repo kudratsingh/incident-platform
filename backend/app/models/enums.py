@@ -24,6 +24,18 @@ class JobStatus(StrEnum):
     CANCELLED = "cancelled"        # saga rollback / dependency parent failed
 
 
+# The statuses a job never leaves under its own power (a DLQ replay is an
+# operator re-entering it deliberately). `FAILED` is deliberately absent: the
+# retry cycle re-enters from it, so a `failed` row is still in flight.
+#
+# `COMPLETED` and `DEAD_LETTER` additionally have a Kafka topic to announce on,
+# which is why `JobRepository.update_status` emits an outbox row for those two
+# and not for `CANCELLED` — there is no `job.cancelled` topic.
+TERMINAL_JOB_STATUSES: frozenset[str] = frozenset(
+    {JobStatus.COMPLETED, JobStatus.DEAD_LETTER, JobStatus.CANCELLED}
+)
+
+
 class SagaStatus(StrEnum):
     RUNNING = "running"
     COMPLETED = "completed"
