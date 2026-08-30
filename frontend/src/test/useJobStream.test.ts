@@ -161,6 +161,57 @@ describe('useJobStream', () => {
     expect(latest().url).toContain('token=second-stream-token')
   })
 
+  it('backs off on consecutive failures instead of retrying at 2s forever', async () => {
+    // The server caps concurrent streams and refuses the extra viewer with a
+    // 503 (backend/app/workers/progress_broker.py). EventSource hides the
+    // status from onerror, so the client cannot read Retry-After — a flat 2s
+    // retry would turn that cap into a hot loop of refused reconnects. The
+    // first retry stays prompt; the second waits longer.
+    await renderStream()
+    const first = latest()
+
+    act(() => { first.simulateError() })
+    await act(async () => { vi.advanceTimersByTime(2500) })
+    await act(async () => {})
+    const second = latest()
+    expect(second).not.toBe(first)
+
+    // Second failure: 2.5s is no longer enough — the delay has doubled.
+    // (onerror closes the source, and MockEventSource.close() drops it from
+    // `instances`, so "no reconnect yet" reads as an empty instance list.)
+    act(() => { second.simulateError() })
+    await act(async () => { vi.advanceTimersByTime(2500) })
+    await act(async () => {})
+    expect(latest()).toBeUndefined()
+
+    // It does reconnect, just later.
+    await act(async () => { vi.advanceTimersByTime(2000) })
+    await act(async () => {})
+    expect(latest()).toBeDefined()
+    expect(streamTokenMock).toHaveBeenCalledTimes(3)
+  })
+
+  it('resets the backoff once a reconnect succeeds', async () => {
+    await renderStream()
+    const first = latest()
+
+    act(() => { first.simulateError() })
+    await act(async () => { vi.advanceTimersByTime(2500) })
+    await act(async () => {})
+    const second = latest()
+
+    // A healthy open clears the accumulated delay, so the next blip is
+    // recovered from promptly rather than inheriting the backed-off wait:
+    // 2.5s is enough again, which it would not be at the doubled delay.
+    act(() => { second.simulateOpen() })
+    act(() => { second.simulateError() })
+    await act(async () => { vi.advanceTimersByTime(2500) })
+    await act(async () => {})
+
+    expect(latest()).toBeDefined()
+    expect(latest()).not.toBe(second)
+  })
+
   it('does NOT reconnect after a terminal event', async () => {
     const { result } = await renderStream()
     act(() => { latest().simulateOpen() })

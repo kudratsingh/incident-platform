@@ -14,8 +14,8 @@ For the broader architectural context, see [`docs/ARCHITECTURE.md`](ARCHITECTURE
 |---|---|---|---|---|---|
 | `rate:{client}:{window_start}` | string (counter) | `rate_limit.py` `_check` | `rate_limit.py` `_check` | `window * 2` (e.g. 120s) | Yes — fails open |
 | `rate:tenant:{tenant_id}:{window_start}` | string (counter) | `quota.py` `_check_tenant_rate` | `quota.py` `_check_tenant_rate` | 120s | Yes — fails open |
-| `job:progress:{job_id}` | Pub/Sub channel (no persisted key) | `progress.py` `publish` | `streaming.py` SSE endpoint via `subscribe` | N/A (Pub/Sub is fire-and-forget) | No — listeners must be connected |
-| `job:progress:last:{job_id}` | string (last `ProgressEvent` as JSON) | `progress.py` `publish` (fed by `sse_consumer`) | `progress.py` `subscribe` / `read_last_event`, for the SSE endpoint | 1h (`LAST_EVENT_TTL_SECONDS`) | Yes — degrades to the pre-snapshot stream; the `jobs` row is the fallback |
+| `job:progress:{job_id}` | Pub/Sub channel (no persisted key) | `progress.py` `publish` | `progress_broker.py` — one shared subscription per process, fanned out to every viewer of that job | N/A (Pub/Sub is fire-and-forget) | No — listeners must be connected |
+| `job:progress:last:{job_id}` | string (last `ProgressEvent` as JSON) | `progress.py` `publish` (fed by `sse_consumer`) | `progress_broker.py` `subscribe` via `progress.py` `read_last_event`, for the SSE endpoint | 1h (`LAST_EVENT_TTL_SECONDS`) | Yes — degrades to the pre-snapshot stream; the `jobs` row is the fallback |
 | `jobs:tenant:{tenant_id}:status:{status}` | set of job_ids | `read_model.py` `_move` | `admin.py` `system_stats` via `read_global_stats` | None | No — read model goes stale |
 | `jobs:user:{user_id}:status:{status}` | set of job_ids | `read_model.py` `_move` | `admin.py` `user_stats` via `read_user_stats` | None | No — read model goes stale |
 | `cache:job:{tenant_id}:{job_id}` | JSON string | `cache.py` `JobCache.set` | `cache.py` `JobCache.get` | 10s | Yes — cache miss = DB read |
@@ -60,7 +60,21 @@ Configuration:
 
 ### SSE progress bridge (`job:progress:{job_id}` Pub/Sub channel + `job:progress:last:{job_id}` snapshot)
 
-The worker publishes progress to Kafka. The `sse-broadcaster` consumer reads Kafka and republishes to Redis Pub/Sub on channel `job:progress:{job_id}`. The browser-facing SSE endpoint at `GET /jobs/{id}/stream` opens a Pub/Sub subscription on that channel and streams events down to the client.
+The worker publishes progress to Kafka. The `sse-broadcaster` consumer reads Kafka and republishes to Redis Pub/Sub on channel `job:progress:{job_id}`. The browser-facing SSE endpoint at `GET /jobs/{id}/stream` reads that channel through the process-wide fan-out broker (`app/workers/progress_broker.py`) and streams events down to the client.
+
+#### Connection budget — why streaming has its own pool and its own cap
+
+A Pub/Sub subscription owns its connection for as long as it is subscribed. The endpoint used to call `redis.pubsub()` per viewer, so the process's open-stream count *was* its held-connection count, and those connections came out of the single 20-slot pool shared with `worker_loop`, the rate limiter, `check_backpressure`, the job cache and the admin stats loops. The practical viewer ceiling was well under 20, and past it the failures landed on everyone *except* the viewer who caused them: the rate limiter failed open silently, `check_backpressure` 500'd `POST /jobs`, admin stats errored. The frontend reconnects every 2s until terminal, so a tab parked on a waiting job pinned a slot indefinitely.
+
+Three things now hold the line:
+
+| Mechanism | Where | Effect |
+|---|---|---|
+| **Fan-out broker** | `workers/progress_broker.py` | One Pub/Sub connection for the whole process. It SUBSCRIBEs a channel on that job's first viewer and UNSUBSCRIBEs on its last; a single reader task pumps messages into a per-viewer `asyncio.Queue`. N viewers of one job and M jobs all cost **one** connection — the viewers↔connections relationship is gone, not widened. |
+| **Dedicated pool** | `core/redis.py` `get_sse_redis_pool()` | Streaming draws from its own pool (`SSE_REDIS_MAX_CONNECTIONS`, default 5), never the shared 20. Whatever streaming does to its own pool, the request path keeps its slots. |
+| **Explicit cap + timeouts** | `SSE_MAX_CONCURRENT_STREAMS` (default 200), `SSE_STREAM_IDLE_TIMEOUT_SECONDS` (300), `SSE_STREAM_MAX_DURATION_SECONDS` (3600) | Past the cap the endpoint answers **503 with `Retry-After`** — a refusal addressed to the viewer asking, instead of a cost charged to unrelated callers. Idle and maximum-duration timeouts reclaim the slot from a parked tab; EventSource reconnects on its own, so ending a stream costs a live viewer one reconnect. Set any of the three to `0` to disable it. |
+
+The cap is per *process*, so the deployment-level ceiling is `SSE_MAX_CONCURRENT_STREAMS × replicas`. A client that meets a 503 here should retry (possibly landing on another replica) — unlike a `backpressure` 503, it is not a signal to stop submitting work, which is why it carries its own `stream_capacity` error code.
 
 Pub/Sub itself is fire-and-forget and at-most-once, so `publish()` also SETs the event as a retained snapshot at `job:progress:last:{job_id}` (1h TTL) — **before** the PUBLISH, so a subscriber can never both miss the live event and find no snapshot. `subscribe()` then reads that snapshot as its first event, and it reads it *after* the SUBSCRIBE has taken effect: the overlap can at worst deliver one event twice (harmless — the UI is last-write-wins on a progress bar), whereas reading first would leave a gap in which an event is lost entirely.
 
@@ -202,7 +216,7 @@ The platform degrades, doesn't fail. Specifically:
 | Surface | Behavior |
 |---|---|
 | `POST /jobs` | Rate limit + tenant quota fail open. Backpressure check fails open. Job submission succeeds via DB + outbox. |
-| `GET /jobs/{id}/stream` (SSE) | Connection opens, sends initial DB state, never streams updates. UI shows static progress. |
+| `GET /jobs/{id}/stream` (SSE) | Connection opens, sends initial DB state, never streams updates. UI shows static progress. The broker closes open streams when its shared connection dies rather than leaving them silently open; EventSource reconnects. Never a 500. |
 | `GET /admin/stats` | Returns whatever was in Redis before the outage (cache or empty). Doesn't 500. |
 | `GET /admin/jobs/{id}` | Cache miss, falls through to DB. Slower but works. |
 | Worker loop | Delayed retry promotion stops (the loop catches the exception and continues). Active job processing continues — the DB and Kafka are the load-bearing components. |
@@ -218,7 +232,9 @@ The platform is designed so that Redis is a **performance + UX** dependency, not
 - `backend/app/utils/cache.py` — `JobCache`
 - `backend/app/utils/backpressure.py` — `check_backpressure`
 - `backend/app/workers/read_model.py` — CQRS read-model projector
-- `backend/app/workers/progress.py` — Pub/Sub publish
+- `backend/app/workers/progress.py` — Pub/Sub publish + retained snapshot
+- `backend/app/workers/progress_broker.py` — one shared Pub/Sub connection fanned out to every open SSE stream; the stream cap and timeouts
 - `backend/app/workers/queue.py` — priority queue + delayed queue
-- `backend/app/api/streaming.py` — SSE endpoint subscribing to Pub/Sub
+- `backend/app/api/streaming.py` — SSE endpoint reading Pub/Sub through the broker
+- `backend/app/core/redis.py` — the two pools: shared (20) and SSE-dedicated (`SSE_REDIS_MAX_CONNECTIONS`)
 - `infra/elasticache.tf` — production ElastiCache provisioning

@@ -39,7 +39,9 @@ from app.models.enums import JobStatus, JobType, UserRole
 from app.models.job import Job
 from app.models.tenant import Tenant
 from app.models.user import User
+from app.workers import progress_broker
 from app.workers.progress import ProgressEvent
+from app.workers.progress_broker import ProgressBroker
 from httpx import AsyncClient
 from jose import jwt
 
@@ -456,4 +458,132 @@ async def test_retained_snapshot_takes_precedence_over_the_row(
         )
 
     # subscribe() (stubbed empty here) was used — no synthetic event was emitted.
+    assert _sse_events(resp.text) == []
+
+
+# ---------------------------------------------------------------------------
+# Pool isolation and the per-process stream cap (WO-R2-11)
+#
+# Each open stream used to hold one connection out of the single 20-connection
+# process-wide pool for its whole life, and `worker_loop` runs in the same
+# process on that same pool — so ~20 parked dashboards starved the rate
+# limiter, `check_backpressure` and the admin stats loops. Two structural
+# answers, asserted here at the HTTP layer:
+#
+#   * streaming draws from its own bounded pool, so it cannot starve anyone,
+#   * a per-process cap refuses the extra viewer with 503 + Retry-After
+#     rather than letting it queue against a finite resource.
+#
+# The fan-out itself (N viewers → one connection) is asserted in
+# tests/unit/test_progress_broker.py, where the Pub/Sub calls are visible.
+# ---------------------------------------------------------------------------
+
+
+class _DeadRedis:
+    """A Redis that refuses everything — stands in for an outage."""
+
+    def pubsub(self) -> object:
+        raise ConnectionError("redis down")
+
+    async def get(self, key: str) -> str | None:
+        raise ConnectionError("redis down")
+
+
+def _test_broker(redis: object, **overrides: object) -> ProgressBroker:
+    kwargs: dict[str, object] = {
+        "max_streams": 1,
+        "idle_timeout_seconds": 1,
+        "max_duration_seconds": 5,
+        "retry_after_seconds": 5,
+    }
+    kwargs.update(overrides)
+    return ProgressBroker(redis, **kwargs)  # type: ignore[arg-type]
+
+
+def test_streaming_draws_from_its_own_pool_not_the_shared_one() -> None:
+    """The SSE pool is a separate object, sized independently of the default.
+
+    This is the whole point of the finding: whatever streaming does to its
+    own pool, the rate limiter, backpressure check and worker loops that hold
+    `get_redis_pool()` keep their 20 slots.
+    """
+    from app.core.redis import get_redis_pool, get_sse_redis_pool
+
+    settings = get_settings()
+    assert get_sse_redis_pool() is not get_redis_pool()
+    assert get_sse_redis_pool().max_connections == settings.sse_redis_max_connections
+    assert get_redis_pool().max_connections == 20
+
+
+async def test_stream_beyond_the_cap_is_refused_while_post_jobs_still_works(
+    client: AsyncClient, job: Job, auth_headers: dict[str, str]
+) -> None:
+    """Cap+1 concurrent viewers: the extra one is refused, the API stays up.
+
+    Pre-fix there was no cap at all — the (cap+1)th viewer opened happily and
+    took another connection out of the shared pool, and it was `POST /jobs`
+    (rate limiter, backpressure, quota — all Redis) that paid for it. Now the
+    refusal is explicit, addressed to the viewer, and carries Retry-After.
+    """
+    broker = _test_broker(_DeadRedis(), max_streams=1)
+    broker.acquire()  # the one permitted stream is already open
+    token = create_stream_token(job.id, job.tenant_id)
+
+    with mock.patch.object(progress_broker, "_broker", broker):
+        resp = await asyncio.wait_for(
+            client.get(f"/api/v1/jobs/{job.id}/stream", params={"token": token}),
+            timeout=5,
+        )
+        assert resp.status_code == 503
+        assert resp.headers["Retry-After"] == "5"
+        assert resp.json()["error_code"] == "stream_capacity"
+
+        # The process is NOT out of Redis — job submission still works.
+        created = await client.post(
+            "/api/v1/jobs", json={"type": "csv_upload"}, headers=auth_headers
+        )
+        assert created.status_code == 201
+
+
+async def test_a_finished_stream_hands_its_slot_back(
+    client: AsyncClient, job: Job
+) -> None:
+    """A closed stream frees capacity for the next viewer.
+
+    With a cap of one and a broker whose Redis is dead, the first stream
+    opens, degrades to an empty body and closes — and the second viewer then
+    gets in rather than meeting a permanently exhausted cap.
+    """
+    broker = _test_broker(_DeadRedis(), max_streams=1)
+    token = create_stream_token(job.id, job.tenant_id)
+
+    with mock.patch.object(progress_broker, "_broker", broker):
+        for _ in range(2):
+            resp = await asyncio.wait_for(
+                client.get(f"/api/v1/jobs/{job.id}/stream", params={"token": token}),
+                timeout=5,
+            )
+            assert resp.status_code == 200
+    assert broker.active_streams == 0
+
+
+async def test_redis_outage_degrades_the_stream_and_never_500s(
+    client: AsyncClient, job: Job
+) -> None:
+    """Fail-open, unchanged: Redis down closes the stream, it does not error.
+
+    The browser's EventSource reconnects on its own. What must never happen
+    is the Redis failure escaping the generator as a 500 out of the API.
+    """
+    broker = _test_broker(_DeadRedis(), max_streams=0)
+    token = create_stream_token(job.id, job.tenant_id)
+
+    with mock.patch.object(progress_broker, "_broker", broker):
+        resp = await asyncio.wait_for(
+            client.get(f"/api/v1/jobs/{job.id}/stream", params={"token": token}),
+            timeout=5,
+        )
+
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/event-stream")
     assert _sse_events(resp.text) == []

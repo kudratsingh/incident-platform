@@ -16,6 +16,20 @@ interface StreamState {
 const TERMINAL = new Set(['completed', 'failed', 'dead_letter', 'cancelled'])
 const BASE_URL = import.meta.env.VITE_API_URL ?? '/api/v1'
 
+// Reconnect backoff. The first retry stays at 2s — a dropped connection on a
+// live job should recover promptly — but consecutive failures back off to a
+// 30s ceiling instead of retrying forever at 2s.
+//
+// The server now caps concurrent streams per process and answers 503 with
+// Retry-After past it (see backend/app/workers/progress_broker.py). EventSource
+// exposes neither the status code nor that header to onerror, so the client
+// cannot read the server's advice; a flat 2s retry would turn the cap into a
+// hot loop of refused reconnects from exactly the viewers who could not get in.
+// Backing off is the client-side half of that contract. A successful open
+// resets the delay, so a healthy stream that blips later still retries fast.
+const RECONNECT_BASE_MS = 2000
+const RECONNECT_MAX_MS = 30000
+
 /**
  * Subscribes to the SSE progress stream for a job.
  *
@@ -26,7 +40,10 @@ const BASE_URL = import.meta.env.VITE_API_URL ?? '/api/v1'
  * it — never the primary access JWT, which must not appear in URLs (ADR 0014).
  *
  * Reconnects automatically if the connection drops before a terminal event,
- * minting a fresh stream token each time (the old one expires in ~60s).
+ * minting a fresh stream token each time (the old one expires in ~60s).  The
+ * first retry is prompt (2s) and consecutive failures back off to a 30s
+ * ceiling, so a server at its concurrent-stream cap is not hammered by the
+ * viewers it just refused; a successful open resets the delay.
  *
  * Lifecycle: everything the effect owns (disposal flag, pending reconnect
  * timer, live EventSource, terminal-seen flag) lives in closure variables
@@ -53,13 +70,16 @@ export function useJobStream(jobId: string | null): StreamState {
     let timer: ReturnType<typeof setTimeout> | null = null
     let es: EventSource | null = null
     let sawTerminal = false
+    let reconnectDelay = RECONNECT_BASE_MS
 
     function scheduleReconnect() {
       if (disposed || sawTerminal) return
+      const delay = reconnectDelay
+      reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX_MS)
       timer = setTimeout(() => {
         timer = null
         void connect()
-      }, 2000)
+      }, delay)
     }
 
     async function connect() {
@@ -82,6 +102,8 @@ export function useJobStream(jobId: string | null): StreamState {
       es = source
 
       source.onopen = () => {
+        // The stream is live — forget any accumulated backoff.
+        reconnectDelay = RECONNECT_BASE_MS
         setState((s) => ({ ...s, connected: true }))
       }
 

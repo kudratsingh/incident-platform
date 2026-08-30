@@ -8,8 +8,13 @@ from app.core import metrics
 from app.core.exceptions import AppError
 from app.core.logging import get_logger, request_id_var, setup_logging
 from app.core.middleware import RequestContextMiddleware, register_route_dimension
-from app.core.redis import close_redis_pool, get_redis_client
+from app.core.redis import (
+    close_redis_pool,
+    close_sse_redis_pool,
+    get_redis_client,
+)
 from app.core.tracing import setup_tracing
+from app.workers.progress_broker import reset_broker
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -169,7 +174,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # Last flush before the loop closes, so the final window is not discarded.
     await metrics.stop_metrics_emitter()
 
+    # Both pools: the shared one every request path uses, and the dedicated
+    # SSE pool the progress broker holds its one Pub/Sub connection on.
+    reset_broker()
     await close_redis_pool()
+    await close_sse_redis_pool()
     logger.info("shutdown")
 
 
@@ -209,6 +218,9 @@ def create_app() -> FastAPI:
                 "details": exc.details,
                 "request_id": request_id_var.get("") or None,
             },
+            # None for every error that does not set them; `Retry-After` on a
+            # stream-capacity refusal is the first that does.
+            headers=exc.headers,
         )
 
     @app.exception_handler(Exception)

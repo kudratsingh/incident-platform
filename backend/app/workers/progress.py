@@ -2,7 +2,10 @@
 Job progress pub/sub via Redis.
 
 The worker publishes ProgressEvents to a per-job channel.
-The SSE endpoint subscribes to that channel and forwards events to the browser.
+The SSE endpoint reads that channel through the process-wide fan-out broker in
+`workers/progress_broker.py` and forwards events to the browser.  This module
+owns the wire format, the channel naming and the retained snapshot; the broker
+owns the connection.
 
 Channel naming: job:progress:{job_id}
 Retained snapshot: job:progress:last:{job_id} (string, 1h TTL)
@@ -19,7 +22,7 @@ the `jobs` table, and the SSE endpoint short-circuits off it).
 
 import json
 import logging
-from collections.abc import AsyncGenerator, Awaitable, Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -108,35 +111,9 @@ async def publish(
     await redis.publish(_channel(job_id), payload)
 
 
-async def subscribe(
-    redis: Redis, job_id: str
-) -> AsyncGenerator[ProgressEvent, None]:
-    """Async generator that yields ProgressEvents until the job reaches a terminal state.
-
-    The first event is the retained snapshot (if any), read AFTER the channel
-    subscription is live. That ordering matters: subscribe-then-read can at
-    worst deliver the same event twice (harmless — the UI is last-write-wins on
-    a progress bar), while read-then-subscribe leaves a gap in which an event
-    published between the two is lost, which is the hang this snapshot exists
-    to prevent.
-    """
-    pubsub = redis.pubsub()
-    await pubsub.subscribe(_channel(job_id))
-
-    try:
-        snapshot = await read_last_event(redis, job_id)
-        if snapshot is not None:
-            yield snapshot
-            if snapshot.status in TERMINAL_STATUSES:
-                return
-
-        async for message in pubsub.listen():
-            if message["type"] != "message":
-                continue
-            event = ProgressEvent(**json.loads(message["data"]))
-            yield event
-            if event.status in TERMINAL_STATUSES:
-                break
-    finally:
-        await pubsub.unsubscribe(_channel(job_id))
-        await pubsub.aclose()  # type: ignore[no-untyped-call]
+# Subscribing lives in `workers/progress_broker.py`, not here. It used to be a
+# `subscribe(redis, job_id)` generator that opened its own `redis.pubsub()`
+# per viewer, which made the process's open-stream count its held-connection
+# count against a 20-slot shared pool (WO-R2-11). The broker keeps the
+# snapshot-then-live-events semantics documented above and shares one Pub/Sub
+# connection across every open stream.
