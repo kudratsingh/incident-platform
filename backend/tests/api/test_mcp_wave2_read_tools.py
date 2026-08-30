@@ -792,6 +792,121 @@ async def test_get_consumer_lag_unknown_group_returns_null_not_error(
     assert payload["consumer_group"] == "never-existed"
     assert payload["lag"] is None
     assert payload["cache_key"] == "kafka:consumer_lag:never-existed"
+    # R2-17: null alone cannot say WHY. A typo'd group and a tracked
+    # group whose fixture vanished both read `lag: null` today.
+    assert payload["lag_known"] is False
+    assert payload["source"] == "unrecognized"
+
+
+async def test_get_consumer_lag_distinguishes_unknown_from_zero(
+    mcp_client, db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
+) -> None:
+    """R2-17 / #160: the dispatcher deliberately does not emit
+    ConsumerLag when lag is unknown, because a fabricated 0 reads as
+    healthy — the same reasoning the CloudWatch backlog alarm documents
+    for absent datapoints. The tool must carry that distinction in its
+    OUTPUT, not just in its description: `lag: 0` (drained, healthy) and
+    `lag: null` (could not determine) are opposite conclusions and an
+    agent reading JSON has to tell them apart."""
+    ac, redis_stub = mcp_client
+    redis_stub._store["kafka:consumer_lag:healthy-consumer"] = "0"
+
+    token = await _token(
+        db_session, default_tenant.id, [Scope.TELEMETRY_READ.value]
+    )
+    drained = _content(
+        await _call(
+            ac, token, "get_consumer_lag", {"consumer_group": "healthy-consumer"}
+        )
+    )
+    # A real, measured zero: the group is caught up.
+    assert drained["lag"] == 0
+    assert drained["lag_known"] is True
+
+    # Same tracked group, fixture absent — NOT the same thing as zero.
+    unknown = _content(
+        await _call(
+            ac, token, "get_consumer_lag", {"consumer_group": "payments-consumer"}
+        )
+    )
+    assert unknown["lag"] is None
+    assert unknown["lag_known"] is False
+    # ... and it is a group the platform tracks, so this is a missing
+    # recorded value (a precondition failure), not a bad group name.
+    assert unknown["source"] == "static"
+
+
+async def test_get_consumer_lag_reports_which_group_is_live_refreshed(
+    mcp_client, db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
+) -> None:
+    """R2-17: the FRESHNESS contract (~60s refresh, 90s TTL) holds for
+    `worker-dispatcher` alone. The other seven are static fixtures the
+    seed script writes and nothing refreshes, so `inject_latency`'s
+    'watch the group's lag grow' is false for all of them. The agent
+    cannot read docs/REDIS.md — the tool has to say so itself."""
+    ac, redis_stub = mcp_client
+    redis_stub._store["kafka:consumer_lag:worker-dispatcher"] = "42"
+    redis_stub._store["kafka:consumer_lag:billing-consumer"] = "15000"
+
+    token = await _token(
+        db_session, default_tenant.id, [Scope.TELEMETRY_READ.value]
+    )
+    live = _content(
+        await _call(
+            ac, token, "get_consumer_lag", {"consumer_group": "worker-dispatcher"}
+        )
+    )
+    assert live["lag"] == 42
+    assert live["source"] == "live"
+
+    fixture = _content(
+        await _call(
+            ac, token, "get_consumer_lag", {"consumer_group": "billing-consumer"}
+        )
+    )
+    assert fixture["lag"] == 15000
+    assert fixture["source"] == "static"
+
+
+async def test_get_consumer_lag_description_scopes_its_freshness_claim(
+    mcp_client, db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
+) -> None:
+    """Contract test for the corrected description. The old text
+    promised a ~60s refresh loop and a 90s TTL for all eight advertised
+    groups; that is true of exactly one. Pin the correction so it cannot
+    silently regress into a blanket claim again."""
+    ac, _ = mcp_client
+    token = await _token(
+        db_session, default_tenant.id, [Scope.TELEMETRY_READ.value]
+    )
+    listing = await ac.post(
+        "/mcp",
+        json=_rpc("tools/list"),
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    tools = {t["name"]: t for t in listing.json()["result"]["tools"]}
+    description = tools["get_consumer_lag"]["description"]
+
+    # The freshness promise must be attributed to the one live group.
+    refresh_sentence = [
+        line for line in description.splitlines() if "60s" in line
+    ]
+    assert refresh_sentence, "freshness claim disappeared entirely"
+    assert "worker-dispatcher" in " ".join(refresh_sentence), (
+        "the ~60s refresh claim is still stated for every advertised "
+        "group; it holds only for worker-dispatcher"
+    )
+    # The non-live groups must be described as unchanging, and in
+    # lab-free words: ADR 0012 rule 1 bans "fixture"/"seed" from the
+    # non-chaos wire surface, so the honest wording has to be
+    # operational ("a recorded constant") rather than about the rig.
+    assert "static" in description.lower()
+    # Every advertised group is still named, so the correction narrowed
+    # the freshness claim without shrinking the menu.
+    from app.mcp.tools.consumer_lag import SEEDED_CONSUMER_GROUPS
+
+    missing = [g for g in SEEDED_CONSUMER_GROUPS if g not in description]
+    assert not missing, f"groups dropped from the description: {missing}"
 
 
 # ---------------------------------------------------------------------------

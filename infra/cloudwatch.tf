@@ -140,6 +140,13 @@ resource "aws_cloudwatch_metric_alarm" "redis_memory" {
 # So a *dead* consumer shows up as absent datapoints, not as a high value, and
 # notBreaching keeps this alarm quiet for it. That case belongs to the ECS
 # task-count alarm and to worker supervision, not here.
+#
+# The MCP read surface makes the same distinction explicitly, so an agent
+# reading JSON cannot mistake it either: `get_consumer_lag` returns
+# `lag_known: false` with `lag: null` for the unknown case and never a
+# fabricated 0 (R2-17). Absent-is-not-zero holds on both the metric and the
+# tool; if one side ever starts emitting a placeholder, fix that side rather
+# than teaching the other to expect it.
 
 resource "aws_cloudwatch_metric_alarm" "queue_depth" {
   alarm_name          = "${var.app_name}-queue-depth-high"

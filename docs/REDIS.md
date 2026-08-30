@@ -38,7 +38,7 @@ Any key under `cache:` / `jobs:cache:` / `kafka:consumer_lag:` / `read_model:` �
 | `dag:paused:{root_job_id}` | string flag | `pause_dag` action tool (`pause_key_for` in `app/utils/dag_pause.py`) | Every dispatch path via `find_blocking_pause` — resolver promotion, resume sweep, delayed-retry promotion, `replay_job`, the scheduled DLQ-replay loop and `_run_job`'s pre-claim re-check, plus a create-time WAITING hold (ADR 0011 + its 2026-08-09 amendment); reported by `get_dag_state` | `ttl_seconds` (default 600s) | Yes — pause fails open, DAG resumes | Yes (`dag:paused:*` scan) |
 | `jobs:dlq_replay_delayed` | sorted set of job_ids by fire-at time | `replay_dlq_by_ids` / `replay_dlq_by_category` (`delay_seconds` path) | `dlq_replay_scheduler.py` via the worker's `_promote_dlq_replay_loop` | None | No — pending delayed replays disappear silently | Yes (ZSET deleted) |
 | `cache:jobs:worker-dispatcher:hot_set` (**eval-only**) | JSON array of seeded DLQ job ids | `seed_eval_fixtures.py` `_seed_hot_set`; also the `create_stale_cache` chaos tool | The stale-cache scenario observes it via `get_cache_key_info`, then deletes it via `invalidate_cache_key` | 24h (seed) / `ttl_seconds` default 600s (tool) | Yes — re-seeded | Re-populated by reset |
-| `kafka:consumer_lag:{group}` (**eval-only** except `worker-dispatcher`) | string (int) | Metrics loop writes only `worker-dispatcher` (row above); `seed_eval_fixtures.py` writes the 7 synthetic groups (`billing-consumer` … `healthy-consumer`) | `get_consumer_lag` MCP tool (any group); `check_backpressure` reads only `worker-dispatcher` | 24h on seeded groups (90s on the real one) | Yes | Re-seeded by reset |
+| `kafka:consumer_lag:{group}` (**eval-only** except `worker-dispatcher`) | string (int) | Metrics loop writes only `worker-dispatcher` (row above); `seed_eval_fixtures.py` writes the 7 synthetic groups (`billing-consumer` … `healthy-consumer`) | `get_consumer_lag` MCP tool (any group); `check_backpressure` reads only `worker-dispatcher` | **none** on seeded groups (90s on the real one) | Yes | Re-seeded by reset |
 
 ---
 
@@ -117,6 +117,10 @@ The key embeds the tenant (E2-01): a caller from another tenant computes a diffe
 ### Consumer lag (`kafka:consumer_lag:worker-dispatcher`)
 
 The metrics loop calls `dispatcher.consumer_lag()` every 60 seconds and writes the result here with TTL 90 (so the key is always fresh-or-missing, never stale).
+
+**Only this one group is refreshed.** The other seven advertised groups (`billing-consumer` … `healthy-consumer`) are static values written once by `seed_eval_fixtures.py::_seed_consumer_lag` and refreshed by nothing. They carried a 24h TTL until R2-17, on the reasoning that a fresh run re-seeds anyway — but the *stack* outlives the run. After a day of uptime without a re-seed the keys expired, and the six live scenarios that assert a non-null lag for these groups began failing as agent errors rather than as an unmet precondition, one wasted paid run each. They are now written durably like every other fixture, with the reset's rebaseline pass responsible for their freshness instead of a TTL.
+
+The same asymmetry made `inject_latency`'s "watch the group's lag grow" false for every group but `worker-dispatcher` — a static number cannot grow. `get_consumer_lag` now reports a `source` of `live` or `static` per group so the agent can tell which readings can move. That field is worded operationally rather than as `fixture`/`seed`: ADR 0012 rule 1 bans lab vocabulary from the non-chaos tool surface and `test_no_lab_vocabulary_on_non_chaos_tool_surface` enforces it, so the wire says "a recorded constant" and this document says which script records it.
 
 `check_backpressure` in `app/utils/backpressure.py` reads this key from the `POST /jobs` hot path. If the value is above `backpressure_lag_threshold`, the request is rejected with `BackpressureError` (503). The API never round-trips to Kafka.
 
