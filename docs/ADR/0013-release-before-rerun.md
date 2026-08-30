@@ -66,7 +66,11 @@ unreleased behind a rerun that is itself frozen — deadlocks the campaign.
 **Positive.** The campaign has a clean rulebook before any colliding PR merges: every fix lands,
 the release is a deliberate gate with named preconditions (SHA-pinned release workflow, quiescent
 tool surface, green suites), and the first post-campaign eval measures the artifact users of the
-fixes will actually run, not a hybrid. The rerun-then-tag deadlock is dissolved in writing rather
+fixes will actually run, not a hybrid. The release workflow precondition gained a second clause in
+WO-R2-31: `release.yml` picks the release path by **event name**, not ref type, so a manual
+`workflow_dispatch` smoke-test build launched from a tag can no longer move `:latest` or
+republish the tag it was launched from — which, before the fix, would have silently overwritten
+the very release this ADR sequences. The rerun-then-tag deadlock is dissolved in writing rather
 than worked around silently.
 
 **Negative.** A live-red discovery moves from before the tag to after it, with the v0.5.1 remedy

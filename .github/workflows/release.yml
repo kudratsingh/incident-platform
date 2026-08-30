@@ -18,6 +18,14 @@
 #      absent an input, the short commit SHA. Dispatch builds never
 #      move `:latest`.
 #
+# Which of the two a run takes is decided by the EVENT NAME, never by the
+# ref type. A `workflow_dispatch` may be started from any ref the repo has,
+# including a `v*` tag — so `GITHUB_REF_TYPE` says "tag" for both surfaces
+# and cannot tell them apart. Gating on it (as this workflow did until
+# WO-R2-31) sent a manual smoke-test build launched from a tag down the full
+# release path: it moved `:latest`, skipped the version-format check and the
+# GHCR collision refusal, and discarded the version input entirely.
+#
 # Requires the repository's Actions to have `packages: write`. GHCR uses
 # the built-in `GITHUB_TOKEN` — no extra secret provisioning.
 
@@ -59,21 +67,41 @@ jobs:
         # ${{ }} interpolation of free text inside run: is a shell-injection
         # surface. (`github.repository_owner` below is fine: an owner name,
         # not free text.)
+        #
+        # Behaviour is covered by .github/release-path-check.py, which
+        # extracts this script and runs it under both event names.
         env:
           INPUT_VERSION: ${{ github.event.inputs.version }}
         run: |
           set -euo pipefail
           IMAGE="ghcr.io/${{ github.repository_owner }}/incident-platform"
-          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+
+          # vX.Y.Z or vX.Y.Z-rcN. Applied to BOTH paths: the `v*` glob on the
+          # push trigger also matches junk like `vfoo`, which would otherwise
+          # be published verbatim AND moved to :latest with no check at all.
+          version_format_ok() {
+            [[ "$1" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc[0-9]+)?$ ]]
+          }
+
+          # Event name, not ref type — see the header. A dispatch started
+          # from a tag ref has GITHUB_REF_TYPE=tag and must NOT land here.
+          # The ref-type conjunct is defence in depth, not the discriminator:
+          # `on.push.tags` already guarantees it, and if a push ever arrives
+          # some other way it falls through to the safe SHA-tag branch.
+          if [[ "${GITHUB_EVENT_NAME}" == "push" && "${GITHUB_REF_TYPE}" == "tag" ]]; then
             # Real release (v* tag push): the only path that publishes
             # :latest. Deliberately NO collision check on this path —
             # re-releasing after deleting a git tag + its GHCR tag is a
             # legitimate flow, and the commander pins images by digest,
             # which contains a force-moved tag.
             VERSION="${GITHUB_REF_NAME}"
+            version_format_ok "${VERSION}" || {
+              echo "::error::bad tag format: ${VERSION} (expected vX.Y.Z or vX.Y.Z-rcN)"
+              exit 1
+            }
             TAGS="${IMAGE}:${VERSION},${IMAGE}:latest"
           elif [[ -n "${INPUT_VERSION}" ]]; then
-            [[ "${INPUT_VERSION}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc[0-9]+)?$ ]] || {
+            version_format_ok "${INPUT_VERSION}" || {
               echo '::error::bad version format (expected vX.Y.Z or vX.Y.Z-rcN)'
               exit 1
             }
@@ -89,6 +117,15 @@ jobs:
           else
             VERSION="sha-${GITHUB_SHA::7}"
             TAGS="${IMAGE}:${VERSION}"
+          fi
+
+          # Belt and braces. Unreachable while the branches above are correct,
+          # which is the point: if a future edit reintroduces the ref-type
+          # discriminator, this refuses the run instead of silently
+          # republishing a released version and moving :latest.
+          if [[ "${TAGS}" == *":latest"* && "${GITHUB_EVENT_NAME}" != "push" ]]; then
+            echo "::error::refusing to move :latest from a ${GITHUB_EVENT_NAME} event"
+            exit 1
           fi
           {
             echo "image=${IMAGE}"
