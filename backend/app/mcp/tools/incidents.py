@@ -38,7 +38,7 @@ class ListIncidentsInput(BaseModel):
     )
     severity: str | None = Field(
         default=None,
-        description="Filter to `info`, `warning`, or `critical`.",
+        description="Filter to `low`, `info`, `warning`, or `critical`.",
     )
     source: str | None = Field(
         default=None,

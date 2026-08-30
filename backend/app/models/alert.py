@@ -25,11 +25,25 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 if TYPE_CHECKING:
     from app.models.tenant import Tenant
 
+# The operator vocabulary a producer may assert. `low` was added by
+# WO-R2-124 (user decision, 2026-08-30 — see ADR 0025): it is a real band
+# below `info` that the incident commander's triage already classifies as
+# noise, and without it two of that classifier's three noise branches were
+# unreachable by any alert this platform could send.
+#
+# Deliberately four values and not more. `medium`/`high` were declined —
+# they map onto `warning`/`critical` and adding them would widen the
+# vocabulary to fit fixtures rather than reality. `unknown` was declined
+# too: it is a *receiver's* default for a malformed payload, not something
+# a producer should be able to assert. ADR 0025 records both refusals.
+SEVERITY_LOW = "low"
 SEVERITY_INFO = "info"
 SEVERITY_WARNING = "warning"
 SEVERITY_CRITICAL = "critical"
 
-ALLOWED_SEVERITIES = frozenset({SEVERITY_INFO, SEVERITY_WARNING, SEVERITY_CRITICAL})
+ALLOWED_SEVERITIES = frozenset(
+    {SEVERITY_LOW, SEVERITY_INFO, SEVERITY_WARNING, SEVERITY_CRITICAL}
+)
 
 
 class Alert(Base):

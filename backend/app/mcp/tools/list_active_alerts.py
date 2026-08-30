@@ -27,7 +27,7 @@ class ListActiveAlertsInput(BaseModel):
 
     severity: str | None = Field(
         default=None,
-        description="Filter by severity: `info`, `warning`, `critical`. "
+        description="Filter by severity: `low`, `info`, `warning`, `critical`. "
         "Omit for all.",
     )
     limit: int = Field(default=50, ge=1, le=200)

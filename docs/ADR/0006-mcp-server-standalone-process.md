@@ -55,6 +55,19 @@ Negative:
 * Two processes means DB pool sizing is set per process, and the MCP process gets a small pool matched to its rate limits.
 * Platform PR-1 grows slightly. Accepted, it remains one coherent slice.
 
+### Implementation status (2026-08-30, WO-R2-68)
+
+Fully provisioned. The compose stanza shipped with PR-1; the ECS half did not, so for some time `infra/` — the only description of production this repo has — contained no MCP task definition, service, target group, security group or alarm, while this ADR and ARCHITECTURE.md both described the process as existing "in every deployed environment". That gap is closed: `aws_ecs_task_definition.mcp`, `aws_ecs_service.mcp`, `aws_lb_target_group.mcp` (probing `/healthz`), `aws_lb_listener_rule.mcp` (`/mcp*`), `aws_security_group.mcp` (admitted by the RDS and Redis groups), `aws_cloudwatch_log_group.mcp` and the `mcp-tasks-low` alarm. `backend/tests/unit/test_mcp_deployable.py` asserts each of them, so the ADR and the Terraform cannot drift apart again silently.
+
+Two details are decisions rather than transcription:
+
+* **The MCP task uses `var.backend_image_tag`,** not a tag of its own. A second tag could skew, and a skew would mean the MCP surface fronting a different commit's service layer than REST — the exact drift this topology was chosen to prevent.
+* **It does not receive `ALEMBIC_DATABASE_URL` or `INCIDENT_APP_DB_PASSWORD`.** Those are the owner credential and the role-sync password, needed only by the task that migrates. The command override bypasses `scripts/entrypoint.sh`, so this process never runs alembic, and a process that cannot run DDL should not hold the credential that could.
+
+Nothing here is applied: the ECS deploy job is gated off ([ADR 0018](0018-production-kafka-posture.md)) because no production Kafka broker is provisioned. `terraform validate` and the CI infra job cover the configuration; the first real `apply` will be whatever enables that deploy.
+
+**The revisit trigger below was considered and not taken.** It asks whether operating two services at solo scale is real friction, and the honest answer is that it has never been operated at all — production has never been deployed, so the evidence the trigger asks for does not exist. The nearest thing to friction on record is WO-R2-60's finding that the standalone process booted with no observability wiring at all, while the API's entrypoint had it (fixed in #182), which is a bug in the second process's boot, not a cost of having one. Choosing "not yet provisioned" instead would have recorded a deferral for roughly eighty lines of Terraform mirroring a pattern already in the file, while every other component of the intended topology was already described there.
+
 Revisit trigger: if operating two services at solo scale proves to be real friction, collapse to the mounted topology by mounting the same ASGI app inside the main application. That change is one line, alters no contracts, no auth, and no agent code, which is exactly why this decision is safe to make now.
 
 ## More information

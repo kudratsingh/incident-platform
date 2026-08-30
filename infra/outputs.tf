@@ -23,6 +23,16 @@ output "backend_service_name" {
   value       = aws_ecs_service.backend.name
 }
 
+output "mcp_service_name" {
+  description = "ECS service name for the MCP standalone process (ADR 0006)"
+  value       = aws_ecs_service.mcp.name
+}
+
+output "mcp_url" {
+  description = "PLATFORM_MCP_URL for agent clients — the MCP protocol endpoint"
+  value       = "http://${aws_lb.main.dns_name}/mcp"
+}
+
 output "frontend_service_name" {
   description = "ECS service name for the frontend"
   value       = aws_ecs_service.frontend.name
