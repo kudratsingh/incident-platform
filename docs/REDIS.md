@@ -117,9 +117,18 @@ The tenant scoping landed in Phase 12 PR D — before that, the sets were keyed 
 
 ### Job cache (`cache:job:{tenant_id}:{job_id}`)
 
-Read-through cache for `GET /jobs/{id}`. JSON serialization of the `JobResponse` schema. TTL 10s. Cache invalidated explicitly on replay and incident-resolve (`JobCache.delete`) so admins re-hitting after a Replay see the fresh state immediately.
+Read-through cache for `GET /jobs/{id}`. JSON serialization of the `JobResponse` schema. TTL 10s. Cache invalidated explicitly on replay and incident-resolve so admins re-hitting after a Replay see the fresh state immediately.
 
 The invalidation site is the **service layer** — `JobService.replay_job` and `JobService.resolve_incident` (`app/services/job.py`) — not the REST handlers. That is what makes every write path coherent: `POST /admin/jobs/{id}/replay`, the MCP replay tools (`replay_dlq_messages` / `replay_dlq_by_ids` / `replay_dlq_by_category`), and the scheduled DLQ-replay loop in `app/workers/dispatcher.py` all funnel through `JobService` (E2-02 — previously only the REST wrappers invalidated, so an agent-driven replay left `GET /jobs/{id}` stale for a full TTL).
+
+**Replay invalidates after the commit, with a tombstone** (`JobCache.invalidate`, R2-23). Two things were wrong with a plain `JobCache.delete` issued from inside the replay transaction:
+
+- *Timing.* Until the transaction commits, the cached row is still what every other connection would read. Deleting early advertises a change nobody can see yet — and hands a concurrent reader an empty slot to refill with the row that has not changed. `replay_job` now registers the invalidation on the session (`app/utils/post_commit.py`) and the session owner drains it once the commit lands: `get_db` for the API and MCP processes, the scheduled-replay loop for the worker. On rollback the drain never runs, which is the point — no commit, no announcement.
+- *The race that timing alone does not close.* A reader that missed and read the pre-replay row from Postgres is still holding it, and its `JobCache.set` can land after the delete. So `invalidate` parks a short `__invalidated__` tombstone in the slot (TTL 30s) instead of emptying it, and `JobCache.set` writes with `NX`. One `SET` both destroys the stale value and closes the slot to every writer until the tombstone expires — long enough that any reader carrying a pre-commit snapshot has given up. Readers miss and go to Postgres, which is the correct answer for as long as we cannot distinguish a fresh write from a stale one. `JobCache.get` reads the tombstone as a miss.
+
+The `NX` has one visible consequence: a live entry is never refreshed mid-TTL — whoever wrote it wins for the remaining seconds. At a 10s TTL that is noise, and the loser's value was no fresher than the winner's.
+
+`resolve_incident` still uses the plain `JobCache.delete`. Same race in principle, but it writes a terminal status that nothing subsequently changes, so a stale entry costs one TTL and then resolves itself.
 
 The `cache:` namespace also makes this key reachable by the `invalidate_cache_key` MCP action, whose allowlist covers `cache:` — an agent can force-refresh a single job read without any change to that tool's contract. Its read counterpart `get_cache_key_info` covers the same prefixes and reports existence / TTL / type / size only — never the cached `JobResponse` payload, which is tenant data.
 

@@ -10,7 +10,7 @@ from app.models.job_dependency import JobDependency
 from app.repositories.base import BaseRepository
 from app.repositories.outbox import OutboxRepository
 from app.schemas.job_events import completed_event_payload, dlq_event_payload
-from sqlalchemy import CursorResult, and_, func, select, update
+from sqlalchemy import CursorResult, and_, func, or_, select, update
 
 # The statuses a job never leaves, and the Kafka topic each one announces on.
 # `CANCELLED` is terminal too but is deliberately absent: the platform has no
@@ -79,6 +79,7 @@ class JobRepository(BaseRepository[Job]):
         retry_count_min: int | None = None,
         retry_count_max: int | None = None,
         remediation_hint: str | None = None,
+        exclude_remediation_hints: Sequence[str] | None = None,
     ) -> tuple[list[Job], int]:
         filters: list[Any] = [Job.tenant_id == tenant_id]
         if user_id is not None:
@@ -99,6 +100,19 @@ class JobRepository(BaseRepository[Job]):
             filters.append(Job.retry_count <= retry_count_max)
         if remediation_hint is not None:
             filters.append(Job.remediation_hint == remediation_hint)
+        if exclude_remediation_hints:
+            # `NOT IN (...)` alone would be wrong here: SQL evaluates it to
+            # NULL for a NULL column, so every *uncategorised* job would be
+            # filtered out as well. An uncategorised DLQ entry is simply one
+            # triage has not classified yet — the opposite of fenced — and
+            # dropping it would quietly shrink the blast radius of the bulk
+            # replay far past what R2-22 asked for.
+            filters.append(
+                or_(
+                    Job.remediation_hint.is_(None),
+                    Job.remediation_hint.not_in(list(exclude_remediation_hints)),
+                )
+            )
 
         where = and_(*filters)
         total = await self._count(where)

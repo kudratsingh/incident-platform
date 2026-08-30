@@ -21,6 +21,7 @@ from app.services.service_account import (
     ServiceAccountService,
     looks_like_service_account_token,
 )
+from app.utils.post_commit import run_post_commit
 from fastapi import Depends
 from fastapi.security import OAuth2PasswordBearer
 from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor
@@ -41,6 +42,16 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
     async with _async_session() as session:
         async with session.begin():
             yield session
+        # The commit has landed. Anything a service deferred because it
+        # must not be visible before then — cache invalidation, today —
+        # runs here (R2-23). On rollback the block above raises and this
+        # never runs, which is the behaviour we want: nothing committed,
+        # nothing to announce.
+        #
+        # This covers the API app and the MCP server, which shares this
+        # dependency. The worker loops own their own `session.begin()`
+        # blocks and call `run_post_commit` themselves.
+        await run_post_commit(session)
 
 
 # ---------------------------------------------------------------------------
