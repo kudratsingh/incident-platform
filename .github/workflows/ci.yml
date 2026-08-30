@@ -324,6 +324,17 @@ jobs:
           print("OK: no run: script interpolates workflow_dispatch inputs.")
           EOF
 
+      # Regression guard for WO-R2-31: release.yml must decide release-vs-
+      # dispatch by EVENT NAME, never by ref type. A workflow_dispatch can be
+      # started from a `v*` tag, so GITHUB_REF_TYPE reads "tag" for both
+      # surfaces — gating on it let a manual smoke-test build move :latest and
+      # republish a released version. This extracts the real `Compute tags`
+      # script and executes it under both event names, so the assertion is
+      # about what the workflow does rather than what it contains. `docker` is
+      # stubbed inside the harness: no registry, no network, no daemon.
+      - name: Release path is chosen by event name
+        run: python3 .github/release-path-check.py
+
   deploy:
     name: Build & Deploy to ECS
     runs-on: ubuntu-latest
