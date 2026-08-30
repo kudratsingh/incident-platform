@@ -25,6 +25,15 @@ Why SSE over WebSockets here:
   - Job progress is unidirectional (server → client only).
   - SSE reconnects automatically in the browser.
   - No need for a full duplex channel.
+
+Connection budget (WO-R2-11): an open stream no longer owns a Redis
+connection.  Every stream in the process reads off one shared Pub/Sub
+connection (`workers/progress_broker.py`) drawn from a pool dedicated to
+streaming (`core/redis.py`), so viewers can no longer starve the rate limiter,
+`check_backpressure` and the worker loops that share the default pool.  The
+number of concurrent streams is capped explicitly instead — past the cap this
+endpoint answers 503 + `Retry-After` — and idle/maximum-duration timeouts stop
+a parked tab from holding a slot forever.
 """
 
 import uuid
@@ -46,12 +55,13 @@ from app.workers.progress import (
     TERMINAL_STATUSES,
     ProgressEvent,
     read_last_event,
-    subscribe,
 )
+from app.workers.progress_broker import acquire_stream_slot, subscribe
 from fastapi import APIRouter, Depends, Query
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 from sse_starlette.sse import EventSourceResponse
+from starlette.background import BackgroundTask
 
 router = APIRouter(tags=["streaming"])
 
@@ -154,13 +164,26 @@ async def stream_job_progress(
         else None
     )
 
-    async def _event_stream() -> AsyncGenerator[dict[str, str], None]:
-        if finished_event is not None and await read_last_event(redis, str(job_id)) is None:
-            # Job is over and Redis retained nothing to say so — the channel
-            # would stay silent forever. Report the row and close.
-            yield {"data": finished_event.to_json(), "event": finished_event.status}
-            return
-        async for event in subscribe(redis, str(job_id)):
-            yield {"data": event.to_json(), "event": event.status}
+    # Reserve the stream slot BEFORE returning a response: a refusal has to be
+    # a normal 503 with Retry-After, not a stream that opens and then dies.
+    # This raises StreamCapacityError and never touches Redis, so a full
+    # process refuses cheaply instead of queueing against a finite pool.
+    slot = acquire_stream_slot()
 
-    return EventSourceResponse(_event_stream())
+    async def _event_stream() -> AsyncGenerator[dict[str, str], None]:
+        try:
+            if finished_event is not None and await read_last_event(redis, str(job_id)) is None:
+                # Job is over and Redis retained nothing to say so — the channel
+                # would stay silent forever. Report the row and close.
+                yield {"data": finished_event.to_json(), "event": finished_event.status}
+                return
+            async for event in subscribe(str(job_id)):
+                yield {"data": event.to_json(), "event": event.status}
+        finally:
+            slot.release()
+
+    # The background task is the belt to the generator's braces: if the client
+    # disappears between here and the first byte the generator is never driven,
+    # so its `finally` never runs and the slot would leak. `release()` is
+    # idempotent, so whichever fires first wins and the other is a no-op.
+    return EventSourceResponse(_event_stream(), background=BackgroundTask(slot.release))

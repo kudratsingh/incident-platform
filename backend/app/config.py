@@ -60,6 +60,28 @@ class Settings(BaseSettings):
     # Redis
     redis_url: RedisDsn = "redis://localhost:6379/0"  # type: ignore[assignment]
 
+    # SSE streaming (see docs/REDIS.md, "SSE progress bridge").
+    #
+    # The streaming path runs on its OWN Redis pool so it can never starve the
+    # worker loops, rate limiter and backpressure check that share the default
+    # 20-connection pool. It is small on purpose: the fan-out broker holds one
+    # Pub/Sub connection for the whole process regardless of how many viewers
+    # are watching, so this is headroom for reconnects, not a per-viewer
+    # budget.
+    sse_redis_max_connections: int = 5
+    # Per-process cap on concurrent open streams. Beyond it a viewer gets 503
+    # + Retry-After instead of silently competing for a finite resource.
+    # 0 disables the cap.
+    sse_max_concurrent_streams: int = 200
+    # A stream with no event for this long is closed; the browser's
+    # EventSource reconnects if the user is still watching. 0 disables.
+    sse_stream_idle_timeout_seconds: int = 300
+    # Hard ceiling on one stream's life, resettable by nothing. Bounds the
+    # slot a chatty-but-endless job could otherwise hold forever. 0 disables.
+    sse_stream_max_duration_seconds: int = 3600
+    # Retry-After (seconds) advertised on a capacity refusal.
+    sse_retry_after_seconds: int = 5
+
     # JWT
     secret_key: str = _INSECURE_DEFAULT_KEY
     algorithm: str = "HS256"
