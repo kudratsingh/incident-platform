@@ -33,12 +33,21 @@ export interface User {
   created_at: string
 }
 
-export interface Tenant {
+/**
+ * What `POST /admin/tenants` actually returns — the tenant row and nothing
+ * else. The rollup counts and the limits are computed by the list endpoint,
+ * so a created tenant is NOT a `Tenant` and must not be spliced into the
+ * tenants list as though it were; refetch the list instead.
+ */
+export interface TenantSummary {
   id: string
   slug: string
   name: string
   is_active: boolean
   created_at: string
+}
+
+export interface Tenant extends TenantSummary {
   users: number
   jobs: number
   rate_limit_per_minute: number

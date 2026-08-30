@@ -10,6 +10,7 @@ import type {
   SLOState,
   SystemStats,
   Tenant,
+  TenantSummary,
   User,
 } from '../types'
 import type { JobListParams } from './jobs'
@@ -72,8 +73,13 @@ export const adminApi = {
 
   getTenant: (id: string) => api.get<Tenant>(`/admin/tenants/${id}`),
 
+  /**
+   * Returns the new tenant row only — no `users`/`jobs` rollups and no
+   * rate/quota limits, which the list endpoint computes. Typed as
+   * TenantSummary so callers cannot mistake it for a list row.
+   */
   createTenant: (slug: string, name: string) =>
-    api.post<Tenant>('/admin/tenants', { slug, name }),
+    api.post<TenantSummary>('/admin/tenants', { slug, name }),
 
   nlQuery: (question: string) =>
     api.post<{
