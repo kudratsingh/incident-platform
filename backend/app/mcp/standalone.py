@@ -15,9 +15,10 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from app.config import assert_chaos_gate
+from app.core import metrics
 from app.core.exceptions import AppError, AuthenticationError
 from app.core.logging import get_logger
-from app.core.middleware import RequestContextMiddleware
+from app.core.middleware import RequestContextMiddleware, register_route_dimension
 from app.dependencies import (
     Principal,
     get_current_principal,
@@ -53,7 +54,15 @@ async def _mcp_lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
     # dependencies._engine's settings but boots separately, and it hits
     # the DB on every tool call (ADR 0015).
     await assert_rls_posture(session_factory, get_settings())
-    yield
+
+    # The MCP process runs the same RequestContextMiddleware as the API, so
+    # it queues RequestLatency too and needs its own flush task — nothing
+    # else in this process drains the queue.
+    await metrics.start_metrics_emitter()
+    try:
+        yield
+    finally:
+        await metrics.stop_metrics_emitter()
 
 
 def create_mcp_app() -> FastAPI:
@@ -125,6 +134,10 @@ def create_mcp_app() -> FastAPI:
     @app.get("/healthz", include_in_schema=False)
     async def healthz() -> dict[str, str]:
         return {"status": "ok"}
+
+    # Two routes, so the `Path` allow-list here is tiny — but registering it
+    # is what makes an unexpected value bucket as `other` rather than bill.
+    register_route_dimension(app)
 
     return app
 
