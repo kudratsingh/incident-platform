@@ -191,6 +191,31 @@ class Settings(BaseSettings):
     # consumer group is more than this many messages behind. 0 disables.
     backpressure_lag_threshold: int = 1000
 
+    # ---- Per-principal / per-identity rate limits (WO-R2-30) ----
+    #
+    # All three are FIXED windows, so the ceiling actually enforced is
+    # 2x the number across a window boundary (see utils/rate_limit.py).
+    # Every value below is sized against that doubled figure.
+    #
+    # MCP: one bucket per service-account principal. Sized to stop a
+    # runaway tool-call loop from saturating the MCP process's DB pool
+    # (SQLAlchemy defaults: pool_size=5 + max_overflow=10 = 15
+    # connections) without ever touching a legitimate eval run, whose
+    # calls are paced by the agent's own LLM turn latency. A stuck
+    # retry loop does thousands per minute; this stops that decisively
+    # and leaves normal investigation untouched.
+    mcp_rate_limit_per_principal: int = 120
+    mcp_rate_limit_window_seconds: int = 60
+
+    # The two admin endpoints that each make one paid Anthropic call per
+    # request. Bounded by spend, not by load: at ~$0.006 a
+    # natural-language query and ~$0.018 a digest, the worst-case
+    # boundary burst is ~$0.12 and ~$0.18 respectively. Both are
+    # human-driven, so these sit far above any real interactive rate.
+    admin_nl_query_rate_limit: int = 10
+    admin_digest_rate_limit: int = 5
+    admin_paid_rate_limit_window_seconds: int = 60
+
     # LLM-driven DLQ triage. Disabled by default; enabling requires an
     # Anthropic API key (read from ANTHROPIC_API_KEY env var by the SDK).
     llm_triage_enabled: bool = False

@@ -3,8 +3,11 @@ Per-tenant rate limit + monthly quota check.
 
 Two enforcement mechanisms, both scoped to the authenticated tenant:
 
-  * Rate limit: requests per minute, sliding window in Redis. The cap is
-    `tenants.rate_limit_per_minute`; 0 disables.
+  * Rate limit: requests per minute, fixed window in Redis (it resets on
+    absolute boundaries rather than moving with the caller, so the real
+    bound is 2x the cap across a boundary instant — see
+    `app/utils/rate_limit.py`). The cap is `tenants.rate_limit_per_minute`;
+    0 disables.
   * Monthly quota: total jobs the tenant created in the current UTC
     calendar month. The cap is `tenants.quota_jobs_per_month`; 0 disables.
     Checked against the number of jobs the request is about to create

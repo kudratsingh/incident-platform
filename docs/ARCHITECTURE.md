@@ -132,7 +132,7 @@ Pre-conditions checked, in order:
 1. **Per-client rate limit** (IP-keyed)
 2. **Backpressure** (Kafka consumer-group lag)
 3. **Auth** (JWT decode + DB user lookup)
-4. **Per-tenant rate limit** (Redis sliding window)
+4. **Per-tenant rate limit** (Redis fixed window — 2x the cap is reachable across a boundary; see [`docs/REDIS.md`](REDIS.md#rate-limits-rate))
 5. **Monthly quota** (SQL count of this month's jobs for the tenant)
 
 Each one fails fast with a structured error envelope. The first three protect the API from external load; the last two protect us from abusive tenants.

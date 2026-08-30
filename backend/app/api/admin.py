@@ -28,11 +28,18 @@ from app.services.job import JobService
 from app.services.runbooks import get as get_runbook
 from app.services.runbooks import list_all as list_runbooks
 from app.services.slo import compute_all as compute_slos
+from app.utils.rate_limit import check_identity_rate_limit
 from app.workers.read_model import read_global_stats, read_user_stats
 from fastapi import APIRouter, Depends
 from redis.asyncio import Redis
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
+
+# Redis key namespaces for the two paid-call limiters. Separate buckets
+# so exhausting the digest allowance never blocks a natural-language
+# query, and vice versa — they are different costs and different paths.
+ADMIN_NL_QUERY_RATE_BUCKET = "admin:nl_query"
+ADMIN_DIGEST_RATE_BUCKET = "admin:digest"
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -115,6 +122,7 @@ async def admin_nl_query(
     enum/literal fields — the model can never smuggle raw SQL or unsafe
     field names into the query.
     """
+    from app.config import get_settings
     from app.core.exceptions import AppError, RequestValidationError
 
     class NLQueryUnavailable(AppError):
@@ -131,6 +139,24 @@ async def admin_nl_query(
         raise NLQueryUnavailable(
             "Natural-language queries are disabled. Set LLM_NL_QUERY_ENABLED=1."
         )
+
+    # Immediately before the paid call, and deliberately not earlier.
+    # This bucket counts *Anthropic calls* (~$0.006 each), which is what
+    # the finding is about — an unbounded paid call per request. A
+    # rejected-because-empty question and a 503 from the feature flag
+    # both cost nothing, so charging them against an operator's
+    # allowance would let a typo burn the budget for a real query
+    # (WO-R2-30). Keyed on the admin user rather than the client IP:
+    # the thing worth bounding is spend attributable to a token, and
+    # several admins behind one office address should not share one
+    # allowance. Fails open on a Redis error, like every limiter here.
+    await check_identity_rate_limit(
+        redis,
+        identity=current_user.id,
+        limit=get_settings().admin_nl_query_rate_limit,
+        window=get_settings().admin_paid_rate_limit_window_seconds,
+        bucket=ADMIN_NL_QUERY_RATE_BUCKET,
+    )
 
     try:
         spec, usage, model = await nl_query.parse_question(question)
@@ -292,6 +318,7 @@ async def admin_generate_digest(
     tenant_id: uuid.UUID | None = None,
     current_user: User = Depends(_require_admin),
     db: AsyncSession = Depends(get_db),
+    redis: Redis = Depends(get_redis),
 ) -> dict[str, Any]:
     """Generate a digest for the caller's tenant immediately, without
     waiting for the periodic loop. Useful for incident-response time.
@@ -314,6 +341,7 @@ async def admin_generate_digest(
     from app.config import get_settings
 
     settings = get_settings()
+
     hours_raw = (body or {}).get("hours") if body else None
     try:
         hours = int(hours_raw) if hours_raw is not None else settings.llm_digest_window_hours
@@ -326,6 +354,20 @@ async def admin_generate_digest(
     if tenant_row is None:
         from app.core.exceptions import NotFoundError
         raise NotFoundError(f"Tenant {effective_tenant} not found")
+
+    # Same reasoning and same position as POST /query: immediately
+    # before the paid call, so a 503 from the flag or a bad tenant id
+    # costs the operator nothing. Tighter ceiling because a digest is
+    # the more expensive of the two calls (~$0.018) and the periodic
+    # `_digest_loop` already produces these on a schedule — the
+    # on-demand endpoint is a convenience, not the main path.
+    await check_identity_rate_limit(
+        redis,
+        identity=current_user.id,
+        limit=settings.admin_digest_rate_limit,
+        window=settings.admin_paid_rate_limit_window_seconds,
+        bucket=ADMIN_DIGEST_RATE_BUCKET,
+    )
 
     window_end = datetime.now(UTC)
     window_start = window_end - timedelta(hours=hours)

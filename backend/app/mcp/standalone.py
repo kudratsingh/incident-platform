@@ -14,7 +14,7 @@ from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from typing import Any
 
-from app.config import assert_chaos_gate
+from app.config import assert_chaos_gate, get_settings
 from app.core import metrics
 from app.core.exceptions import AppError, AuthenticationError
 from app.core.logging import get_logger
@@ -27,12 +27,18 @@ from app.dependencies import (
 )
 from app.mcp import handlers, protocol
 from app.mcp import tools as _tools  # noqa: F401 — side-effect: register tools
+from app.utils.rate_limit import check_identity_rate_limit
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
 logger = get_logger(__name__)
+
+# Redis key namespace for the per-principal MCP limit. Distinct from the
+# API's buckets so an agent's MCP allowance and any REST allowance it
+# also holds are independent counters.
+MCP_RATE_BUCKET = "mcp:principal"
 
 
 @asynccontextmanager
@@ -73,6 +79,11 @@ def create_mcp_app() -> FastAPI:
     # Chaos framework triple-gate — enforce the "never in production"
     # invariant before we even mount routes. See ADR 0008.
     assert_chaos_gate()
+
+    # Resolved once, at factory time rather than per request: the
+    # ceilings are deployment config, and a test that rebuilds the app
+    # with overridden settings gets the overridden values.
+    settings = get_settings()
 
     app = FastAPI(
         title="incident-platform MCP",
@@ -151,6 +162,31 @@ def create_mcp_app() -> FastAPI:
             )
             return JSONResponse(status_code=200, content=resp.model_dump())
 
+        # Per-principal rate limit, between parsing and dispatch.
+        #
+        # After parsing so a malformed body still gets its JSON-RPC
+        # parse error rather than a 429 (the request never reached a
+        # tool, and charging it to the principal's bucket would let bad
+        # framing exhaust a good caller's allowance). Before dispatch
+        # because dispatch is where the DB pool and the tool side
+        # effects are — the whole point is to refuse before the work.
+        #
+        # Only authenticated callers are keyed: `principal_or_error` is
+        # an `AppError` for anonymous requests, and `initialize` is
+        # deliberately allowed unauthenticated (handled inside
+        # dispatch). Anonymous traffic is bounded at the edge, not here;
+        # this limiter's contract is per-principal, and inventing a
+        # bucket for callers who have no principal would be a different
+        # control wearing this one's name.
+        if isinstance(principal_or_error, Principal):
+            await check_identity_rate_limit(
+                redis,
+                identity=principal_or_error.id,
+                limit=settings.mcp_rate_limit_per_principal,
+                window=settings.mcp_rate_limit_window_seconds,
+                bucket=MCP_RATE_BUCKET,
+            )
+
         response = await handlers.dispatch(
             parsed,
             db=db,
@@ -202,6 +238,8 @@ def _status_to_jsonrpc(status: int) -> int:
         return protocol.MCP_UNAUTHORIZED
     if status == 403:
         return protocol.MCP_FORBIDDEN
+    if status == 429:
+        return protocol.MCP_RATE_LIMITED
     if 400 <= status < 500:
         return protocol.JSONRPC_INVALID_REQUEST
     return protocol.JSONRPC_INTERNAL_ERROR
