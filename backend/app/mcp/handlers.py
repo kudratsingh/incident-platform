@@ -11,6 +11,11 @@ Error mapping to JSON-RPC codes:
   - unknown tool                        → MCP_TOOL_NOT_FOUND
   - other `AppError`                    → MCP_TOOL_ERROR
   - anything else                       → JSONRPC_INTERNAL_ERROR
+
+Every one of those is a JSON-RPC envelope: `tools/call` is wrapped end to
+end, so no exception — including one raised after the tool has already
+run — can reach the transport as a bare 500. See ADR 0010's 2026-08-30
+addendum for what the transaction looks like underneath.
 """
 
 import time
@@ -37,8 +42,9 @@ from app.services.operator_audit import (
     OUTCOME_UNAUTHORIZED,
     record_tool_invocation,
 )
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 from redis.asyncio import Redis
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 logger = get_logger(__name__)
@@ -120,6 +126,39 @@ def handle_tools_list(request_id: str | int | None) -> p.JsonRpcResponse:
 
 
 async def handle_tools_call(
+    request_id: str | int | None,
+    params: dict[str, Any],
+    *,
+    ctx: ToolContext,
+) -> p.JsonRpcResponse:
+    """Transaction envelope around a single tool call.
+
+    Nothing gets out of here except a `JsonRpcResponse`. The work is in
+    `_run_tool_call`; this wrapper exists so that *every* step of it —
+    argument validation, execution, the audit write, the idempotency
+    store — is covered by one handler. It used to be that the
+    post-execution block sat past the end of the last `except`, so an
+    exception there (an idempotency-key collision, most plausibly)
+    unwound straight out of `dispatch` into Starlette. `get_db` saw the
+    exception on the way through and rolled the request transaction
+    back, taking the success audit row for an action that had already
+    run with it, and the client got a plain-text 500 it could only read
+    as a transport failure — so it retried, and the Tier-1 side effect
+    happened a second time with no audit row for either attempt.
+    """
+    try:
+        return await _run_tool_call(request_id, params, ctx=ctx)
+    except Exception:
+        # Deliberately last-resort. Every *expected* failure is handled
+        # inside with an audit row attached; reaching here means an
+        # unhandled one, and the response still has to be an envelope.
+        logger.exception("mcp tools/call failed outside every handled path")
+        return _error(
+            request_id, p.JSONRPC_INTERNAL_ERROR, "internal server error"
+        )
+
+
+async def _run_tool_call(
     request_id: str | int | None,
     params: dict[str, Any],
     *,
@@ -293,8 +332,18 @@ async def handle_tools_call(
             )
             return _ok(request_id, result.model_dump())
 
+    # SAVEPOINT around the handler. A tool that fails for any reason
+    # rolls back its own partial writes and nothing else: the request
+    # transaction stays open and usable, which is what lets the audit
+    # row below actually be written. The flush is inside the savepoint
+    # on purpose — a deferred DB error (constraint violation, FK drift —
+    # the class that sank #70) has to surface while there is still a
+    # savepoint to roll back to, not at the outer commit where the
+    # response has already been decided.
     try:
-        output = await tool_def.handler(parsed_input, ctx)
+        async with ctx.db.begin_nested():
+            output = await tool_def.handler(parsed_input, ctx)
+            await ctx.db.flush()
     except AuthenticationError as exc:
         latency_ms = (time.perf_counter() - start) * 1000
         await record_tool_invocation(
@@ -348,16 +397,14 @@ async def handle_tools_call(
     except Exception as exc:
         latency_ms = (time.perf_counter() - start) * 1000
         logger.exception("mcp tool crashed", extra={"tool": tool_def.name})
-        # Discard any partial writes the tool staged before it crashed
-        # (#5). Without this rollback, the outer get_db() cleanup would
-        # commit those writes behind our "internal tool error" response
-        # — the client sees failure while the DB kept the half-executed
-        # effect. The audit below is savepoint-wrapped (#6); if it fails
-        # against the rolled-back session it drops silently to the log.
-        try:
-            await ctx.db.rollback()
-        except Exception:
-            logger.exception("mcp handler rollback after tool crash failed")
+        # The savepoint above already discarded whatever the tool staged
+        # before it died (#5), so the client's "internal tool error" and
+        # the database now agree. This used to be `await ctx.db.rollback()`,
+        # which closed the transaction `get_db` opened as a context
+        # manager: SQLAlchemy then refused every later statement with
+        # "Can't operate on closed transaction inside context manager",
+        # so the audit write below — savepoint-wrapped and silent on
+        # failure (#6) — was dropped to the log on every crashed call.
         await record_tool_invocation(
             audit_repo,
             principal=ctx.principal,
@@ -388,25 +435,21 @@ async def handle_tools_call(
     )
 
     # Persist the response under the idempotency key so a repeat call
-    # with the same key returns the same result verbatim.
+    # with the same key returns the same result verbatim. The write can
+    # lose a race for the key, in which case the recorded outcome — not
+    # ours — is what this call answers with.
     if idempotency_service is not None and idempotency_key is not None:
-        await idempotency_service.store(
-            principal=ctx.principal,
+        duplicate = await _store_response(
+            ctx=ctx,
+            request_id=request_id,
+            service=idempotency_service,
             tool_name=tool_def.name,
             idempotency_key=idempotency_key,
             arguments=call_params.arguments,
-            response=output.model_dump(mode="json"),
-            ttl=_IDEMPOTENCY_TTL,
+            output=output,
         )
-
-    # Force the session to send pending SQL so any deferred DB error
-    # (constraint violation, FK drift — the class that sank #70) surfaces
-    # here as an exception rather than silently at the outer commit. That
-    # way a success response only goes out if the writes actually
-    # reached the DB successfully; a failure at flush lands in the
-    # `except Exception` handler above and the whole tx is rolled back.
-    # See ADR 0010's commit-before-response section.
-    await ctx.db.flush()
+        if duplicate is not None:
+            return duplicate
 
     # Emit the tool result as a single text content block whose body is
     # the JSON-serialized output model. Structured content is the norm
@@ -416,6 +459,87 @@ async def handle_tools_call(
         content=[p.ToolCallContent(text=output.model_dump_json())]
     )
     return _ok(request_id, result.model_dump())
+
+
+async def _store_response(
+    *,
+    ctx: ToolContext,
+    request_id: str | int | None,
+    service: IdempotencyService,
+    tool_name: str,
+    idempotency_key: str,
+    arguments: dict[str, Any],
+    output: BaseModel,
+) -> p.JsonRpcResponse | None:
+    """Record this call's response under its idempotency key.
+
+    Returns `None` when the record was written and the caller should
+    answer with its own fresh result. Returns a response to send when
+    the key turned out to be taken — a duplicate call — because then the
+    recorded outcome is the one answer for that key and ours is not.
+
+    The insert runs in its own SAVEPOINT. A collision (a concurrent call
+    with the same key, or an expired-but-unreaped record still occupying
+    the unique index) raises `IntegrityError`, which on Postgres poisons
+    the whole transaction unless there is a savepoint to roll back to —
+    and the transaction at that point already holds the audit row for a
+    Tier-1 action that really did execute. That row is the agent's
+    safety grade (`evals/guards.py` reads `agent.tool_invoked`), so it
+    outranks the cache write: the store may fail, the audit may not.
+    """
+    try:
+        async with ctx.db.begin_nested():
+            await service.store(
+                principal=ctx.principal,
+                tool_name=tool_name,
+                idempotency_key=idempotency_key,
+                arguments=arguments,
+                response=output.model_dump(mode="json"),
+                ttl=_IDEMPOTENCY_TTL,
+            )
+        return None
+    except IntegrityError:
+        logger.warning(
+            "idempotency key taken between lookup and store",
+            extra={"tool": tool_name, "idempotency_key": idempotency_key},
+        )
+
+    # Savepoint rolled back, transaction intact. Whoever holds the key
+    # holds the answer, so read it back and hand that to the caller.
+    try:
+        hit = await service.lookup(
+            principal=ctx.principal,
+            tool_name=tool_name,
+            idempotency_key=idempotency_key,
+            arguments=arguments,
+        )
+    except IdempotencyKeyReusedError as exc:
+        # The winner used this key for different arguments. Same refusal
+        # the pre-execution lookup would have given, and a retry now hits
+        # it there instead — without re-running the tool.
+        return _error(
+            request_id,
+            p.MCP_TOOL_ERROR,
+            exc.message,
+            {"error_code": exc.error_code},
+        )
+
+    if hit is not None:
+        result = p.ToolCallResult(
+            content=[p.ToolCallContent(text=_serialize_cached_response(hit.response))]
+        )
+        return _ok(request_id, result.model_dump())
+
+    # No live record to defer to: the key is held by an expired one that
+    # `lookup` reads as absent. The action ran and is audited, so the
+    # honest answer is our own result — uncached, which means a retry
+    # re-executes. That window is a property of expiry-without-reaping,
+    # not of this call; see ADR 0010's addendum.
+    logger.warning(
+        "tool response not cached; idempotency key held by an expired record",
+        extra={"tool": tool_name, "idempotency_key": idempotency_key},
+    )
+    return None
 
 
 def _extract_idempotency_key(arguments: dict[str, Any]) -> str | None:

@@ -100,6 +100,37 @@ def create_mcp_app() -> FastAPI:
             ).model_dump(),
         )
 
+    @app.exception_handler(Exception)
+    async def _unhandled_error_handler(
+        request: Request, exc: Exception
+    ) -> JSONResponse:
+        """Last line of defence for the JSON-RPC contract.
+
+        Without this, anything that escapes the dispatch layer — a
+        commit that fails during dependency teardown, a bug in a
+        middleware — comes back as Starlette's plain-text
+        `Internal Server Error`. An MCP client can't parse that as a
+        response at all, so it reads as a transport failure and gets
+        retried; if the request had already run a Tier-1 action, the
+        retry runs it again. Every exit from this process is an
+        envelope, even the ones we didn't see coming.
+        """
+        logger.exception("unhandled error on the MCP surface")
+        return JSONResponse(
+            status_code=500,
+            # `exclude={"result"}` rather than `exclude_none=True`: the
+            # request id is unknowable this far out, and JSON-RPC wants
+            # that said as an explicit `"id": null`, not by omitting the
+            # member.
+            content=protocol.JsonRpcResponse(
+                id=None,
+                error=protocol.JsonRpcError(
+                    code=protocol.JSONRPC_INTERNAL_ERROR,
+                    message="internal server error",
+                ),
+            ).model_dump(exclude={"result"}),
+        )
+
     @app.post("/mcp", response_class=JSONResponse)
     async def mcp_endpoint(
         payload: dict[str, Any],
