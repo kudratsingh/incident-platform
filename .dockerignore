@@ -44,3 +44,29 @@ Thumbs.db
 # Docs
 README.md
 CLAUDE.md
+docs/
+
+# Session context archives (WO-R2-66). context/README.md and the repo
+# .gitignore both say these transcripts carry live credentials, and they are
+# ~32 MB of binary besides. No COPY in the Dockerfile references them — the
+# image is built from explicit COPYs of backend/, scripts/, runbooks/ and
+# alembic.ini, never `COPY . .` — so this was the build *context* shipping
+# them to the daemon, not the image shipping them onward. Excluding them
+# keeps it that way by construction rather than by the current shape of the
+# COPY list: the next person to add a broad COPY should not be one line away
+# from baking credentials into a published layer.
+context/
+
+# Infrastructure — Terraform sources, and .terraform/ can hold provider
+# binaries and a state file with resource attributes in the clear. Nothing
+# in the image reads any of it.
+infra/
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+
+# Local tooling caches (never referenced by a COPY, pure context weight)
+.mypy_cache/
+.ruff_cache/
+.claude/

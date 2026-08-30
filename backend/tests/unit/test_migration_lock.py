@@ -24,11 +24,22 @@ class _StubDialect:
         self.name = name
 
 
+class _StubResult:
+    """The bit of `sqlalchemy.Result` the helper touches."""
+
+    def __init__(self, rows: list[Any]) -> None:
+        self._rows = rows
+
+    def all(self) -> list[Any]:
+        return self._rows
+
+
 class _StubConnection:
     """Records executed statements and mimics SQLAlchemy 2.0 autobegin."""
 
     def __init__(self, dialect_name: str, *, in_transaction: bool = False) -> None:
         self.dialect = _StubDialect(dialect_name)
+        self.rows: list[Any] = []
         self.executed: list[tuple[str, Any]] = []
         self.commits = 0
         self._in_transaction = in_transaction
@@ -36,9 +47,12 @@ class _StubConnection:
     def in_transaction(self) -> bool:
         return self._in_transaction
 
-    def execute(self, statement: Any, parameters: Any = None) -> None:
+    def execute(self, statement: Any, parameters: Any = None) -> "_StubResult":
         self.executed.append((str(statement), parameters))
         self._in_transaction = True  # autobegin
+        # A real Connection.execute returns a Result; the helper drains it
+        # before committing, because a commit closes it.
+        return _StubResult(self.rows)
 
     def commit(self) -> None:
         self.commits += 1

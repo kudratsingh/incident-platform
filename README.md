@@ -149,8 +149,15 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
 
-# Run migrations
-cd backend && alembic upgrade head && cd ..
+# Run migrations (from the repo root — alembic.ini lives here, and the
+# alembic CLI does not search parent directories, so `cd backend` cannot
+# work). Migrations run as the database OWNER: since ADR 0015 the runtime
+# DATABASE_URL is the non-owner incident_app role, which cannot create
+# tables, so alembic takes ALEMBIC_DATABASE_URL when it is set.
+make migrate-local
+# ...which is exactly:
+#   ALEMBIC_DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/incident_platform \
+#     .venv/bin/python -m alembic upgrade head
 
 # API + worker (same process for local dev via the app.main lifespan)
 uvicorn backend.app.main:app --reload --port 8000

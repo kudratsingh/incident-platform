@@ -304,14 +304,66 @@ def create_app() -> FastAPI:
 
     @app.get("/healthz", include_in_schema=False)
     async def healthz() -> dict[str, str]:
+        """Process liveness. No I/O, no dependencies, never 503.
+
+        This is what the **ALB target group** probes (`infra/alb.tf`), and the
+        question it answers is the only one a target group should ask: can
+        this task serve HTTP? Pointing the target group at the deep check
+        instead meant a single Redis outage failed every target at once and
+        turned a degraded-but-serving API into a total one (WO-R2-65) — every
+        Redis-dependent path in this application already fails open, so the
+        API keeps answering while Redis is away, and there is nothing for a
+        load balancer to route around when *all* targets share the outage.
+        """
         return {"status": "ok"}
+
+    @app.get("/healthz/worker", include_in_schema=False)
+    async def healthz_worker() -> JSONResponse:
+        """Task liveness, including the in-process worker. No external I/O.
+
+        This is what the **ECS container check** probes (`infra/ecs.tf`), and
+        it is the probe with restart authority. It exists to keep two
+        different questions apart, which one endpoint could not (WO-R2-65
+        composing with ADR 0009's amendment):
+
+          * "Should this task be replaced?" — yes for a worker that died and
+            could not be restarted in-process, because a replacement task
+            fixes it. That is ADR 0009's requirement and it still holds here.
+          * "Is a dependency down?" — never a reason to replace a task.
+            Postgres and Redis are shared, so a task recycled over them comes
+            back to the same outage, having destroyed whatever in-flight work
+            it was holding. The deep check answers this one, for operators
+            and dashboards, and nothing with restart authority reads it.
+
+        `worker_status()` is synchronous and I/O-free, so this endpoint cannot
+        block on a dependency and therefore cannot fail for one.
+        """
+        worker = worker_supervisor.worker_status()
+        return JSONResponse(
+            status_code=200 if worker.healthy else 503,
+            content={
+                "status": "ok" if worker.healthy else "degraded",
+                "worker": "ok" if worker.healthy else "error",
+                "worker_detail": worker.detail,
+            },
+        )
 
     @app.get(f"{settings.api_v1_prefix}/health", include_in_schema=False)
     async def health() -> JSONResponse:
-        """Deep health check used by ECS and load balancers.
+        """Deep readiness check, for operators and dashboards.
 
         Verifies DB connectivity, Redis connectivity **and worker liveness**.
         Returns 200 if all three are healthy, 503 otherwise.
+
+        **Nothing with restart or routing authority probes this endpoint**
+        (WO-R2-65). It used to be both the ALB target-group check and the ECS
+        container check, which made a Redis outage — a dependency every
+        caller of it already fails open on — deregister every backend target
+        and recycle every task mid-job. The two probes now ask the narrower
+        questions they are each entitled to act on: `/healthz` for "can this
+        task serve HTTP" and `/healthz/worker` for "is this task worth
+        keeping". This endpoint keeps the whole truth for the human reading
+        it during an incident.
 
         The worker check changes what a green answer here means. It used to
         mean "this process can reach its dependencies"; it now means "…and it
@@ -324,11 +376,13 @@ def create_app() -> FastAPI:
         dead worker makes it go *absent*, and both alarms read missing data as
         `notBreaching`.
 
-        Both probes that consume this endpoint act on it: the ECS container
-        check (`infra/ecs.tf`) and the ALB target group (`infra/alb.tf`), each
-        30s apart with a 3-failure threshold. A worker that recovers does so
-        well inside that window (the restart ladder caps at 30s); one that
-        cannot gets the task recycled, which is the correct outcome.
+        The worker half of that judgement is still acted on, by
+        `/healthz/worker` and the ECS container check that probes it every
+        30s with a 3-failure threshold. A worker that recovers does so well
+        inside that window (the restart ladder caps at 30s); one that cannot
+        gets the task recycled, which is the correct outcome — and now it is
+        the *only* condition on that path, so the recycle happens for the
+        reason ADR 0009 intended and not for a Redis blip.
 
         The worker probe is in-process and I/O-free, so it adds nothing to the
         endpoint's latency.

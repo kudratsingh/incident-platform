@@ -31,7 +31,7 @@ resource "aws_secretsmanager_secret_version" "database_url" {
   secret_id = aws_secretsmanager_secret.database_url.id
 
   # Built from RDS endpoint after the instance is created.
-  secret_string = "postgresql+asyncpg://incident_app:${random_password.app_db.result}@${aws_db_instance.main.endpoint}/${var.db_name}"
+  secret_string = "postgresql+asyncpg://incident_app:${urlencode(random_password.app_db.result)}@${aws_db_instance.main.endpoint}/${var.db_name}"
 }
 
 # ── ALEMBIC_DATABASE_URL — owner (RDS master) ─────────────────────────────────
@@ -46,16 +46,37 @@ resource "aws_secretsmanager_secret_version" "database_url_owner" {
   secret_id = aws_secretsmanager_secret.database_url_owner.id
 
   # The exact URL the runtime used before the incident_app flip.
-  secret_string = "postgresql+asyncpg://${var.db_username}:${random_password.db.result}@${aws_db_instance.main.endpoint}/${var.db_name}"
+  #
+  # `urlencode` is load-bearing (WO-R2-65). random_password.db's
+  # override_special set contains `%`, `#`, `?`, `:`, `@` and `/`, every one
+  # of which means something inside a URL. SQLAlchemy percent-DECODES the
+  # password while parsing, so a generated password containing `%` followed
+  # by two hex digits reached RDS as different bytes than RDS was created
+  # with — an authentication failure with no plausible cause, appearing only
+  # for some passwords, and only on the path that migrates the schema. The
+  # others truncate or re-split the URL instead. RDS itself is still given
+  # the raw value (rds.tf), which is correct: the encoding belongs to the
+  # URL, not to the credential.
+  #
+  # One caveat, pinned by backend/tests/unit/test_owner_dsn_encoding.py:
+  # `urlencode` is form-encoding, so it renders a SPACE as `+`, which
+  # SQLAlchemy reads back as a literal `+`. No space can occur here —
+  # override_special below has none, and random_password draws only from
+  # alphanumerics plus that set — but adding one would reintroduce this
+  # class of bug through the fix.
+  secret_string = "postgresql+asyncpg://${var.db_username}:${urlencode(random_password.db.result)}@${aws_db_instance.main.endpoint}/${var.db_name}"
 }
 
 # ── INCIDENT_APP_DB_PASSWORD ──────────────────────────────────────────────────
 
 # special=false is deliberate: the password is embedded in the runtime URL
 # above, and the random_password.db override_special set (#$&<>:? etc.) would
-# need URL-encoding — a pre-existing latent bug on the master URL that stays
-# out of scope. Do NOT touch random_password.db: changing it rotates the live
-# RDS master password.
+# need URL-encoding. That encoding now exists on both URLs (WO-R2-65), so this
+# is defence in depth rather than the only thing standing between the runtime
+# and an unparseable DSN — but keep it: an alphanumeric password is also the
+# one that survives being copied into a psql invocation by hand.
+# Do NOT touch random_password.db: changing it rotates the live RDS master
+# password.
 resource "random_password" "app_db" {
   length  = 32
   special = false

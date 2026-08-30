@@ -16,8 +16,9 @@ sync engine. Setting the RUN_ALEMBIC_SYNC environment variable to any
 non-empty value is an explicit operator override that forces the sync
 path regardless of the URL's dialect.
 
-Both online paths funnel through do_run_migrations, which takes a
-session-level Postgres advisory lock on the migrating connection for the
+Both online paths funnel through do_run_migrations, which first refuses
+outright if the connected role cannot create tables (WO-R2-67), then takes
+a session-level Postgres advisory lock on the migrating connection for the
 whole run (see app/core/migration_lock.py) — that is what makes
 concurrent ECS task startups serialize instead of racing on pg_type.
 """
@@ -44,6 +45,7 @@ import app.models.user  # noqa: E402, F401
 from app.core.db_url import is_async_url  # noqa: E402
 from app.core.migration_lock import (  # noqa: E402
     acquire_migration_lock,
+    execute_preserving_transaction_state,
     release_migration_lock,
 )
 from app.models.base import Base  # noqa: E402
@@ -79,6 +81,61 @@ def run_migrations_offline() -> None:
         context.run_migrations()
 
 
+class MigrationRoleError(RuntimeError):
+    """The connected role cannot apply migrations."""
+
+
+def assert_role_can_migrate(connection: object) -> None:
+    """Refuse to start a migration the connected role cannot finish.
+
+    The two-URL scheme (ADR 0015) means there are now two credentials in
+    play and only one of them can run DDL, so "which role am I?" became a
+    question with a wrong answer. `make migrate` had the wrong one: it
+    exec'd alembic inside the `app` container, which connects as the
+    non-owner `incident_app` role and cannot CREATE (WO-R2-67).
+
+    Without this check that failure arrives as a `permission denied for
+    schema public` from somewhere in the middle of whichever revision first
+    creates a table — after earlier revisions have already applied, on a
+    connection that had every appearance of working. The message names
+    neither the role nor the variable that would fix it. Checking up front
+    costs one round-trip and turns it into a sentence.
+
+    Postgres only: the privilege model being asserted is Postgres's. Other
+    dialects (the SQLite unit harness) pass through untouched.
+    """
+    from sqlalchemy import text
+
+    dialect = getattr(getattr(connection, "dialect", None), "name", "")
+    if dialect != "postgresql":
+        return
+
+    # Through the lock module's helper, not a bare execute: SQLAlchemy 2.0
+    # autobegins on the first statement, and MigrationContext downgrades
+    # `begin_transaction()` to a null context when it finds a transaction it
+    # did not open — so a plain `connection.execute()` here would leave every
+    # migration to roll back on close. Verified the hard way: the preflight
+    # applied all 11 revisions and left 0 tables behind.
+    rows = execute_preserving_transaction_state(
+        connection,  # type: ignore[arg-type]
+        text(
+            "SELECT current_user AS role_name, "
+            "has_schema_privilege(current_user, 'public', 'CREATE') AS can_create"
+        ),
+    )
+    row = rows[0]
+    if not row.can_create:
+        raise MigrationRoleError(
+            f"role {row.role_name!r} cannot CREATE in schema public, so it "
+            "cannot apply migrations. Migrations run as the database owner: "
+            "set ALEMBIC_DATABASE_URL to the owner DSN (in compose, "
+            "`make migrate` runs the dedicated `migrate` service, which "
+            "already has it; in ECS it is the database-url-owner secret). "
+            "The runtime DATABASE_URL is deliberately the non-owner "
+            "incident_app role — see ADR 0015."
+        )
+
+
 def do_run_migrations(connection: object) -> None:
     """Run the migrations on a SYNC connection, holding the advisory lock.
 
@@ -89,6 +146,9 @@ def do_run_migrations(connection: object) -> None:
     then no-ops on an already-current alembic_version. Non-Postgres
     dialects report locked=False and nothing is executed.
     """
+    # Before the lock: a role that cannot migrate should not make every
+    # other task queue behind it while it finds that out.
+    assert_role_can_migrate(connection)
     locked = acquire_migration_lock(connection)  # type: ignore[arg-type]
     try:
         context.configure(

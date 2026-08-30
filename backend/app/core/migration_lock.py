@@ -24,10 +24,11 @@ Both helpers are no-ops on non-Postgres dialects; alembic can be pointed
 at SQLite ad-hoc and `SELECT pg_advisory_lock` would explode there.
 """
 
-from typing import Final
+from collections.abc import Sequence
+from typing import Any, Final
 
 from sqlalchemy import text
-from sqlalchemy.engine import Connection
+from sqlalchemy.engine import Connection, Row
 from sqlalchemy.sql.elements import TextClause
 
 #: ASCII "alembic" (7 bytes, so it fits comfortably in the int64 the
@@ -39,9 +40,11 @@ _ACQUIRE_SQL: Final[TextClause] = text("SELECT pg_advisory_lock(:key)")
 _RELEASE_SQL: Final[TextClause] = text("SELECT pg_advisory_unlock(:key)")
 
 
-def _execute_preserving_transaction_state(
-    connection: Connection, statement: TextClause
-) -> None:
+def execute_preserving_transaction_state(
+    connection: Connection,
+    statement: TextClause,
+    params: dict[str, Any] | None = None,
+) -> Sequence[Row[Any]]:
     """Run ``statement`` and leave the connection's transaction state as found.
 
     This is load-bearing, not tidiness. ``MigrationContext`` snapshots
@@ -56,11 +59,19 @@ def _execute_preserving_transaction_state(
     itself: session-level advisory locks are independent of transaction
     boundaries. When the caller already had a transaction open we leave it
     alone — ending someone else's transaction would be worse.
+
+    Public because the migration environment needs the same guarantee for
+    its role preflight (WO-R2-67): any statement run on the migration
+    connection before ``context.configure()`` trips the same wire, and a
+    second hand-rolled copy of this dance is a second chance to get it
+    subtly wrong. Read-only callers get the rows back.
     """
     caller_had_transaction = connection.in_transaction()
-    connection.execute(statement, {"key": MIGRATION_LOCK_KEY})
+    # Rows are drained before any commit: committing closes the result.
+    rows = connection.execute(statement, params or {}).all()
     if not caller_had_transaction and connection.in_transaction():
         connection.commit()
+    return rows
 
 
 def acquire_migration_lock(connection: Connection) -> bool:
@@ -71,7 +82,9 @@ def acquire_migration_lock(connection: Connection) -> bool:
     """
     if connection.dialect.name != "postgresql":
         return False
-    _execute_preserving_transaction_state(connection, _ACQUIRE_SQL)
+    execute_preserving_transaction_state(
+        connection, _ACQUIRE_SQL, {"key": MIGRATION_LOCK_KEY}
+    )
     return True
 
 
@@ -83,4 +96,6 @@ def release_migration_lock(connection: Connection) -> None:
     """
     if connection.dialect.name != "postgresql":
         return
-    _execute_preserving_transaction_state(connection, _RELEASE_SQL)
+    execute_preserving_transaction_state(
+        connection, _RELEASE_SQL, {"key": MIGRATION_LOCK_KEY}
+    )
