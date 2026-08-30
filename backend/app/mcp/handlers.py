@@ -114,6 +114,14 @@ def handle_tools_list(request_id: str | int | None) -> p.JsonRpcResponse:
             description=t.description,
             inputSchema=t.input_json_schema(),
             outputSchema=t.output_json_schema(),
+            # `.value` rather than the Scope member: model_dump() has to
+            # produce a bare JSON string, not an enum repr, or the
+            # commander's snapshot diffs on the serialization instead of
+            # on the scope.
+            required_scope=(
+                t.required_scope.value if t.required_scope is not None else None
+            ),
+            is_idempotent=t.is_idempotent,
         )
         for t in list_tools()
     ]

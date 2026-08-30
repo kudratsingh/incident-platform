@@ -39,10 +39,18 @@ LAB_VOCABULARY = re.compile(
 
 
 def _wire_surface(td: ToolDefinition) -> str:
-    """Everything `tools/list` serializes for one tool, concatenated."""
+    """Every free-text thing `tools/list` serializes for one tool.
+
+    `tools/list` also advertises `is_idempotent` since WO-R2-32. It is
+    excluded deliberately rather than by oversight: a bool has no vocabulary
+    to leak. `required_scope` is included even though it is drawn from a
+    closed 5-member enum today — it is a string on the wire, so if that ever
+    becomes free-form the screen already covers it.
+    """
     return "\n".join(
         [
             td.description,
+            str(td.required_scope.value if td.required_scope else ""),
             json.dumps(td.input_json_schema(), sort_keys=True),
             json.dumps(td.output_json_schema(), sort_keys=True),
         ]
