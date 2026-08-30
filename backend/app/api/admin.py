@@ -21,8 +21,9 @@ from app.repositories.outbox import OutboxRepository
 from app.repositories.tenant import TenantRepository
 from app.repositories.triage import TriageRepository
 from app.repositories.user import UserRepository
-from app.schemas.common import PaginatedResponse
+from app.schemas.common import MAX_PAGE_SIZE, PaginatedResponse
 from app.schemas.job import AdminJobListParams, JobResponse
+from app.schemas.tenant import TenantLimitsUpdate
 from app.schemas.user import UserResponse
 from app.services import incident_digest, nl_query
 from app.services.job import JobService
@@ -31,7 +32,7 @@ from app.services.runbooks import list_all as list_runbooks
 from app.services.slo import compute_all as compute_slos
 from app.utils.rate_limit import check_identity_rate_limit
 from app.workers.read_model import read_global_stats, read_user_stats
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from redis.asyncio import Redis
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -433,8 +434,8 @@ async def admin_get_digest(
 
 @router.get("/tenants")
 async def admin_list_tenants(
-    page: int = 1,
-    page_size: int = 50,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=MAX_PAGE_SIZE),
     current_user: User = Depends(require_platform_admin),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
@@ -543,7 +544,7 @@ async def admin_get_tenant(
 @router.patch("/tenants/{tenant_id}")
 async def admin_update_tenant_limits(
     tenant_id: uuid.UUID,
-    body: dict[str, Any],
+    body: TenantLimitsUpdate,
     current_user: User = Depends(require_platform_admin),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
@@ -551,8 +552,14 @@ async def admin_update_tenant_limits(
 
     Body fields (both optional): `rate_limit_per_minute`, `quota_jobs_per_month`.
     Each must be a non-negative integer (0 disables the relevant check).
+
+    The bounds live on `TenantLimitsUpdate`, not here: the hand-rolled
+    `isinstance(value, int)` this replaced accepted Python bools, so a
+    JSON `true` became a rate limit of 1 (WO-R2-61). Validating in the
+    schema also means a bad body is rejected before the tenant lookup,
+    so the caller gets every problem with their request at once.
     """
-    from app.core.exceptions import NotFoundError, RequestValidationError
+    from app.core.exceptions import NotFoundError
 
     repo = TenantRepository(db)
     tenant = await repo.get_by_id(tenant_id)
@@ -561,12 +568,10 @@ async def admin_update_tenant_limits(
 
     fields = ("rate_limit_per_minute", "quota_jobs_per_month")
     before = {f: getattr(tenant, f) for f in fields}
-    for field in fields:
-        if field in body:
-            value = body[field]
-            if not isinstance(value, int) or value < 0:
-                raise RequestValidationError(f"{field} must be a non-negative integer")
-            setattr(tenant, field, value)
+    # `exclude_unset` keeps this a genuine partial update: a field the
+    # caller omitted is left alone rather than reset to a default.
+    for field, value in body.model_dump(exclude_unset=True).items():
+        setattr(tenant, field, value)
     after = {f: getattr(tenant, f) for f in fields}
     changed = after != before
     if changed:
@@ -713,8 +718,8 @@ async def resolve_incident(
 
 @router.get("/users", response_model=PaginatedResponse[UserResponse])
 async def list_users(
-    page: int = 1,
-    page_size: int = 20,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=MAX_PAGE_SIZE),
     tenant_id: uuid.UUID | None = None,
     current_user: User = Depends(_require_admin),
     db: AsyncSession = Depends(get_db),

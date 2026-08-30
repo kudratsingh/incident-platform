@@ -35,7 +35,7 @@ from app.repositories.service_account import (
     ServiceAccountRepository,
     ServiceAccountTokenRepository,
 )
-from app.schemas.common import PaginatedResponse
+from app.schemas.common import MAX_PAGE_SIZE, PaginatedResponse
 from app.schemas.service_account import (
     ServiceAccountCreate,
     ServiceAccountResponse,
@@ -105,7 +105,7 @@ async def create_service_account(
 async def list_service_accounts(
     tenant_id: uuid.UUID | None = None,
     page: int = Query(1, ge=1),
-    page_size: int = Query(20, ge=1, le=100),
+    page_size: int = Query(20, ge=1, le=MAX_PAGE_SIZE),
     current_user: User = Depends(_require_admin),
     db: AsyncSession = Depends(get_db),
 ) -> PaginatedResponse[ServiceAccountResponse]:

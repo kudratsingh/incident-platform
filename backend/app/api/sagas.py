@@ -15,12 +15,13 @@ from app.repositories.job import JobRepository
 from app.repositories.job_dependency import JobDependencyRepository
 from app.repositories.outbox import OutboxRepository
 from app.repositories.saga import SagaRepository
+from app.schemas.common import MAX_PAGE_SIZE
 from app.schemas.job import JobResponse, validate_processor_payload
 from app.services.job import JobService
 from app.services.saga import SagaService, SagaStep
 from app.utils.admission import JOB_CREATE_RATE_BUCKET, check_job_admission
 from app.utils.rate_limit import rate_limiter
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field, model_validator
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -96,8 +97,8 @@ class SagaListResponse(BaseModel):
 
 @router.get("", response_model=SagaListResponse)
 async def list_sagas(
-    page: int = 1,
-    page_size: int = 20,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=MAX_PAGE_SIZE),
     current_user: User = Depends(get_current_user),
     effective_tenant: uuid.UUID = Depends(get_effective_tenant),
     db: AsyncSession = Depends(get_db),
