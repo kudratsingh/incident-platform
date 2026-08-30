@@ -24,6 +24,8 @@ Skipped automatically when Docker / testcontainers isn't available.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import subprocess
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -239,3 +241,164 @@ async def test_crashed_tool_rolls_back_its_writes_but_not_its_audit_row(
     assert len(rows) == 1, "the crashed call left no audit row"
     assert rows[0].extra_data is not None
     assert rows[0].extra_data["outcome"] == "error"
+
+
+# ---------------------------------------------------------------------------
+# R2-27 — the claim is atomic, so a retried tool call cannot 500 after
+# taking effect.
+#
+# Also Postgres-only, for a second reason on top of the one at the top of
+# this file: SQLite's in-memory engine serialises everything onto one
+# connection, so "two concurrent requests" cannot exist there at all. The
+# race these pin is the whole finding.
+# ---------------------------------------------------------------------------
+
+CONCURRENT_TOOL_NAME = "pg_claim_probe"
+
+
+class _SlowIn(BaseModel):
+    idempotency_key: str
+
+
+class _SlowOut(BaseModel):
+    ok: bool
+    execution: int
+
+
+@pytest.fixture
+def claim_probe_tool() -> Any:
+    """A Tier-1-shaped action that is slow enough to hold its claim while
+    a second caller arrives, and that counts its own executions."""
+    snapshot = _snapshot_for_tests()
+    state: dict[str, Any] = {
+        "executions": 0,
+        "started": asyncio.Event(),
+        "proceed": asyncio.Event(),
+    }
+
+    @tool(
+        CONCURRENT_TOOL_NAME,
+        description="Counts executions, waits to be released. Test-only.",
+        input_model=_SlowIn,
+        output_model=_SlowOut,
+        required_scope=Scope.ACTIONS_EXECUTE,
+        is_idempotent=True,
+    )
+    async def _slow(inp: _SlowIn, ctx: ToolContext) -> _SlowOut:
+        state["executions"] += 1
+        state["started"].set()
+        await state["proceed"].wait()
+        return _SlowOut(ok=True, execution=state["executions"])
+
+    yield state
+    _restore_for_tests(snapshot)
+
+
+async def test_concurrent_same_key_calls_execute_once_and_replay(
+    factory: Any, claim_probe_tool: Any
+) -> None:
+    """Two `tools/call` requests with the same Idempotency-Key: one
+    execution, one cached replay, and no 500 for either.
+
+    Before the claim, the lookup and the claiming INSERT sat in the same
+    READ COMMITTED transaction with nothing between them, so both callers
+    missed the cache and both ran the action. The loser then hit
+    `uq_idempotency_scope` on the way out — after its side effect had
+    already landed.
+
+    The reservation row closes the window rather than repairing it: the
+    second caller's `ON CONFLICT DO NOTHING` finds the first caller's
+    uncommitted row and waits on it, then reads the committed response
+    and replays it."""
+    state = claim_probe_tool
+    principal = await _seed(factory)
+    args = {"idempotency_key": "pg-concurrent-1"}
+
+    first = asyncio.create_task(
+        _call(factory, principal, CONCURRENT_TOOL_NAME, args)
+    )
+    # The first caller now holds the claim and is parked inside the tool.
+    await asyncio.wait_for(state["started"].wait(), timeout=10)
+    second = asyncio.create_task(
+        _call(factory, principal, CONCURRENT_TOOL_NAME, args)
+    )
+    # Give the second caller time to reach the claim and block on it.
+    await asyncio.sleep(0.5)
+    state["proceed"].set()
+
+    first_response, second_response = await asyncio.wait_for(
+        asyncio.gather(first, second), timeout=30
+    )
+
+    assert first_response.error is None, first_response.error
+    assert second_response.error is None, second_response.error
+    assert state["executions"] == 1, (
+        f"the action ran {state['executions']} times for one key"
+    )
+
+    # Both callers answer with the one recorded outcome.
+    payloads = [
+        json.loads(r.result["content"][0]["text"])
+        for r in (first_response, second_response)
+    ]
+    assert payloads[0] == payloads[1] == {"ok": True, "execution": 1}
+
+    # Exactly one record, and exactly one success audit row: the replay
+    # is audited as a call, but it is not a second execution.
+    async with factory() as session:
+        records = (
+            await session.execute(select(IdempotencyRecord))
+        ).scalars().all()
+    assert len(records) == 1
+    assert records[0].response_json == {"ok": True, "execution": 1}
+
+
+CRASH_CLAIM_TOOL_NAME = "pg_claim_crash"
+
+
+@pytest.fixture
+def crashing_claim_tool() -> Any:
+    """Tier-1 shaped (so it takes a claim) and always raises."""
+    snapshot = _snapshot_for_tests()
+
+    @tool(
+        CRASH_CLAIM_TOOL_NAME,
+        description="Idempotent action that raises. Test-only.",
+        input_model=_SlowIn,
+        output_model=_SlowOut,
+        required_scope=Scope.ACTIONS_EXECUTE,
+        is_idempotent=True,
+    )
+    async def _crash_claim(inp: _SlowIn, ctx: ToolContext) -> _SlowOut:
+        raise RuntimeError("simulated tool crash after the claim")
+
+    yield
+    _restore_for_tests(snapshot)
+
+
+async def test_a_failed_tool_releases_its_claim_for_a_later_retry(
+    factory: Any, crashing_claim_tool: Any
+) -> None:
+    """A claim taken before execution must not outlive a failed call.
+
+    The envelope deliberately commits the request transaction on a tool
+    error, so that the `outcome=error` audit row survives (#154) — which
+    means a reservation row would commit right along with it and wedge
+    the key for its whole TTL. A retry has to be able to re-execute, so
+    the claim is released on every path that does not record a
+    response."""
+    principal = await _seed(factory)
+
+    response = await _call(
+        factory,
+        principal,
+        CRASH_CLAIM_TOOL_NAME,
+        {"idempotency_key": "pg-crash-release-1"},
+    )
+    assert response.error is not None
+
+    async with factory() as session:
+        records = (
+            await session.execute(select(IdempotencyRecord))
+        ).scalars().all()
+    assert records == [], "a failed call left its claim behind"

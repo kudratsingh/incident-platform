@@ -171,8 +171,14 @@ def rls_db(pg: Any) -> RlsDb:
 
     async_url = pg.get_connection_url()
     _alembic(async_url, "upgrade", "head")
+    # Named revision, not a relative "-1": the point is to reverse the
+    # role+grants migration specifically, and a relative step silently
+    # retargets itself at whatever migration landed on head most
+    # recently. Downgrading TO b8e4a1c92f35's parent reverses it (and
+    # anything stacked on top) whatever the head of the day is.
+    _alembic(async_url, "downgrade", "b8e4a1c92f35")
     _alembic(async_url, "downgrade", "-1")  # drops role + grants (b8e4a1c92f35)
-    _alembic(async_url, "upgrade", "head")  # recreates them
+    _alembic(async_url, "upgrade", "head")  # recreates them, and the rest
     _run_db_bootstrap(async_url, "app_pw")
 
     return RlsDb(

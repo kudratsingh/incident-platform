@@ -210,26 +210,85 @@ The MCP app also registers a catch-all `Exception` handler (`app/mcp/standalone.
 
 ### What this does not do
 
-- **`store()` does not reclaim an expired row.** The colliding caller is answered correctly and audited, but its response is not cached, so a further retry of that key re-executes. Closing that needs `store()` to overwrite a record its own `lookup()` already declared absent — a change to the service's semantics, tracked as the follow-up order that depends on this one.
-- **It does not deduplicate the execution itself.** Two concurrent calls on one key still both run the tool; only the *answer* is deduplicated. Preventing the double execution needs the key reserved before the handler runs, not after.
+- **`store()` does not reclaim an expired row.** The colliding caller is answered correctly and audited, but its response is not cached, so a further retry of that key re-executes. Closing that needs `store()` to overwrite a record its own `lookup()` already declared absent — a change to the service's semantics, tracked as the follow-up order that depends on this one. *(2026-08-30: done — WO-R2-27, addendum below.)*
+- **It does not deduplicate the execution itself.** Two concurrent calls on one key still both run the tool; only the *answer* is deduplicated. Preventing the double execution needs the key reserved before the handler runs, not after. *(2026-08-30: done — WO-R2-27, addendum below.)*
 - **The 24h TTL and the reaper are untouched.** Only the claim about what the leftover row does to a caller changes.
 
 Verification: `backend/tests/api/test_mcp_transaction_envelope.py` (crash path leaves an `outcome=error` row while the tool's own writes roll back; collision returns an envelope; nothing escapes as a bare 500) and `backend/tests/integration/test_mcp_envelope_postgres.py` (the same two facts against a real `uq_idempotency_scope` violation, which is the only place the savepoint's necessity is observable — Postgres aborts the whole transaction on a constraint violation, SQLite does not).
+
+---
+
+## Addendum — 2026-08-30 (WO-R2-27) — the key is claimed before the action runs
+
+*The decision above is unchanged: 24h TTL, 409 on same-key-different-args, hourly reaper. What changes is **when** the key is taken. The two follow-ups the WO-R2-06 addendum left open are closed here, and they turn out to be one change.*
+
+### Recording the key after the fact could not be made safe
+
+WO-R2-06 made the collision survivable: savepoint the `store()`, catch the `IntegrityError`, read back whoever won, answer with their response. That is a repair, and it runs *after* the action has already happened. Two consequences it could not reach, both listed as its own reservations:
+
+- Two concurrent calls on one key both executed. Only the answer was deduplicated, not the effect — and for Tier-1 actions the effect is the whole point.
+- A caller that collided with an expired-but-unreaped row got its answer uncached, so the next retry executed a third time.
+
+Both come from the same ordering. The lookup and the claiming INSERT sat in one READ COMMITTED transaction with the entire action between them, and nothing in that gap reserved anything, so "the key is free" was a fact about the past by the time it was acted on.
+
+### The claim
+
+`IdempotencyService.acquire()` now takes the key **before** the handler runs, in a single statement:
+
+```
+INSERT INTO idempotency_records (..., response_json, ...)
+VALUES (..., NULL, ...)
+ON CONFLICT (tenant_id, principal_id, idempotency_key) DO NOTHING
+RETURNING id
+```
+
+Winning that insert is what authorises execution. There is no window between deciding the key is free and holding it, because they are the same operation. `acquire` returns one of three things, and only the first executes anything:
+
+| Outcome | Meaning | Caller |
+| --- | --- | --- |
+| `Claim` | The insert returned an id — we own the key | Runs the tool, then `complete(claim, response)` |
+| `Replay` | Lost, and the holder has a response | Returns the holder's response verbatim |
+| raise | Lost, and the holder disagrees or is unfinished | `IdempotencyKeyReusedError` (409) or `IdempotencyKeyInFlightError` |
+
+`response_json` became nullable to make the reserved-but-unanswered state representable (migration `c9e41a7b62d5`). NULL means "claimed, not yet answered" — a state, not a missing value.
+
+**On Postgres the loser blocks rather than failing.** `ON CONFLICT DO NOTHING` against an *uncommitted* conflicting row waits on the holder's transaction instead of returning immediately. The second caller therefore parks until the first commits its response, then reads it and replays. The blocking is the serialisation; it is not a cost to design around. This is also why the concurrency test is Postgres-only twice over: SQLite's in-memory engine puts every session on one connection, so two concurrent requests cannot exist there to begin with.
+
+### Completion cannot lose a race, and failure must release
+
+`complete()` is an UPDATE by primary key on a row this call inserted, so the duplicate-key error that used to land at store time has nowhere to come from. It stays savepoint-wrapped for the reason WO-R2-06 established — the audit row for an action that really executed outranks the cache write — but the failure it guards against is now hypothetical rather than routine.
+
+The claim introduces one obligation the old shape did not have. The envelope deliberately commits the request transaction even when the tool failed, so that the `outcome=error` audit row survives; a reservation row would commit right alongside it and hold the key for its full 24 hours. So **every path that does not complete releases**: the handler sets a flag at the end of the successful execution block and a `finally` deletes the claim otherwise. A failed call must leave the key re-usable, or one crash would turn into a permanently dead key.
+
+A release that itself cannot be written is the one remaining way to strand a key. It is logged at ERROR, and a retry meets `idempotency_key_in_flight` — retryable, and distinct from `idempotency_key_reused`, which is the caller's mistake and never clears.
+
+### `lookup` evicts instead of reading past
+
+The expired-record half needed no separate mechanism. `lookup()` now deletes the expired row it finds rather than returning `None` and leaving it on the unique index, and `acquire()` evicts an expired holder and retries the claim exactly once. A second lost attempt means a live caller took the key in between, so we defer to them rather than spin.
+
+This retires the WO-R2-06 addendum's third collision bullet ("only an expired record exists — the caller gets its own result, uncached"). There is no such case now: the expired row is gone before the action runs, and the claim that replaces it is completed normally.
+
+### What this does not do
+
+- **The 24h TTL and the reaper are untouched.** The reaper now also collects any stranded claim, since an unfinished claim carries the same `expires_at` as a completed record.
+- **It does not make tool handlers themselves idempotent.** The key is deduplicated; a handler with an external side effect that is retried under a *different* key is still that handler's problem.
 
 ## Verification
 
 - `test_idempotency_service.py` — canonical-JSON invariance (same dict, different insertion orders → same hash), expiry (records past `expires_at` return `None`), same-key-different-args (raises 409), cross-tool collision (raises 409).
 - `test_mcp_wave3_tier1_actions.py::test_restart_consumer_group_replay_returns_cached_response` — end-to-end replay through a Tier-1 action; second call returns the first response, doesn't re-execute.
-- `test_mcp_transaction_envelope.py` — the envelope contract (WO-R2-06): crash path returns an envelope *and* persists an `outcome=error` row, the crashed tool's own writes roll back, a `store()` collision on an expired key returns an envelope with the success row committed, a duplicate in flight returns the recorded outcome.
-- `tests/integration/test_mcp_envelope_postgres.py` — the same against a real `uq_idempotency_scope` violation. Postgres aborts the transaction on a constraint violation and its COMMIT then degrades to a ROLLBACK, so this is the only tier where losing the savepoint is observable; SQLite passes either way.
+- `test_mcp_transaction_envelope.py` — the envelope contract (WO-R2-06): crash path returns an envelope *and* persists an `outcome=error` row, the crashed tool's own writes roll back, an expired key re-executes and still returns an envelope, a duplicate call returns the recorded outcome.
+- `tests/integration/test_mcp_envelope_postgres.py` — the same against a real `uq_idempotency_scope` violation. Postgres aborts the transaction on a constraint violation and its COMMIT then degrades to a ROLLBACK, so this is the only tier where losing the savepoint is observable; SQLite passes either way. Also the WO-R2-27 concurrency proof: two genuinely concurrent `tools/call` requests on one key produce one execution and one replay, and a failed call leaves no claim behind.
+- `test_mcp_wave3_tier1_actions.py` — that a replay is a replay: the side-effect count on the Redis stub distinguishes a cached answer from a re-execution, which the payload alone cannot (both produce `deleted=False`).
 - **Deferred (item #26)**: cross-repo hash contract test pinning a fixed argument dict on both platform and commander sides.
 
 ## Pointers
 
 - `backend/app/services/idempotency.py` — the service; `_hash_arguments` is the contract function.
-- `backend/app/mcp/handlers.py` — `_IDEMPOTENCY_TTL = timedelta(hours=24)`, passed into `store(...)` by `_store_response`, which owns the savepoint and the collision resolution.
+- `backend/app/mcp/handlers.py` — `_IDEMPOTENCY_TTL = timedelta(hours=24)`, passed into `acquire(...)` before the handler runs and into `complete(...)` after it; `_complete_claim` and `_release_claim` own the savepoints.
 - `backend/app/mcp/standalone.py` — the catch-all `Exception` handler that keeps every failure a JSON-RPC envelope.
-- `backend/app/repositories/idempotency.py` — `IdempotencyRecord` table (`expires_at` column, indexed).
+- `backend/app/repositories/idempotency.py` — `insert_claim` (the `ON CONFLICT DO NOTHING` reservation), `complete_claim`, `delete_by_id`, `delete_expired` (the reaper).
+- `backend/alembic/versions/c9e41a7b62d5_idempotency_claim.py` — makes `response_json` nullable so the reserved state is representable.
 - `backend/tests/unit/test_idempotency_service.py` — hash + expiry + collision unit tests.
 - Related: [ADR 0007 — Machine-principal scope model](0007-machine-principal-scope-model.md) (Tier-1 vs Tier-2 action tiering).
 - Postmortem context: [Postmortem 0002 — Phantom supervisor](../postmortems/0002-phantom-supervisor.md) (idempotency stress-tested during the seven-run debug loop).
