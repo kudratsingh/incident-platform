@@ -72,6 +72,23 @@ class Job(TimestampMixin, Base):
     completed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # When the stale-PENDING backstop last re-published this job (WO-R2-28).
+    # The backstop's own de-duplication marker: it stamps this inside the same
+    # transaction as the outbox insert and then refuses to re-publish a job it
+    # already re-published inside the cutoff window. Kept separate from
+    # `updated_at` on purpose — that one is the staleness signal ("time since
+    # last progress") and is rendered to operators, so a sweep write must not
+    # be able to masquerade as progress or reset the visible age.
+    requeued_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # When the worker executing this job last checked in (WO-R2-28). Renewed
+    # by `_renew_running_leases_loop` while the job is this process's, read by
+    # the stale-RUNNING sweep in every replica. NULL means nobody has checked
+    # in — which is what a crash orphan looks like, so NULL reads as stale.
+    heartbeat_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     saga_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("sagas.id", ondelete="SET NULL"),

@@ -1,5 +1,6 @@
 import uuid
-from datetime import UTC, datetime
+from collections.abc import Collection, Sequence
+from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
 from app.config import get_settings
@@ -118,6 +119,8 @@ class JobRepository(BaseRepository[Job]):
         status: str,
         extra: dict[str, Any] | None = None,
         event_message: str | None = None,
+        *,
+        guard: Sequence[Any] | None = None,
     ) -> Job | None:
         """Write a job status, emitting its lifecycle event when terminal.
 
@@ -137,6 +140,25 @@ class JobRepository(BaseRepository[Job]):
         dead-letter event and is ignored by events that have no such field.
         It is deliberately the *only* thing a caller can vary — the rest of the
         payload is derived from the row, so the sites cannot drift apart again.
+
+        `guard` turns the write into a compare-and-set: the extra predicates
+        are ANDed into the WHERE clause, and if they no longer hold the method
+        writes nothing, emits nothing, cascades nothing and returns None. It
+        exists for writers that decided from a *previous* read that a row needs
+        settling and must not act if the row moved underneath them — today the
+        stale-RUNNING sweep (WO-R2-28), which re-checks the lease and
+        `started_at` it observed during its scan so it cannot dead-letter a job
+        another replica is still executing.
+
+        A guarded refusal and a missing row both return None, which is the same
+        answer to the same question: nothing was written. Callers that need the
+        distinction have already read the row.
+
+        The guard lives here rather than in a separate CAS method because the
+        ADR 0001 addendum makes terminal-event emission non-elective — every
+        path that writes a terminal status goes through this method, so a
+        conditional terminal write has to be a mode of it, not a second copy
+        of it that can drift.
         """
         values: dict[str, Any] = {"status": status}
         if extra:
@@ -151,10 +173,17 @@ class JobRepository(BaseRepository[Job]):
         if status in ("completed", "failed", "dead_letter") and "completed_at" not in values:
             values["completed_at"] = datetime.now(UTC)
 
-        await self.session.execute(
-            update(Job).where(Job.id == job_id).values(**values)
+        result = cast(
+            CursorResult[Any],
+            await self.session.execute(
+                update(Job)
+                .where(Job.id == job_id, *(guard or ()))
+                .values(**values)
+            ),
         )
         await self.session.flush()
+        if guard is not None and result.rowcount != 1:
+            return None
         job = await self.get_by_id(job_id)
         if job is not None and status in _TERMINAL_EVENT_STATUSES:
             await self._emit_terminal_event(job, status, event_message)
@@ -223,6 +252,64 @@ class JobRepository(BaseRepository[Job]):
         )
         await self.session.flush()
         return result.rowcount == 1
+
+    async def renew_running_leases(
+        self,
+        job_ids: Collection[uuid.UUID],
+        *,
+        max_age_seconds: float,
+    ) -> int:
+        """Check in on behalf of the jobs this worker is executing (WO-R2-28).
+
+        Emits
+
+            UPDATE jobs SET heartbeat_at=now()
+            WHERE id IN :ids AND status='running'
+              AND started_at >= now() - :max_age
+
+        and returns the number of rows renewed. The lease is what tells the
+        stale-RUNNING sweep in *another* replica that a job it can see is
+        someone's live work rather than a crash orphan; before it, the only
+        signal was a set in one process's memory, so a second replica read
+        every other replica's jobs as orphaned.
+
+        `max_age_seconds` is the reason this is not an unconditional renewal.
+        A worker that hangs would otherwise defend its own stuck job forever,
+        which is WO-R2-07's finding wearing a new hat — the state nothing in
+        the tree can reclaim. Past that age the renewal stops, the lease goes
+        stale on its own, and the sweep reclaims the job like any other. The
+        caller sets the age from `stale_running_threshold_seconds` plus the
+        in-flight grace, so the lease never outlives the point at which the
+        sweep is already entitled to act.
+
+        `started_at IS NULL` rows drop out of the comparison rather than being
+        renewed, matching the sweep, which skips them for the same reason:
+        there is no age to reason about.
+
+        `updated_at` is pinned to its own value so the ORM's `onupdate` does
+        not fire. A check-in is not progress, and this statement runs every
+        renewal interval for every running job — letting it move `updated_at`
+        would churn a column the DLQ list and trace views render, and would
+        make a job that has been wedged for an hour look freshly touched.
+        """
+        if not job_ids:
+            return 0
+        now = datetime.now(UTC)
+        result = cast(
+            CursorResult[Any],
+            await self.session.execute(
+                update(Job)
+                .where(
+                    Job.id.in_(list(job_ids)),
+                    Job.status == JobStatus.RUNNING,
+                    Job.started_at
+                    >= now - timedelta(seconds=max_age_seconds),
+                )
+                .values(heartbeat_at=now, updated_at=Job.updated_at)
+            ),
+        )
+        await self.session.flush()
+        return int(result.rowcount)
 
     async def promote_waiting_to_pending(self, job_id: uuid.UUID) -> bool:
         """Atomically promote a WAITING job to PENDING (E1-04).

@@ -39,6 +39,7 @@ This file (`CLAUDE.md`) is the high-signal index. Treat it as the entry point �
   - [0018 — Production Kafka is not provisioned](docs/ADR/0018-production-kafka-posture.md) — no broker in `infra/`, ECS deploy gated off, `KAFKA_BOOTSTRAP_SERVERS` omitted unless set
   - [0019 — Stale-RUNNING recovery sweep dead-letters, never re-publishes](docs/ADR/0019-stale-running-recovery-sweep.md) — worker-crash orphans go to the DLQ, not back onto `job.submitted`; revisit once a job can prove it did not partially execute
   - [0022 — Promotable-only resume sweep, and a stranded parent cascades CANCELLED](docs/ADR/0022-promotable-only-resume-sweep-and-dependency-cascade.md) — amends 0011; the sweep's limit now bounds promotable work, and `CANCELLED` gains a second, non-saga writer
+  - [0023 — A dispatcher sweep only acts on a row it can prove it owns, and only once per window](docs/ADR/0023-dispatcher-sweep-ownership.md) — amends 0019 and 0021; `requeued_at` de-duplicates the stale-PENDING backstop, `heartbeat_at` plus a compare-and-set stop one replica dead-lettering another's running job
 - [`docs/postmortems/`](docs/postmortems/) — one file per incident (backfilled or written at the time). Format: Impact / Timeline / Root cause / Detection gap / Fix / Prevention rule adopted.
   - [0009 — Consumer lifecycle and supervision](docs/ADR/0009-consumer-lifecycle-and-supervision.md)
 - [`docs/ROADMAP.md`](docs/ROADMAP.md) — open extension ideas, sized + categorized
@@ -91,8 +92,9 @@ What's actually shipped (as of the most recent merge):
   - **Delayed-retry promote** — moves exponentially-backed-off retries from a Redis sorted-set back into Kafka via the outbox
   - **DLQ replay promote** — fires operator-scheduled DLQ replays whose delay window has elapsed
   - **Resume-unblocked-waiting sweep** — promotes `WAITING` children once their DAG pause lifts; backstops missed promotions. Selects only rows with no unmet parent, oldest first behind a rotating cursor, so permanently-blocked children cannot starve it ([ADR 0022](docs/ADR/0022-promotable-only-resume-sweep-and-dependency-cascade.md))
-  - **Stale-PENDING backstop** — re-publishes `PENDING` jobs left with no `jobs:delayed` timer by a crash window
-  - **Stale-RUNNING sweep** — dead-letters `RUNNING` jobs orphaned by a hard worker crash, after `STALE_RUNNING_THRESHOLD_SECONDS` (default 900). Never re-publishes them ([ADR 0019](docs/ADR/0019-stale-running-recovery-sweep.md)). Its exclusion for this process's own in-flight jobs is time-bounded, not permanent — a local job stuck past its execution deadline is reclaimed too ([ADR 0021](docs/ADR/0021-bounded-execution-and-non-blocking-dispatch.md))
+  - **Stale-PENDING backstop** — re-publishes `PENDING` jobs left with no `jobs:delayed` timer by a crash window. Stamps `requeued_at` in the same transaction as the outbox insert, so a job is re-published at most once per 300s window instead of every pass for as long as the dispatcher is behind ([ADR 0023](docs/ADR/0023-dispatcher-sweep-ownership.md))
+  - **Stale-RUNNING sweep** — dead-letters `RUNNING` jobs orphaned by a hard worker crash, after `STALE_RUNNING_THRESHOLD_SECONDS` (default 900). Never re-publishes them ([ADR 0019](docs/ADR/0019-stale-running-recovery-sweep.md)). Skips any job whose lease (`heartbeat_at`) is still live, so one replica cannot dead-letter another's running job, and compare-and-sets the recovery write against what its scan observed ([ADR 0023](docs/ADR/0023-dispatcher-sweep-ownership.md)). Its exclusion for this process's own in-flight jobs is time-bounded, not permanent — a local job stuck past its execution deadline is reclaimed too ([ADR 0021](docs/ADR/0021-bounded-execution-and-non-blocking-dispatch.md))
+  - **Lease renewal** — checks in every 20s on the `RUNNING` jobs this worker holds, which is what makes the sweep above able to tell live work from a crash orphan across replicas. Stops renewing once a job is past its deadline plus grace, so a wedged worker cannot defend its own stuck job forever ([ADR 0023](docs/ADR/0023-dispatcher-sweep-ownership.md))
   - **Metrics loop** — emits CloudWatch gauges (`QueueDepth`, `InFlightJobs`, `ConsumerLag`) and caches the lag in Redis for the backpressure check
   - **Digest loop** (Phase 10) — every `LLM_DIGEST_INTERVAL_HOURS` (default 24), generates a per-tenant incident summary via Claude and persists it to `incident_summaries`
   - **Idempotency reaper** — hourly DELETE of expired `idempotency_records` rows (closes ADR 0010's "no reaper" follow-up)
@@ -743,7 +745,7 @@ Deferred until the incident-commander agent is wired up and driving eval scenari
 │   │   │   └── incident_digest.py  # Phase 10 — periodic per-tenant digests
 │   │   │
 │   │   ├── workers/
-│   │   │   ├── dispatcher.py       # JobDispatcherConsumer + worker_loop (starts all 8 consumers + 9 loops)
+│   │   │   ├── dispatcher.py       # JobDispatcherConsumer + worker_loop (starts all 8 consumers + 10 loops)
 │   │   │   ├── async_tasks.py      # asyncio — bulk_api_sync
 │   │   │   ├── thread_adapters.py  # threading — csv_upload
 │   │   │   ├── cpu_processors.py   # multiprocessing — doc_analysis, report_gen
