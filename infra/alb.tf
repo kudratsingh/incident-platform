@@ -15,8 +15,19 @@ resource "aws_lb_target_group" "backend" {
   vpc_id      = aws_vpc.main.id
   target_type = "ip"
 
+  # Shallow liveness, deliberately NOT the deep dependency check
+  # (WO-R2-65). A target group decides who receives traffic, so the only
+  # thing it may ask is whether this task can serve HTTP. `/api/v1/health`
+  # returns 503 when Redis is unreachable — a dependency every path in the
+  # application already fails open on — so probing it here deregistered
+  # every backend target simultaneously and turned a degraded API into an
+  # unreachable one. There is nothing to route around when all targets
+  # share the same outage.
+  #
+  # Worker liveness has not been dropped; it moved to the probe that can
+  # act on it, the ECS container check in ecs.tf (ADR 0009, amended).
   health_check {
-    path                = "/api/v1/health"
+    path                = "/healthz"
     healthy_threshold   = 2
     unhealthy_threshold = 3
     interval            = 30

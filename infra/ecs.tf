@@ -118,8 +118,15 @@ resource "aws_ecs_task_definition" "backend" {
         }
       }
 
+      # Task liveness including the in-process worker, and nothing else
+      # (WO-R2-65). This is the probe with restart authority, so it must
+      # fire for conditions a replacement task actually fixes: a worker
+      # that died and could not be restarted in-process (ADR 0009), not a
+      # shared dependency being down. Curling `/api/v1/health` here meant a
+      # Redis outage recycled every task mid-job, destroying in-flight work
+      # to arrive back at the same outage.
       healthCheck = {
-        command     = ["CMD-SHELL", "curl -f http://localhost:8000/api/v1/health || exit 1"]
+        command     = ["CMD-SHELL", "curl -f http://localhost:8000/healthz/worker || exit 1"]
         interval    = 30
         timeout     = 5
         retries     = 3

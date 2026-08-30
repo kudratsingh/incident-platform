@@ -6,11 +6,17 @@
 # (up/down/logs/migrate/seed-*/mcp-probe) assume `docker compose up -d`.
 
 .PHONY: help up down logs test test-integration lint typecheck lint-imports \
-        seed-incident-commander seed-eval-fixtures mcp-probe migrate
+        seed-incident-commander seed-eval-fixtures mcp-probe migrate \
+        migrate-local
 
 # Overridable so the target works from a git worktree, which has no .venv of
 # its own: `make test-integration PYTHON=/path/to/main/.venv/bin/python`.
 PYTHON ?= .venv/bin/python
+
+# Owner (DDL-capable) DSN for `migrate-local`. Deliberately separate from the
+# runtime DATABASE_URL: since ADR 0015 the application connects as the
+# non-owner `incident_app` role, and migrations must not (WO-R2-67).
+OWNER_DATABASE_URL ?= postgresql+asyncpg://postgres:postgres@localhost:5432/incident_platform
 
 # Every pytest invocation goes through this. Borrowing another checkout's
 # interpreter also borrows its *editable install*: the .pth file in that venv
@@ -61,8 +67,23 @@ typecheck:  ## Run mypy strict via the host venv (repo root; mypy_path=backend)
 lint-imports:  ## Check the ADR 0006 import contracts (app.mcp -> app.services, one way)
 	PYTHONPATH=$(CURDIR)/backend .venv/bin/lint-imports
 
-migrate:  ## Apply any pending Alembic migrations (idempotent)
-	docker compose exec app alembic -c /app/alembic.ini upgrade head
+migrate:  ## Apply any pending Alembic migrations in the compose stack (idempotent)
+	# Runs the dedicated `migrate` service, not `exec` into `app` (WO-R2-67).
+	# The app container connects as the non-owner `incident_app` role, which
+	# cannot CREATE — so the documented way to run migrations could not apply
+	# any migration that creates or alters a table. The `migrate` service is
+	# the one place that already holds the owner DSN, and it is what `app` and
+	# `mcp` both depend on, so this is the same definition rather than a
+	# second one that can drift from it. It also runs `db_bootstrap`
+	# afterwards, which the old `exec` path skipped entirely.
+	docker compose run --rm migrate
+
+migrate-local:  ## Apply migrations from the host venv against a local Postgres
+	# The host-venv counterpart, for the README's "Backend" flow. alembic.ini
+	# lives at the repo root and the alembic CLI does not search parent
+	# directories, so this only works from here — which is why the README used
+	# to document a `cd backend` that could never have worked.
+	ALEMBIC_DATABASE_URL="$(OWNER_DATABASE_URL)" $(PYTHON) -m alembic upgrade head
 
 seed-incident-commander:  ## Create the incident-commander SA + print a fresh token
 	docker compose exec app python /app/scripts/seed_incident_commander.py

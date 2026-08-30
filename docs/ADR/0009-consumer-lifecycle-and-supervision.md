@@ -141,6 +141,8 @@ Restarting a dead worker is only half of it — the half that fails when the wor
 
 So the liveness lands on `GET /api/v1/health`, which both the ECS container check (`infra/ecs.tf`) and the ALB target group (`infra/alb.tf`) already probe every 30s with a 3-failure threshold. **A green answer there no longer means "this process can reach Postgres and Redis" — it means "…and it is processing jobs."** That is a deliberate widening, and it is only correct because `worker_loop` runs *inside* the API process (see "More than one process runs this" in ARCHITECTURE.md); the day a separate worker deployable exists, this probe has to move with it.
 
+> **Superseded in part — see the [2026-08-30 amendment](#amendment-2026-08-30--the-probes-were-split-wo-r2-65) below.** Reporting worker liveness to the probe with restart authority was right and still holds. Reporting it on the *same endpoint* as Postgres and Redis, and letting the ALB probe that endpoint too, was not: it gave a shared dependency the power to deregister every target and recycle every task. The signal moved to `/healthz/worker`; the reasoning above is unchanged.
+
 Liveness is answered from three sources, cheapest first, with no I/O:
 
 1. the supervisor's state (`not_started` / `running` / `restarting` / `stopped`);
@@ -162,3 +164,45 @@ The one line this adds to `dispatcher.py` — `worker_tick()` at the top of `_pr
 ### Verification
 
 `backend/tests/unit/test_worker_supervision.py` — eight tests driving the *real* lifespan (nothing else in the suite does; `httpx.ASGITransport` skips startup/shutdown, which is why a dead worker had no test that could see it): the done-callback logs the death, a crashed worker restarts, a *cancelled* worker restarts, an orderly shutdown does not resurrect it, `/api/v1/health` reports 503 with a dead worker and 200 with a live one, a stale heartbeat is unhealthy on its own, and shutdown still closes the producer and both pools after a worker crash.
+
+
+---
+
+## Amendment (2026-08-30) — the probes were split (WO-R2-65)
+
+**Status:** Accepted · **Amends:** "The deep health check now means something different", above.
+
+### What was wrong
+
+This ADR put worker liveness on `GET /api/v1/health` because that endpoint was already probed by something that could act on it. That was true, but it was probed by *two* somethings, with different powers, and the endpoint also reported two shared dependencies:
+
+| Probe | Power | Read the deep check |
+|---|---|---|
+| ECS container check | replace the task | yes |
+| ALB target group | remove the target from rotation | yes |
+
+`/api/v1/health` returns 503 when Redis is unreachable. Redis is shared by every task, and every request path that touches it already fails open — so a Redis blip made the ALB deregister **all** backend targets at once (an outage assembled out of a degradation, with nothing to route around because every target failed together) and made ECS **replace every task** mid-job, destroying in-flight work to arrive back at the same unreachable Redis. Neither reaction can fix its cause. The widening this ADR chose was sound; the endpoint it chose carried three unrelated signals to two automatic actuators.
+
+### Decision
+
+Three endpoints, one question each:
+
+| Endpoint | Question | Consumer |
+|---|---|---|
+| `/healthz` | can this task serve HTTP? | ALB target group |
+| `/healthz/worker` | is this task worth keeping? | ECS container check |
+| `/api/v1/health` | what is the state of everything? | operators, dashboards |
+
+`/healthz/worker` reports exactly what this ADR argued for — the supervisor state, `task.done()`, and the two heartbeats — and nothing else. It performs no I/O, so it cannot fail for a dependency; a worker that can recover still does so in-process well inside the 3 × 30s window, and one that cannot still gets its task recycled. **Nothing automatic reads the deep check any more.** That is the whole change: it keeps the full picture for the human who curls it during an incident, and it has no authority over traffic or restarts.
+
+### Consequences
+
+- A dead worker no longer deregisters the task from the ALB. The API half is still serving, so it should keep receiving traffic; the remedy is a recycle, which the ECS probe orders.
+- A Redis or Postgres outage no longer recycles tasks or empties the target group. It shows up in the deep check, in `RedisMemory`/`DatabaseConnections` alarms, and in the failure the callers report — none of which is a reason to destroy running work.
+- The invariant this ADR relies on is unchanged: `worker_loop` runs inside the API process, so "is this task worth keeping" is still a question about the worker. The day a separate worker deployable exists, `/healthz/worker` moves with it — same caveat as before, now attached to a probe that means only that.
+
+### Verification
+
+`backend/tests/unit/test_worker_supervision.py` — the original eight tests plus four for the split: the worker probe reports a dead worker, the worker probe is green with a live one, the ALB probe stays 200 with a *dead* worker, and — the assertion this amendment exists for — with Redis unreachable, `/healthz` and `/healthz/worker` both stay 200 while `/api/v1/health` returns 503.
+
+`backend/tests/unit/test_probe_paths.py` keeps the Terraform and the route table from drifting apart: every probed path is a real route, the target group probes `/healthz`, the container check probes `/healthz/worker`, and neither infra file names the deep check.

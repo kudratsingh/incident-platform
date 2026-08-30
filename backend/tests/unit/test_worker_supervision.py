@@ -57,11 +57,14 @@ class _Boot:
         self.close_redis_pool = AsyncMock()
         self.close_sse_redis_pool = AsyncMock()
         self.shutdown_error: BaseException | None = None
+        # The faked Redis client, exposed so a test can make it unreachable
+        # (WO-R2-65: which probes are allowed to notice).
+        self.redis = AsyncMock()
 
 
 def _patch_boot(monkeypatch: pytest.MonkeyPatch, worker: Callable[..., Any]) -> _Boot:
     boot = _Boot()
-    redis = AsyncMock()
+    redis = boot.redis
     monkeypatch.setattr(
         "app.core.migration_check.assert_migrations_current", AsyncMock()
     )
@@ -379,3 +382,109 @@ async def test_shutdown_closes_producer_and_pools_when_the_worker_died(
     boot.stop_producer.assert_awaited_once()
     boot.close_redis_pool.assert_awaited_once()
     boot.close_sse_redis_pool.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# Which probe is allowed to notice what (WO-R2-65)
+#
+# ADR 0009 put worker liveness on the deep check because the probe that
+# governs restarts had to be able to see a dead worker. That was right, and
+# the endpoint it landed on was also the ALB target-group check and the ECS
+# container check — so it governed *traffic* too, and it also reported
+# Postgres and Redis. A Redis outage therefore deregistered every backend
+# target at once and recycled every task mid-job, over a dependency that
+# every request path already fails open on.
+#
+# The split: /healthz answers "can this task serve HTTP" (ALB),
+# /healthz/worker answers "is this task worth keeping" (ECS, restart
+# authority), /api/v1/health keeps the whole truth for operators.
+# ---------------------------------------------------------------------------
+
+
+async def test_worker_probe_reports_a_dead_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ADR 0009's requirement, on the probe that now carries it."""
+    seen: dict[str, Any] = {}
+
+    worker = _CrashingWorker()
+    async with _booted(monkeypatch, worker) as (client, _boot):
+        deadline = time.monotonic() + 2.0
+        unhealthy = False
+        while time.monotonic() < deadline:
+            response = await client.get("/healthz/worker")
+            seen["status"] = response.status_code
+            seen["body"] = response.json()
+            if response.status_code == 503 and seen["body"].get("worker") == "error":
+                unhealthy = True
+                break
+            await asyncio.sleep(0.02)
+
+    assert unhealthy, (
+        "the probe with restart authority stayed green with a dead worker — "
+        f"last saw {seen}"
+    )
+
+
+async def test_worker_probe_is_green_with_a_live_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worker = _HealthyWorker()
+    async with _booted(monkeypatch, worker) as (client, _boot):
+        await asyncio.sleep(0.05)
+        response = await client.get("/healthz/worker")
+
+    assert response.status_code == 200, response.json()
+    assert response.json()["worker"] == "ok"
+
+
+async def test_the_alb_probe_ignores_a_dead_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dead worker is not a reason to stop routing HTTP to this task.
+
+    The API half still serves every request it could serve a moment ago;
+    the remedy is a task recycle, which the ECS probe above orders. Failing
+    the target group as well would take the API down for a worker fault.
+    """
+    worker = _CrashingWorker()
+    async with _booted(monkeypatch, worker) as (client, _boot):
+        # Wait until the worker is genuinely being reported dead...
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            if (await client.get("/healthz/worker")).status_code == 503:
+                break
+            await asyncio.sleep(0.02)
+        # ...and only then ask the traffic probe.
+        response = await client.get("/healthz")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+
+
+async def test_a_redis_outage_fails_only_the_deep_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """THE assertion for WO-R2-65.
+
+    With Redis unreachable, neither the probe that routes traffic nor the
+    probe that recycles tasks may fail — a replacement task comes back to
+    the same Redis, and every target sharing the outage means there is
+    nothing to route around. The deep check still tells the truth, because
+    nothing acts on it automatically.
+    """
+    worker = _HealthyWorker()
+    async with _booted(monkeypatch, worker) as (client, boot):
+        await asyncio.sleep(0.05)
+        boot.redis.ping.side_effect = ConnectionError("redis is unreachable")
+
+        liveness = await client.get("/healthz")
+        worker_probe = await client.get("/healthz/worker")
+        deep = await client.get("/api/v1/health")
+
+    assert liveness.status_code == 200, "the ALB would have deregistered this target"
+    assert worker_probe.status_code == 200, "ECS would have recycled this task"
+    assert deep.status_code == 503, deep.json()
+    body = deep.json()
+    assert body["redis"] == "error"
+    assert body["worker"] == "ok"
