@@ -69,3 +69,25 @@ async def test_delete_silently_ignores_redis_error() -> None:
     redis = AsyncMock()
     redis.delete.side_effect = ConnectionError("Redis down")
     await JobCache.delete(redis, _JOB_ID, _TENANT_ID)  # should not raise
+
+
+async def test_get_discards_a_payload_that_is_not_a_job_dict() -> None:
+    """R2-20: `create_stale_cache` writes a JSON *array*. Under the old
+    `cache:` allowlist it could land on a live `cache:job:` key, and
+    `json.loads` happily returned the list — which `JobResponse.
+    model_validate` then rejected, 500-ing `GET /jobs/{id}` for the
+    whole TTL. A corrupt entry must read as a miss so the caller
+    degrades to a slower DB read, not an error."""
+    import json
+
+    redis = AsyncMock()
+    redis.get.return_value = json.dumps(["stale-fixture-deadbeef"])
+    assert await JobCache.get(redis, _JOB_ID, _TENANT_ID) is None
+
+
+async def test_get_discards_a_payload_that_is_not_json() -> None:
+    """Same degradation for a non-JSON body — already covered by the
+    broad `except`, pinned here so the shape check doesn't narrow it."""
+    redis = AsyncMock()
+    redis.get.return_value = "not json at all"
+    assert await JobCache.get(redis, _JOB_ID, _TENANT_ID) is None

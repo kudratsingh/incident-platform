@@ -43,6 +43,23 @@ class PoisonMessageBrokerUnavailableError(AppError):
     status_code = 503
     error_code = "kafka_unavailable"
 
+
+class PoisonMessageSendFailedError(AppError):
+    """The broker answered but refused the send — unknown topic, no
+    partition leader, message too large, ACL denial.
+
+    Deliberately NOT `kafka_unavailable`: that code names an
+    unreachable broker, and the operator response differs (bring the
+    broker up vs. create the topic / fix the payload). Before R2-16
+    only `start()` was inside the broad catch, so every one of these
+    escaped as `-32603 internal tool error` — which the commander's
+    ChaosClient buckets as a transport fault, hiding a fixture bug as
+    flakiness."""
+
+    status_code = 502
+    error_code = "kafka_send_failed"
+
+
 logger = get_logger(__name__)
 
 
@@ -79,12 +96,13 @@ class PoisonMessageOutput(BaseModel):
         description="Kafka send succeeded from the platform's "
         "perspective. The paired synthetic DLQ entry is guaranteed."
     )
-    dlq_job_id: str | None = Field(
-        default=None,
+    dlq_job_id: str = Field(
         description="ID of the synthetic DLQ entry the hook wrote "
         "(remediation_hint=replay_safe). Observable via "
-        "`list_dlq_messages`. `null` only when no user exists in the "
-        "caller's tenant to attach the job to (defensive)."
+        "`list_dlq_messages`. Always populated on a successful call: "
+        "an unseeded tenant gets a lazy-created chaos owner rather "
+        "than a skipped row, so `accepted` and this field can no "
+        "longer disagree."
     )
 
 
@@ -129,7 +147,12 @@ async def poison_message(
                 f"Kafka broker not reachable at "
                 f"{settings.kafka_bootstrap_servers}: {exc}"
             ) from exc
-        await producer.send_and_wait(inp.topic, value=body, key=key_bytes)
+        try:
+            await producer.send_and_wait(inp.topic, value=body, key=key_bytes)
+        except Exception as exc:
+            raise PoisonMessageSendFailedError(
+                f"Kafka refused the send to topic {inp.topic!r}: {exc}"
+            ) from exc
     finally:
         try:
             await producer.stop()
@@ -143,30 +166,42 @@ async def poison_message(
     # remediation loop keys off. Real consumers log+commit schema
     # errors rather than routing to DLQ, so without this row the
     # agent has nothing to hypothesize about.
-    dlq_job_id: str | None = None
+    #
+    # An unseeded tenant is the normal case on a fresh eval stack, not a
+    # defensive edge (R2-16). Skipping the row there while still
+    # answering `accepted=true` made the scenario silently unwinnable and
+    # mis-scored the agent — a wasted paid run. Both sibling hooks
+    # (`create_bad_data_job`, `seed_dlq_messages`) lazy-create the same
+    # chaos owner for exactly this case, and reusing their helper means
+    # the reset's `_delete_chaos_owner_users` sweep reaches this row too.
+    tenant_id = ctx.principal.tenant_id
     user = (
         await ctx.db.execute(
-            select(User).where(User.tenant_id == ctx.principal.tenant_id).limit(1)
+            select(User).where(User.tenant_id == tenant_id).limit(1)
         )
     ).scalar_one_or_none()
-    if user is not None:
-        error_msg = (
-            f"SchemaValidationError: payload missing required field on "
-            f"topic '{inp.topic}' (chaos poison_message)"
-        )
-        job = Job(
-            tenant_id=ctx.principal.tenant_id,
-            user_id=user.id,
-            type=JobType.BULK_API_SYNC.value,
-            status=JobStatus.DEAD_LETTER.value,
-            payload={"chaos_fixture": "poison_message", "topic": inp.topic},
-            retry_count=3,
-            error_message=error_msg,
-            remediation_hint=RemediationHint.REPLAY_SAFE.value,
-        )
-        ctx.db.add(job)
-        await ctx.db.flush()
-        dlq_job_id = str(job.id)
+    if user is None:
+        from app.mcp.tools.chaos.create_bad_data_job import _ensure_chaos_owner
+
+        user = await _ensure_chaos_owner(ctx, tenant_id)
+
+    error_msg = (
+        f"SchemaValidationError: payload missing required field on "
+        f"topic '{inp.topic}' (chaos poison_message)"
+    )
+    job = Job(
+        tenant_id=tenant_id,
+        user_id=user.id,
+        type=JobType.BULK_API_SYNC.value,
+        status=JobStatus.DEAD_LETTER.value,
+        payload={"chaos_fixture": "poison_message", "topic": inp.topic},
+        retry_count=3,
+        error_message=error_msg,
+        remediation_hint=RemediationHint.REPLAY_SAFE.value,
+    )
+    ctx.db.add(job)
+    await ctx.db.flush()
+    dlq_job_id = str(job.id)
 
     logger.warning(
         "chaos poison_message sent",

@@ -940,3 +940,37 @@ async def test_delete_chaos_owner_users_removes_users_and_their_jobs(
     assert (
         await db_session.execute(_select(Job).where(Job.id == real_job.id))
     ).scalar_one_or_none() is not None
+
+
+async def test_clear_poisoned_job_cache_sweeps_the_live_read_namespace() -> None:
+    """R2-20: the reset sweeps `chaos:*`, but a stale-cache write that
+    landed on `cache:job:{tenant}:{job}` carries no chaos marker — so a
+    poisoned entry outlived the reset for the rest of its TTL, and the
+    500s it caused could not be correlated with the scenario that caused
+    them. Deleting the read cache is free: it is a 10s read-through
+    cache that repopulates from Postgres on the next request."""
+    import uuid as _uuid
+
+    from app.utils.cache import JobCache
+
+    reset = _reset_module()
+    poisoned = JobCache._key(_uuid.uuid4(), _uuid.uuid4())
+
+    redis = AsyncMock()
+    scan_results = iter([(0, [poisoned.encode()])])
+    scanned_patterns: list[str] = []
+
+    def _scan(**kwargs):  # type: ignore[no-untyped-def]
+        scanned_patterns.append(kwargs["match"])
+        return next(scan_results)
+
+    redis.scan.side_effect = _scan
+    redis.delete = AsyncMock(return_value=1)
+
+    deleted = await reset._clear_job_read_cache(redis)
+
+    assert deleted == 1
+    assert scanned_patterns == [reset._JOB_CACHE_PATTERN]
+    # The pattern must actually match the key builder's output — a
+    # hand-typed pattern that matches nothing is the D-13 failure mode.
+    assert fnmatch.fnmatch(poisoned, reset._JOB_CACHE_PATTERN)

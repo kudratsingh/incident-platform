@@ -45,9 +45,42 @@ _DEFAULT_HOT_SET_KEY = "cache:jobs:worker-dispatcher:hot_set"
 # of `backend/app/mcp/tools/actions/invalidate_cache_key.py::_ALLOWED_PREFIXES`.
 _ALLOWED_PREFIXES = ("cache:", "jobs:cache:", "read_model:")
 
+# Carved back out of `cache:` above (R2-20). The allowlist is inherited
+# from the *compensator*, and the compensator is deliberately allowed to
+# reach the live per-job read cache — an agent force-refreshing a stale
+# job read needs exactly that. Write access is the asymmetric half: this
+# hook's payload is a JSON array of fabricated IDs, and
+# `cache:job:{tenant}:{job}` is read through `JobResponse.model_validate`
+# on the `GET /jobs/{id}` hot path. A hook aimed at a fixture key could
+# therefore break a real user-facing read for the whole TTL, in a
+# namespace the reset did not sweep.
+#
+# Deny-inside-allow rather than a narrower allowlist: the subset
+# invariants in `tests/unit/test_cache_key_allowlist.py` are stated over
+# `_ALLOWED_PREFIXES`, and they should keep meaning "the compensator can
+# undo anything we write". Kept as a literal for the same reason the
+# other tuples are (it is baked into the tool's schema text), with
+# `test_chaos_hook_cannot_write_the_live_job_read_cache` importing
+# `JobCache._key` so a rename breaks the test instead of silently
+# unguarding the namespace.
+_FORBIDDEN_PREFIXES = ("cache:job:",)
+
+
+def _key_admitted(key: str) -> bool:
+    """The hook's whole admission rule, in one importable place so the
+    cross-module tripwire test asserts the real decision rather than a
+    re-implementation of it."""
+    if any(key.startswith(p) for p in _FORBIDDEN_PREFIXES):
+        return False
+    return any(key.startswith(p) for p in _ALLOWED_PREFIXES)
+
 
 class CreateStaleCacheError(AppError):
     status_code = 400
+    # One refusal code for both halves of `_key_admitted`, matching the
+    # precedent `get_cache_key_info` sets against `invalidate_cache_key`:
+    # it is the same "this key is not yours to touch" decision, so a
+    # caller can handle it uniformly. The message says which half fired.
     error_code = "stale_cache_key_forbidden"
 
 
@@ -62,7 +95,10 @@ class CreateStaleCacheInput(BaseModel):
             "Redis key to populate. Must start with one of "
             f"{list(_ALLOWED_PREFIXES)} so `invalidate_cache_key` can "
             "serve as the compensator (its allowlist would refuse "
-            "arbitrary keys). Default is the hot_set key the "
+            "arbitrary keys), and must NOT start with "
+            f"{list(_FORBIDDEN_PREFIXES)} — that is the platform's live "
+            "per-job read cache, which serves `GET /jobs/{id}` to real "
+            "users. Default is the hot_set key the "
             "`remediate_stale_cache_success` scenario reads."
         ),
     )
@@ -99,7 +135,9 @@ class CreateStaleCacheOutput(BaseModel):
         "cleanup. Value is a JSON array of fabricated IDs so an "
         "operator inspecting Redis doesn't confuse this with real "
         "cache. Bounded TTL (max 1h) so a forgotten cleanup "
-        "self-clears."
+        "self-clears. Refuses `cache:job:` keys "
+        "(`stale_cache_key_forbidden`): that is the live per-job read "
+        "cache behind `GET /jobs/{id}`, not a fixture namespace."
     ),
     input_model=CreateStaleCacheInput,
     output_model=CreateStaleCacheOutput,
@@ -108,7 +146,15 @@ class CreateStaleCacheOutput(BaseModel):
 async def create_stale_cache(
     inp: CreateStaleCacheInput, ctx: ToolContext
 ) -> CreateStaleCacheOutput:
-    if not any(inp.key.startswith(p) for p in _ALLOWED_PREFIXES):
+    if any(inp.key.startswith(p) for p in _FORBIDDEN_PREFIXES):
+        raise CreateStaleCacheError(
+            f"Key {inp.key!r} is inside the platform's live per-job read "
+            f"cache ({list(_FORBIDDEN_PREFIXES)}), which serves "
+            "`GET /jobs/{id}`. This hook writes a JSON array, so the "
+            "write would break that endpoint for real users until the "
+            "TTL lapsed. Use the default hot_set fixture key instead."
+        )
+    if not _key_admitted(inp.key):
         raise CreateStaleCacheError(
             f"Key {inp.key!r} is not under an allowlisted prefix. "
             f"Allowed: {list(_ALLOWED_PREFIXES)}. `invalidate_cache_key` "

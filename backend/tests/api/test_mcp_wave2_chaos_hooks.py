@@ -900,3 +900,194 @@ async def test_create_stale_cache_round_trip_with_invalidate_cache_key(
             assert key not in redis_stub._store
     finally:
         teardown()
+
+
+async def test_create_stale_cache_refuses_the_live_job_read_cache_key(
+    db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
+) -> None:
+    """R2-20: `cache:` is a prefix of the platform's live per-job read
+    cache `cache:job:{tenant}:{job}`. Writing this hook's JSON array
+    there breaks `GET /jobs/{id}` for real users until the TTL lapses.
+    The hook must refuse the key before any Redis call, the same way
+    `get_cache_key_info` refuses a namespace it does not own."""
+    redis_stub = _RedisStub()
+    app, teardown = _mcp_app_with_chaos_enabled(db_session, redis_stub)
+    live_key = f"cache:job:{default_tenant.id}:{uuid.uuid4()}"
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app, raise_app_exceptions=False),
+            base_url="http://test",
+        ) as ac:
+            token = await _token(
+                db_session, default_tenant.id, [Scope.CHAOS_INVOKE.value]
+            )
+            body = await _call(
+                ac, token, "create_stale_cache", {"key": live_key}
+            )
+        assert body["error"]["code"] == protocol.MCP_TOOL_ERROR
+        assert body["error"]["data"]["error_code"] == "stale_cache_key_forbidden"
+        # Refused *before* Redis — nothing was written.
+        assert live_key not in redis_stub._store
+    finally:
+        teardown()
+
+
+async def test_poison_message_lazy_creates_chaos_owner_on_unseeded_tenant(
+    db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
+) -> None:
+    """R2-16: the synthetic DLQ row is `poison_message`'s only observable
+    effect (real consumers log-and-drop schema errors). On a tenant with
+    no users the hook used to skip the row and still answer
+    accepted=true, leaving the scenario unwinnable. Both sibling hooks
+    lazy-create a chaos owner for exactly this case — so must this one."""
+    from app.models.job import Job
+    from app.models.tenant import Tenant
+    from app.models.user import User
+    from sqlalchemy import select as _select
+
+    fresh_tenant = Tenant(
+        slug=f"poison-t-{uuid.uuid4().hex[:8]}",
+        name="Chaos-only tenant",
+        is_active=True,
+    )
+    db_session.add(fresh_tenant)
+    await db_session.flush()
+    pre_users = (
+        await db_session.execute(
+            _select(User).where(User.tenant_id == fresh_tenant.id)
+        )
+    ).scalars().all()
+    assert pre_users == []
+
+    redis_stub = _RedisStub()
+    app, teardown = _mcp_app_with_chaos_enabled(db_session, redis_stub)
+    producer = AsyncMock()
+    producer.start = AsyncMock()
+    producer.stop = AsyncMock()
+    producer.send_and_wait = AsyncMock()
+    try:
+        with patch("aiokafka.AIOKafkaProducer", return_value=producer):
+            async with AsyncClient(
+                transport=ASGITransport(app=app, raise_app_exceptions=False),
+                base_url="http://test",
+            ) as ac:
+                token = await _token(
+                    db_session, fresh_tenant.id, [Scope.CHAOS_INVOKE.value]
+                )
+                payload = _content(
+                    await _call(
+                        ac,
+                        token,
+                        "poison_message",
+                        {"topic": "job.submitted", "payload": {}},
+                    )
+                )
+        assert payload["accepted"] is True
+        assert payload["dlq_job_id"] is not None
+        job = (
+            await db_session.execute(
+                _select(Job).where(Job.id == uuid.UUID(payload["dlq_job_id"]))
+            )
+        ).scalar_one()
+        assert job.tenant_id == fresh_tenant.id
+        owner = (
+            await db_session.execute(_select(User).where(User.id == job.user_id))
+        ).scalar_one()
+        # Same chaos owner the sibling hooks create — so the reset's
+        # `_delete_chaos_owner_users` sweep reaches this one too.
+        assert owner.tenant_id == fresh_tenant.id
+        assert owner.email.startswith("chaos-owner")
+        assert owner.is_active is False
+    finally:
+        teardown()
+
+
+async def test_poison_message_send_failure_returns_typed_broker_error(
+    db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
+) -> None:
+    """R2-16: only `start()` was inside the broad catch, so a
+    `send_and_wait` failure (unknown topic, no leader, auth) escaped as
+    an opaque -32603 the ChaosClient buckets as a transport fault. It
+    needs its own code — `kafka_unavailable` would be a misnomer for a
+    broker that answered and rejected the send."""
+    redis_stub = _RedisStub()
+    app, teardown = _mcp_app_with_chaos_enabled(db_session, redis_stub)
+    producer = AsyncMock()
+    producer.start = AsyncMock()
+    producer.stop = AsyncMock()
+    producer.send_and_wait = AsyncMock(side_effect=OSError("unknown topic"))
+    try:
+        with patch("aiokafka.AIOKafkaProducer", return_value=producer):
+            async with AsyncClient(
+                transport=ASGITransport(app=app, raise_app_exceptions=False),
+                base_url="http://test",
+            ) as ac:
+                token = await _token(
+                    db_session, default_tenant.id, [Scope.CHAOS_INVOKE.value]
+                )
+                body = await _call(
+                    ac,
+                    token,
+                    "poison_message",
+                    {"topic": "job.submitted", "payload": {}},
+                )
+        assert body["error"]["code"] == protocol.MCP_TOOL_ERROR
+        assert body["error"]["data"]["error_code"] == "kafka_send_failed"
+        producer.stop.assert_awaited()
+    finally:
+        teardown()
+
+
+async def test_seed_dlq_messages_unknown_hint_is_a_validation_error(
+    db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
+) -> None:
+    """R2-16: strengthens `test_seed_dlq_messages_rejects_unknown_hint`.
+    A bare `ValueError` reached the client as -32603 `internal tool
+    error` and logged `mcp tool crashed` — indistinguishable from a real
+    platform fault. Constraining the field on the input model rejects it
+    at parse time with -32602 instead, and the enumerated values become
+    visible in the tool's inputSchema."""
+    redis_stub = _RedisStub()
+    app, teardown = _mcp_app_with_chaos_enabled(db_session, redis_stub)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app, raise_app_exceptions=False),
+            base_url="http://test",
+        ) as ac:
+            token = await _token(
+                db_session, default_tenant.id, [Scope.CHAOS_INVOKE.value]
+            )
+            body = await _call(
+                ac,
+                token,
+                "seed_dlq_messages",
+                {"remediation_hint": "definitely_not_a_hint"},
+            )
+            listing = await ac.post(
+                "/mcp",
+                json=_rpc("tools/list"),
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        assert body["error"]["code"] == protocol.JSONRPC_INVALID_PARAMS
+        assert body["error"]["code"] != protocol.JSONRPC_INTERNAL_ERROR
+        # The agent can now discover the valid values without a failed call.
+        tools = {t["name"]: t for t in listing.json()["result"]["tools"]}
+        schema = tools["seed_dlq_messages"]["inputSchema"]
+        assert "replay_safe" in json.dumps(schema["properties"]["remediation_hint"])
+    finally:
+        teardown()
+
+
+def test_seed_dlq_hint_literal_matches_the_enum() -> None:
+    """R2-16: the hint values are spelled out on the input model so they
+    reach the agent through the tool's inputSchema. That copy can drift
+    from `RemediationHint` — if the enum gains a member the tool would
+    silently refuse a legitimate hint. Pin the two together."""
+    import typing
+
+    from app.mcp.tools.chaos.seed_dlq_messages import _HINT_VALUES
+    from app.models.enums import RemediationHint
+
+    assert set(typing.get_args(_HINT_VALUES)) == {
+        h.value for h in RemediationHint
+    }
