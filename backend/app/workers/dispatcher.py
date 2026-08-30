@@ -110,6 +110,54 @@ _STALE_RUNNING_SWEEP_LIMIT = 100  # RUNNING rows examined per pass
 
 MAX_CONCURRENT_JOBS = 10  # cap on simultaneously running jobs
 
+# WO-R2-07 / ADR 0021. How long a job may stay RUNNING *past* the
+# stale-RUNNING threshold before the sweep reclaims it despite being one of
+# this process's in-flight ids.
+#
+# ADR 0019 made that exclusion unconditional, which was right while execution
+# was unbounded — the sweep could not tell a slow job from a stuck one, so it
+# had to assume slow. `job_execution_timeout_seconds` now draws that line:
+# a local job still RUNNING long past its own deadline is stuck, not slow,
+# and the exclusion has to lapse or it is once again the one state nothing
+# recovers. The grace only has to cover the deadline breach plus the
+# dead-letter write it triggers; reaping inside that window would fan out a
+# spurious `job.dlq` and then be overwritten by the write already in flight.
+#
+# Sized against the threshold, not the deadline, because the sweep's SQL has
+# already filtered to rows older than the threshold by the time this applies.
+_IN_FLIGHT_EXCLUSION_GRACE_SECONDS = 300.0
+
+# Cap on jobs dispatched but not yet finished — running plus waiting for a
+# concurrency slot. `handle_message` no longer blocks on the semaphore (that
+# stalled the poll loop and got the group evicted), so without a cap a
+# saturated worker would spawn a task per message without limit.
+#
+# Past the cap `handle_message` raises `DispatchBacklogFull`, which is the
+# base consumer's existing backpressure primitive: the offset is not
+# committed and the partition seeks back for redelivery. Crucially that
+# happens *without* the poll loop stopping — `getmany()` keeps being called
+# and the group keeps its member, which is the whole point of the fix.
+_MAX_DISPATCH_BACKLOG = MAX_CONCURRENT_JOBS * 10
+
+
+class JobExecutionTimeout(Exception):
+    """A processor overran `job_execution_timeout_seconds`.
+
+    Deliberately NOT a bare `TimeoutError`. Processors raise `TimeoutError`
+    themselves all the time (an HTTP client giving up on an upstream), and
+    that is an ordinary transient failure that has earned its retries.
+    Only the dispatcher's own deadline dead-letters, so the two must be
+    distinguishable at the `except` — see `_execute_processor`.
+    """
+
+
+class DispatchBacklogFull(Exception):
+    """Raised by `handle_message` when the dispatch backlog is at its cap.
+
+    Signals the base consumer to leave the offset uncommitted and seek back,
+    so the message is redelivered once the worker has drained.
+    """
+
 # Strategy map: job type → processor coroutine
 _PROCESSORS = {
     JobType.BULK_API_SYNC: async_tasks.process_bulk_api_sync,
@@ -122,6 +170,53 @@ _PROCESSORS = {
 # `JobRepository.update_status` became the single producer of terminal events
 # (ADR 0001 addendum). Nothing in this module builds a terminal payload by hand
 # any more — writing the status IS emitting the event.
+
+
+def _execution_timeout_seconds(job_type: str) -> float:
+    """The execution deadline for `job_type`, in seconds.
+
+    One knob for every type today. The seam exists because the processors do
+    not share a cost model — csv_upload runs on a 4-thread pool, doc_analysis
+    and report_gen on a process pool — so the first per-type deadline has an
+    obvious place to go that is not a call site.
+    """
+    return float(get_settings().job_execution_timeout_seconds)
+
+
+async def _execute_processor(
+    processor: Any,
+    payload: dict[str, Any],
+    publish: Any,
+    timeout_seconds: float,
+) -> dict[str, Any]:
+    """Run `processor` under a hard deadline.
+
+    Raises `JobExecutionTimeout` when the deadline expires, and lets every
+    other exception through untouched — including a `TimeoutError` the
+    processor raised itself, which is an ordinary transient failure with
+    retries still owed to it. `asyncio.timeout` re-raises an inner
+    `TimeoutError` unchanged, so `expired()` is the only thing that reliably
+    tells "we cancelled it" from "it gave up": catching bare `TimeoutError`
+    around the call would silently dead-letter every upstream blip.
+
+    Cancellation reaches the processor at its next await point. One caveat
+    worth stating plainly: a processor parked in `run_in_executor` unblocks
+    *here* immediately, but the thread or process it handed the work to runs
+    to completion regardless — neither can be preempted in Python. The
+    concurrency slot and the job row are released either way, which is what
+    the finding is about; the leaked pool worker is a narrower problem and is
+    recorded in ADR 0021 rather than papered over here.
+    """
+    try:
+        async with asyncio.timeout(timeout_seconds) as deadline:
+            result: dict[str, Any] = await processor(payload, publish)
+            return result
+    except TimeoutError:
+        if deadline.expired():
+            raise JobExecutionTimeout(
+                f"job exceeded the {timeout_seconds}s execution deadline"
+            ) from None
+        raise
 
 
 async def _run_job(
@@ -301,8 +396,86 @@ async def _run_job(
         span.set_attribute("job.type", job_type)
         span.set_attribute("job.retry_count", retry_count)
 
+        timeout_seconds = _execution_timeout_seconds(job_type)
+        span.set_attribute("job.execution_timeout_seconds", timeout_seconds)
+
         try:
-            result: dict[str, Any] = await processor(payload, _publish)
+            result: dict[str, Any] = await _execute_processor(
+                processor, payload, _publish, timeout_seconds
+            )
+
+        except JobExecutionTimeout as exc:
+            # Terminal on the first breach — deliberately NOT a retry.
+            #
+            # The deadline is a function of the payload, and a retry does not
+            # change the payload: three more attempts would spend three more
+            # full deadlines, holding a concurrency slot each, to arrive back
+            # here. (The pathological shape this fix exists for —
+            # `{row_count: 1_000_000, chunk_size: 1}` — is ~22h of chunk
+            # reads; the deadline turns that into 10 minutes, and retrying it
+            # would turn it back into 40.) Dead-lettering routes it straight
+            # into the machinery that already exists for jobs needing a human
+            # or agent decision: the DLQ tab, LLM triage, saga compensation,
+            # Tier-1 replay.
+            #
+            # `retry_count` is left alone for the same reason the crash sweep
+            # leaves it alone (ADR 0019) — it is the attempt history triage
+            # and the DLQ tab reason about, and this was not an attempt that
+            # failed on its merits.
+            span.record_exception(exc)
+            span.set_status(trace.StatusCode.ERROR, str(exc))
+            error = f"Execution timed out: {exc}"
+            async with session_factory() as session:
+                async with session.begin():
+                    repo = JobRepository(session)
+                    audit = AuditRepository(session)
+                    # Terminal status and `job.dlq` outbox row in one write,
+                    # via the single writer (ADR 0001 addendum). A hand-rolled
+                    # status write here would kill the job in Postgres with no
+                    # consumer hearing: saga stranded, id pinned in the read
+                    # model, triage never run, SSE never closed.
+                    await repo.update_status(
+                        job_id,
+                        JobStatus.DEAD_LETTER,
+                        extra={
+                            "error_message": error,
+                            # Badged so the admin DLQ table can tell a job
+                            # that overran from one that threw, without an
+                            # audit join per row (F2-16).
+                            "dead_lettered_by": "execution_timeout",
+                        },
+                        event_message=error,
+                    )
+                    await audit.log(
+                        "job.dead_letter",
+                        tenant_id=tenant_id,
+                        job_id=job_id,
+                        extra_data={
+                            "error": str(exc),
+                            "reason": "execution_timeout",
+                            "timeout_seconds": timeout_seconds,
+                            "retry_count": retry_count,
+                        },
+                    )
+            logger.error(
+                "job dead-lettered — execution deadline exceeded",
+                extra={
+                    "job_type": job_type,
+                    "timeout_seconds": timeout_seconds,
+                    "retry_count": retry_count,
+                },
+            )
+            await metrics.emit_count(
+                "JobDeadLettered", dimensions={"JobType": str(job_type)}
+            )
+            # Distinct from the aggregate above on purpose: a rise in
+            # deadline breaches is a capacity/payload signal, and it is
+            # invisible inside the general dead-letter count.
+            await metrics.emit_count(
+                "JobExecutionTimeout", dimensions={"JobType": str(job_type)}
+            )
+            job_id_var.reset(token)
+            return
 
         except Exception as exc:
             new_retry_count = retry_count + 1
@@ -486,17 +659,36 @@ class JobDispatcherConsumer(BaseKafkaConsumer):
     """
     Consumes `job.submitted` and dispatches each job to `_run_job`.
 
-    Concurrency: an asyncio.Semaphore bounds in-flight jobs to MAX_CONCURRENT_JOBS.
-    When the worker is saturated, `handle_message` blocks on acquire, naturally
-    creating backpressure against the partition (the consumer stops polling until
-    a slot opens — within max_poll_interval_ms, otherwise it's kicked from the group).
+    Concurrency: an asyncio.Semaphore bounds *executing* jobs to
+    MAX_CONCURRENT_JOBS. The slot is acquired inside the spawned task, never
+    in `handle_message` (WO-R2-07, ADR 0021).
 
-    Offset semantics: the base class commits offsets after `handle_message` returns.
-    We spawn `_run_job` as a background task and return immediately, so the offset
-    advances at dispatch time rather than at job completion. The trade-off:
+    That distinction is the whole finding. `handle_message` runs on the
+    consumer's poll loop, so awaiting the semaphore there stopped the loop
+    from calling `getmany()`: MAX_CONCURRENT_JOBS slow jobs took the worker
+    out of the group entirely once `fetcher_idle_time` passed
+    `max_poll_interval_ms`, with nothing to restart it — and the
+    stale-RUNNING sweep skipped exactly those in-flight ids, so nothing
+    could recover it either. It was described as backpressure, but Kafka
+    backpressure that stops polling is eviction on a timer.
+
+    Backpressure now comes from two bounded mechanisms that both keep the
+    loop polling: `_MAX_DISPATCH_BACKLOG` (raise `DispatchBacklogFull`, the
+    offset is not committed, the partition seeks back) and
+    `job_execution_timeout_seconds` (no job holds a slot indefinitely).
+
+    Offset semantics: the base class commits offsets after `handle_message`
+    returns. We spawn `_run_and_release` as a background task and return
+    immediately, so the offset advances at dispatch time rather than at job
+    completion. The trade-off:
       * Pro: high throughput, the consumer is never blocked by a long job.
       * Con: a worker crash between commit-and-completion leaves the job in DB
         as RUNNING with no message left to redeliver it.
+      * Con: a job may now be committed while still queued for a slot rather
+        than already executing, so a crash in that window leaves it PENDING
+        with no message either. That one has a backstop —
+        `_requeue_stale_pending_once` re-publishes PENDING rows with no
+        progress — where the RUNNING window needs the sweep below.
 
     Crash recovery for that window is `_stale_running_sweep_loop`, which
     dead-letters RUNNING rows older than `stale_running_threshold_seconds`
@@ -544,8 +736,26 @@ class JobDispatcherConsumer(BaseKafkaConsumer):
             )
             return
 
-        # Acquire a slot — blocks (and stops polling) when at capacity.
-        await self.semaphore.acquire()
+        # Bounded backlog, checked but never *awaited* — this method runs on
+        # the poll loop and must return promptly no matter how saturated the
+        # worker is. Raising leaves the offset uncommitted and seeks the
+        # partition back (see `BaseKafkaConsumer._process_one`), so the
+        # message returns after the worker drains, while `getmany()` keeps
+        # being called and the group keeps its member.
+        if len(self.in_flight) >= _MAX_DISPATCH_BACKLOG:
+            logger.warning(
+                "dispatch backlog full — message not accepted, will be redelivered",
+                extra={
+                    "job_id": job_id_str,
+                    "backlog": len(self.in_flight),
+                    "limit": _MAX_DISPATCH_BACKLOG,
+                },
+            )
+            await metrics.emit_count("JobDispatchRejected")
+            raise DispatchBacklogFull(
+                f"dispatch backlog at capacity ({_MAX_DISPATCH_BACKLOG})"
+            )
+
         # Claim the id BEFORE spawning the task, not inside it: between
         # `create_task` and the coroutine's first step there is a scheduling
         # gap in which the sweep could run and see the row as an orphan.
@@ -556,6 +766,20 @@ class JobDispatcherConsumer(BaseKafkaConsumer):
         task.add_done_callback(self.in_flight.discard)
 
     async def _run_and_release(self, job_id_str: str) -> None:
+        # The concurrency slot is taken HERE, inside the task — the poll loop
+        # has already moved on. Waiting for capacity is work the dispatcher
+        # does in the background, not something the consumer does instead of
+        # polling.
+        try:
+            await self.semaphore.acquire()
+        except BaseException:
+            # Cancelled while queued for a slot — `worker_loop`'s shutdown
+            # path awaits `in_flight`, so this is reachable on an orderly
+            # stop. Drop the claim: an id in `in_flight_job_ids` with no task
+            # behind it makes the sweep skip a row nobody is executing.
+            self.in_flight_job_ids.discard(job_id_str)
+            raise
+
         try:
             await _run_job(job_id_str, self.session_factory, self.redis)
         except Exception as exc:
@@ -1007,11 +1231,15 @@ async def _sweep_stale_running_once(
 
     Two exclusions, both load-bearing:
 
-      * `dispatcher.in_flight_job_ids` — this process's own live work. The
-        sweep shares a process with legitimately-long jobs (chaos
-        `inject_latency`, large payloads), and reaping one out from under
-        its own processor would fire a spurious `job.dlq` and then be
-        overwritten by the processor's COMPLETED write.
+      * `dispatcher.in_flight_job_ids` — this process's own live work,
+        excluded for `_IN_FLIGHT_EXCLUSION_GRACE_SECONDS` past the threshold
+        rather than forever. Reaping a job out from under its own processor
+        fires a spurious `job.dlq` and is then overwritten by that
+        processor's own terminal write, so the exclusion has to cover the
+        deadline breach and the dead-letter write it triggers. It must not
+        cover more than that: an unconditional exclusion (ADR 0019 as
+        originally written) made a hung local job the one state nothing in
+        the tree could reclaim, which is half of WO-R2-07.
       * the age cutoff, which is compared **in SQL**. `started_at` is
         TIMESTAMP WITH TIME ZONE but SQLite hands back naive datetimes, so
         aware-vs-naive Python math raises TypeError (the same trap
@@ -1056,8 +1284,6 @@ async def _sweep_stale_running_once(
     recovered = 0
     for row in rows:
         job_id_str = str(row.id)
-        if job_id_str in dispatcher.in_flight_job_ids:
-            continue
 
         # `row.started_at` came back naive on SQLite and aware on Postgres;
         # normalise before subtracting so the observability fields below
@@ -1067,7 +1293,28 @@ async def _sweep_stale_running_once(
             started_at = started_at.replace(tzinfo=UTC)
         stale_seconds = (now - started_at).total_seconds()
 
+        # The in-flight exclusion is no longer permanent (WO-R2-07, amending
+        # ADR 0019 §3). It existed because the sweep could not tell a
+        # legitimately-slow local job from a stuck one, so it had to assume
+        # slow — which made a hung local job the single state no sweep could
+        # ever reclaim. `job_execution_timeout_seconds` now draws that line
+        # for us: a job of ours still RUNNING this far past the threshold is
+        # one whose own deadline should already have fired, so it is stuck.
+        # Inside the grace the exclusion still holds, which is what keeps the
+        # sweep off a job whose deadline just fired and whose dead-letter
+        # write is still in flight.
+        in_flight = job_id_str in dispatcher.in_flight_job_ids
+        if in_flight and stale_seconds < (
+            threshold_seconds + _IN_FLIGHT_EXCLUSION_GRACE_SECONDS
+        ):
+            continue
+
         error = "worker crash recovery: job exceeded stale-RUNNING threshold"
+        if in_flight:
+            error = (
+                "stuck job recovery: still RUNNING long past its execution "
+                "deadline while held by this worker"
+            )
         try:
             async with session_factory() as session:
                 async with session.begin():
@@ -1099,7 +1346,15 @@ async def _sweep_stale_running_once(
                         job_id=row.id,
                         extra_data={
                             "error": error,
-                            "reason": "worker_crash_recovery",
+                            # Distinguished so replay tooling and triage can
+                            # tell a crash orphan (nobody was running it)
+                            # from a local job that outlived its deadline
+                            # (something was, and stopped responding).
+                            "reason": (
+                                "stuck_local_job"
+                                if in_flight
+                                else "worker_crash_recovery"
+                            ),
                             "stale_seconds": stale_seconds,
                             "started_at": started_at.isoformat(),
                         },
@@ -1115,12 +1370,18 @@ async def _sweep_stale_running_once(
 
         recovered += 1
         logger.error(
-            "stale RUNNING job dead-lettered (worker crash recovery)",
+            "stale RUNNING job dead-lettered"
+            + (
+                " (stuck local job past its deadline)"
+                if in_flight
+                else " (worker crash recovery)"
+            ),
             extra={
                 "job_id": job_id_str,
                 "tenant_id": str(row.tenant_id),
                 "job_type": row.type,
                 "stale_seconds": stale_seconds,
+                "held_by_this_worker": in_flight,
             },
         )
         await metrics.emit_count(

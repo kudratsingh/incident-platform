@@ -1,6 +1,17 @@
 # ADR 0019 — Stale-RUNNING recovery sweep dead-letters, never re-publishes
 
-**Status:** Accepted · **Date:** 2026 Q3 · **Owner:** Platform
+**Status:** Accepted, amended by [ADR 0021](0021-bounded-execution-and-non-blocking-dispatch.md) ·
+**Date:** 2026 Q3 · **Owner:** Platform
+
+> **Amendment (ADR 0021, WO-R2-07).** §3's in-flight exclusion is no longer
+> unconditional. It was correct while processor execution had no deadline — the sweep
+> could not tell a legitimately-slow local job from a hung one, so it had to assume
+> slow — but that made a hung local job the one state nothing in the tree could
+> reclaim. Now that `job_execution_timeout_seconds` bounds execution, the exclusion
+> lapses `_IN_FLIGHT_EXCLUSION_GRACE_SECONDS` past the threshold and such a job is
+> recovered with `reason: stuck_local_job`. §3's second paragraph is also imprecise on
+> chaos `inject_latency`: it sleeps the *poll* loop, so it delays dispatch, not
+> execution, and never counted against the threshold the way the text implies.
 
 ## Context
 

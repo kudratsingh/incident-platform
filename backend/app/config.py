@@ -112,6 +112,29 @@ class Settings(BaseSettings):
     # live job looks orphaned here and survives purely on this threshold.
     stale_running_threshold_seconds: int = 900
 
+    # Hard deadline on a single processor execution (WO-R2-07, ADR 0021).
+    # `await processor(...)` had none, so one job could hold a concurrency
+    # slot forever and the sweep above deliberately skipped it for being
+    # in-flight — the one stuck state nothing in the tree could reclaim.
+    #
+    # The value has to sit inside a window, and both ends are load-bearing:
+    #
+    #   lower bound — the longest legitimate processor runtime. Every knob a
+    #     payload can turn is bounded (`schemas/job.py`), and the slowest
+    #     bounded shape is a csv_upload at `_MAX_CSV_CHUNKS` chunks: ~200s on
+    #     the 4-thread pool. Chaos `inject_latency` does NOT count against
+    #     this — its 60s cap sleeps the consumer's *poll* loop
+    #     (`kafka_consumer.run`), delaying dispatch, not execution. It
+    #     stretches the gap before `started_at`, never the span this bounds.
+    #   upper bound — `stale_running_threshold_seconds` (900s). This must
+    #     fire first and by a wide margin, or the two recovery paths race:
+    #     the sweep would dead-letter a job whose processor is still running
+    #     and whose own terminal write is still coming.
+    #
+    # 600s sits between them with room at both ends. Raising it past the
+    # stale-RUNNING threshold re-opens the finding, so keep the ordering.
+    job_execution_timeout_seconds: float = 600.0
+
     # How many failed publish attempts an outbox row gets before the relay
     # dead-letters it (ADR 0001 Decision item 3 / its 2026 Q3 addendum).
     # The relay ticks once a second and retries every unpublished row every

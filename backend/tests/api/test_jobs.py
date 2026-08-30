@@ -596,6 +596,41 @@ async def test_create_job_rejects_zero_chunk_size(
     assert "chunk_size" in resp.text
 
 
+async def test_create_job_rejects_a_cheap_payload_that_buys_hours_of_work(
+    client: AsyncClient, auth_headers: dict[str, str]
+) -> None:
+    """WO-R2-07. row_count and chunk_size were bounded separately and their
+    relationship was not — so this payload passed both field bounds and
+    bought a million 0.08s chunk reads, hours of execution from a request
+    that costs nothing to submit."""
+    resp = await client.post(
+        "/api/v1/jobs",
+        json={
+            "type": "csv_upload",
+            "payload": {"row_count": 1_000_000, "chunk_size": 1},
+        },
+        headers=auth_headers,
+    )
+    assert resp.status_code == 422
+    assert "chunk" in resp.text
+
+
+async def test_create_job_accepts_the_boundary_chunk_count(
+    client: AsyncClient, auth_headers: dict[str, str]
+) -> None:
+    """The cap is the documented maximum row_count at the default chunk_size,
+    so every shape that was reasonable before the bound still validates."""
+    resp = await client.post(
+        "/api/v1/jobs",
+        json={
+            "type": "csv_upload",
+            "payload": {"row_count": 1_000_000, "chunk_size": 100},
+        },
+        headers=auth_headers,
+    )
+    assert resp.status_code == 201
+
+
 async def test_create_job_accepts_boundary_endpoint_count(
     client: AsyncClient, auth_headers: dict[str, str]
 ) -> None:
