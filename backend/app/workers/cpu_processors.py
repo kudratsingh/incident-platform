@@ -17,6 +17,7 @@ multiple smaller process submissions.
 """
 
 import multiprocessing
+import threading
 import time
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
@@ -49,24 +50,72 @@ _MAX_POOL_WORKERS = 4
 #     _reset_pool() drops the broken pool so the next attempt rebuilds it.
 _process_pool: ProcessPoolExecutor | None = None
 
+# Guards the (pool, generation) pair. A threading lock rather than an
+# asyncio one because these two functions are plain sync calls, reachable
+# from any thread and from more than one event loop in tests; it is held
+# only around bookkeeping, never around a shutdown or a submit.
+_pool_lock = threading.Lock()
 
-def _get_pool() -> ProcessPoolExecutor:
-    """Return the process pool, creating it on first use."""
+# Monotonic id of the *current* pool, handed out with it and quoted back
+# when a caller asks for a reset.
+#
+# Without it, `_reset_pool` dropped whatever pool happened to be current.
+# A dead child breaks the pool for every job at once, so several jobs
+# fail together and each one calls the reset: the first drops the broken
+# pool, an unrelated job rebuilds and submits, and the second reset then
+# tore down that healthy replacement — with `cancel_futures=True`, taking
+# live work with it, and leaving the next job to rebuild again. Comparing
+# generations makes a reset apply only to the pool its caller actually
+# observed as broken, so concurrent resets collapse into one rebuild
+# (WO-R2-64).
+_pool_generation = 0
+
+
+def _get_pool() -> tuple[ProcessPoolExecutor, int]:
+    """Return the process pool and its generation, creating it on first use.
+
+    The generation travels with the pool deliberately: a caller cannot
+    ask for a correct reset without saying *which* pool it saw fail, and
+    returning them together is what stops the two reads drifting apart.
+    """
+    global _process_pool, _pool_generation
+    with _pool_lock:
+        if _process_pool is None:
+            _pool_generation += 1
+            _process_pool = ProcessPoolExecutor(
+                max_workers=_MAX_POOL_WORKERS,
+                mp_context=multiprocessing.get_context("spawn"),
+            )
+        return _process_pool, _pool_generation
+
+
+def _reset_pool(generation: int | None = None) -> None:
+    """Discard the pool `generation` identified, so the next call rebuilds.
+
+    Pass the generation returned alongside the pool that just failed. If
+    the current pool is a later one, someone has already handled this
+    breakage and rebuilt — the reset is a no-op rather than a teardown of
+    a healthy pool. `generation=None` means "drop whatever is current"
+    and is for teardown callers (tests, shutdown) that are not reacting
+    to a specific failure.
+    """
     global _process_pool
-    if _process_pool is None:
-        _process_pool = ProcessPoolExecutor(
-            max_workers=_MAX_POOL_WORKERS,
-            mp_context=multiprocessing.get_context("spawn"),
-        )
-    return _process_pool
+    with _pool_lock:
+        if _process_pool is None:
+            return
+        if generation is not None and generation != _pool_generation:
+            logger.info(
+                "cpu_processors.pool_reset_skipped",
+                extra={
+                    "observed_generation": generation,
+                    "current_generation": _pool_generation,
+                },
+            )
+            return
+        pool, _process_pool = _process_pool, None
 
-
-def _reset_pool() -> None:
-    """Discard the current pool (best effort) so the next call builds a fresh one."""
-    global _process_pool
-    pool, _process_pool = _process_pool, None
-    if pool is None:
-        return
+    # Outside the lock: shutdown can block, and nothing else may touch
+    # this pool now that it is detached.
     try:
         pool.shutdown(wait=False, cancel_futures=True)
     except Exception:  # pragma: no cover - shutdown of a broken pool is best effort
@@ -159,17 +208,22 @@ async def process_doc_analysis(
     loop = asyncio.get_running_loop()
 
     await publish(5, "Submitting document analysis to process pool")
+    pool, generation = _get_pool()
     try:
         result: dict[str, Any] = await loop.run_in_executor(
-            _get_pool(), _analyze_document, payload
+            pool, _analyze_document, payload
         )
     except BrokenProcessPool:
         # A child died (OOM kill, host pressure). The pool is permanently
         # broken; drop it and re-raise so _run_job's normal retry path picks
         # this up — the next attempt builds a fresh pool instead of failing
         # every CPU job from here until the task restarts.
+        #
+        # Scoped to the generation we submitted against: a sibling job
+        # failing on the same dead pool may already have rebuilt it, and
+        # tearing that replacement down would cancel its in-flight work.
         logger.warning("cpu_processors.pool_broken", extra={"processor": "doc_analysis"})
-        _reset_pool()
+        _reset_pool(generation)
         raise
     await publish(
         100,
@@ -187,14 +241,15 @@ async def process_report_gen(
     loop = asyncio.get_running_loop()
 
     await publish(5, f"Generating report over {payload.get('row_count', 10000)} rows")
+    pool, generation = _get_pool()
     try:
         result: dict[str, Any] = await loop.run_in_executor(
-            _get_pool(), _generate_report, payload
+            pool, _generate_report, payload
         )
     except BrokenProcessPool:
         # See process_doc_analysis.
         logger.warning("cpu_processors.pool_broken", extra={"processor": "report_gen"})
-        _reset_pool()
+        _reset_pool(generation)
         raise
     await publish(
         100,

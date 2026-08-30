@@ -218,10 +218,37 @@ def test_generate_report_clamps_oversized_counts() -> None:
     assert result["groups"] == 1000
 
 
-def test_analyze_document_clamps_page_count() -> None:
-    """Clamped to 1000 pages; we only assert the reported value, not the work."""
+def test_analyze_document_clamps_page_count_floor() -> None:
+    """A negative page count is floored at 0, not passed to `range()`."""
     result = _analyze_document({"page_count": -5})
     assert result["pages_analyzed"] == 0
+
+
+def test_analyze_document_clamps_page_count_ceiling() -> None:
+    """The bound this function exists for, and the one that was untested.
+
+    `page_count` is the loop count for per-page CPU work in a pool
+    subprocess, so an unclamped value from a replayed payload is
+    unbounded process-pool time. The test that claimed to pin the
+    ceiling only ever passed `page_count=-5`, exercising the `max(0, …)`
+    floor; `MAX_PAGE_COUNT` itself was never asserted (R2-64).
+
+    Patched out to nothing so the assertion is about the clamp rather
+    than about sitting through `MAX_PAGE_COUNT * 0.05s` of simulated
+    work — which is also why the old test could not have covered this.
+    """
+    with patch.object(cpu_processors.time, "sleep", lambda _s: None):
+        result = _analyze_document({"page_count": 5000})
+
+    assert result["pages_analyzed"] == cpu_processors.MAX_PAGE_COUNT
+    assert result["word_count"] == cpu_processors.MAX_PAGE_COUNT * 300
+
+
+def test_analyze_document_page_count_below_the_ceiling_is_untouched() -> None:
+    """The clamp is a ceiling, not a rewrite — a legal value passes through."""
+    with patch.object(cpu_processors.time, "sleep", lambda _s: None):
+        result = _analyze_document({"page_count": 7})
+    assert result["pages_analyzed"] == 7
 
 
 async def test_csv_upload_zero_chunk_size_does_not_raise() -> None:
@@ -241,8 +268,8 @@ async def test_csv_upload_zero_chunk_size_does_not_raise() -> None:
 def test_get_pool_uses_spawn_context_and_is_a_singleton() -> None:
     _reset_pool()
     try:
-        pool = _get_pool()
-        assert _get_pool() is pool
+        pool, generation = _get_pool()
+        assert _get_pool() == (pool, generation)
         assert pool._mp_context.get_start_method() == "spawn"
     finally:
         _reset_pool()
@@ -252,7 +279,7 @@ async def test_broken_process_pool_resets_pool_and_propagates() -> None:
     """A killed child poisoned every later CPU job at HEAD — the pool was never rebuilt."""
     log, publish = _collect_publishes()
     _reset_pool()
-    original = _get_pool()
+    original, _ = _get_pool()
     loop = asyncio.get_running_loop()
 
     async def _broken(*args: object, **kwargs: object) -> object:
@@ -266,7 +293,7 @@ async def test_broken_process_pool_resets_pool_and_propagates() -> None:
         assert cpu_processors._process_pool is None
 
         # The next attempt (the dispatcher's retry) gets a fresh pool.
-        assert _get_pool() is not original
+        assert _get_pool()[0] is not original
     finally:
         _reset_pool()
 
@@ -288,3 +315,104 @@ async def test_broken_process_pool_in_report_gen_resets_pool() -> None:
         assert cpu_processors._process_pool is None
     finally:
         _reset_pool()
+
+
+# ---------------------------------------------------------------------------
+# Concurrent pool resets (WO-R2-64)
+#
+# `_reset_pool` used to unconditionally drop whatever pool was current.
+# When several CPU jobs failed on the same broken pool — the normal case,
+# since a dead child breaks the pool for everyone at once — the first
+# reset rebuilt it and the second tore the *replacement* down, taking
+# any freshly submitted future with it (`cancel_futures=True`). The
+# generation counter makes a reset apply only to the pool the caller
+# actually observed as broken.
+# ---------------------------------------------------------------------------
+
+
+class _FakePool:
+    """Records shutdowns without spawning real subprocesses."""
+
+    built: list["_FakePool"] = []
+
+    def __init__(self, **_kwargs: Any) -> None:
+        self.shutdowns: list[bool] = []
+        _FakePool.built.append(self)
+
+    def shutdown(self, wait: bool = True, cancel_futures: bool = False) -> None:
+        self.shutdowns.append(cancel_futures)
+
+
+@pytest.fixture
+def fake_pools() -> Any:
+    _reset_pool()
+    _FakePool.built = []
+    with patch.object(cpu_processors, "ProcessPoolExecutor", _FakePool):
+        yield _FakePool
+    _reset_pool()
+    _FakePool.built = []
+
+
+def test_stale_reset_spares_a_rebuilt_pool(fake_pools: Any) -> None:
+    """The exact interleaving that used to cancel live work.
+
+    Two jobs fail on pool P1. The first reset drops it; an unrelated job
+    then rebuilds as P2 and submits work. The second failing job's reset
+    still refers to P1 — it must be a no-op, not a teardown of P2."""
+    p1, generation = _get_pool()
+
+    _reset_pool(generation)  # first failure, against the pool it saw
+    assert cpu_processors._process_pool is None
+    assert p1.shutdowns == [True]
+
+    p2, generation2 = _get_pool()  # unrelated job rebuilds and submits
+    assert p2 is not p1
+    assert generation2 != generation
+
+    _reset_pool(generation)  # second failure, stale observation
+
+    assert cpu_processors._process_pool is p2
+    assert p2.shutdowns == []
+    # Exactly one rebuild: P1 and P2, never a third.
+    assert fake_pools.built == [p1, p2]
+
+
+def test_reset_without_a_generation_is_still_unconditional(
+    fake_pools: Any,
+) -> None:
+    """Teardown callers (tests, shutdown paths) that pass no generation
+    keep the old drop-whatever-is-there behaviour."""
+    p1, _ = _get_pool()
+    _reset_pool()
+    assert cpu_processors._process_pool is None
+    assert p1.shutdowns == [True]
+
+
+async def test_concurrent_broken_jobs_rebuild_the_pool_once(
+    fake_pools: Any,
+) -> None:
+    """The same thing end-to-end: two CPU jobs awaiting the same broken
+    pool, failing together, must leave exactly one rebuild behind."""
+    _, publish = _collect_publishes()
+    p1, _ = _get_pool()
+    loop = asyncio.get_running_loop()
+
+    async def _broken(*_args: object, **_kwargs: object) -> object:
+        # Yield first, so both coroutines are past _get_pool() and
+        # holding the same pool before either one fails.
+        await asyncio.sleep(0)
+        raise BrokenProcessPool("a child was killed")
+
+    with patch.object(loop, "run_in_executor", side_effect=_broken):
+        results = await asyncio.gather(
+            process_doc_analysis({"page_count": 1}, publish),
+            process_report_gen({"row_count": 1}, publish),
+            return_exceptions=True,
+        )
+
+    assert all(isinstance(r, BrokenProcessPool) for r in results)
+    # One teardown of the broken pool, and no pool built to replace it
+    # behind a caller's back — the next job rebuilds lazily.
+    assert p1.shutdowns == [True]
+    assert fake_pools.built == [p1]
+    assert cpu_processors._process_pool is None
