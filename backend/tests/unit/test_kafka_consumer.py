@@ -23,8 +23,35 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from aiokafka import ConsumerRecord, TopicPartition
 from aiokafka.errors import CommitFailedError, IllegalStateError
+from app.workers import schema_registry
 from app.workers.kafka_consumer import BaseKafkaConsumer
 from app.workers.schema_registry import SchemaValidationError
+from jsonschema import Draft202012Validator
+
+#: The synthetic topic every test here consumes from. It is not a real topic
+#: and has no schema file.
+SYNTHETIC_TOPIC = "test.topic"
+
+
+@pytest.fixture(autouse=True)
+def register_synthetic_topic(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Give `test.topic` a permissive schema for the duration of each test.
+
+    This module is about commit and seek discipline, not about validation:
+    the payloads are `{"n": offset}` and the point is which offsets get
+    committed. It used to work because `validate()` silently no-opped for any
+    unregistered topic, which is precisely the behaviour WO-R2-62 removed —
+    an unmapped topic now raises, and `_process_one` would treat every record
+    here as a poison pill and commit past it, testing nothing.
+
+    Registering the topic explicitly says that out loud. The poison-pill tests
+    below still patch `validate_schema` to raise, so the path stays covered.
+    """
+    monkeypatch.setitem(
+        schema_registry._VALIDATORS,
+        SYNTHETIC_TOPIC,
+        Draft202012Validator({"type": "object"}),
+    )
 
 
 def _mk_record(

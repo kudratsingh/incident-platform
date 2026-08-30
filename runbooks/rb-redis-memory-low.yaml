@@ -4,34 +4,86 @@ severity: medium
 alarm: incident-platform-redis-memory-low
 
 summary: |
-  ElastiCache Redis is running low on memory. Once it hits the eviction
-  threshold, keys without TTLs will start being evicted, which can break
-  rate-limit counters, cached job responses, and (most damagingly) the
-  CQRS read-model job-status sets.
+  ElastiCache Redis is running low on memory. Production runs
+  `maxmemory-policy noeviction` (docs/REDIS.md), so this does NOT end in
+  eviction — it ends in **writes failing with OOM** while every existing key
+  stays exactly where it is. Reads keep working throughout.
+
+  That distinction is the whole runbook. Nothing gets quietly dropped to make
+  room; instead the next `SET`/`ZADD` returns an OOM error and the caller
+  degrades. What degrades, per docs/REDIS.md:
+    - Rate limiter and tenant quota fail *open* — requests get through
+      uncapped rather than being rejected.
+    - `cache:job:*` writes fail — every /jobs/{id} read falls through to
+      Postgres, so RDS load climbs.
+    - The CQRS read-model projection stops advancing, so admin counts freeze
+      and then drift from the `jobs` table. It does not self-heal: an id only
+      moves when an event names it, and a finished job has no more events
+      coming. `rebuild_read_model` is the way back.
+    - Delayed-retry pushes fail, so retries are silently lost — those jobs sit
+      in `failed` with `retry_count < max_retries` until replayed by hand.
 
 symptoms:
-  - "Rate limiter behaving inconsistently (some requests allowed past the cap)"
-  - "Cached /jobs/{id} responses stale or missing"
-  - "Admin Overview counts going backwards"
+  - "FreeableMemory falling steadily toward zero"
+  - "OOM command not allowed when used memory > 'maxmemory' in backend logs"
+  - "Rate limiter letting requests past the cap (it fails open when Redis writes fail)"
+  - "Admin Overview counts frozen, then drifting from the jobs table"
+  - "RDS CPU climbing at the same time — the job cache is no longer absorbing reads"
 
 diagnosis_steps:
-  - id: redis-info
+  - id: check-memory-headroom
+    description: >-
+      How close to the cap, and is the policy still what we think it is? If
+      maxmemory_policy is not noeviction, this runbook's model is wrong and
+      the eviction counters below become the signal instead.
+    command: "redis-cli info memory | grep -E 'used_memory_human|maxmemory_human|maxmemory_policy'"
+  - id: check-oom-errors
+    description: >-
+      Have writes started failing yet? This is the gate for everything below.
+      Under noeviction the OOM error counter is the real signal — evicted_keys
+      stays 0 no matter how bad it gets, because nothing is ever evicted.
+    command: "redis-cli info errorstats | grep -i oom"
+  - id: redis-memkeys
     description: "What's the largest type / key prefix using memory?"
     command: "redis-cli --memkeys"
-  - id: check-eviction
-    description: "Has Redis already evicted any keys?"
-    command: "redis-cli info stats | grep evicted_keys"
+  - id: check-chaos-residue
+    description: >-
+      Was this a saturate_redis run? Its filler keys carry a short TTL
+      (default 60s) and drain on their own, but keys they pushed out do not
+      come back by themselves.
+    command: "redis-cli --scan --pattern 'chaos:sat:*' | wc -l"
   - id: check-read-model
-    description: "Has the CQRS projector been creating an outsized number of sets?"
-    command: "redis-cli --scan --pattern 'jobs:user:*:status:*' | wc -l"
+    description: >-
+      How much of the heap is the CQRS projection? These are ZSETs capped at
+      READ_MODEL_WINDOW (10,000) with a 7-day TTL refreshed on write
+      (WO-R2-56), so a runaway here means many tenants/users rather than one
+      unbounded key.
+    command: "redis-cli --scan --pattern 'jobs:tenant:*:status:*' | wc -l"
 
 mitigation:
-  - "Scale ElastiCache up one node size (cache.t3.small → cache.t3.medium)."
-  - "If the read model is the culprit: shorten TTL on per-user sets or move historical jobs out of the projection."
-  - "Short-term relief: FLUSHDB the rate-limit keys (`jobs:create:*`) — they regenerate in seconds."
+  - "Scale ElastiCache up one node size (cache.t3.micro → cache.t3.small).
+    This is the only mitigation that adds headroom rather than reclaiming it."
+  - "Reclaim the job cache — the one key family that is pure cache and
+    regenerates on the next read. Targeted scan-and-delete, per docs/REDIS.md:
+    `redis-cli --scan --pattern 'cache:job:*' | xargs redis-cli del`.
+    Do NOT use FLUSHDB: docs/REDIS.md calls it too blunt because it also wipes
+    `delayed_queue` and `priority_queue`, which are durable state with no TTL —
+    every pending retry would be lost with no way to recover it."
+  - "Do not bother clearing rate-limit keys (`rate:{client}:{window_start}`,
+    `rate:tenant:{tenant_id}:{window_start}`). They carry a 120s TTL and
+    expire on their own; they are never the bulk of the heap."
+  - "If the read model is the bulk: it is already bounded, so the lever is
+    fewer keys, not shorter ones. After any OOM window, run
+    `read_model.rebuild_read_model(session, redis)` to restore counts from the
+    jobs table — the projection cannot heal itself."
 
 escalation:
-  - "If evicted_keys > 0 and CQRS counts are visibly wrong, alert the on-call platform engineer."
+  - "If the OOM error count is above zero, writes are already failing — page
+    the on-call platform engineer. Scaling the node is the only fix that
+    restores write capacity."
+  - "If admin counts are visibly wrong after the memory pressure clears, say so
+    when escalating: the read model needs a rebuild, and until it runs the
+    Overview numbers are understated."
 
 related_dashboards:
-  - "ElastiCache → FreeableMemory, EngineCPUUtilization, Evictions"
+  - "ElastiCache → FreeableMemory, EngineCPUUtilization, CurrConnections"

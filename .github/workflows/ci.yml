@@ -65,6 +65,13 @@ jobs:
       - name: Mypy
         run: mypy -p app
 
+      # ADR 0006's "an import-linter rule in CI enforces this" was not true
+      # until this step existed: the tool was not installed and had no config,
+      # so `app.mcp -> app.services` was one-directional by convention only.
+      # Contracts live in [tool.importlinter] in pyproject.toml.
+      - name: Import contracts
+        run: lint-imports
+
   # Unit + API only — `testpaths` in pyproject.toml scopes bare `pytest` to
   # those two directories. This job deliberately provisions NO services: the
   # suite it runs uses an in-memory SQLite engine and a mocked Redis (see
@@ -223,11 +230,13 @@ jobs:
       - name: Terraform validate
         run: terraform -chdir=infra validate
 
-      # F2-15: Redis must stay encrypted. `validate` cannot catch a revert to
-      # the bare aws_elasticache_cluster resource (an unencrypted cluster is
-      # still valid HCL), so pin the two encryption flags textually.
-      - name: ElastiCache encryption flags present
-        run: grep -q transit_encryption_enabled infra/elasticache.tf && grep -q at_rest_encryption_enabled infra/elasticache.tf
+      # F2-15 (the Redis encryption guard) used to live here as two `grep -q`
+      # calls for the flag *names*, which passed unchanged if either flag was
+      # flipped to false — the regression it existed to catch was not caught.
+      # It now parses the assigned value, in
+      # backend/tests/unit/test_infra_encryption_posture.py, and runs in the
+      # `test` job: this job has Terraform but no Python environment, and the
+      # check is worth more than the shell one-liner it would have to be here.
 
       # F2-07 / ADR 0018: production Kafka is deliberately not provisioned, and
       # the docs spent four files claiming otherwise by pointing at a Terraform

@@ -23,158 +23,20 @@ semantic fault (QueueDepth reads only the Redis delayed-retry set, not the
 Kafka backlog) and is held by review and the runbooks, not by this guard.
 """
 
-import ast
 import re
 from dataclasses import dataclass
-from pathlib import Path
 
-CUSTOM_NAMESPACE = "IncidentPlatform"
-
-#: Emitter helpers whose first positional argument is the metric name and whose
-#: `dimensions=` keyword carries the dimension keys.
-EMITTER_FUNCTIONS = frozenset({"emit_count", "emit_gauge"})
-
-#: Sentinel for a metric emitted with dimensions we cannot resolve statically
-#: (a variable rather than a dict literal). Any alarm dimension set is accepted
-#: for such a metric — better a gap than a false failure that teaches people to
-#: edit this file to make it quiet.
-WILDCARD = "*"
-
-
-def _repo_root() -> Path:
-    """Locate the repo root by walking up from this file until Dockerfile is found."""
-    for parent in Path(__file__).resolve().parents:
-        if (parent / "Dockerfile").is_file():
-            return parent
-    raise AssertionError("no Dockerfile found in any parent of this test file")
-
+from ._emitters import CUSTOM_NAMESPACE, WILDCARD
+from ._emitters import emitted_metrics as _emitted_metrics
+from ._hcl import blocks as _blocks
+from ._hcl import excise as _excise
+from ._hcl import has_key as _has_key
+from ._hcl import repo_root as _repo_root
+from ._hcl import scalar as _scalar
 
 # ---------------------------------------------------------------------------
-# Emitter side — what backend/app actually publishes
+# Alarm side — reads infra/cloudwatch.tf through the shared HCL scanner
 # ---------------------------------------------------------------------------
-
-
-def _dimension_keys(call: ast.Call) -> frozenset[str] | str:
-    """Dimension keys of one emit call, or WILDCARD if not statically knowable."""
-    for keyword in call.keywords:
-        if keyword.arg != "dimensions":
-            continue
-        if isinstance(keyword.value, ast.Constant) and keyword.value.value is None:
-            return frozenset()
-        if not isinstance(keyword.value, ast.Dict):
-            return WILDCARD
-        keys = set()
-        for key in keyword.value.keys:
-            if not isinstance(key, ast.Constant) or not isinstance(key.value, str):
-                return WILDCARD
-            keys.add(key.value)
-        return frozenset(keys)
-    # No `dimensions=` kwarg at all: emitted with no dimensions.
-    return frozenset()
-
-
-def _emitted_metrics() -> dict[str, set[frozenset[str]] | str]:
-    """Map every emitted metric name to the dimension key-sets it is emitted with.
-
-    Walks backend/app rather than importing it: the emit sites are spread over
-    request middleware and several worker loops, and only a static sweep sees
-    all of them without running any of them.
-    """
-    app_dir = _repo_root() / "backend" / "app"
-    emitted: dict[str, set[frozenset[str]] | str] = {}
-
-    for path in sorted(app_dir.rglob("*.py")):
-        tree = ast.parse(path.read_text(), filename=str(path))
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            func = node.func
-            name = func.attr if isinstance(func, ast.Attribute) else None
-            if name not in EMITTER_FUNCTIONS:
-                continue
-            if not node.args:
-                continue
-            first = node.args[0]
-            if not isinstance(first, ast.Constant) or not isinstance(first.value, str):
-                # Dynamic metric name — nothing to bind an alarm to.
-                continue
-            metric = first.value
-            keys = _dimension_keys(node)
-            existing = emitted.get(metric)
-            if existing == WILDCARD:
-                continue
-            if keys == WILDCARD:
-                emitted[metric] = WILDCARD
-            else:
-                assert isinstance(keys, frozenset)
-                if isinstance(existing, set):
-                    existing.add(keys)
-                else:
-                    emitted[metric] = {keys}
-
-    return emitted
-
-
-# ---------------------------------------------------------------------------
-# Alarm side — a small HCL scanner over infra/cloudwatch.tf
-# ---------------------------------------------------------------------------
-
-
-def _match_brace(text: str, open_index: int) -> int:
-    """Index just past the `}` closing the `{` at `open_index`.
-
-    String-aware and comment-aware: SEARCH expressions embed literal braces
-    (`'{IncidentPlatform,JobType} MetricName=...'`) and a naive depth counter
-    walks straight off the end of the file on them.
-    """
-    depth = 0
-    i = open_index
-    n = len(text)
-    while i < n:
-        char = text[i]
-        if char == '"':
-            i += 1
-            while i < n and text[i] != '"':
-                i += 2 if text[i] == "\\" else 1
-        elif char == "#":
-            while i < n and text[i] != "\n":
-                i += 1
-            continue
-        elif char == "{":
-            depth += 1
-        elif char == "}":
-            depth -= 1
-            if depth == 0:
-                return i + 1
-        i += 1
-    raise AssertionError(f"unbalanced braces from offset {open_index}")
-
-
-def _blocks(text: str, pattern: str) -> list[tuple[re.Match[str], str, int, int]]:
-    """Every block whose header matches `pattern`, as (header, body, start, end)."""
-    found = []
-    for header in re.finditer(pattern, text, flags=re.MULTILINE):
-        open_index = text.index("{", header.end() - 1)
-        end = _match_brace(text, open_index)
-        found.append((header, text[open_index + 1 : end - 1], open_index, end))
-    return found
-
-
-def _scalar(body: str, key: str) -> str | None:
-    """Value of a top-level `key = "value"` assignment, still backslash-escaped.
-
-    The string body must tolerate `\\"` — the SEARCH expressions embed quoted
-    metric names — so a plain `[^"]*` would truncate at the first inner quote
-    and silently yield no match at all.
-    """
-    match = re.search(
-        rf'^\s*{key}\s*=\s*"((?:[^"\\]|\\.)*)"\s*$', body, flags=re.MULTILINE
-    )
-    return match.group(1) if match else None
-
-
-def _has_key(body: str, key: str) -> bool:
-    return re.search(rf"^\s*{key}\s*=", body, flags=re.MULTILINE) is not None
 
 
 def _dimensions(body: str) -> dict[str, str]:
@@ -189,16 +51,6 @@ def _dimensions(body: str) -> dict[str, str]:
         if match and not line.lstrip().startswith("#"):
             dims[match.group(1)] = match.group(2).strip('"')
     return dims
-
-
-def _excise(body: str, spans: list[tuple[int, int]]) -> str:
-    """Body with the given [start, end) spans blanked out, offsets preserved."""
-    chars = list(body)
-    for start, end in spans:
-        for i in range(start, min(end, len(chars))):
-            if chars[i] != "\n":
-                chars[i] = " "
-    return "".join(chars)
 
 
 @dataclass(frozen=True)

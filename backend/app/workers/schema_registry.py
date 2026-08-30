@@ -36,27 +36,73 @@ _SCHEMA_DIR = Path(__file__).resolve().parent.parent / "schemas" / "kafka"
 _FORMAT_CHECKER = FormatChecker()
 
 
-def _load_all() -> dict[str, Draft202012Validator]:
-    """Load every *.schema.json in the schema dir, keyed by topic name.
+#: Prefix identifying a topic field on Settings. Every field with this prefix
+#: is a topic that must have a schema; the mapping below is derived from them
+#: rather than written out, so a new topic cannot be added without one.
+_TOPIC_FIELD_PREFIX = "kafka_topic_"
 
-    Topic <-> filename mapping is taken from the settings module so renaming
-    a topic only requires editing config and the file."""
+#: Topics that deliberately reuse another topic's schema, as
+#: {settings field suffix: schema stem}. Everything not listed here derives
+#: its own filename from its field name, so this stays a list of *decisions*
+#: rather than a copy of the topic list — the shape the old hand-written dict
+#: had, where an omission was indistinguishable from a topic with no schema.
+_SHARED_SCHEMA = {
+    # DLQ uses the same shape as job.failed (with dead_lettered=True).
+    "job_dlq": "job_failed",
+}
+
+
+class SchemaRegistryError(RuntimeError):
+    """Raised at import when a topic in Settings has no schema file."""
+
+
+def topic_schema_files() -> dict[str, str]:
+    """Every `Settings.kafka_topic_*` value mapped to its schema filename.
+
+    Walks the Settings model rather than repeating its fields. CLAUDE.md
+    states that every topic in `Settings.kafka_topic_*` must have a matching
+    `.schema.json`; deriving the mapping is what makes that a fact about the
+    code instead of a request to whoever adds the next topic.
+    """
     settings = get_settings()
-    mapping = {
-        settings.kafka_topic_job_submitted: "job_submitted.schema.json",
-        settings.kafka_topic_job_progress: "job_progress.schema.json",
-        settings.kafka_topic_job_completed: "job_completed.schema.json",
-        settings.kafka_topic_job_failed: "job_failed.schema.json",
-        # DLQ uses the same shape as job.failed (with dead_lettered=True).
-        settings.kafka_topic_job_dlq: "job_failed.schema.json",
-    }
+    mapping = {}
+    for field in type(settings).model_fields:
+        if not field.startswith(_TOPIC_FIELD_PREFIX):
+            continue
+        suffix = field[len(_TOPIC_FIELD_PREFIX) :]
+        stem = _SHARED_SCHEMA.get(suffix, suffix)
+        mapping[str(getattr(settings, field))] = f"{stem}.schema.json"
+    return mapping
+
+
+def _load_all() -> dict[str, Draft202012Validator]:
+    """Load a validator per configured topic, keyed by topic name.
+
+    Raises rather than skipping a topic whose schema file is missing. The
+    alternative — registering what exists and leaving the rest unvalidated —
+    is the failure this guard exists to prevent, and it fails at the worst
+    possible moment: silently, in production, one topic at a time. Failing at
+    import turns it into a boot error on the deploy that introduced it.
+    """
     validators: dict[str, Draft202012Validator] = {}
-    for topic, filename in mapping.items():
+    missing = []
+    for topic, filename in topic_schema_files().items():
         path = _SCHEMA_DIR / filename
+        if not path.is_file():
+            missing.append(f"{topic!r} -> {filename}")
+            continue
         with path.open() as f:
             schema = json.load(f)
         Draft202012Validator.check_schema(schema)
         validators[topic] = Draft202012Validator(schema, format_checker=_FORMAT_CHECKER)
+
+    if missing:
+        raise SchemaRegistryError(
+            "every topic in Settings.kafka_topic_* needs a schema in "
+            f"{_SCHEMA_DIR}; missing: {', '.join(sorted(missing))}. Add the "
+            "schema file, or map the topic onto an existing one in "
+            "_SHARED_SCHEMA if it deliberately reuses that shape."
+        )
     return validators
 
 
@@ -67,15 +113,34 @@ class SchemaValidationError(ValueError):
     """Raised when a payload fails its topic's schema."""
 
 
+class UnknownTopicError(SchemaValidationError):
+    """Raised when `validate` is called for a topic with no registered schema.
+
+    A subclass of SchemaValidationError on purpose: both callers already treat
+    that as "this message is not publishable / not consumable" and handle it
+    (the producer logs and drops, the consumer commits past the poison pill).
+    An unmapped topic is the same situation — an event nobody can vouch for —
+    so it takes the same path rather than needing new handling at every call
+    site, while still being catchable on its own where the distinction matters.
+    """
+
+
 def validate(topic: str, payload: dict[str, Any]) -> None:
     """Raise SchemaValidationError if `payload` is not valid for `topic`.
 
-    No-op if the topic has no registered schema — keeps callers simple when
-    new topics are added before their schemas are written.
+    Raises UnknownTopicError for a topic with no schema. This used to return
+    silently, which meant an unregistered topic got *no* validation at all
+    while every call site believed it had been validated — the check reported
+    success by doing nothing. `_load_all` makes that state unreachable for
+    topics declared in Settings; this covers a topic name passed as a bare
+    string from somewhere else.
     """
     validator = _VALIDATORS.get(topic)
     if validator is None:
-        return
+        raise UnknownTopicError(
+            f"no schema registered for topic {topic!r}; known topics: "
+            f"{sorted(_VALIDATORS)}"
+        )
     try:
         validator.validate(payload)
     except ValidationError as exc:

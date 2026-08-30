@@ -41,8 +41,15 @@ diagnosis_steps:
     description: "Are external APIs the bulk_api_sync calls saturated or rate-limited?"
 
 mitigation:
-  - "Scale the worker tasks horizontally (raise desired count of the worker ECS service)."
-  - "If one job type is stuck: pause new submissions of that type via a feature flag while you investigate."
+  - "Scale workers by raising the desired count of the `incident-platform-backend`
+    ECS service. There is no separate worker service: the dispatcher and every
+    other consumer loop run in-process inside the backend task (infra/ecs.tf
+    defines exactly two services, backend and frontend), so backend task count
+    *is* worker count. Each task adds MAX_CONCURRENT_JOBS (10) job slots."
+  - "If one job type is stuck: there is no per-type pause. What exists is
+    `pause_dag` (MCP action tool, `dag:paused:{root_job_id}`), which holds one
+    DAG rather than a type. To shed load across the board instead, lower the
+    rate limit on POST /jobs."
   - "If external API is the bottleneck: confirm circuit breaker opened; let it shed load."
 
 escalation:
