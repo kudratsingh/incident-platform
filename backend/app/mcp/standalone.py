@@ -8,6 +8,12 @@ schemas, different lifecycle.
 
 Public surface: exactly one route, `POST /mcp`. Everything the agent
 needs is a JSON-RPC method on that endpoint.
+
+Same code as the API means same *code*, not same behaviour by default:
+this process has its own boot, so anything the API sets up at import time
+has to be set up here too. `bootstrap_process_observability` below is
+that, factored into one call so a third entrypoint cannot forget a piece
+of it (WO-R2-60).
 """
 
 from collections.abc import AsyncGenerator
@@ -19,6 +25,11 @@ from app.core import metrics
 from app.core.exceptions import AppError, AuthenticationError
 from app.core.logging import get_logger
 from app.core.middleware import RequestContextMiddleware, register_route_dimension
+from app.core.observability import (
+    MCP_SERVICE_NAME,
+    bootstrap_process_observability,
+    instrument_app,
+)
 from app.dependencies import (
     Principal,
     get_current_principal,
@@ -32,6 +43,15 @@ from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
+
+# Before anything in this process logs a line or opens a span. The MCP
+# process ran none of this until WO-R2-60: the root logger sat at WARNING
+# with Python's default formatter, so every INFO the agent-facing surface
+# emitted was dropped and the rest was unstructured, and no TracerProvider
+# was installed so it exported zero spans with `OTLP_ENDPOINT` configured
+# for it. This is the surface the agent talks to — when a live run
+# misbehaves, this process is where the evidence has to be.
+bootstrap_process_observability(service_name=MCP_SERVICE_NAME)
 
 logger = get_logger(__name__)
 
@@ -205,6 +225,11 @@ def create_mcp_app() -> FastAPI:
     # Two routes, so the `Path` allow-list here is tiny — but registering it
     # is what makes an unexpected value bucket as `other` rather than bill.
     register_route_dimension(app)
+
+    # After every route is mounted, same as the API app: this is what puts
+    # a server span around each `POST /mcp` and makes the SQLAlchemy and
+    # Redis spans underneath it hang off something.
+    instrument_app(app)
 
     return app
 

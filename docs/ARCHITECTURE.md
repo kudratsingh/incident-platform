@@ -544,6 +544,10 @@ Alerts are raised against the **platform tenant**, because the objectives themse
 
 OpenTelemetry auto-instrumentation enabled on FastAPI, SQLAlchemy, and Redis. Traces export to OTLP (X-Ray in prod, Jaeger locally).
 
+**Per process, and both processes do it** (R2-60). `app/core/observability.py` holds the bootstrap — `setup_logging`, `setup_tracing`, the Redis instrumentor — and `app.main` and `app.mcp.standalone` each call it at import, before anything logs, with their own `service.name` (`incident-platform` / `incident-platform-mcp`) so a trace says which deployable it passed through. `instrument_app` runs at the end of each app factory, after every route is mounted. SQLAlchemy is instrumented in `app/dependencies.py` instead, because it binds to the engine rather than the process and every entrypoint imports that module for a session; `instrumented_libraries()` reports all three so a process can assert its own coverage rather than assume it.
+
+The MCP process had none of this. Same image and same code is not the same *boot*: the agent-facing surface emitted unstructured logs with every INFO dropped (root logger at WARNING, Python's default formatter) and exported zero spans while `OTLP_ENDPOINT` was set for it — so the one process an operator inspects when a live agent run misbehaves was the one with no evidence in it.
+
 **Cross-process trace propagation:** when the API creates a job, it injects the current OTel context as `__traceparent` into the job payload. The worker's `_run_job` extracts it and continues the trace as a child span. End-to-end visibility: browser → API → worker → DB → external API.
 
 The trace ID is logged with every structured log entry (via `trace_id_var` contextvar) and stored on the job row. The admin UI lets you filter by trace ID.

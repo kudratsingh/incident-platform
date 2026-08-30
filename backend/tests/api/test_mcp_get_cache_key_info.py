@@ -271,12 +271,15 @@ async def test_reports_missing_key_as_absent(
     token = await _token(
         db_session, default_tenant.id, [Scope.TELEMETRY_READ.value]
     )
+    # The tenant in the key is the caller's own. It used to be a hardcoded
+    # nil UUID, which since R2-54 is a *cross-tenant* probe and refused —
+    # a small illustration of how easy that key was to build by accident.
     info = _content(
         await _call(
             ac,
             token,
             "get_cache_key_info",
-            {"key": "cache:job:00000000-0000-0000-0000-000000000000:none"},
+            {"key": f"cache:job:{default_tenant.id}:none"},
         )
     )
     assert info["exists"] is False

@@ -25,6 +25,12 @@ Deliberately NOT an arbitrary-Redis-read primitive:
     are tenant data. Existence / TTL / type / size answer the
     operational question ("is a stale entry sitting there?") without
     exposing them.
+  - Tenant-scoped (R2-54) — withholding the payload was not enough on its
+    own. Existence, TTL and size of another tenant's cached job is an
+    existence oracle over their jobs, so the tenant segment of the key
+    now has to be the calling principal's. See
+    `app/mcp/tools/_cache_scope.py`; the same check guards
+    `invalidate_cache_key`.
 
 Requires `telemetry:read`.
 """
@@ -34,6 +40,7 @@ from typing import Any
 from app.core.exceptions import AppError
 from app.core.scopes import Scope
 from app.mcp.registry import ToolContext, tool
+from app.mcp.tools._cache_scope import assert_key_in_tenant
 from pydantic import BaseModel, ConfigDict, Field
 
 # Mirror of `invalidate_cache_key._ALLOWED_PREFIXES` — observe-what-you-
@@ -80,8 +87,10 @@ class GetCacheKeyInfoInput(BaseModel):
         max_length=512,
         description=(
             "Exact Redis key to inspect. Must start with one of "
-            f"{list(_READABLE_PREFIXES)}. Patterns are not supported — "
-            "one exact key per call."
+            f"{list(_READABLE_PREFIXES)}. Tenant-scoped keys "
+            "(`cache:job:{tenant_id}:{job_id}`) are readable only within "
+            "the calling principal's own tenant. Patterns are not "
+            "supported — one exact key per call."
         ),
     )
 
@@ -119,9 +128,9 @@ class GetCacheKeyInfoOutput(BaseModel):
         "`invalidate_cache_key` may delete — so a suspect cache entry "
         "can be checked before remediation and confirmed gone after. "
         "Keys outside these namespaces are refused "
-        "(`cache_key_forbidden`). Exact key only: this tool cannot "
-        "enumerate keys, match patterns, or read arbitrary Redis "
-        "state.\n"
+        "(`cache_key_forbidden`), as are tenant-scoped keys belonging to "
+        "another tenant. Exact key only: this tool cannot enumerate "
+        "keys, match patterns, or read arbitrary Redis state.\n"
         "FRESHNESS: live probe, measured at call time."
     ),
     input_model=GetCacheKeyInfoInput,
@@ -136,6 +145,14 @@ async def get_cache_key_info(
             f"Key {inp.key!r} is not under a readable namespace. "
             f"Allowed: {list(_READABLE_PREFIXES)}"
         )
+    # Shape-only was never the whole answer (R2-54): existence, TTL and
+    # size of `cache:job:{tenant}:{job}` are an existence oracle over
+    # another tenant's jobs even with the payload withheld. Refused
+    # before any Redis call, so the refusal cannot vary with what is
+    # actually there.
+    assert_key_in_tenant(
+        inp.key, tenant_id=ctx.principal.tenant_id, error=CacheKeyInfoError
+    )
 
     type_name = _as_str(await ctx.redis.type(inp.key))
     if type_name is None or type_name == "none":

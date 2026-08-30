@@ -5,26 +5,31 @@ from typing import Any
 from app.config import assert_chaos_gate, get_settings
 from app.core import metrics
 from app.core.exceptions import AppError
-from app.core.logging import get_logger, request_id_var, setup_logging
+from app.core.logging import get_logger, request_id_var
 from app.core.middleware import RequestContextMiddleware, register_route_dimension
+from app.core.observability import (
+    API_SERVICE_NAME,
+    bootstrap_process_observability,
+    instrument_app,
+)
 from app.core.redis import (
     close_redis_pool,
     close_sse_redis_pool,
     get_redis_client,
 )
-from app.core.tracing import setup_tracing
 from app.workers import supervisor as worker_supervisor
 from app.workers.progress_broker import reset_broker
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-from opentelemetry.instrumentation.redis import RedisInstrumentor
 
 _settings = get_settings()
-setup_logging(level=_settings.log_level, log_file=_settings.log_file)
-setup_tracing(service_name="incident-platform", otlp_endpoint=_settings.otlp_endpoint)
-RedisInstrumentor().instrument()
+# Shared with `app.mcp.standalone` — see `app/core/observability.py`. The
+# MCP process ran none of this until WO-R2-60, which is why it is one
+# function now rather than four lines an entrypoint can half-copy.
+bootstrap_process_observability(
+    service_name=API_SERVICE_NAME, settings=_settings
+)
 
 logger = get_logger(__name__)
 
@@ -369,7 +374,7 @@ def create_app() -> FastAPI:
     # complete allow-list for the RequestLatency `Path` dimension.
     register_route_dimension(app)
 
-    FastAPIInstrumentor.instrument_app(app)
+    instrument_app(app)
     return app
 
 
