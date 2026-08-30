@@ -201,16 +201,17 @@ Notably **not** granted: `actions:propose`. Tier-2 actions and the approvals sub
 ### Infrastructure
 - **Docker / Docker Compose** for local dev (Postgres + Redis + Redpanda + MinIO + backend + frontend).
 - **Terraform** for the AWS stack in `infra/` — VPC, ECS Fargate, RDS, ElastiCache, ALB, ECR, IAM, Secrets Manager, S3, CloudWatch alarms with runbook URLs in their descriptions. No Kafka broker: see [ADR 0018](docs/ADR/0018-production-kafka-posture.md).
-- **CI/CD** — `.github/workflows/ci.yml`: frontend tsc + tests, ruff + mypy on backend, pytest with coverage gate, Terraform static checks, and a Docker build → ECR → ECS deploy job that is opt-in behind the `ENABLE_ECS_DEPLOY` repository variable (unset — the job skips; see [ADR 0018](docs/ADR/0018-production-kafka-posture.md)).
+- **CI/CD** — `.github/workflows/ci.yml`: frontend tsc + tests, ruff + mypy on backend, pytest with coverage gate, a Docker-gated `integration` job running the Testcontainers tier (real Postgres + Redpanda), Terraform static checks, actionlint, and a Docker build → ECR → ECS deploy job that is opt-in behind the `ENABLE_ECS_DEPLOY` repository variable (unset — the job skips; see [ADR 0018](docs/ADR/0018-production-kafka-posture.md)).
 - Cloud target: **AWS ECS/Fargate**; **RDS Postgres**; **ElastiCache Redis**; **S3** for artifacts. **Kafka has no production broker** — nothing in `infra/` provisions one ([ADR 0018](docs/ADR/0018-production-kafka-posture.md)).
 
 ### Testing
 - `pytest` with fixtures, parametrization, factories.
-- Layers: **unit** (`backend/tests/unit/`), **API contract** (`backend/tests/api/`), **integration** (`backend/tests/integration/` — Testcontainers, Docker-gated). Load tests in `backend/tests/load/` (Locust).
+- Layers: **unit** (`backend/tests/unit/`), **API contract** (`backend/tests/api/`), **integration** (`backend/tests/integration/` — Testcontainers, Docker-gated, opt-in locally via the three `RUN_*` variables). Load tests in `backend/tests/load/` (Locust).
 - `mypy --strict` in CI on the `app` package.
 - `ruff check backend/` in CI.
-- Coverage gate at 70% (see `pyproject.toml`).
-- Current test count: **240+** passing (161 unit + 82 API + 3 gated integration).
+- Coverage gate at 70% (see `pyproject.toml`) — enforced on the unit + API job only; the integration job runs `--no-cov`.
+- Current test count: **726** passing (447 unit + 254 API + 25 integration).
+- The integration tier runs in its own CI job (`integration`), which exports every `RUN_*` gate and then **fails if any test skipped** — a fully-skipped run exits 0 in pytest, which is how this tier stayed invisible until it was wired up.
 
 ---
 
@@ -385,18 +386,18 @@ Logs must be queryable by trace ID end-to-end: browser → API → worker → re
 ## Testing Strategy
 
 ### Layers
-1. **Unit tests** (`backend/tests/unit/`) — services, processors, validators, repositories, consumers. 161 tests. No I/O.
-2. **API contract tests** (`backend/tests/api/`) — full FastAPI app with dependency overrides; SQLite in-memory DB; mocked Redis. 82 tests.
-3. **Integration tests** (`backend/tests/integration/`) — Testcontainers with Redpanda. Docker-gated; opt-in via `pytest backend/tests/integration/`.
+1. **Unit tests** (`backend/tests/unit/`) — services, processors, validators, repositories, consumers. 447 tests. No I/O.
+2. **API contract tests** (`backend/tests/api/`) — full FastAPI app with dependency overrides; SQLite in-memory DB; mocked Redis. 254 tests.
+3. **Integration tests** (`backend/tests/integration/`) — Testcontainers with real Postgres 16 (RLS enforcement, eval-reset SQL, migration advisory lock, outbox relay exclusivity) and Redpanda (Kafka round-trip). 25 tests across five files. Docker-gated; run locally with `make test-integration`, and in CI by the `integration` job.
 4. **Load tests** (`backend/tests/load/`) — Locust scenarios for the job submission path.
 5. **Failure-mode tests** — circuit-breaker open/close, schema validation rejecting bad payloads, redelivery dedup via unique constraints.
 
 ### Tooling
 - `pytest` fixtures and parametrization.
 - Factories for test data (inline `_make_*` helpers; could grow into proper factories later).
-- Testcontainers for the Redpanda integration test (Docker availability is skip-gated).
+- Testcontainers for the whole integration tier — Postgres 16 in four files, Redpanda in one (Docker availability is skip-gated).
 - Coverage gate at 70% in `pyproject.toml`.
-- All unit + API tests run on every PR via `ci.yml`.
+- Unit + API tests run on every PR via the `test` job in `ci.yml`; the integration tier runs on every PR via the `integration` job, which sets `RUN_RLS_TEST` / `RUN_EVAL_RESET_TEST` / `RUN_MIGRATION_LOCK_TEST` and then asserts that all five files contributed tests and none skipped.
 
 ---
 
@@ -554,7 +555,7 @@ All four services use `client.messages.parse(..., output_format=SomePydanticMode
   - **Dead-letter topic**: `job.dlq`. Admin UI inspects (with per-type breakdown) and replays. Replay resets `retry_count` (a bug we fixed in `#27`).
   - **Schema Registry** ✅ — file-based JSON Schema in `backend/app/schemas/kafka/`; format checker on (enforces `uuid` etc.); producer + consumer validate on every message.
   - **Local dev**: Redpanda in `docker-compose.yml`. **Production Kafka is not yet provisioned** — nothing in `infra/` creates a broker, `KAFKA_BOOTSTRAP_SERVERS` is omitted from the task definition unless `var.kafka_bootstrap_servers` is set, and the ECS deploy job is gated off. See [ADR 0018](docs/ADR/0018-production-kafka-posture.md).
-  - **Testing** ✅ — Testcontainers-based integration test in `backend/tests/integration/test_kafka_e2e.py` spins up Redpanda on a pre-allocated host port and verifies producer ↔ consumer round-trip with schema validation on both ends. Skipped if Docker isn't available.
+  - **Testing** ✅ — Testcontainers-based integration test in `backend/tests/integration/test_kafka_e2e.py` spins up Redpanda on a pre-allocated host port and verifies producer ↔ consumer round-trip with schema validation on both ends. Skipped if Docker isn't available; runs on every PR in the `integration` CI job, which fails if it skips.
 - **Outbox pattern** ✅ — `outbox_events` table; written in same transaction as job state changes; `_outbox_relay_loop` polls every second and publishes. Partial index on `published_at IS NULL` for hot-path scan.
 - **CQRS** ✅ — `ReadModelProjector` maintains Redis sets per status (global + per-user); `GET /admin/stats` reads only those, no SQL aggregate on `jobs`. Sets keyed by `job_id` are idempotent under at-least-once delivery.
 - **Event sourcing** ✅ — `job_events` table appended by `EventLogConsumer`; `GET /admin/jobs/{id}/timeline` replays. Frontend renders a vertical timeline with topic/partition/offset per row.
@@ -645,7 +646,7 @@ Deferred until the incident-commander agent is wired up and driving eval scenari
 │
 ├── .github/
 │   └── workflows/
-│       └── ci.yml                  # lint, type, test, frontend, build, deploy
+│       └── ci.yml                  # lint, type, test, integration, frontend, infra, workflows, deploy
 │
 ├── context/                        # session history; INDEX.md is the map, archives/ is gitignored
 │   ├── INDEX.md                    # one line per session — read first
@@ -764,9 +765,9 @@ Deferred until the incident-commander agent is wired up and driving eval scenari
 │   │   └── utils/                  # rate_limit, quota, cache, decorators, mixins, backpressure, circuit_breaker
 │   │
 │   └── tests/
-│       ├── unit/                   # 161 tests
-│       ├── api/                    # 82 tests
-│       ├── integration/            # Testcontainers (Docker-gated: Redpanda, Postgres for RLS)
+│       ├── unit/                   # 447 tests
+│       ├── api/                    # 254 tests
+│       ├── integration/            # 25 tests — Testcontainers (Docker-gated: Postgres ×4 files, Redpanda ×1)
 │       ├── load/                   # Locust
 │       └── conftest.py             # SQLite-in-memory + dependency overrides + default_tenant fixture
 │
@@ -822,7 +823,7 @@ Deferred until the incident-commander agent is wired up and driving eval scenari
 - **Release ordering for the 2026-08 fix campaign: fixes → new version → re-pin → eval** ([ADR 0013](docs/ADR/0013-release-before-rerun.md), maintainer decision 2026-08-08, superseding the earlier "don't cut a tag before the clean-baseline rerun" note). All campaign fixes merge first; the owner cuts `v0.5.0`; the commander re-pins by digest and reblesses its contract snapshot in one planned re-sync PR (expected diff: `+seed_dlq_messages` plus the enumerated description deltas); only then does the eval run, and that run becomes the new baseline. `master` serving 27 tools vs `v0.4.9`'s 26 is the expected, ledgered rebless delta — not a reason to hold the tag. What the ordering gives up (pre-tag live validation, remedied by a `v0.5.1` cycle if the post-release run finds a live-only bug) is recorded in the ADR. Post-`v0.5.0` drift: `master` now serves **29** tools with `CHAOS_ENABLED=true` (9 of them chaos) — `get_cache_key_info` (#146) and `create_stuck_dag` (the chaos hook that manufactures a genuinely stuck DAG chain for `remediate_runaway_saga_success`) both landed after the tag and ride the next release as ledgered `+get_cache_key_info` / `+create_stuck_dag` rebless deltas. Count it with `list_tools()` rather than trusting this number; it has drifted before.
 - **Run the backend locally:** `docker compose up postgres redis redpanda minio -d`, then `./.venv/bin/uvicorn app.main:app --reload --app-dir backend`. Set `KAFKA_BOOTSTRAP_SERVERS=localhost:9092` and run the worker as a separate process (the same `app.main` lifespan starts both, so for local dev you typically just run the API and the worker fires in the same process).
 - **Run the frontend:** `cd frontend && npm run dev` — proxies `/api` to `http://localhost:8000`.
-- **Run tests:** `cd backend && ../.venv/bin/python -m pytest tests/` (skips integration unless you explicitly target `tests/integration/`). CI runs `mypy -p app`, `ruff check backend/`, and `pytest` on every PR.
+- **Run tests:** `make test` (unit + API, no Docker needed). The integration tier is a separate target — `make test-integration` — because it needs a reachable Docker daemon and is gated behind `RUN_RLS_TEST` / `RUN_EVAL_RESET_TEST` / `RUN_MIGRATION_LOCK_TEST`, which that target exports for you. Running bare `pytest` collects only `backend/tests/unit` and `backend/tests/api` (`testpaths` in `pyproject.toml`); pointing it at `tests/integration/` directly collects those files but they **skip** unless the gates are set, so a "0 failed" there is not a pass. CI runs `mypy -p app`, `ruff check backend/`, `pytest` and the full integration tier on every PR.
 - **The two-URL scheme (`DATABASE_URL` vs `ALEMBIC_DATABASE_URL`):** since WO-P2-03 the runtime `DATABASE_URL` is the **non-owner `incident_app` role** (in compose: `incident_app:localdev`); alembic prefers `ALEMBIC_DATABASE_URL` — the owner URL — and falls back to `DATABASE_URL` when it's unset (local migrate one-shot, tests). The role's password is synced at boot by `python -m app.core.db_bootstrap` from `INCIDENT_APP_DB_PASSWORD` (in compose it rides the `migrate` one-shot, because the app service's custom `command:` bypasses `scripts/entrypoint.sh`). Anything needing owner powers — ad-hoc DDL, backfills — must use the owner URL (`database-url-owner` secret in prod, the `postgres:postgres` URL locally). The boot posture probe logs ERROR on an RLS-bypassing connection and hard-fails only in production ([ADR 0015](docs/ADR/0015-force-rls-and-nonowner-app-role.md), rollout section).
 - **Add a migration:** `cd backend && ../.venv/bin/alembic revision --autogenerate -m "describe change"` — but always **read the generated file** before committing; autogenerate misses things like enum updates and partial indexes.
 - **Add a Kafka consumer group:** subclass `BaseKafkaConsumer`, implement `handle_message`, instantiate in `worker_loop` in `app/workers/dispatcher.py`. The base class does schema validation, offset management, and per-message error handling.
@@ -941,9 +942,9 @@ When adding a new error: subclass `AppError`, set `status_code` + `error_code`, 
 
 Three layers, each with a clear purpose. Picking the right one matters:
 
-- **Unit (`backend/tests/unit/`)** — services, processors, validators, repositories, consumers. **No I/O**. SQLite in-memory if a DB is needed (via the `db_session` fixture); mocks for Redis/Kafka/Anthropic. 161 tests.
-- **API contract (`backend/tests/api/`)** — full FastAPI app via httpx ASGITransport, dependency overrides swap in SQLite + mock Redis. Tests request/response shape + auth + error envelope. 82 tests.
-- **Integration (`backend/tests/integration/`)** — real Postgres or Redpanda via Testcontainers. Docker-gated (skipped on `RUN_RLS_TEST=1` for the RLS test, etc.). Tests the things only a real DB / broker can prove (RLS enforcement, Kafka redelivery, schema validation end-to-end).
+- **Unit (`backend/tests/unit/`)** — services, processors, validators, repositories, consumers. **No I/O**. SQLite in-memory if a DB is needed (via the `db_session` fixture); mocks for Redis/Kafka/Anthropic. 447 tests.
+- **API contract (`backend/tests/api/`)** — full FastAPI app via httpx ASGITransport, dependency overrides swap in SQLite + mock Redis. Tests request/response shape + auth + error envelope. 254 tests.
+- **Integration (`backend/tests/integration/`)** — real Postgres or Redpanda via Testcontainers. 25 tests across five files. Tests the things only a real DB / broker can prove (RLS enforcement and tenant isolation, audit-log immutability, outbox single-writer exclusivity, the migration advisory lock, Kafka redelivery, schema validation end-to-end). Docker-gated, and three of the five files carry an **opt-in** env gate as well: `RUN_RLS_TEST`, `RUN_EVAL_RESET_TEST`, `RUN_MIGRATION_LOCK_TEST`. Those files are skipped when the variable is **unset** — set it to `1` to run them, which is what `make test-integration` and the `integration` CI job both do.
 
 When in doubt: write a unit test. Move up only when you need the real thing.
 

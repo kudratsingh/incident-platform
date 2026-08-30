@@ -65,40 +65,17 @@ jobs:
       - name: Mypy
         run: mypy -p app
 
+  # Unit + API only — `testpaths` in pyproject.toml scopes bare `pytest` to
+  # those two directories. This job deliberately provisions NO services: the
+  # suite it runs uses an in-memory SQLite engine and a mocked Redis (see
+  # backend/tests/conftest.py), so the Postgres and Redis service containers
+  # that used to sit here — along with the DATABASE_URL / REDIS_URL they
+  # exported — were read by nothing and implied coverage this job never had.
+  # Real-server coverage lives in the `integration` job below, which brings
+  # its own containers up through Testcontainers.
   test:
     name: Tests
     runs-on: ubuntu-latest
-
-    services:
-      postgres:
-        image: postgres:16-alpine
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: incident_platform_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U postgres"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 5
-
-      redis:
-        image: redis:7-alpine
-        ports:
-          - 6379:6379
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 5
-
-    env:
-      DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/incident_platform_test
-      REDIS_URL: redis://localhost:6379/0
-      SECRET_KEY: ci-secret-key-not-for-production
-      ENVIRONMENT: test
 
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -113,6 +90,115 @@ jobs:
 
       - name: Run tests
         run: pytest --cov=backend/app --cov-report=term-missing --cov-fail-under=70
+
+  # The Docker-gated tier: real Postgres 16 and real Redpanda, brought up per
+  # module by Testcontainers. These five files are the only proofs the repo
+  # has of Postgres RLS tenant isolation, audit-log immutability and outbox
+  # single-writer exclusivity, and until this job existed none of them ran in
+  # any automated run — `testpaths` excluded the directory and the three
+  # RUN_* gates were set nowhere.
+  #
+  # The tier stays opt-in locally (a developer without Docker still gets a
+  # clean unit/API run) but is mandatory here: every gate its tests consult
+  # is exported below, so a skipped test means a gate regressed, not that the
+  # environment is unsuitable. The census step turns that into a hard failure
+  # — an all-skipped run would otherwise report success and put this job
+  # straight back into the misleading-green state it was added to end.
+  integration:
+    name: Integration (Testcontainers)
+    runs-on: ubuntu-latest
+
+    env:
+      RUN_RLS_TEST: "1"
+      RUN_EVAL_RESET_TEST: "1"
+      RUN_MIGRATION_LOCK_TEST: "1"
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+
+      # Two of the five files (test_kafka_e2e, test_outbox_relay_concurrency)
+      # gate purely on Docker being reachable, with no env override. If the
+      # daemon were missing they would skip silently and the census below
+      # would fail with a confusing count, so assert the real precondition
+      # here and fail with a message that names it.
+      - name: Docker must be available
+        run: |
+          set -euo pipefail
+          if ! docker info > /dev/null 2>&1; then
+            echo "ERROR: no reachable Docker daemon — the integration tier cannot run." >&2
+            exit 1
+          fi
+          echo "OK: Docker daemon reachable."
+
+      # --no-cov: the repo-wide addopts carry --cov-fail-under=70, measured
+      # against all of backend/app. This tier exercises migrations, RLS and
+      # the relay rather than the request surface, so it cannot clear that
+      # bar on its own and the gate belongs to the `test` job.
+      - name: Run integration tests
+        run: |
+          pytest backend/tests/integration \
+            -v -ra --no-cov --junitxml=integration-results.xml
+
+      # Proof of work: assert the tier actually executed. pytest exits 0 on a
+      # fully-skipped run, which is exactly how this tier stayed invisible.
+      - name: Census — every integration file ran, nothing skipped
+        if: always()
+        run: |
+          python3 - <<'EOF'
+          import collections
+          import sys
+          import xml.etree.ElementTree as ET
+
+          # The five files this job exists to run. A rename or deletion must
+          # be a deliberate edit here, not a silently shrinking test count.
+          EXPECTED = {
+              "test_rls_enforcement",
+              "test_eval_reset_postgres",
+              "test_kafka_e2e",
+              "test_migration_lock_pg",
+              "test_outbox_relay_concurrency",
+          }
+
+          try:
+              root = ET.parse("integration-results.xml").getroot()
+          except (OSError, ET.ParseError) as exc:
+              print(f"ERROR: no usable JUnit report ({exc}) — pytest did not get far enough.")
+              sys.exit(1)
+
+          per_file = collections.Counter()
+          skipped = []
+          for case in root.iter("testcase"):
+              module = (case.get("classname") or "").split(".")[-1]
+              per_file[module] += 1
+              if case.find("skipped") is not None:
+                  skipped.append(f"{module}::{case.get('name')}")
+
+          print("Collected tests per integration file:")
+          for module in sorted(per_file):
+              print(f"  {module:<34} {per_file[module]:>3}")
+          print(f"  {'TOTAL':<34} {sum(per_file.values()):>3}")
+
+          failed = False
+          missing = EXPECTED - set(per_file)
+          if missing:
+              print(f"\nERROR: these files contributed no tests: {sorted(missing)}")
+              failed = True
+          if skipped:
+              print(f"\nERROR: {len(skipped)} test(s) skipped — every gate is set in this job,")
+              print("so a skip means a gate regressed, not that the environment is unsuitable:")
+              for name in skipped:
+                  print(f"  {name}")
+              failed = True
+          sys.exit(1 if failed else 0)
+          EOF
 
   infra:
     name: Infra
@@ -241,7 +327,7 @@ jobs:
   deploy:
     name: Build & Deploy to ECS
     runs-on: ubuntu-latest
-    needs: [lint, test, frontend]
+    needs: [lint, test, integration, frontend]
     # Opt-in. AWS credentials are not configured, so this job failed at
     # "Configure AWS credentials" on every master push and left master red —
     # burying the signal from lint/test/frontend. Gating on a repository

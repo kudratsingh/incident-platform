@@ -15,7 +15,7 @@ Built as an intentional showcase of senior-level distributed-systems patterns: t
 - **LLM features** (Claude via Anthropic SDK): DLQ triage, retry-policy advisor, natural-language admin queries, periodic incident summaries — all off-by-default and fail-open.
 - **AWS deployment** via Terraform: VPC + ECS Fargate + RDS + ElastiCache + S3 + ALB + CloudWatch alarms with linked runbooks. No Kafka broker is provisioned and the deploy job is opt-in — see [ADR 0018](docs/ADR/0018-production-kafka-posture.md).
 
-Current test suite: **243 passing tests** (161 unit + 82 API contract + 3 gated Testcontainers integration). `mypy --strict` clean; 70% coverage gate.
+Current test suite: **726 passing tests** (447 unit + 254 API contract + 25 Testcontainers integration). `mypy --strict` clean; 70% coverage gate on the unit + API job. All three tiers run on every PR.
 
 ---
 
@@ -73,7 +73,7 @@ Full architecture with request lifecycles, concurrency model, and failure-mode c
 | Observability | OpenTelemetry (auto-instrumented FastAPI + SQLAlchemy + Redis) → OTLP → X-Ray; CloudWatch metrics + alarms + linked runbooks |
 | LLM | Anthropic Python SDK (Claude Opus 4.7 with adaptive thinking + prompt caching) |
 | Infrastructure | Terraform (VPC, ECS Fargate, RDS, ElastiCache, ALB, ACM, IAM, Secrets Manager) |
-| CI/CD | GitHub Actions — ruff + mypy + pytest + tsc; Docker build → ECR → ECS deploy |
+| CI/CD | GitHub Actions — ruff + mypy + pytest + tsc + a Docker-gated Testcontainers integration tier; Docker build → ECR → ECS deploy |
 
 ---
 
@@ -194,12 +194,15 @@ docker compose up --build
 
 ### Convenience Makefile targets
 
-Once the stack is up, `make help` lists every target. The ones you'll hit most:
+`make help` lists every target. The ones you'll hit most:
 
 | Target | What it does |
 |---|---|
 | `make up` / `make down` | Bring the stack up (rebuild + detach) / stop it |
 | `make logs` | Tail the backend logs |
+| `make test` | Unit + API tests on the host venv — no stack, no Docker |
+| `make test-integration` | The Docker-gated integration tier (Testcontainers brings up its own Postgres + Redpanda; the compose stack is **not** required) |
+| `make lint` / `make typecheck` | ruff / mypy --strict, same invocations as CI |
 | `make migrate` | Apply pending Alembic migrations (idempotent) |
 | `make seed-incident-commander` | Create or re-seed the `incident-commander` service account (existing scopes are merged, never narrowed — set `SA_REPLACE_SCOPES=1` to narrow deliberately) and print a fresh scoped token (paste into the agent's `.env` as `PLATFORM_TOKEN`) |
 | `make seed-eval-fixtures` | Populate the platform with realistic data for the incident-commander agent's live eval suite |
@@ -231,8 +234,11 @@ Re-runs are safe (every ID is `uuid5`-derived, existing rows are skipped) so `ma
 ## Testing
 
 ```bash
-# All layers
-pytest backend/tests/
+# Unit + API (no Docker, no services needed)
+make test
+
+# The Docker-gated integration tier — real Postgres + Redpanda
+make test-integration
 
 # Fast unit tests only (no I/O, mocked deps)
 pytest backend/tests/unit/
@@ -240,14 +246,13 @@ pytest backend/tests/unit/
 # API contract tests (full FastAPI app with dependency overrides)
 pytest backend/tests/api/
 
-# Testcontainers integration tests (Docker-gated)
-pytest backend/tests/integration/
-
 # With coverage report
 pytest --cov=backend/app --cov-report=html
 ```
 
-Unit + API tests use SQLite in-memory + mocked Redis so they run without any external services. Integration tests spin up real Postgres (for RLS) or Redpanda (for Kafka round-trips) via Testcontainers and are opt-in.
+Unit + API tests use SQLite in-memory + mocked Redis so they run without any external services. Bare `pytest` collects only those two directories — `testpaths` in `pyproject.toml` scopes it deliberately, so there is no "run everything" invocation.
+
+Integration tests spin up real Postgres (RLS enforcement, the eval-reset SQL, the migration advisory lock, outbox relay exclusivity) or Redpanda (Kafka round-trips) via Testcontainers. They need a reachable Docker daemon, and three of the five files are additionally **opt-in** behind `RUN_RLS_TEST`, `RUN_EVAL_RESET_TEST` and `RUN_MIGRATION_LOCK_TEST`. `make test-integration` exports all three; running `pytest backend/tests/integration/` by hand without them collects the files and then silently **skips** most of them, which still exits 0 — use the make target.
 
 Load tests live in `backend/tests/load/` (Locust).
 
@@ -283,7 +288,7 @@ Load tests live in `backend/tests/load/` (Locust).
 │       ├── hooks/                  useAuth, useJobStream (SSE)
 │       └── pages/                  Login, Register, Dashboard, JobDetail, Admin, Sagas, TenantDetail
 ├── infra/                          Terraform for the full AWS stack
-├── .github/workflows/              CI: lint, type, test, build, deploy
+├── .github/workflows/              CI: lint, type, test, integration, frontend, infra, build, deploy
 ├── docker-compose.yml
 └── pyproject.toml
 ```
@@ -341,7 +346,7 @@ cd backend && mypy -p app
 cd frontend && npx tsc --noEmit
 ```
 
-CI runs all three on every PR alongside the pytest suite. See `.github/workflows/ci.yml`.
+CI runs all three on every PR alongside the unit + API suite (`test` job) and the Testcontainers integration tier (`integration` job). See `.github/workflows/ci.yml`.
 
 ---
 

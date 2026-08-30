@@ -90,9 +90,15 @@ _TABLES_IN_DELETE_ORDER = (
 
 def _alembic(database_url: str, *args: str) -> None:
     """Run an alembic command against the container, exactly as
-    `test_rls_enforcement.py` does."""
+    `test_rls_enforcement.py` does.
+
+    ALEMBIC_DATABASE_URL is popped for the same reason it is there: env.py
+    prefers it over DATABASE_URL, so an inherited value would point this
+    migration at a database that is not the throwaway container.
+    """
     env = os.environ.copy()
     env["DATABASE_URL"] = database_url
+    env.pop("ALEMBIC_DATABASE_URL", None)
     subprocess.check_call(
         [sys.executable, "-m", "alembic", "-c", str(REPO_ROOT / "alembic.ini"), *args],
         env=env,
