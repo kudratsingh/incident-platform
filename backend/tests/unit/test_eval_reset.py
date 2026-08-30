@@ -1096,3 +1096,82 @@ def test_idempotency_purge_precedes_the_destructive_steps() -> None:
             f"{destructive} must not commit before the idempotency purge "
             "has had its chance to fail"
         )
+
+
+# ---------------------------------------------------------------------------
+# _seed_consumer_lag durability — WO-R2-17
+# ---------------------------------------------------------------------------
+
+
+class _ExpiringRedis:
+    """Redis stub that actually honours `ex`, driven by a fake clock.
+
+    The 24h-TTL bug is invisible to an `AsyncMock`: it records the
+    `ex` kwarg and answers every later `get`. To assert the fixtures
+    survive an aged stack the stub has to expire them the way Redis
+    would."""
+
+    def __init__(self) -> None:
+        self._store: dict[str, tuple[str, float | None]] = {}
+        self.now = 0.0
+
+    async def set(self, key: str, value: object, ex: int | None = None) -> bool:
+        expires_at = None if ex is None else self.now + ex
+        self._store[key] = (str(value), expires_at)
+        return True
+
+    async def get(self, key: str) -> str | None:
+        entry = self._store.get(key)
+        if entry is None:
+            return None
+        value, expires_at = entry
+        if expires_at is not None and self.now >= expires_at:
+            del self._store[key]
+            return None
+        return value
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+async def test_seeded_lag_fixtures_survive_a_stack_older_than_a_day() -> None:
+    """R2-17: the seven fixture lag keys were written with a 24h TTL
+    while every other fixture is durable. Six live scenarios assert a
+    non-null lag for these groups, so a stack up longer than a day since
+    its last seed/reset answered `lag: null` and burned a paid run —
+    with no precondition guarding it.
+
+    Seeds, ages the clock past 24h, and reads back the way
+    `get_consumer_lag` would."""
+    seed = _seed_module()
+    redis = _ExpiringRedis()
+
+    await seed._seed_consumer_lag(redis)
+    redis.advance(24 * 3600 + 60)
+
+    for group, expected in seed._CONSUMER_LAGS.items():
+        raw = await redis.get(f"{seed._LAG_KEY_PREFIX}{group}")
+        assert raw is not None, (
+            f"{group} lag fixture expired after 24h — the scenarios that "
+            "assert a non-null lag for it now fail as agent errors"
+        )
+        assert int(raw) == expected
+
+
+async def test_seed_consumer_lag_writes_no_expiry() -> None:
+    """The mechanism behind the test above, pinned directly: durable
+    like every other fixture, re-anchored by the reset rather than by a
+    TTL. `worker-dispatcher` stays out of the fixture set — the metrics
+    loop owns that key with a 90s TTL and must not be overwritten."""
+    seed = _seed_module()
+    redis = AsyncMock()
+
+    await seed._seed_consumer_lag(redis)
+
+    assert redis.set.await_count == len(seed._CONSUMER_LAGS)
+    for call in redis.set.await_args_list:
+        assert call.kwargs.get("ex") is None, (
+            "seeded lag keys must be durable — a TTL makes an aged stack "
+            "answer lag: null for groups scenarios assert are non-null"
+        )
+    assert "worker-dispatcher" not in seed._CONSUMER_LAGS

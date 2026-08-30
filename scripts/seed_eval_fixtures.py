@@ -114,8 +114,13 @@ _TENANT_SLUG = os.getenv("SEED_TENANT_SLUG", "default")
 # Kept in one place so a typo doesn't drift the tool + the seed apart.
 # Mirror of app.mcp.tools.consumer_lag._CONSUMER_LAG_KEY_PREFIX.
 _LAG_KEY_PREFIX = "kafka:consumer_lag:"
-# Long TTL so evals don't decay mid-run. Fresh runs re-seed anyway.
-_LAG_TTL_SECONDS = 24 * 3600
+# Written WITHOUT expiry, like every other fixture in this script
+# (R2-17). These used to carry a 24h TTL on the theory that "fresh runs
+# re-seed anyway" — but the stack outlives the run. After a day of
+# uptime without a re-seed the keys simply vanished, and the six live
+# scenarios that assert a non-null lag for these groups started failing
+# as agent errors rather than as an unmet precondition: one wasted paid
+# run per occurrence. Durability is the reset's job, not a TTL's.
 
 # The `remediate_stale_cache_success` eval scenario expects this Redis
 # key to exist with recognisably-stale contents, then invalidates it via
@@ -440,10 +445,14 @@ async def _ensure_seed_user(
 
 
 async def _seed_consumer_lag(redis: aioredis.Redis) -> None:
+    """Write the synthetic consumer-lag fixtures durably.
+
+    No TTL — see `_LAG_KEY_PREFIX`. `worker-dispatcher` is deliberately
+    absent from `_CONSUMER_LAGS`: the metrics loop owns that key with a
+    90s TTL, and a durable fixture written over it would pin a stale lag
+    the loop could no longer correct."""
     for group, lag in _CONSUMER_LAGS.items():
-        await redis.set(
-            f"{_LAG_KEY_PREFIX}{group}", str(lag), ex=_LAG_TTL_SECONDS
-        )
+        await redis.set(f"{_LAG_KEY_PREFIX}{group}", str(lag))
 
 
 async def _seed_hot_set(redis: aioredis.Redis) -> None:

@@ -553,3 +553,96 @@ async def test_replay_dlq_by_ids_refuses_a_job_in_a_paused_dag(
     assert jobs[1].status == JobStatus.DEAD_LETTER.value
     assert jobs[1].retry_count == 3
     assert jobs[0].status == JobStatus.PENDING.value
+
+
+async def test_restart_consumer_group_reports_whether_it_knows_the_group(
+    mcp_client, db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
+) -> None:
+    """R2-17: the tool never checked `consumer_group` against anything,
+    so a typo'd name cleared no flags and still answered
+    `accepted: true` — the stalled consumer stayed dead while the agent
+    read success. No hard whitelist (that would refuse a legitimate
+    future group); instead the response says whether the platform
+    recognises the name, so a caller can tell a no-op apart from a
+    restart."""
+    ac, redis_stub = mcp_client
+    token = await _token(
+        db_session, default_tenant.id, [Scope.ACTIONS_EXECUTE.value]
+    )
+
+    typo = _content(
+        await _call(
+            ac,
+            token,
+            "restart_consumer_group",
+            {
+                "consumer_group": "worker-dispatchr",
+                "idempotency_key": "restart-typo-1",
+            },
+        )
+    )
+    # Still accepted — the tool stays permissive by design.
+    assert typo["accepted"] is True
+    assert typo["group_recognized"] is False
+    assert typo["kill_key_cleared"] is False
+    assert typo["latency_key_cleared"] is False
+
+    # A real group the platform runs, from settings.
+    redis_stub._store[kill_key_for("audit-writer")] = "killed"
+    real = _content(
+        await _call(
+            ac,
+            token,
+            "restart_consumer_group",
+            {
+                "consumer_group": "audit-writer",
+                "idempotency_key": "restart-real-1",
+            },
+        )
+    )
+    assert real["group_recognized"] is True
+    assert real["kill_key_cleared"] is True
+
+    # A seeded eval group counts as recognised too — scenarios drive
+    # restarts against these names.
+    seeded = _content(
+        await _call(
+            ac,
+            token,
+            "restart_consumer_group",
+            {
+                "consumer_group": "billing-consumer",
+                "idempotency_key": "restart-seeded-1",
+            },
+        )
+    )
+    assert seeded["group_recognized"] is True
+
+    # Leak guard still holds: recognition must not name the chaos rig.
+    assert "chaos" not in json.dumps(typo)
+
+
+async def test_restart_consumer_group_description_does_not_promise_a_restart(
+    mcp_client, db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
+) -> None:
+    """Contract test: `accepted` means the flags were cleared, not that
+    a consumer came back. The description must say what the platform
+    actually checks, since `group_recognized: false` is the only signal
+    distinguishing a typo from a genuine no-op restart."""
+    ac, _ = mcp_client
+    token = await _token(
+        db_session, default_tenant.id, [Scope.ACTIONS_EXECUTE.value]
+    )
+    listing = await ac.post(
+        "/mcp",
+        json=_rpc("tools/list"),
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    tools = {t["name"]: t for t in listing.json()["result"]["tools"]}
+    description = tools["restart_consumer_group"]["description"]
+
+    assert "group_recognized" in description, (
+        "the field an agent needs to detect a typo'd group is not "
+        "documented where the agent reads"
+    )
+    assert "chaos" not in description.lower()
