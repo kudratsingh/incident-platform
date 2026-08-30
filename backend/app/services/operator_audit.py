@@ -67,17 +67,23 @@ async def record_tool_invocation(
     request_id: str | None = None,
     is_chaos: bool = False,
     denied_by: str | None = None,
-) -> None:
+) -> bool:
     """Write an `agent.tool_invoked` row for a single MCP tool call.
+    Returns whether the row was staged.
 
     When `is_chaos=True` the action is `chaos.tool_invoked` (or
     `chaos.tool_denied` if `denied_by` is set), so chaos activity
     filters cleanly on the admin Audit tab as a separate stream from
     general agent traffic — see ADR 0008.
 
-    Never raises — audit failures must not turn a successful tool call
-    into a client-visible error. If persistence fails the row is dropped
-    and a structured log line is written by the caller's session commit.
+    Never raises — the savepoint below means a failed insert costs the
+    audit row and nothing else, so the caller still holds a usable
+    session and can decide what a missing row is worth. That decision is
+    the caller's, not this helper's: `app.mcp.handlers` treats `False` as
+    fatal to the request, because an action that took effect with no
+    record of it is the failure R2-51 is about. A caller that would
+    rather degrade than fail may ignore the return value — but say so at
+    the call site.
     """
     extra: dict[str, Any] = {
         "tool_name": tool_name,
@@ -118,6 +124,8 @@ async def record_tool_invocation(
             "audit write failed; dropping tool-invocation row",
             extra={"tool_name": tool_name, "outcome": outcome},
         )
+        return False
+    return True
 
 
 __all__ = [

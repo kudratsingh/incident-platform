@@ -1,13 +1,17 @@
 import uuid
 from typing import Any
 
+from app.core.logging import get_logger
 from app.models.audit import (
     PRINCIPAL_TYPE_SERVICE_ACCOUNT,
     PRINCIPAL_TYPE_USER,
+    REQUEST_ID_MAX_LENGTH,
     AuditLog,
 )
 from app.repositories.base import BaseRepository
 from sqlalchemy import and_, select
+
+logger = get_logger(__name__)
 
 
 class AuditRepository(BaseRepository[AuditLog]):
@@ -48,6 +52,21 @@ class AuditRepository(BaseRepository[AuditLog]):
             principal_type = PRINCIPAL_TYPE_USER
         if principal_id is None and principal_type == PRINCIPAL_TYPE_USER:
             principal_id = user_id
+
+        # Last resort, and only that: `app.core.middleware` already refuses
+        # to put an over-long correlation id into circulation. This is here
+        # because every other writer (worker loops, consumers, scripts) sets
+        # the contextvar itself, and losing the whole row to a too-long
+        # correlation id is a strictly worse outcome than losing the tail of
+        # the id. Postgres raises on the overflow where SQLite silently
+        # stores it, so without this the failure mode is production-only.
+        if request_id is not None and len(request_id) > REQUEST_ID_MAX_LENGTH:
+            logger.warning(
+                "truncating over-long request_id for the audit row",
+                extra={"action": action, "supplied_length": len(request_id)},
+            )
+            request_id = request_id[:REQUEST_ID_MAX_LENGTH]
+
         return await self.create(
             action=action,
             tenant_id=tenant_id,

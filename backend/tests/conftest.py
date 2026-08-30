@@ -10,6 +10,7 @@ Integration tests targeting real Postgres live in backend/tests/integration/.
 """
 
 from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock
 
 import pytest
@@ -21,6 +22,7 @@ from app.models.base import Base
 from app.models.enums import UserRole
 from app.models.user import User
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy.exc import ProgrammingError
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -61,6 +63,94 @@ async def db_session(sqlite_engine) -> AsyncGenerator[AsyncSession, None]:  # ty
         async with session.begin():
             yield session
             await session.rollback()
+
+
+# ---------------------------------------------------------------------------
+# Postgres transaction semantics, on SQLite
+# ---------------------------------------------------------------------------
+
+
+class AbortingSession:
+    """An `AsyncSession` that aborts its transaction the way Postgres does.
+
+    Postgres refuses every statement after a failed one — `current
+    transaction is aborted, commands ignored until end of transaction
+    block` — until the transaction, or a SAVEPOINT enclosing the failure,
+    is rolled back. SQLite has no such rule: a failed statement is just a
+    failed statement, and the next one runs fine.
+
+    That difference is why a whole class of bug (R2-59: a handler swallows
+    a DB error, and every write the request makes afterwards is silently
+    dropped) is invisible to this suite. This proxy forwards everything to
+    a real session and adds exactly Postgres' rule, so a unit test can
+    assert what production does.
+
+    `fail_on` picks the statement that blows up — matching on rendered SQL,
+    so it stands in for "the table isn't there" without needing a real
+    migration state.
+    """
+
+    def __init__(
+        self,
+        inner: AsyncSession,
+        *,
+        fail_on: str,
+        error: str = "relation does not exist",
+    ) -> None:
+        self._inner = inner
+        self._fail_on = fail_on
+        self._error = error
+        self.aborted = False
+
+    def __getattr__(self, name: str):  # type: ignore[no-untyped-def]
+        return getattr(self._inner, name)
+
+    def _guard(self) -> None:
+        if self.aborted:
+            raise ProgrammingError(
+                "current transaction is aborted, commands ignored until "
+                "end of transaction block",
+                params=None,
+                orig=Exception("InFailedSqlTransaction"),
+            )
+
+    async def execute(self, statement, *args, **kwargs):  # type: ignore[no-untyped-def]
+        self._guard()
+        if self._fail_on in str(statement):
+            self.aborted = True
+            raise ProgrammingError(
+                self._error, params=None, orig=Exception(self._error)
+            )
+        try:
+            return await self._inner.execute(statement, *args, **kwargs)
+        except Exception:
+            self.aborted = True
+            raise
+
+    async def flush(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        self._guard()
+        try:
+            return await self._inner.flush(*args, **kwargs)
+        except Exception:
+            self.aborted = True
+            raise
+
+    def begin_nested(self):  # type: ignore[no-untyped-def]
+        """A SAVEPOINT — and rolling back to one un-aborts the transaction,
+        which is the entire point of the fix under test."""
+        inner_cm = self._inner.begin_nested()
+        outer = self
+
+        @asynccontextmanager
+        async def _wrapper() -> AsyncGenerator[None, None]:
+            async with inner_cm:
+                try:
+                    yield
+                except BaseException:
+                    outer.aborted = False
+                    raise
+
+        return _wrapper()
 
 
 # ---------------------------------------------------------------------------

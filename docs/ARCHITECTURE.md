@@ -465,6 +465,10 @@ What happens when a component dies, in priority order.
 **Data loss:** none — RDS automated backups + Multi-AZ.
 **Runbook:** `runbooks/rb-rds-cpu-high.yaml` covers degradation; a full outage page → on-call → AWS console.
 
+**Partial failures are the sharp ones.** Postgres aborts the *whole transaction* on a failed statement — every later statement in it returns `current transaction is aborted, commands ignored until end of transaction block`. So a handler that catches a DB error and returns a degraded result has silently broken every write that comes after it in that request, including its own audit row. Two tools did exactly that (R2-59: `get_deploy_history`'s missing-table fallback, `get_postgres_health`'s `ok=false`), and the failure was invisible in tests because SQLite has no such rule.
+
+Anything that swallows a DB error now goes through `app/core/db_degrade.degrade_on_db_error`, which takes a SAVEPOINT first and rolls back to it — so the degraded path leaves a usable session. `tests/conftest.py::AbortingSession` reproduces the Postgres rule on SQLite so the property is testable in the unit tier. If you add a new fallback-on-DB-error path, use that helper; a bare `except SQLAlchemyError` is the bug.
+
 ### Redis
 
 **Symptom:** API still works but degraded. Rate limits fail open (everyone gets through). Backpressure check fails open (no rejections). SSE streams freeze (no updates). Admin overview shows stale numbers. Job cache misses on every request.
@@ -543,6 +547,18 @@ OpenTelemetry auto-instrumentation enabled on FastAPI, SQLAlchemy, and Redis. Tr
 **Cross-process trace propagation:** when the API creates a job, it injects the current OTel context as `__traceparent` into the job payload. The worker's `_run_job` extracts it and continues the trace as a child span. End-to-end visibility: browser → API → worker → DB → external API.
 
 The trace ID is logged with every structured log entry (via `trace_id_var` contextvar) and stored on the job row. The admin UI lets you filter by trace ID.
+
+### Correlation ids are validated, not trusted (R2-51)
+
+`X-Request-ID` and `X-Trace-ID` are caller-supplied, and `X-Request-ID` is copied onto every `audit_logs` row the request writes. That makes the header an input to a *write*, not just to a log line, so `RequestContextMiddleware` validates it: at most `CORRELATION_ID_MAX_LENGTH` (128) characters from `[A-Za-z0-9._:+=-]`, and anything else is replaced with a fresh UUID rather than truncated. The response echoes the id actually in force.
+
+Two reasons it is a substitution and not a trim. `audit_logs.request_id` is `String(255)`, and every audit writer on the MCP path is savepoint-wrapped and silent on failure — so before this, a header longer than the column made the audit *insert* fail while the tool call committed, i.e. anyone who could reach the load balancer could suppress the record of an action by sending a long enough header. And truncation would let one caller mint any number of distinct headers that collapse onto a single `request_id`, which corrupts the correlation the column exists for.
+
+`AuditRepository.log` enforces the column width as a last resort for the writers that set the contextvar themselves (worker loops, consumers, scripts). Note the asymmetry it protects against: Postgres raises on the overflow, SQLite stores it, so without that bound the failure mode only exists in production.
+
+### An MCP action that cannot be audited does not commit (R2-51)
+
+`record_tool_invocation` still never raises — the savepoint means a failed audit insert costs the row and nothing else. What changed is who decides what a missing row is worth. `app/mcp/handlers.py` now treats it as fatal: `AuditWriteFailedError` is the one exception the `tools/call` envelope deliberately lets escape, so `get_db` rolls the request back and the standalone app's catch-all returns a JSON-RPC internal error. A 200 for a Tier-1 action with no record that it ran is not an outcome this surface offers. Non-DB side effects (a Redis `DEL`) have already happened and cannot be unwound; retrying under the same idempotency key is safe, because every path that does not complete a claim releases it.
 
 ---
 

@@ -6,12 +6,17 @@ Both **fail open** on error: the tool never raises; instead the
 agent should treat `ok=false` as strong evidence rather than as an
 unavailable tool — a red result *is* the useful signal.
 
+Failing open is a claim about this tool's own result, never about the
+caller's transaction: the Postgres probe runs inside a SAVEPOINT so an
+`ok=false` answer leaves the request able to keep writing (R2-59).
+
 Both `telemetry:read`.
 """
 
 from collections.abc import Mapping
 from typing import Any
 
+from app.core.db_degrade import degrade_on_db_error
 from app.core.scopes import Scope
 from app.mcp.registry import ToolContext, tool
 from pydantic import BaseModel, ConfigDict, Field
@@ -105,7 +110,22 @@ async def get_postgres_health(
     import time
 
     dialect = "unknown"
-    try:
+    healthy: PostgresHealthOutput | None = None
+
+    # SAVEPOINT around the probe. `ok=false` is a report, not a licence to
+    # leave the session wrecked: on Postgres a failed statement aborts the
+    # whole transaction, so before R2-59 a health probe that came back
+    # unhealthy also took down every write that ran after it in the same
+    # request — including the envelope's own audit row for this call.
+    # Rolling back to the savepoint keeps the transaction usable, which is
+    # what makes a degraded answer survivable rather than contagious.
+    #
+    # `catch=Exception` preserves this probe's original surface: it is a
+    # health check, and "the driver raised something we did not classify"
+    # is itself the answer it exists to give.
+    async with degrade_on_db_error(
+        ctx.db, what="postgres health probe", catch=Exception
+    ) as probe:
         if ctx.db.bind is not None:
             dialect = ctx.db.bind.dialect.name
 
@@ -123,14 +143,18 @@ async def get_postgres_health(
             )
             active_conns = int(row.scalar_one())
 
-        return PostgresHealthOutput(
+        healthy = PostgresHealthOutput(
             ok=True,
             ping_latency_ms=round(latency, 3),
             active_connections=active_conns,
             dialect=dialect,
         )
-    except Exception as exc:
-        return PostgresHealthOutput(ok=False, dialect=dialect, error=str(exc))
+
+    if probe.failed or healthy is None:
+        return PostgresHealthOutput(
+            ok=False, dialect=dialect, error=str(probe.error)
+        )
+    return healthy
 
 
 def _maybe_int(v: Any) -> int | None:
