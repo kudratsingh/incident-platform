@@ -132,7 +132,9 @@ PRIMARY KEY: composite `(job_id, depends_on_job_id)`. No row carries a tenant_id
 
 Cycle-free by construction: dependencies can only reference existing jobs, which means the graph is always a DAG. We never let a job reference a child that doesn't exist yet.
 
-`DependencyResolver` consumer reads `job.completed` events and promotes `WAITING` children to `PENDING` when all parents are done.
+`DependencyResolver` consumer reads `job.completed` events and promotes `WAITING` children to `PENDING` when all parents are done. The dispatcher's 10s resume sweep is the backstop for children whose promotion event has already passed — it selects `WAITING` rows with no unmet parent, oldest first, behind a rotating cursor.
+
+When a parent instead reaches a terminal non-`COMPLETED` status (`DEAD_LETTER` or `CANCELLED`), its `WAITING` non-saga descendants cascade to `CANCELLED` rather than waiting forever, recursively, with the reason recorded in `error_message`. Saga steps are excluded — `SagaCoordinator` cancels those by saga membership. `FAILED` is not a cascade source: the retry cycle re-enters from it, so such a parent may still complete. See [ADR 0022](ADR/0022-promotable-only-resume-sweep-and-dependency-cascade.md).
 
 ---
 

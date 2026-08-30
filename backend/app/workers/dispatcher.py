@@ -35,6 +35,7 @@ from app.core.logging import get_logger, job_id_var, trace_id_var
 from app.core.tracing import extract_context, get_tracer
 from app.models.enums import TERMINAL_JOB_STATUSES, JobStatus, JobType
 from app.models.job import Job
+from app.models.job_dependency import JobDependency
 from app.repositories.audit import AuditRepository
 from app.repositories.job import JobRepository
 from app.repositories.job_dependency import JobDependencyRepository
@@ -61,8 +62,9 @@ from app.workers.supervisor import worker_tick
 from app.workers.triage_consumer import LlmTriageConsumer
 from opentelemetry import trace
 from opentelemetry.trace import SpanKind
-from sqlalchemy import select
+from sqlalchemy import literal, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.orm import aliased
 
 logger = get_logger(__name__)
 tracer = get_tracer(__name__)
@@ -74,7 +76,10 @@ POLL_INTERVAL = 0.5  # seconds between queue checks
 # DAG pause, or a missed job.completed), so seconds of latency after a
 # pause lifts is fine and the DB scan stays cheap.
 _RESUME_SWEEP_INTERVAL = 10  # seconds
-_RESUME_SWEEP_LIMIT = 200  # WAITING rows examined per pass
+# Promotable WAITING rows examined per pass. This bounds *promotable* work
+# only — the SQL below excludes rows with an unmet parent, so the limit can
+# no longer be consumed by rows that are never going to move (R2-09).
+_RESUME_SWEEP_LIMIT = 200
 
 # Delay applied when a delayed-retry promotion fails and the job is pushed
 # back onto `jobs:delayed`. Short on purpose: the backoff the job was
@@ -1032,6 +1037,149 @@ async def _promote_delayed_loop(
         await asyncio.sleep(POLL_INTERVAL)
 
 
+# Cursor a resume-sweep pass hands to the next one: the (created_at, id) of
+# the last row it examined, or None to start again from the oldest.
+_ResumeCursor = tuple[Any, uuid.UUID]
+
+
+def _promotable_waiting_stmt(cursor: _ResumeCursor | None) -> Any:
+    """WAITING jobs with no unmet parent, oldest first, after `cursor`.
+
+    The eligibility test lives in SQL rather than in the Python loop, and that
+    is the whole fix for R2-09. Previously the query was `status == WAITING
+    LIMIT 200` and the `unmet_count` check happened per-row afterwards, so
+    permanently-blocked children — the ones whose parent is DEAD_LETTER or
+    CANCELLED and therefore never reaching COMPLETED — were still *candidates*.
+    They consumed the 200 slots and were then discarded, every pass, forever.
+    Nothing cascades them away and nothing purges them, so once a tenant
+    accumulated 200 of them the sweep promoted nothing for anybody: the set is
+    platform-wide, so one tenant's stuck backlog starved every other tenant's
+    held children.
+
+    Raising the limit does not fix this — the blocked set grows without bound,
+    so any constant is eventually swallowed. Excluding the rows does fix it:
+    with `NOT EXISTS (unmet parent)` in the WHERE clause, the LIMIT can only
+    ever truncate work that a later pass can still promote.
+
+    `ORDER BY created_at, id` plus the rotating cursor is the second line of
+    defence, for the residual case the predicate cannot see: children that are
+    promotable in SQL but held back in Python by a DAG pause (the pause lives
+    in Redis). More than `_RESUME_SWEEP_LIMIT` of those under one long pause
+    would re-starve an unordered query. The cursor makes each pass resume where
+    the last stopped, so every eligible row is reached within a bounded number
+    of passes instead of depending on whatever order the planner happened to
+    return. `id` is in the sort key because `created_at` alone is not unique —
+    bulk-created siblings share a timestamp, and a non-deterministic tiebreak
+    would let the cursor skip rows.
+    """
+    parent = aliased(Job)
+    has_unmet_parent = (
+        select(literal(1))
+        .select_from(JobDependency)
+        .join(parent, parent.id == JobDependency.depends_on_job_id)
+        .where(
+            JobDependency.job_id == Job.id,
+            parent.status != JobStatus.COMPLETED,
+        )
+        .correlate(Job)
+        .exists()
+    )
+    stmt = (
+        select(Job)
+        .where(Job.status == JobStatus.WAITING, ~has_unmet_parent)
+        .order_by(Job.created_at, Job.id)
+        .limit(_RESUME_SWEEP_LIMIT)
+    )
+    if cursor is not None:
+        # Bind each half against its own column type: `Job.id` is a UUID
+        # TypeDecorator, and an untyped literal would reach the driver as a
+        # raw uuid.UUID that SQLite cannot bind.
+        stmt = stmt.where(
+            tuple_(Job.created_at, Job.id)
+            > tuple_(
+                literal(cursor[0], Job.created_at.type),
+                literal(cursor[1], Job.id.type),
+            )
+        )
+    return stmt
+
+
+async def _resume_unblocked_waiting_once(
+    session_factory: async_sessionmaker[AsyncSession],
+    redis: Any,
+    cursor: _ResumeCursor | None = None,
+) -> _ResumeCursor | None:
+    """One pass of the resume sweep. Returns the cursor for the next pass.
+
+    A short page (fewer rows than the limit) means the tail was reached, so
+    the cursor resets to None and the next pass starts from the oldest row
+    again — that is the "rotating" part. A full page hands back the last row
+    examined, so the next pass continues past it.
+    """
+    settings = get_settings()
+    examined = 0
+    # Read the cursor off the last row *inside* the transaction. After the
+    # commit these instances are expired, and touching an attribute then
+    # would emit a lazy refresh against a closed session.
+    next_cursor: _ResumeCursor | None = None
+    async with session_factory() as session:
+        async with session.begin():
+            dep_repo = JobDependencyRepository(session)
+            job_repo = JobRepository(session)
+            outbox_repo = OutboxRepository(session)
+
+            rows = list(
+                (
+                    await session.execute(_promotable_waiting_stmt(cursor))
+                ).scalars()
+            )
+            examined = len(rows)
+            if rows:
+                next_cursor = (rows[-1].created_at, rows[-1].id)
+
+            for child in rows:
+                # The DAG pause lives in Redis, so it cannot be pushed into
+                # the query above; it stays a per-row check. A paused child
+                # is skipped but still counts against this pass's page,
+                # which is exactly what the cursor exists to survive.
+                if (
+                    await find_blocking_pause(redis, dep_repo, child.id)
+                    is not None
+                ):
+                    continue
+
+                # E1-04: CAS the promotion — the DependencyResolver
+                # (or a concurrent sweep pass) may promote the same
+                # child first. The loser must skip the outbox add
+                # too, or it still mints a duplicate job.submitted.
+                if not await job_repo.promote_waiting_to_pending(child.id):
+                    continue
+                await outbox_repo.add(
+                    tenant_id=child.tenant_id,
+                    topic=settings.kafka_topic_job_submitted,
+                    key=f"{child.tenant_id}:{child.user_id}",
+                    payload={
+                        "event": "job.submitted",
+                        "tenant_id": str(child.tenant_id),
+                        "job_id": str(child.id),
+                        "user_id": str(child.user_id),
+                        "job_type": child.type,
+                        "payload": dict(child.payload or {}),
+                        "priority": child.priority,
+                        "trace_id": child.trace_id,
+                    },
+                )
+                logger.info(
+                    "resume sweep promoted child",
+                    extra={"child_id": str(child.id)},
+                )
+
+    # A short page means the tail was reached: rotate back to the start.
+    if examined < _RESUME_SWEEP_LIMIT:
+        return None
+    return next_cursor
+
+
 async def _resume_unblocked_waiting_loop(
     session_factory: async_sessionmaker[AsyncSession],
     redis: Any,
@@ -1055,63 +1203,24 @@ async def _resume_unblocked_waiting_loop(
     `promote_waiting_to_pending` below is a CAS, so a second replica
     sweeping the same child loses the compare-and-set and skips the outbox
     add with it. Concurrent sweeps are wasted scans, not duplicate events.
+
+    The cursor is per-replica in-memory state, and deliberately so: it is a
+    fairness hint, not a correctness mechanism. Two replicas holding
+    different cursors just scan different pages, and a restart losing one
+    only means that replica starts from the oldest row again.
     """
-    settings = get_settings()
+    cursor: _ResumeCursor | None = None
     while True:
         try:
-            async with session_factory() as session:
-                async with session.begin():
-                    dep_repo = JobDependencyRepository(session)
-                    job_repo = JobRepository(session)
-                    outbox_repo = OutboxRepository(session)
-
-                    rows = (
-                        await session.execute(
-                            select(Job)
-                            .where(Job.status == JobStatus.WAITING)
-                            .limit(_RESUME_SWEEP_LIMIT)
-                        )
-                    ).scalars()
-
-                    for child in rows:
-                        if await dep_repo.unmet_count(child.id) > 0:
-                            continue
-                        if (
-                            await find_blocking_pause(redis, dep_repo, child.id)
-                            is not None
-                        ):
-                            continue
-
-                        # E1-04: CAS the promotion — the DependencyResolver
-                        # (or a concurrent sweep pass) may promote the same
-                        # child first. The loser must skip the outbox add
-                        # too, or it still mints a duplicate job.submitted.
-                        if not await job_repo.promote_waiting_to_pending(
-                            child.id
-                        ):
-                            continue
-                        await outbox_repo.add(
-                            tenant_id=child.tenant_id,
-                            topic=settings.kafka_topic_job_submitted,
-                            key=f"{child.tenant_id}:{child.user_id}",
-                            payload={
-                                "event": "job.submitted",
-                                "tenant_id": str(child.tenant_id),
-                                "job_id": str(child.id),
-                                "user_id": str(child.user_id),
-                                "job_type": child.type,
-                                "payload": dict(child.payload or {}),
-                                "priority": child.priority,
-                                "trace_id": child.trace_id,
-                            },
-                        )
-                        logger.info(
-                            "resume sweep promoted child",
-                            extra={"child_id": str(child.id)},
-                        )
+            cursor = await _resume_unblocked_waiting_once(
+                session_factory, redis, cursor
+            )
         except asyncio.CancelledError:
             break
         except Exception as exc:
+            # Reset on error: the failing pass may have advanced past rows it
+            # never examined, and re-scanning is cheap next to stranding them.
+            cursor = None
             logger.error("resume sweep error", extra={"error": str(exc)})
 
         await asyncio.sleep(_RESUME_SWEEP_INTERVAL)

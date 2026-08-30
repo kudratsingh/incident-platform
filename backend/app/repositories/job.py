@@ -5,6 +5,7 @@ from typing import Any, cast
 from app.config import get_settings
 from app.models.enums import JobStatus
 from app.models.job import Job
+from app.models.job_dependency import JobDependency
 from app.repositories.base import BaseRepository
 from app.repositories.outbox import OutboxRepository
 from app.schemas.job_events import completed_event_payload, dlq_event_payload
@@ -19,6 +20,25 @@ from sqlalchemy import CursorResult, and_, func, select, update
 # a schema-registry change with four consumers to update; tracked in
 # docs/ROADMAP.md rather than smuggled in here.
 _TERMINAL_EVENT_STATUSES = (JobStatus.DEAD_LETTER, JobStatus.COMPLETED)
+
+# The statuses that strand a dependency DAG below them. A parent here will
+# never reach COMPLETED under its own power, so every WAITING descendant is
+# blocked forever — `unmet_count` counts a non-COMPLETED parent as unmet and
+# nothing else ever clears it. Reaching one of these cascades CANCELLED down
+# the non-saga descendants (R2-09), which is the behaviour the `CANCELLED`
+# enum comment has advertised ("dependency parent failed") since the DAG
+# landed but nothing implemented.
+#
+# `FAILED` is deliberately absent, for the same reason it is absent from
+# `TERMINAL_JOB_STATUSES`: the retry cycle re-enters from it, so a `failed`
+# parent is still in flight and may yet complete. Cascading from it would
+# cancel children of a job that is about to succeed.
+_CASCADE_SOURCE_STATUSES = (JobStatus.DEAD_LETTER, JobStatus.CANCELLED)
+
+# Cycle guard for the cascade walk. `job_dependencies` can only point backward
+# in time (see the model docstring), so a real DAG terminates long before
+# this; the bound exists so a corrupted edge set cannot spin the worker.
+_CASCADE_MAX_DEPTH = 50
 
 
 class JobRepository(BaseRepository[Job]):
@@ -138,6 +158,8 @@ class JobRepository(BaseRepository[Job]):
         job = await self.get_by_id(job_id)
         if job is not None and status in _TERMINAL_EVENT_STATUSES:
             await self._emit_terminal_event(job, status, event_message)
+        if job is not None and status in _CASCADE_SOURCE_STATUSES:
+            await self.cascade_cancel_blocked_children(job_id, status)
         return job
 
     async def _emit_terminal_event(
@@ -221,6 +243,85 @@ class JobRepository(BaseRepository[Job]):
         )
         await self.session.flush()
         return result.rowcount == 1
+
+    async def cascade_cancel_blocked_children(
+        self, parent_id: uuid.UUID, parent_status: str
+    ) -> int:
+        """Cancel the WAITING non-saga descendants of a stranded parent (R2-09).
+
+        A parent in DEAD_LETTER or CANCELLED will never reach COMPLETED, so
+        `unmet_count` counts it as unmet forever and its WAITING children can
+        never be promoted by anything — not the DependencyResolver, which only
+        reacts to `job.completed`, and not the resume sweep, which requires the
+        same predicate. Before this, those rows simply accumulated: the enum
+        comment promised the cascade, nothing performed it, and the resume
+        sweep's `LIMIT 200` candidate set filled up with rows no mechanism
+        could remove, starving the healthy children queued behind them.
+
+        Runs in the caller's transaction, same as `_emit_terminal_event`, so a
+        parent cannot be dead-lettered in Postgres while its children stay
+        WAITING in the same database.
+
+        Scope, and why each bound is here:
+
+        * `saga_id IS NULL` — saga steps belong to `SagaCoordinator`, which
+          cancels them by saga membership (`SagaRepository.waiting_steps`) and
+          not by the dependency DAG. Filtering them out keeps the two
+          mechanisms disjoint: no double-cancel, no race with the coordinator.
+        * `status == WAITING` — a CAS in set form. A child already RUNNING or
+          terminal is not ours to touch, and the predicate is what makes a
+          concurrent cascade from a sibling parent idempotent.
+        * Level-by-level, not one recursive CTE: `UPDATE ... WITH RECURSIVE`
+          is not portable to the SQLite the unit suite runs on, and the depth
+          of a real job DAG is single digits.
+
+        The walk continues through cancelled children because `unmet_count`
+        treats a CANCELLED parent as unmet too — stopping at the first level
+        would just relocate the stuck set one generation down.
+
+        Returns the number of rows cancelled, for the caller's logging.
+        """
+        reason = f"dependency parent {parent_id} ended in {parent_status}"
+        cancelled = 0
+        frontier: list[uuid.UUID] = [parent_id]
+        seen: set[uuid.UUID] = {parent_id}
+
+        for _ in range(_CASCADE_MAX_DEPTH):
+            if not frontier:
+                break
+            rows = await self.session.execute(
+                select(JobDependency.job_id)
+                .join(Job, Job.id == JobDependency.job_id)
+                .where(
+                    JobDependency.depends_on_job_id.in_(frontier),
+                    Job.status == JobStatus.WAITING,
+                    Job.saga_id.is_(None),
+                )
+            )
+            targets = [r[0] for r in rows.all() if r[0] not in seen]
+            if not targets:
+                break
+
+            result = cast(
+                CursorResult[Any],
+                await self.session.execute(
+                    update(Job)
+                    .where(
+                        Job.id.in_(targets),
+                        Job.status == JobStatus.WAITING,
+                        Job.saga_id.is_(None),
+                    )
+                    .values(
+                        status=JobStatus.CANCELLED, error_message=reason
+                    )
+                ),
+            )
+            await self.session.flush()
+            cancelled += result.rowcount
+            seen.update(targets)
+            frontier = targets
+
+        return cancelled
 
     async def dlq_stats(self, tenant_id: uuid.UUID) -> tuple[int, dict[str, int]]:
         """Total DLQ count plus per-job-type breakdown, scoped to one tenant."""

@@ -1,6 +1,18 @@
 # ADR 0011 — DAG pause is enforced by the resolver, not just recorded
 
-**Status:** Accepted (v0.4.9) · **Date:** 2026 Q3 · **Owner:** Platform
+**Status:** Accepted (v0.4.9), amended by [ADR 0022](0022-promotable-only-resume-sweep-and-dependency-cascade.md) ·
+**Date:** 2026 Q3 · **Owner:** Platform
+
+> **Amendment (ADR 0022, WO-R2-09).** §2's sweep selected `WHERE status = 'waiting'
+> LIMIT 200` and tested eligibility in Python afterwards, so `WAITING` children of a
+> `DEAD_LETTER`/`CANCELLED` parent — which nothing could ever promote and nothing
+> removed — filled every page and starved the sweep platform-wide. The eligibility
+> test now lives in SQL (`NOT EXISTS` an unmet parent), with `ORDER BY created_at, id`
+> and a rotating cursor behind it, and a terminal non-`COMPLETED` parent now cascades
+> `CANCELLED` to its non-saga descendants so the blocked set stops growing. The
+> "New always-on loop" consequence below names the wrong remedy: a smaller limit and a
+> `(status, created_at)` index would not have helped, because the blocked set grows
+> without bound.
 
 ## Context
 
@@ -54,6 +66,8 @@ The alternative — fail closed — means a Redis blip silently freezes every DA
 
 **New always-on loop.** One additional DB query every 10s per worker (bounded at 200 rows). Negligible at current scale; if `WAITING` volume ever grows, the natural fix is an index-backed query on `(status, created_at)` and a smaller limit, not a longer interval — the interval is what bounds post-pause resume latency.
 
+> **Superseded by [ADR 0022](0022-promotable-only-resume-sweep-and-dependency-cascade.md).** This prescription was wrong. The pressure did not come from `WAITING` *volume* but from `WAITING` rows that could never be promoted, so a smaller limit would have made it strictly worse and no index would have helped. The limit now bounds *promotable* rows, which is what makes it safe at any volume.
+
 **What this does not do.** There is still no `resume_dag` tool; the only way to lift a pause early is to wait out the TTL. That's now a real gap rather than a cosmetic one, since the pause actually holds. Sized as a follow-up.
 
 ## Alternatives considered
@@ -86,7 +100,7 @@ A retry, a replay, and a newly created job are all **new dispatches**. They are 
 | # | Probe site | On a blocking pause |
 |---|---|---|
 | 1 | `DependencyResolver` (promotion on `job.completed`) | child stays `WAITING` |
-| 2 | `_resume_unblocked_waiting_loop` (10s resume sweep) | child stays `WAITING`, re-evaluated next pass |
+| 2 | `_resume_unblocked_waiting_loop` (10s resume sweep) | child stays `WAITING`, re-evaluated on a later pass — the keyset cursor from [ADR 0022](0022-promotable-only-resume-sweep-and-dependency-cascade.md) §2 means "next" only when the eligible set fits in one page |
 | 3 | `_promote_delayed_once` (delayed-retry promotion) | no outbox row; job re-pushed onto `jobs:delayed` with `_PAUSE_RECHECK_SECONDS` (10s) |
 | 4 | `JobService.replay_job` (interactive replays) | `JobError` before any mutation — no status change, no audit row, no outbox row |
 | 5 | `_promote_dlq_replay_loop` (scheduled DLQ replays) | re-scheduled with `_PAUSED_REPLAY_DEFER_SECONDS` (30s), *not* refused |
