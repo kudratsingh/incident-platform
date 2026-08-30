@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from app.repositories.outbox import OutboxRepository
 from app.workers import dispatcher
+from app.workers.schema_registry import SchemaValidationError
 
 # ---------------------------------------------------------------------------
 # OutboxRepository
@@ -47,6 +48,53 @@ async def test_repo_mark_published_executes_when_ids_given() -> None:
     session.flush.assert_awaited_once()
 
 
+async def test_repo_mark_failed_noop_on_empty_list() -> None:
+    session = AsyncMock()
+    repo = OutboxRepository(session)
+    await repo.mark_failed([], "boom")
+    session.execute.assert_not_awaited()
+
+
+async def test_repo_mark_failed_sets_the_dead_letter_columns() -> None:
+    """published_at lifts the row out of the fetch window; failed_at keeps it
+    honest about never having been delivered; error_message says why."""
+    session = AsyncMock()
+    repo = OutboxRepository(session)
+    await repo.mark_failed([uuid.uuid4()], "record too large")
+
+    session.execute.assert_awaited_once()
+    values = session.execute.await_args.args[0].compile().params
+    assert values["published_at"] is not None
+    assert values["failed_at"] is not None
+    assert values["error_message"] == "record too large"
+
+
+async def test_repo_mark_failed_truncates_a_giant_error() -> None:
+    """An over-long error string would abort the marking transaction, which is
+    the one transaction that must not fail — it is what ends the retry loop."""
+    session = AsyncMock()
+    repo = OutboxRepository(session)
+    await repo.mark_failed([uuid.uuid4()], "x" * 10_000)
+
+    values = session.execute.await_args.args[0].compile().params
+    assert len(values["error_message"]) == 900
+
+
+async def test_repo_fetch_unpublished_excludes_rows_past_the_cap() -> None:
+    """The predicate, not just the marking branch, keeps a capped-out row out
+    of the window — the marking write can be lost to a crash."""
+    session = AsyncMock()
+    # execute() is awaited, but its *result* is a sync object — an AsyncMock
+    # would hand back a coroutine from .scalars().
+    session.execute.return_value = MagicMock()
+    repo = OutboxRepository(session)
+    await repo.fetch_unpublished()
+
+    sql = str(session.execute.await_args.args[0])
+    assert "published_at IS NULL" in sql
+    assert "attempts <" in sql
+
+
 # ---------------------------------------------------------------------------
 # _outbox_relay_loop
 # ---------------------------------------------------------------------------
@@ -73,12 +121,20 @@ def _session_factory_with(events: list[MagicMock]) -> tuple[MagicMock, MagicMock
     return factory, repo
 
 
-def _outbox_row(topic: str = "job.submitted", payload: dict | None = None) -> MagicMock:
+def _outbox_row(
+    topic: str = "job.submitted",
+    payload: dict | None = None,
+    attempts: int = 0,
+) -> MagicMock:
     row = MagicMock()
     row.id = uuid.uuid4()
     row.topic = topic
     row.key = "user-1"
     row.payload = payload or {"job_id": str(uuid.uuid4())}
+    # A real int, not an auto-created MagicMock attribute: the relay does
+    # arithmetic and a comparison on this to decide whether the row has
+    # reached the attempt cap.
+    row.attempts = attempts
     return row
 
 
@@ -288,3 +344,121 @@ async def test_job_service_create_writes_outbox() -> None:
     assert kwargs["payload"]["event"] == "job.submitted"
     assert kwargs["payload"]["tenant_id"] == str(tenant_id)
     assert kwargs["payload"]["job_id"] == str(job.id)
+
+
+# ---------------------------------------------------------------------------
+# Dead-lettering (WO-R2-05)
+#
+# ADR 0001 Decision item 3 has always specified this behaviour and the code
+# has never had it: `increment_attempts` bumped a counter that nothing read,
+# so a row that could never publish was retried every tick forever while
+# holding one of the relay's fixed 100 fetch slots.
+# ---------------------------------------------------------------------------
+
+
+async def test_relay_dead_letters_a_schema_invalid_row_immediately() -> None:
+    """A schema violation is deterministic: the same payload fails the same
+    way on every future tick, so there is nothing to wait for."""
+    bad = _outbox_row()
+    factory, repo = _session_factory_with([bad])
+
+    with patch("app.workers.dispatcher.OutboxRepository", return_value=repo), \
+         patch(
+             "app.workers.dispatcher.kafka_producer.publish_raw",
+             side_effect=SchemaValidationError("job_id is not a uuid"),
+         ), \
+         patch(
+             "app.workers.dispatcher.asyncio.sleep",
+             side_effect=[None, StopAsyncIteration],
+         ):
+        with pytest.raises(StopAsyncIteration):
+            await dispatcher._outbox_relay_loop(factory)
+
+    repo.mark_failed.assert_awaited()
+    failed_ids, error = repo.mark_failed.await_args_list[0].args
+    assert failed_ids == [bad.id]
+    assert "job_id is not a uuid" in error
+    # Not retried, and not counted as a delivery.
+    assert repo.increment_attempts.await_args_list[0].args[0] == []
+    assert repo.mark_published.await_args_list[0].args[0] == []
+
+
+async def test_relay_retries_a_transient_failure_below_the_cap() -> None:
+    """A broker blip must not cost the row its place in the queue."""
+    row = _outbox_row(attempts=3)
+    factory, repo = _session_factory_with([row])
+
+    with patch("app.workers.dispatcher.OutboxRepository", return_value=repo), \
+         patch("app.workers.dispatcher.get_settings") as settings_mock, \
+         patch(
+             "app.workers.dispatcher.kafka_producer.publish_raw",
+             side_effect=RuntimeError("broker down"),
+         ), \
+         patch(
+             "app.workers.dispatcher.asyncio.sleep",
+             side_effect=[None, StopAsyncIteration],
+         ):
+        settings_mock.return_value.outbox_max_attempts = 5
+        with pytest.raises(StopAsyncIteration):
+            await dispatcher._outbox_relay_loop(factory)
+
+    assert repo.increment_attempts.await_args_list[0].args[0] == [row.id]
+    repo.mark_failed.assert_not_awaited()
+
+
+async def test_relay_dead_letters_a_row_that_reaches_the_attempt_cap() -> None:
+    """The backstop for failures we cannot classify. One more failure takes
+    this row to the cap, so it is abandoned instead of incremented."""
+    row = _outbox_row(attempts=4)
+    factory, repo = _session_factory_with([row])
+
+    with patch("app.workers.dispatcher.OutboxRepository", return_value=repo), \
+         patch("app.workers.dispatcher.get_settings") as settings_mock, \
+         patch(
+             "app.workers.dispatcher.kafka_producer.publish_raw",
+             side_effect=RuntimeError("MessageSizeTooLargeError"),
+         ), \
+         patch(
+             "app.workers.dispatcher.asyncio.sleep",
+             side_effect=[None, StopAsyncIteration],
+         ):
+        settings_mock.return_value.outbox_max_attempts = 5
+        with pytest.raises(StopAsyncIteration):
+            await dispatcher._outbox_relay_loop(factory)
+
+    repo.mark_failed.assert_awaited()
+    failed_ids, error = repo.mark_failed.await_args_list[0].args
+    assert failed_ids == [row.id]
+    assert "abandoned after 5 attempts" in error
+    assert "MessageSizeTooLargeError" in error
+    assert repo.increment_attempts.await_args_list[0].args[0] == []
+
+
+async def test_relay_dead_letters_one_row_without_disturbing_the_others() -> None:
+    """Isolation was never the missing piece — the exit was. Both must hold at
+    once: the poison row leaves, the healthy rows publish this same tick."""
+    good_one = _outbox_row()
+    poison = _outbox_row(attempts=99)
+    good_two = _outbox_row()
+    factory, repo = _session_factory_with([good_one, poison, good_two])
+
+    async def publish_side_effect(topic: str, key: str, payload: dict) -> None:
+        if payload is poison.payload:
+            raise RuntimeError("record too large")
+
+    with patch("app.workers.dispatcher.OutboxRepository", return_value=repo), \
+         patch("app.workers.dispatcher.get_settings") as settings_mock, \
+         patch(
+             "app.workers.dispatcher.kafka_producer.publish_raw",
+             side_effect=publish_side_effect,
+         ), \
+         patch(
+             "app.workers.dispatcher.asyncio.sleep",
+             side_effect=[None, StopAsyncIteration],
+         ):
+        settings_mock.return_value.outbox_max_attempts = 100
+        with pytest.raises(StopAsyncIteration):
+            await dispatcher._outbox_relay_loop(factory)
+
+    assert repo.mark_published.await_args_list[0].args[0] == [good_one.id, good_two.id]
+    assert repo.mark_failed.await_args_list[0].args[0] == [poison.id]

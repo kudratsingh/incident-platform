@@ -68,8 +68,11 @@ If we ever outgrow polling latency or want to eliminate the write amplification,
 
 ## Verification
 
-- Integration test `test_outbox_relay` (in `backend/tests/integration/test_kafka_e2e.py`) confirms the round-trip: write outbox row → relay publishes → consumer reads from Kafka.
-- Unit test `test_outbox.py` confirms the relay marks rows published only after `send_and_wait` returns, and marks them failed (not retried forever) on `SchemaValidationError`.
+*Both bullets in this section were false as written until 2026 Q3; see the second addendum below for what was wrong and why it mattered.*
+
+- Integration test `test_relay_round_trip_reaches_a_real_consumer` (in `backend/tests/integration/test_outbox_dead_letter.py`) confirms the round-trip against real Postgres and real Redpanda: write outbox row → relay publishes → consumer reads from Kafka.
+- The same file's `test_an_unpublishable_row_is_dead_lettered_at_the_cap` and `test_a_healthy_row_behind_a_full_window_of_poison_still_publishes` confirm that a row which can never publish is abandoned rather than retried forever, and that it stops blocking the rows behind it.
+- Unit tests in `backend/tests/unit/test_outbox.py` confirm the relay marks rows published only after `publish_raw` returns, and dead-letters them — immediately on `SchemaValidationError`, at the cap otherwise.
 
 ## Pointers
 
@@ -103,3 +106,44 @@ Two deliberate limits:
 The escape hatch the original text described — choosing not to emit — still exists for non-terminal statuses, which is where it was actually useful (a retry writes `PENDING` and its own "retrying" `job.failed` event). It no longer exists for the terminal ones, where every use of it was a bug.
 
 Verification: `backend/tests/unit/test_terminal_event_single_write.py` asserts, against real rows, that each terminal write lands with its event in one transaction — and that both roll back together.
+
+---
+
+## Addendum (2026 Q3) — the failed state described in Decision item 3 now exists
+
+*The decision above is unchanged and remains accepted. This section records that one clause of it was aspirational for two years, what the gap cost, and how it is closed. Everything above the addenda is the original text.*
+
+### What was missing
+
+Decision item 3 says a `SchemaValidationError` "marks the row failed permanently (`published_at=NOW`, `error_message=...`) rather than retrying forever". `kafka_producer.publish_raw`'s docstring repeats the promise from the other side ("so the relay marks the row failed"). [ADR 0002](0002-json-schema-vs-protobuf.md) restates it a third time in its Consequences.
+
+None of it was true. The relay had no such branch, `outbox_events` had no `error_message` column, and `increment_attempts` maintained a counter that no query, alarm or code path ever read. Every failure was treated as transient, so every failure was retried on the next tick, forever.
+
+The **Positive** consequence above — "per-row failure isolation: a bad payload that fails schema validation doesn't block the rest of the queue" — was half right in a way that made the gap easy to miss. The per-row `try/except` does give isolation: one bad payload cannot abort the batch. But isolation without an exit only means the bad row comes back next tick.
+
+### Why it was worse than "some rows retry a lot"
+
+`fetch_unpublished` returns a *fixed* window: the oldest `OUTBOX_RELAY_BATCH` (100) unpublished rows. A permanently unpublishable row does not slow the relay down — it occupies one of exactly 100 slots, permanently. So this is a cliff, not a ramp. At 99 poison rows everything still works. At 100 the window is entirely poison, nothing else is ever fetched, and event delivery stops for every tenant at once — while the API, the database and `QueueDepth` all read perfectly healthy, because `QueueDepth` measures the Redis delayed set and knows nothing about this queue.
+
+One row was enough to get there on its own. A job whose `job.submitted` event can never publish stays `PENDING`; the stale-`PENDING` sweep (`_requeue_stale_pending_loop`, ungated and every 60s) then appends a *fresh copy* of the same unpublishable row. One bad payload reached the 100-row cliff by itself, unassisted.
+
+### What was built
+
+- **`failed_at` + `error_message` columns** (migration `e5c93b7a2d18`). `published_at=NOW` is what lifts a row out of the fetch window, exactly as item 3 specifies, so the partial index on `published_at IS NULL` is untouched. `failed_at` keeps that honest: `published_at IS NOT NULL AND failed_at IS NULL` is a real delivery, and a row that was abandoned can never be mistaken for one that arrived.
+- **Two exits from the retry loop.** A `SchemaValidationError` dead-letters on the first attempt — it is deterministic, so the second attempt is pure waste. Everything else dead-letters after `outbox_max_attempts`.
+- **`attempts < cap` in `fetch_unpublished`'s predicate**, so a row that reached the cap stays out of the window even if the marking write was lost to a crash.
+- **`OutboxUnpublishedDepth` / `OutboxOldestUnpublishedAgeSeconds` gauges and `OutboxDeadLettered`**, emitted by the relay leader, with two CloudWatch alarms (`outbox-relay-stalled`, `outbox-dead-lettered`) and [`rb-outbox-relay-stalled`](../../runbooks/rb-outbox-relay-stalled.yaml). Age rather than depth is the stall signal: a busy system holds many rows for a second each, a stalled one holds three forever.
+- **A payload size cap at submission** (`max_job_payload_bytes`, 256 KiB, enforced in `validate_processor_payload` — the one choke point `POST /jobs` and `POST /sagas` share). This bounds the trigger. A >1 MiB event is refused identically by the broker on every retry, and until now any authenticated user could create one through the ordinary API.
+
+### The cap is a backstop, not the mechanism
+
+`outbox_max_attempts` defaults to 900 — deliberately generous, because the relay retries every unpublished row every second, which makes `attempts` a proxy for *seconds of continuous failure* rather than a count of anything row-specific. A broker outage fails every row in the batch, so a tight cap would quarantine an entire healthy backlog over a blip. That is why the deterministic failure gets its own immediate exit: the common poison case never waits for the cap, and the cap can afford to be patient about everything else.
+
+Dead-lettering is quarantine, not deletion. The row keeps its payload and gains a reason; requeueing is one `UPDATE`, and consumers are idempotent under the at-least-once delivery this ADR already promises, so replaying is safe. The runbook has the statement.
+
+### Two corrections to the text above
+
+- The **Verification** section cited an integration test `test_outbox_relay` in `backend/tests/integration/test_kafka_e2e.py`. No test of that name has ever existed in this repo, and `test_kafka_e2e.py` does not touch the outbox at all — it exercises a producer and consumer directly. So the round-trip this ADR is *about* had no end-to-end proof anywhere, which is a large part of how item 3 stayed unimplemented without anyone noticing. The section now cites tests that exist, in the integration tier that [runs on every PR](../../.github/workflows/ci.yml) with a zero-skip census.
+- The **Negative** consequence "outbox table grows unboundedly" now has a second reason to be true — dead-lettered rows are kept on purpose — and the same future archival PR covers both. Keep dead-lettered rows out of any archival predicate that assumes `published_at IS NOT NULL` means delivered.
+
+Verification: `backend/tests/integration/test_outbox_dead_letter.py` (real Postgres + real Redpanda; the oversize row is refused by the actual Kafka client, not a mock) and the dead-lettering tests in `backend/tests/unit/test_outbox.py`.

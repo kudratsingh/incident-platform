@@ -1,7 +1,9 @@
+import json
 import uuid
 from datetime import datetime
 from typing import Any
 
+from app.config import get_settings
 from app.models.enums import JobStatus, JobType
 from app.schemas.common import PaginationParams
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
@@ -63,6 +65,35 @@ _PAYLOAD_MODELS: dict[str, type[BaseModel]] = {
 }
 
 
+def _bound_payload_size(payload: dict[str, Any]) -> None:
+    """Reject a payload too large to ever survive the trip to Kafka.
+
+    `extra="allow"` bounds the knobs the processors read and nothing else,
+    so an arbitrary key of arbitrary length passes every other check here.
+    That payload is copied verbatim into the `job.submitted` outbox row
+    (`_job_submitted_payload`), and a record above the broker's
+    `message.max.bytes` (1 MiB by default) is refused identically on every
+    retry — a poison row, created through the ordinary submission API, by
+    an ordinary user, with no privileges and no malice required.
+
+    The relay now dead-letters such a row instead of retrying it forever
+    (ADR 0001's 2026 Q3 addendum), but that is the backstop. This is the
+    trigger, and refusing 250 KB at the door with a 422 is a far better
+    outcome for the caller than accepting the job and silently never
+    emitting its events.
+
+    Measured on the serialised form, since bytes on the wire are what the
+    broker counts. The envelope fields around the payload are small and
+    fixed; the default cap leaves them three quarters of a MiB of room.
+    """
+    size = len(json.dumps(payload, default=str).encode())
+    limit = get_settings().max_job_payload_bytes
+    if size > limit:
+        raise ValueError(
+            f"payload is {size} bytes, which exceeds the {limit}-byte limit"
+        )
+
+
 def validate_processor_payload(job_type: str, payload: dict[str, Any] | None) -> None:
     """Raise ValueError if `payload` exceeds the bounds for `job_type`.
 
@@ -71,7 +102,9 @@ def validate_processor_payload(job_type: str, payload: dict[str, Any] | None) ->
     of them leaves the other as a trivial bypass.
 
     Job types with no bound model — saga compensation types like
-    `csv_upload.compensate`, or anything not in JobType — are a no-op.
+    `csv_upload.compensate`, or anything not in JobType — are a no-op for
+    the per-type knobs, but NOT for the size check: that one runs first and
+    applies to every type, because "no bound model" is otherwise a bypass.
 
     Raises ValueError rather than re-raising the pydantic ValidationError so
     that a caller-side @model_validator turns it into the standard flat 422
@@ -79,6 +112,7 @@ def validate_processor_payload(job_type: str, payload: dict[str, Any] | None) ->
     """
     if payload is None:
         return
+    _bound_payload_size(payload)
     model = _PAYLOAD_MODELS.get(str(job_type))
     if model is None:
         return

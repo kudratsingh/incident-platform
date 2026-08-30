@@ -1,5 +1,6 @@
 """API contract tests for /api/v1/jobs endpoints."""
 
+import pytest
 from httpx import AsyncClient
 
 
@@ -621,3 +622,60 @@ async def test_create_job_allows_unrelated_payload_keys(
     )
     assert resp.status_code == 201
     assert resp.json()["payload"]["source_uri"] == "s3://bucket/doc.pdf"
+
+
+async def test_create_job_rejects_an_oversize_payload(
+    client: AsyncClient, auth_headers: dict[str, str]
+) -> None:
+    """A payload too big to publish must be refused at the door (WO-R2-05).
+
+    `extra="allow"` bounds the knobs the processors read and nothing else, so
+    one arbitrary key used to be enough to build a job whose `job.submitted`
+    event exceeds Kafka's 1 MiB limit. The broker refuses that record
+    identically on every retry — a poison outbox row, created by an ordinary
+    user through the ordinary API. The relay dead-letters such a row now, but
+    a 422 here is a far better answer than accepting the job and silently
+    never emitting any of its events.
+    """
+    resp = await client.post(
+        "/api/v1/jobs",
+        json={
+            "type": "doc_analysis",
+            "payload": {"page_count": 1, "blob": "x" * (512 * 1024)},
+        },
+        headers=auth_headers,
+    )
+    assert resp.status_code == 422
+    assert "exceeds" in resp.text
+
+
+async def test_create_job_accepts_a_large_but_publishable_payload(
+    client: AsyncClient, auth_headers: dict[str, str]
+) -> None:
+    """The cap must not become a new way to break ordinary large jobs."""
+    resp = await client.post(
+        "/api/v1/jobs",
+        json={
+            "type": "doc_analysis",
+            "payload": {"page_count": 1, "blob": "x" * 1024},
+        },
+        headers=auth_headers,
+    )
+    assert resp.status_code == 201
+
+
+async def test_oversize_payload_is_rejected_for_unbounded_job_types(
+    client: AsyncClient, auth_headers: dict[str, str]
+) -> None:
+    """Job types with no bound model are the bypass the size check must cover.
+
+    `validate_processor_payload` returns early for any type without a payload
+    model. If the size check sat after that lookup it would protect exactly
+    the four types that need it least.
+    """
+    from app.schemas.job import validate_processor_payload
+
+    with pytest.raises(ValueError, match="exceeds"):
+        validate_processor_payload(
+            "csv_upload.compensate", {"blob": "x" * (512 * 1024)}
+        )

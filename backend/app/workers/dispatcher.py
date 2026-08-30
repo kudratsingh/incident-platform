@@ -21,6 +21,7 @@ Concurrency model selection (this is the core design decision):
 """
 
 import asyncio
+import time
 import uuid
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
@@ -54,6 +55,7 @@ from app.workers.event_log_consumer import EventLogConsumer
 from app.workers.kafka_consumer import BaseKafkaConsumer, _check_chaos_kill_strict
 from app.workers.read_model import ReadModelProjector
 from app.workers.saga_coordinator import SagaCoordinator
+from app.workers.schema_registry import SchemaValidationError
 from app.workers.sse_consumer import SseConsumer
 from app.workers.triage_consumer import LlmTriageConsumer
 from opentelemetry import trace
@@ -1272,6 +1274,40 @@ async def _promote_dlq_replay_loop(
 OUTBOX_RELAY_INTERVAL = 1.0  # seconds between outbox polls
 OUTBOX_RELAY_BATCH = 100
 
+#: How often the relay reports queue health. The tick runs once a second;
+#: CloudWatch does not need that, and only the leader emits so the gauge
+#: stays one series rather than one per replica.
+_OUTBOX_GAUGE_INTERVAL = 60.0
+_last_outbox_gauge_at: float = 0.0
+
+
+async def _emit_outbox_gauges(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Publish outbox depth + oldest-row age, at most once a minute.
+
+    `QueueDepth` cannot cover this. It measures the Redis delayed set, which
+    is untouched by a relay stall — the outbox can stop delivering entirely
+    while every existing dashboard reads green. These two gauges are the
+    only signal that would notice, so their emission failing must not take
+    the tick down with it.
+    """
+    global _last_outbox_gauge_at
+    now = time.monotonic()
+    if now - _last_outbox_gauge_at < _OUTBOX_GAUGE_INTERVAL:
+        return
+    _last_outbox_gauge_at = now
+    try:
+        async with session_factory() as session:
+            async with session.begin():
+                depth, oldest_age = await OutboxRepository(session).unpublished_stats()
+        await metrics.emit_gauge("OutboxUnpublishedDepth", float(depth))
+        await metrics.emit_gauge(
+            "OutboxOldestUnpublishedAgeSeconds", oldest_age, unit="Seconds"
+        )
+    except Exception as exc:
+        logger.warning("outbox gauge emission failed", extra={"error": str(exc)})
+
 #: Zero-argument factory returning the leader gate's async context
 #: manager. Injected by the tests — the SQLite tiers have no advisory
 #: locks, so the real gate is a no-op there and the interesting states
@@ -1288,50 +1324,114 @@ async def _outbox_relay_tick(
       1. Read up to OUTBOX_RELAY_BATCH unpublished rows in one transaction.
       2. For each row, attempt to publish to Kafka.
       3. Mark successfully-published rows in a second transaction.
-      4. Rows whose publish failed remain unpublished and are retried next tick.
+      4. Rows whose publish failed transiently stay unpublished and are
+         retried next tick; rows that can never publish are dead-lettered.
 
     The caller holds the relay leader lock for the whole of this. That is
     load-bearing and cannot be replaced by locking the rows in step 1:
     step 1's transaction commits before a single publish happens, so any
     `FOR UPDATE` taken there is already released by step 2 (ADR 0020).
+
+    Step 4 is why the row-level try/except is not enough on its own. It
+    gives per-row *isolation* — one bad payload cannot abort the batch —
+    but isolation without an exit means the bad row is fetched again next
+    tick, forever. The fetch window is a fixed OUTBOX_RELAY_BATCH oldest
+    rows, so a permanently unpublishable row does not degrade throughput
+    gradually: it consumes one of exactly 100 slots until 100 of them are
+    consumed, and then delivery stops completely, for every tenant, with no
+    error rate to notice it by. Two exits, per ADR 0001 Decision item 3:
+
+      * `SchemaValidationError` — deterministic. The same payload will fail
+        the same way on every future tick, so retrying is pure cost.
+        Dead-letter on the first attempt.
+      * anything else `outbox_max_attempts` times over — the backstop for
+        failures we cannot classify (a record the broker refuses as
+        oversize, a topic that does not exist). Generous by default,
+        because a broker outage fails every row in the batch and this must
+        not turn a blip into a quarantined backlog.
+
+    Dead-lettering keeps the row and its payload; see `mark_failed`.
     """
     async with session_factory() as session:
         async with session.begin():
             repo = OutboxRepository(session)
             events = await repo.fetch_unpublished(limit=OUTBOX_RELAY_BATCH)
 
+    await _emit_outbox_gauges(session_factory)
+
     if not events:
         return
 
+    max_attempts = get_settings().outbox_max_attempts
     published_ids: list[uuid.UUID] = []
-    failed_ids: list[uuid.UUID] = []
+    retry_ids: list[uuid.UUID] = []
+    dead_lettered: list[tuple[uuid.UUID, str]] = []
     for event in events:
         try:
             await kafka_producer.publish_raw(
                 topic=event.topic, key=event.key, payload=event.payload
             )
             published_ids.append(event.id)
-        except Exception as exc:
-            failed_ids.append(event.id)
-            logger.warning(
-                "outbox publish failed, will retry",
+        except SchemaValidationError as exc:
+            dead_lettered.append((event.id, f"schema validation failed: {exc}"))
+            logger.error(
+                "outbox row dead-lettered — payload does not match its schema",
                 extra={
                     "outbox_id": str(event.id),
                     "topic": event.topic,
                     "error": str(exc),
                 },
             )
+        except Exception as exc:
+            # `attempts` is the value read in step 1; this failure is the
+            # increment that has not been written yet.
+            attempts = (event.attempts or 0) + 1
+            if attempts >= max_attempts:
+                dead_lettered.append(
+                    (event.id, f"abandoned after {attempts} attempts: {exc}")
+                )
+                logger.error(
+                    "outbox row dead-lettered — attempt cap reached",
+                    extra={
+                        "outbox_id": str(event.id),
+                        "topic": event.topic,
+                        "attempts": attempts,
+                        "error": str(exc),
+                    },
+                )
+            else:
+                retry_ids.append(event.id)
+                logger.warning(
+                    "outbox publish failed, will retry",
+                    extra={
+                        "outbox_id": str(event.id),
+                        "topic": event.topic,
+                        "attempts": attempts,
+                        "error": str(exc),
+                    },
+                )
 
     async with session_factory() as session:
         async with session.begin():
             repo = OutboxRepository(session)
             await repo.mark_published(published_ids)
-            await repo.increment_attempts(failed_ids)
+            await repo.increment_attempts(retry_ids)
+            # One statement per row: each carries its own error text, and
+            # dead-lettering is rare enough that batching would buy nothing.
+            for row_id, error in dead_lettered:
+                await repo.mark_failed([row_id], error)
 
-    if published_ids:
+    if dead_lettered:
+        await metrics.emit_count("OutboxDeadLettered", float(len(dead_lettered)))
+
+    if published_ids or dead_lettered:
         logger.info(
             "outbox batch published",
-            extra={"published": len(published_ids), "failed": len(failed_ids)},
+            extra={
+                "published": len(published_ids),
+                "failed": len(retry_ids),
+                "dead_lettered": len(dead_lettered),
+            },
         )
 
 

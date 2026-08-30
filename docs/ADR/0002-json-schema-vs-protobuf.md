@@ -73,3 +73,23 @@ The path of least resistance. What we'd do for a prototype.
 - `backend/app/workers/kafka_producer.py` — producer-side validation in `publish_raw`
 - `backend/app/workers/kafka_consumer.py` — consumer-side validation in `BaseKafkaConsumer._process_one`
 - `backend/tests/integration/test_kafka_e2e.py` — Testcontainers round-trip including schema validation
+
+---
+
+## Addendum (2026 Q3) — the Consequences claim about outbox dead-lettering is now true
+
+*The decision above is unchanged and remains accepted. This section exists because one line of it described behaviour the code did not have.*
+
+Under **Consequences → Positive**, this ADR claims:
+
+> **Producer-side validation catches bugs before publish.** A schema-invalid event from the outbox relay marks the outbox row failed (`error_message=`) rather than poisoning Kafka.
+
+Half of that was always true and is the part this ADR actually decides: `publish_raw` validates before sending, so a schema-invalid event never reaches consumers. That much held.
+
+The second half — "marks the outbox row failed (`error_message=`)" — did not. There was no `error_message` column and no failed state. A schema-invalid outbox row was retried on every relay tick, once a second, indefinitely, while holding a slot in the relay's fixed 100-row fetch window. The claim was inherited from [ADR 0001](0001-outbox-vs-cdc.md) Decision item 3, which specified the same unimplemented behaviour; repeating it here made it look twice-confirmed rather than never-built.
+
+Both are now implemented. A `SchemaValidationError` from `publish_raw` dead-letters the row on its first attempt — `published_at=NOW, failed_at=NOW, error_message=...` — so the sentence above now describes what happens. See [ADR 0001's 2026 Q3 addendum](0001-outbox-vs-cdc.md) for the mechanism, the attempt cap that covers non-schema failures, and the alarms.
+
+One consequence specific to this ADR's subject: a schema violation is the *cleanest* dead-letter case, because it is deterministic. The same payload fails the same way on every future tick, so unlike a broker error there is nothing to gain by retrying and no ambiguity about whether the failure belongs to the row or the infrastructure. That is why it exits on attempt one rather than waiting out the cap — a distinction only producer-side validation makes possible, and a concrete argument for validating before the send that the original Consequences list was reaching for.
+
+Verification: `test_relay_dead_letters_a_schema_invalid_row_immediately` in `backend/tests/unit/test_outbox.py`, and the hundred schema-invalid rows in `backend/tests/integration/test_outbox_dead_letter.py::test_a_healthy_row_behind_a_full_window_of_poison_still_publishes`.

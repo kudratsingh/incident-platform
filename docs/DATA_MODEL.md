@@ -193,14 +193,33 @@ This is intentional redundancy. If a future bug means a Kafka event fires withou
 | `topic` | String(255) NOT NULL | Kafka topic name. |
 | `key` | String(255) NOT NULL | The composite `{tenant_id}:{user_id}` partition key. |
 | `payload` | JSONB NOT NULL | The event body, will be validated against the topic's schema by the relay. |
-| `attempts` | Integer NOT NULL (default 0) | Incremented each time the relay tries to publish; surfaces stuck rows. |
+| `attempts` | Integer NOT NULL (default 0) | Failed publishes so far. Read by both the relay (dead-letter at `outbox_max_attempts`) and `fetch_unpublished`'s predicate. |
 | `created_at` | DateTime NOT NULL | |
-| `published_at` | DateTime NULLABLE | NULL = unpublished. Filled by the relay on success or on permanent failure (with `error_message`). |
-| `error_message` | Text NULLABLE | Set when the row is permanently dropped (schema validation failure). Distinguishes "stuck retrying" from "given up." |
+| `published_at` | DateTime NULLABLE | NULL = still queued. Set when the relay is *done* with the row — delivered **or** dead-lettered. Not proof of delivery on its own; read with `failed_at`. |
+| `failed_at` | DateTime NULLABLE | Non-NULL exactly when the row was abandoned without reaching Kafka. `published_at IS NOT NULL AND failed_at IS NULL` is a real publish. |
+| `error_message` | Text NULLABLE | Why it was abandoned. Truncated to 900 chars by the writer. |
+
+The dead-letter queue is a query, not a table:
+
+```sql
+SELECT id, topic, attempts, error_message, failed_at
+  FROM outbox_events WHERE failed_at IS NOT NULL ORDER BY failed_at DESC;
+```
+
+Rows are kept with their payloads intact so they can be requeued — see
+[`rb-outbox-relay-stalled`](../runbooks/rb-outbox-relay-stalled.yaml).
+
+> `error_message` was listed in this table for two years before the column
+> existed, described as something the relay set on permanent failure. It
+> did not: there was no failed state and no cap, so a row that could never
+> publish was retried every tick forever while holding one of the relay's
+> fixed 100 fetch slots. Both columns and both exits are real as of
+> migration `e5c93b7a2d18`; see [ADR 0001](ADR/0001-outbox-vs-cdc.md)'s
+> 2026 Q3 addendum.
 
 ### Indexes
 
-- `ix_outbox_events_published_at_null` — **partial index** WHERE `published_at IS NULL`. Critical for the hot polling path; without it, the relay scan would degrade to a full table scan as the table grows.
+- `ix_outbox_events_unpublished` — **partial index** on `created_at` WHERE `published_at IS NULL`. Critical for the hot polling path; without it, the relay scan would degrade to a full table scan as the table grows. Dead-lettering sets `published_at`, so abandoned rows drop out of this index rather than accumulating in it.
 
 ### Why this exists at all
 

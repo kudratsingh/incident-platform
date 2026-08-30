@@ -4,9 +4,15 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
+from app.config import get_settings
 from app.models.outbox import OutboxEvent
 from app.repositories.base import BaseRepository
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
+
+#: Keep well under the column width; the tail of a long driver traceback
+#: is rarely the informative part and an over-long value would abort the
+#: marking transaction, which is the one transaction that must not fail.
+_ERROR_MESSAGE_MAX_CHARS = 900
 
 
 class OutboxRepository(BaseRepository[OutboxEvent]):
@@ -44,10 +50,25 @@ class OutboxRepository(BaseRepository[OutboxEvent]):
         single writer is the advisory-lock leader gate the caller holds
         around the whole tick — see ADR 0020. If you ever collapse the
         relay into one transaction, add the clause back and say so there.
+
+        The `attempts` bound is the second half of the poison-row guard.
+        `mark_failed` already lifts a capped-out row out of this window by
+        setting `published_at`, so in the normal path this predicate never
+        fires. It matters when that write did not happen: the relay crashed
+        between incrementing and marking, or the rows predate the cap.
+
+        Without it, one such row is not just retried forever — it holds a
+        slot in a *fixed-size* window, and this window is the entire input
+        to the relay. 100 of them and nothing else is ever fetched, so
+        delivery stops for every tenant at once, silently.
         """
+        max_attempts = get_settings().outbox_max_attempts
         stmt = (
             select(OutboxEvent)
-            .where(OutboxEvent.published_at.is_(None))
+            .where(
+                OutboxEvent.published_at.is_(None),
+                OutboxEvent.attempts < max_attempts,
+            )
             .order_by(OutboxEvent.created_at.asc())
             .limit(limit)
         )
@@ -65,6 +86,12 @@ class OutboxRepository(BaseRepository[OutboxEvent]):
         await self.session.flush()
 
     async def increment_attempts(self, ids: list[uuid.UUID]) -> None:
+        """Count one failed publish against each row.
+
+        The counter is not decoration: `fetch_unpublished` filters on it and
+        the relay dead-letters on it. Anything that increments must be
+        prepared for the row to leave the queue once it reaches the cap.
+        """
         if not ids:
             return
         await self.session.execute(
@@ -73,3 +100,62 @@ class OutboxRepository(BaseRepository[OutboxEvent]):
             .values(attempts=OutboxEvent.attempts + 1)
         )
         await self.session.flush()
+
+    async def mark_failed(self, ids: list[uuid.UUID], error: str) -> None:
+        """Dead-letter rows: abandon them without publishing.
+
+        Sets `published_at=NOW, error_message=...` exactly as ADR 0001
+        Decision item 3 specifies, which is what lifts the row out of
+        `fetch_unpublished`'s window, plus `failed_at` so a row that was
+        abandoned is never mistaken for one that was delivered.
+
+        The row is kept, with its payload intact. This is quarantine, not
+        deletion: recovering from a cap that fired too eagerly (a long
+        broker outage) is one statement —
+
+            UPDATE outbox_events
+               SET published_at = NULL, failed_at = NULL,
+                   error_message = NULL, attempts = 0
+             WHERE failed_at IS NOT NULL AND ...;
+
+        `error` is truncated to fit the column; a driver-level string
+        overflow here would roll back the whole marking transaction and put
+        the poison row straight back into the window.
+        """
+        if not ids:
+            return
+        now = datetime.now(UTC)
+        await self.session.execute(
+            update(OutboxEvent)
+            .where(OutboxEvent.id.in_(ids))
+            .values(
+                published_at=now,
+                failed_at=now,
+                error_message=error[:_ERROR_MESSAGE_MAX_CHARS],
+            )
+        )
+        await self.session.flush()
+
+    async def unpublished_stats(self) -> tuple[int, float]:
+        """(depth, age-of-oldest-in-seconds) over the live queue.
+
+        Feeds the relay's stall alarm. `QueueDepth` cannot serve that role:
+        it measures the Redis delayed set, which reads perfectly healthy
+        while the outbox is completely stalled.
+
+        Deliberately counts every unpublished row, including ones already
+        past the attempt cap that `fetch_unpublished` skips — the alarm's
+        job is to notice rows that are not moving, whatever the reason.
+        """
+        result = await self.session.execute(
+            select(func.count(), func.min(OutboxEvent.created_at)).where(
+                OutboxEvent.published_at.is_(None)
+            )
+        )
+        depth, oldest = result.one()
+        if not depth or oldest is None:
+            return 0, 0.0
+        if oldest.tzinfo is None:
+            # SQLite hands back naive datetimes; Postgres gives aware ones.
+            oldest = oldest.replace(tzinfo=UTC)
+        return int(depth), max(0.0, (datetime.now(UTC) - oldest).total_seconds())
