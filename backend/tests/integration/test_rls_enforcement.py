@@ -60,6 +60,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from app.core.rls_check import tenant_scoped_tables
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
@@ -75,23 +76,12 @@ pytestmark = pytest.mark.skipif(
     reason="set RUN_RLS_TEST=1 and install Docker + testcontainers[postgres] to run",
 )
 
-# Every tenant-scoped table under RLS: the six from c4f8e9a52340 plus the
-# five from the FORCE-and-full-coverage migration. Mirrors the policy-table
-# lists in those two migration files (the unit gate test_rls_coverage.py
-# keeps the lists themselves honest against the ORM metadata).
-ALL_TENANT_RLS_TABLES = [
-    "jobs",
-    "audit_logs",
-    "outbox_events",
-    "job_events",
-    "sagas",
-    "job_triages",
-    "incident_summaries",
-    "service_accounts",
-    "alerts",
-    "idempotency_records",
-    "deploy_markers",
-]
+# Every tenant-scoped table under RLS, from the same derivation the boot
+# probe uses (WO-R2-26) rather than a third hand-maintained copy: the ORM
+# metadata, minus the `users` bootstrap exemption. A new tenant-scoped
+# table joins this list, the unit coverage gate and the runtime probe at
+# once, the moment its model exists.
+ALL_TENANT_RLS_TABLES = sorted(tenant_scoped_tables())
 
 
 @pytest.fixture(scope="module")
@@ -606,3 +596,92 @@ async def test_job_delete_still_nulls_audit_fk_via_ri_bypass(rls_db: RlsDb) -> N
         assert row["job_id"] is None, "FK ON DELETE SET NULL must have nulled job_id"
     finally:
         await sup.close()
+
+
+# ---------------------------------------------------------------------------
+# R2-26 — the boot probe must catch RLS being OFF, not just unFORCEd
+# ---------------------------------------------------------------------------
+
+
+async def _probe_as_app(rls_db: RlsDb, environment: str) -> None:
+    """Run the boot probe over the production (non-owner) role."""
+    from app.config import Settings
+    from app.core.rls_check import assert_rls_posture
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    settings = Settings(
+        _env_file=None, environment=environment, secret_key="x" * 48
+    )
+    engine = create_async_engine(rls_db.app_async_url)
+    try:
+        await assert_rls_posture(
+            async_sessionmaker(engine, expire_on_commit=False), settings
+        )
+    finally:
+        await engine.dispose()
+
+
+async def test_probe_catches_rls_switched_off_on_one_table(
+    rls_db: RlsDb, caplog: Any
+) -> None:
+    """A table with row-level security switched off entirely used to pass
+    as 'rls posture ok'.
+
+    The probe never selected `pg_class.relrowsecurity`, so it could only
+    see the *owner exemption* (FORCE off). For the non-owner production
+    role its inert calculation short-circuited to False no matter what,
+    which means the one runtime tripwire on the security boundary was
+    blind to the most direct way of disabling it. `DISABLE ROW LEVEL
+    SECURITY` on any tenant table and every query against it is
+    unconstrained.
+    """
+    import asyncpg
+
+    sup = await asyncpg.connect(rls_db.superuser_dsn)
+    try:
+        await sup.execute("ALTER TABLE job_events DISABLE ROW LEVEL SECURITY")
+
+        with pytest.raises(RuntimeError, match="row-level security"):
+            await _probe_as_app(rls_db, "production")
+
+        # Outside production the probe must still say so, loudly, and boot.
+        caplog.clear()
+        with caplog.at_level("ERROR"):
+            await _probe_as_app(rls_db, "development")
+        assert any(
+            "job_events" in record.getMessage() for record in caplog.records
+        ), "the posture failure named no table"
+    finally:
+        await sup.execute("ALTER TABLE job_events ENABLE ROW LEVEL SECURITY")
+        await sup.execute("ALTER TABLE job_events FORCE ROW LEVEL SECURITY")
+        await sup.close()
+
+    # Restored: healthy again.
+    await _probe_as_app(rls_db, "production")
+
+
+async def test_probe_catches_a_dropped_tenant_isolation_policy(
+    rls_db: RlsDb,
+) -> None:
+    """RLS ENABLEd + FORCEd with no policy is not a safe posture — it is
+    a different one. Postgres denies by default when no policy matches,
+    so a dropped `tenant_isolation` does not leak rows; it silently
+    breaks the table instead, and either way the posture the probe
+    claims to verify is gone. It must not report ok.
+    """
+    import asyncpg
+
+    sup = await asyncpg.connect(rls_db.superuser_dsn)
+    try:
+        await sup.execute("DROP POLICY tenant_isolation ON sagas")
+
+        with pytest.raises(RuntimeError, match="row-level security"):
+            await _probe_as_app(rls_db, "production")
+    finally:
+        await sup.execute(
+            "CREATE POLICY tenant_isolation ON sagas "
+            "USING (tenant_id = current_setting('app.tenant_id', true)::uuid)"
+        )
+        await sup.close()
+
+    await _probe_as_app(rls_db, "production")
