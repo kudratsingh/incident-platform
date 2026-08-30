@@ -27,7 +27,7 @@ The platform is gaining an agent-facing MCP surface so that Incident Commander, 
 
 Option 2. The MCP server is code in this repo at backend/app/mcp/ and a process of its own in every deployed environment.
 
-* Handlers call service layer functions directly, the same functions the REST endpoints call. No SQL in handlers, no reaching into other routers. Imports are one directional: app.mcp imports app.services, and nothing imports app.mcp. An import-linter rule in CI enforces this.
+* Handlers call service layer functions directly, the same functions the REST endpoints call. No SQL in handlers, no reaching into other routers. Imports are one directional: app.mcp imports app.services, and nothing imports app.mcp. Two import-linter contracts in CI enforce this: a `layers` contract for the direction and a `forbidden` contract for the "nothing imports app.mcp" half. Both live in `[tool.importlinter]` in pyproject.toml. (They were added in WO-R2-62 — this sentence claimed CI enforcement for some time while import-linter was not installed, had no config and ran in no job.)
 * A dedicated ASGI entrypoint at backend/app/mcp/standalone.py builds the MCP app with the shared auth dependencies and DB session wiring. The same Docker image runs it with a different command on its own port with its own health check.
 * Every request authenticates as a machine principal through the same dependency chain as REST. Scopes are enforced per tool. Every call writes an audit record. An unauthenticated tools/list returns 401, and PR-1 carries that test.
 * Clients configure PLATFORM_MCP_URL separately from PLATFORM_REST_URL. In compose, the MCP surface is a second container from the pinned platform image.

@@ -5,7 +5,7 @@
 # does not need the compose stack either. The container targets
 # (up/down/logs/migrate/seed-*/mcp-probe) assume `docker compose up -d`.
 
-.PHONY: help up down logs test test-integration lint typecheck \
+.PHONY: help up down logs test test-integration lint typecheck lint-imports \
         seed-incident-commander seed-eval-fixtures mcp-probe migrate
 
 # Overridable so the target works from a git worktree, which has no .venv of
@@ -54,6 +54,12 @@ lint:  ## Run ruff via the host venv (same invocation as CI)
 
 typecheck:  ## Run mypy strict via the host venv (repo root; mypy_path=backend)
 	.venv/bin/mypy -p app
+
+# Contracts are in [tool.importlinter] in pyproject.toml. PYTHONPATH for the
+# same reason as PYTEST above: from a worktree, the borrowed venv's editable
+# install points at the MAIN tree, so without it this greens the wrong checkout.
+lint-imports:  ## Check the ADR 0006 import contracts (app.mcp -> app.services, one way)
+	PYTHONPATH=$(CURDIR)/backend .venv/bin/lint-imports
 
 migrate:  ## Apply any pending Alembic migrations (idempotent)
 	docker compose exec app alembic -c /app/alembic.ini upgrade head

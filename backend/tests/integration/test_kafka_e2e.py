@@ -29,9 +29,11 @@ import pytest
 import pytest_asyncio
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer, TopicPartition
 from app.config import get_settings
+from app.workers import schema_registry
 from app.workers.kafka_consumer import BaseKafkaConsumer
 from app.workers.schema_registry import SchemaValidationError
 from app.workers.schema_registry import validate as validate_schema
+from jsonschema import Draft202012Validator
 
 try:
     import docker  # noqa: F401
@@ -202,6 +204,17 @@ async def test_handler_failure_seeks_back_and_redelivers(
     past the failure."""
     topic = f"test.redelivery.{uuid.uuid4().hex[:8]}"
     group = f"test-redelivery-{uuid.uuid4().hex[:8]}"
+
+    # An ephemeral topic with no schema file. `validate()` used to no-op for
+    # unregistered topics; since WO-R2-62 it raises, and `_process_one` would
+    # treat both records as poison pills and commit past them — the exact
+    # behaviour this test asserts must NOT happen, so it would pass for the
+    # wrong reason if it were left unregistered rather than failing. What is
+    # under test is redelivery, so register the topic permissively and let the
+    # scripted handler failure be the only failure in play.
+    monkeypatch.setitem(
+        schema_registry._VALIDATORS, topic, Draft202012Validator({"type": "object"})
+    )
 
     producer = AIOKafkaProducer(
         bootstrap_servers=redpanda,

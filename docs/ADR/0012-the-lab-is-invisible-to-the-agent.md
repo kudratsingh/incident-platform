@@ -90,10 +90,21 @@ So the operative constraint is now: **do not cut a tag before the rerun.** Taggi
 > **Follow-up built (2026-08-09).** That registry-level test now exists:
 > `backend/tests/unit/test_lab_invisibility.py` screens every tool whose
 > `required_scope != chaos:invoke` — description, `required_scope`, plus
-> serialized `inputSchema` and `outputSchema` — for a word-boundary match on
-> `chaos|eval|seed|seeded|fixture|harness|scenario`. It keys on `required_scope`
+> serialized `inputSchema` and `outputSchema` — for a match on
+> `chaos|eval|seed|fixture|harness|scenario`. It keys on `required_scope`
 > rather than `is_chaos` so the screen still holds in a chaos-*enabled*
 > environment, where the chaos tools are registered but remain exempt.
+>
+> **Inflection gap closed (WO-R2-62).** The stems were originally anchored
+> with `\b` on both sides, so the screen matched only the exact singular:
+> `fixture` was banned and `fixtures` was not, and the same held for
+> `scenarios`, `evals`, `seeds`, `seeding` and `harnesses`. Those are the
+> forms a description is *more* likely to use, so the gate was letting through
+> most of what it was written to stop. The trailing boundary now tolerates a
+> closed set of inflections (`-s`, `-es`, `-ed`, `-ing`). It stays a fixed set
+> rather than an open `\w*` so that "evaluate" and "evaluation" — which this
+> ADR calls legitimate — keep passing, and so that reading the pattern still
+> tells you which words are banned.
 >
 > **Surface widened (WO-R2-32).** `tools/list` now also advertises
 > `required_scope` and `is_idempotent`. `required_scope` was added to the

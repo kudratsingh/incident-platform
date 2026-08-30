@@ -40,6 +40,7 @@ dev = [
     "pytest-cov>=5.0.0",
     "mypy>=1.10.0",
     "ruff>=0.4.0",
+    "import-linter>=2.0",
     "sqlalchemy[mypy]>=2.0.0",
 
     "types-python-jose>=3.3.4",
@@ -84,3 +85,48 @@ ignore = ["N818", "UP046"]
 
 [tool.coverage.run]
 omit = ["*/tests/*", "*/alembic/*"]
+
+# ADR 0006 says the MCP server is a standalone process that calls the service
+# layer directly, and that an import-linter rule in CI keeps that one
+# directional. Three places in the repo claimed the rule existed (CLAUDE.md,
+# app/mcp/__init__.py, the ADR) while import-linter was not a dependency, had
+# no config, and ran in no job — the invariant held by convention alone, which
+# is exactly the state a "locked in" design decision must not be in.
+#
+# Run by the `Import contracts` step of the `lint` CI job, and locally with
+# `make lint-imports`. Needs `app` importable, which the editable install
+# provides in CI and PYTHONPATH provides from a worktree.
+[tool.importlinter]
+root_package = "app"
+
+# The rule as ADR 0006 states it. A layers contract is directional: a higher
+# layer may import a lower one, never the reverse. Only these two packages are
+# ordered here — `exhaustive` is off deliberately, because the rest of the app
+# has no layering claim to make and pretending otherwise would produce a
+# contract nobody could keep green.
+[[tool.importlinter.contracts]]
+name = "app.mcp depends on app.services, never the reverse"
+type = "layers"
+layers = ["app.mcp", "app.services"]
+
+# The other half of the same ADR sentence: "nothing imports app.mcp". The MCP
+# surface is a leaf, so that collapsing it back into the API (the ADR's own
+# revisit trigger) stays the one-line change the ADR promises rather than an
+# untangling.
+[[tool.importlinter.contracts]]
+name = "Nothing outside app.mcp imports app.mcp"
+type = "forbidden"
+source_modules = [
+    "app.api",
+    "app.core",
+    "app.models",
+    "app.repositories",
+    "app.schemas",
+    "app.services",
+    "app.utils",
+    "app.workers",
+    "app.config",
+    "app.dependencies",
+    "app.main",
+]
+forbidden_modules = ["app.mcp"]
