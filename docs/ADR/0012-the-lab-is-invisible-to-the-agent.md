@@ -89,11 +89,18 @@ So the operative constraint is now: **do not cut a tag before the rerun.** Taggi
 
 > **Follow-up built (2026-08-09).** That registry-level test now exists:
 > `backend/tests/unit/test_lab_invisibility.py` screens every tool whose
-> `required_scope != chaos:invoke` — description plus serialized `inputSchema`
-> and `outputSchema` — for a word-boundary match on
+> `required_scope != chaos:invoke` — description, `required_scope`, plus
+> serialized `inputSchema` and `outputSchema` — for a word-boundary match on
 > `chaos|eval|seed|seeded|fixture|harness|scenario`. It keys on `required_scope`
 > rather than `is_chaos` so the screen still holds in a chaos-*enabled*
 > environment, where the chaos tools are registered but remain exempt.
+>
+> **Surface widened (WO-R2-32).** `tools/list` now also advertises
+> `required_scope` and `is_idempotent`. `required_scope` was added to the
+> screened surface: it is a closed 5-member enum today, but it is a string on
+> the wire, so the screen covers it if that ever becomes free-form.
+> `is_idempotent` is excluded deliberately rather than by oversight — a bool
+> has no vocabulary to leak.
 >
 > It caught six leaks the one-tool regression test could not, all shipped in
 > `v0.4.9`'s 26-tool surface: `list_active_alerts` ("chaos runs"),

@@ -102,7 +102,26 @@ class ToolInfo(BaseModel):
     model. Clients that don't know about it will ignore it; clients that
     do (the commander's contract-snapshot job) can diff the actual
     platform-advertised output shape against their pinned snapshot
-    without treating the local registry as a source-of-truth proxy."""
+    without treating the local registry as a source-of-truth proxy.
+
+    `required_scope` and `is_idempotent` are platform extensions too
+    (WO-R2-32), and they exist for the same reason `outputSchema` does:
+    the commander's contract snapshot can only catch a change it can
+    see. Both were registry-only, so re-scoping a tool or silently
+    dropping its idempotency was invisible to the snapshot diff and
+    could not be caught by the contract test.
+
+    `is_idempotent` is the one that bites. It is what makes a Tier-1
+    recovery re-invoke return the cached response verbatim; if it is
+    dropped, the retry actually re-runs, returns a *different* payload,
+    and verification reads that as a spurious escalation — a failure
+    that surfaces far from its cause. Advertising it makes the drop a
+    snapshot diff instead.
+
+    Both are snake_case, unlike `inputSchema`/`outputSchema`. The
+    camelCase convention belongs to the MCP spec's own fields; these
+    mirror `ToolDefinition`'s attribute names, which is what the
+    commander's `_tool_view` reads on the other side."""
 
     name: str
     description: str
@@ -112,6 +131,22 @@ class ToolInfo(BaseModel):
         description=(
             "JSON Schema of the tool's declared output model. Platform "
             "extension — not in the MCP spec proper."
+        ),
+    )
+    required_scope: str | None = Field(
+        default=None,
+        description=(
+            "Scope a principal must hold to call this tool, as the bare "
+            "scope string (e.g. 'actions:execute'). None for the few "
+            "tools that require no scope. Platform extension."
+        ),
+    )
+    is_idempotent: bool = Field(
+        default=False,
+        description=(
+            "Whether a repeat call with the same idempotency_key returns "
+            "the cached response instead of re-running the tool. "
+            "Platform extension."
         ),
     )
 
