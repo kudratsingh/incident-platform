@@ -8,6 +8,7 @@ import pytest
 from app.models.enums import JobStatus, JobType
 from app.models.job import Job
 from app.schemas import job_events
+from app.utils.post_commit import register_post_commit
 from app.workers import dispatcher
 from redis.exceptions import ConnectionError as RedisConnectionError
 
@@ -1056,6 +1057,55 @@ async def test_promote_dlq_replay_once_acks_the_claim_after_a_fired_replay() -> 
     mock_ack.assert_awaited_once_with(
         redis, tenant_id=tenant_id, principal_id=principal_id, job_id=job_id
     )
+
+
+async def test_promote_dlq_replay_once_drains_post_commit_hooks() -> None:
+    """R2-23 wiring: this loop owns its own `session.begin()`, so it has
+    to drain the post-commit queue itself — the `get_db` dependency that
+    does it for the API and MCP processes never runs here, and a
+    scheduled replay would otherwise leave `GET /jobs/{id}` serving the
+    pre-replay status for a full TTL.
+
+    Pinned explicitly because nothing else would notice it going
+    missing. Every other test around this function patches `replay_job`
+    out, so no hook is ever registered and the drain is a silent no-op —
+    which is exactly how the R2-21 refactor that extracted this function
+    could have dropped the line without a red test.
+    """
+    tenant_id = uuid.uuid4()
+    principal_id = uuid.uuid4()
+    job_id = uuid.uuid4()
+    redis = AsyncMock()
+    session = _make_session()
+    session.info = {}  # the real `AsyncSession.info`; AsyncMock has none
+    factory = MagicMock(return_value=session)
+    drained: list[str] = []
+
+    async def _hook() -> None:
+        drained.append("invalidated")
+
+    async def _replay_registering_a_hook(*_a: object, **_kw: object) -> None:
+        register_post_commit(session, _hook)
+
+    with patch(
+        "app.workers.dispatcher.dlq_replay_scheduler.claim_ready",
+        new=AsyncMock(return_value=[(tenant_id, principal_id, job_id)]),
+    ), \
+         patch(
+             "app.workers.dispatcher.dlq_replay_scheduler.ack_replay",
+             new=AsyncMock(),
+         ), \
+         patch(
+             "app.workers.dispatcher.find_blocking_pause",
+             new=AsyncMock(return_value=None),
+         ), \
+         patch(
+             "app.services.job.JobService.replay_job",
+             new=_replay_registering_a_hook,
+         ):
+        await dispatcher._promote_dlq_replay_once(factory, redis)
+
+    assert drained == ["invalidated"]
 
 
 async def test_promote_dlq_replay_once_acks_a_permanently_failed_replay() -> None:

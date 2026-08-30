@@ -8,6 +8,7 @@ from app.core.exceptions import AuthorizationError, JobError, NotFoundError
 from app.models.enums import JobStatus, JobType, UserRole
 from app.models.job import Job
 from app.services.job import JobService
+from app.utils.post_commit import run_post_commit
 
 
 def _make_job(**kwargs: object) -> Job:
@@ -310,18 +311,39 @@ async def test_replay_invalidates_job_cache() -> None:
     """E2-02: invalidation must live in the SERVICE layer, not only in the
     REST admin wrapper — otherwise the three MCP replay tools and the
     scheduled DLQ-replay loop leave `GET /jobs/{id}` serving stale status
-    for a whole TTL."""
+    for a whole TTL.
+
+    R2-23 moved *when*: the invalidation is queued on the session and
+    fires once the transaction commits, so what the service owes is a
+    registered hook, not an eager Redis call. The ordering itself is
+    asserted against a real engine in
+    `test_replay_lifecycle_reset.py::test_cache_invalidation_happens_after_the_commit`,
+    which is where it can be observed at all — a mocked session has no
+    commit to be before or after.
+    """
     svc, job_repo, _, _ = _make_service()
     tenant_id = uuid.uuid4()
     dead_job = _make_job(status=JobStatus.DEAD_LETTER, tenant_id=tenant_id)
     job_repo.get_for_tenant.return_value = dead_job
     job_repo.update_status.return_value = dead_job
+    job_repo.session.info = {}
 
     await svc.replay_job(dead_job.id, tenant_id, requesting_user_id=uuid.uuid4())
 
-    svc.redis.delete.assert_awaited_once_with(  # type: ignore[attr-defined]
-        f"cache:job:{tenant_id}:{dead_job.id}"
-    )
+    # Nothing eager: the row is still uncommitted at this point, so the
+    # cached value is still what every other connection would read.
+    svc.redis.delete.assert_not_awaited()  # type: ignore[attr-defined]
+    svc.redis.set.assert_not_awaited()  # type: ignore[attr-defined]
+
+    hooks = job_repo.session.info["app.post_commit_hooks"]
+    assert len(hooks) == 1
+
+    await run_post_commit(job_repo.session)
+
+    svc.redis.set.assert_awaited_once()  # type: ignore[attr-defined]
+    args, kwargs = svc.redis.set.await_args  # type: ignore[attr-defined,misc]
+    assert args[0] == f"cache:job:{tenant_id}:{dead_job.id}"
+    assert kwargs["ex"] > 0  # a tombstone with a TTL, not a bare delete
 
 
 # ---------------------------------------------------------------------------

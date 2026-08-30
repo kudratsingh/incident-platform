@@ -91,3 +91,55 @@ async def test_get_discards_a_payload_that_is_not_json() -> None:
     redis = AsyncMock()
     redis.get.return_value = "not json at all"
     assert await JobCache.get(redis, _JOB_ID, _TENANT_ID) is None
+
+
+# ---------------------------------------------------------------------------
+# invalidate — the post-commit tombstone (R2-23)
+# ---------------------------------------------------------------------------
+
+
+async def test_set_refuses_to_overwrite_an_occupied_slot() -> None:
+    """`nx=True` is the whole mechanism behind `invalidate`, so it is
+    pinned on the command rather than only on the behaviour: a reader
+    whose DB read predates a committed replay must not be able to bury
+    the tombstone under the row it is still holding."""
+    redis = AsyncMock()
+    await JobCache.set(redis, _JOB_ID, _TENANT_ID, _JOB_DATA)
+    _args, kwargs = redis.set.await_args  # type: ignore[misc]
+    assert kwargs["nx"] is True
+
+
+async def test_invalidate_parks_a_tombstone_with_a_ttl() -> None:
+    """Not a DELETE: an empty slot is one a stale reader can refill. The
+    tombstone occupies it, and its TTL has to outlive the cache TTL or
+    the slot reopens while that reader is still in flight."""
+    from app.utils.cache import _JOB_TTL
+
+    redis = AsyncMock()
+    await JobCache.invalidate(redis, _JOB_ID, _TENANT_ID)
+
+    redis.delete.assert_not_awaited()
+    args, kwargs = redis.set.await_args  # type: ignore[misc]
+    assert args[0] == f"cache:job:{_TENANT_ID}:{_JOB_ID}"
+    assert kwargs["ex"] > _JOB_TTL
+
+
+async def test_get_reads_a_tombstoned_slot_as_a_miss() -> None:
+    """And quietly — a tombstone is an expected state, not the corrupt
+    payload the R2-20 warning path is about."""
+    from app.utils.cache import _INVALIDATED
+
+    redis = AsyncMock()
+    redis.get.return_value = _INVALIDATED
+    assert await JobCache.get(redis, _JOB_ID, _TENANT_ID) is None
+
+    redis.get.return_value = _INVALIDATED.encode()
+    assert await JobCache.get(redis, _JOB_ID, _TENANT_ID) is None
+
+
+async def test_invalidate_silently_ignores_redis_error() -> None:
+    """It runs after the commit — the write is durable whatever Redis
+    does, and the cost of a lost invalidation is one TTL of staleness."""
+    redis = AsyncMock()
+    redis.set.side_effect = ConnectionError("Redis down")
+    await JobCache.invalidate(redis, _JOB_ID, _TENANT_ID)  # should not raise

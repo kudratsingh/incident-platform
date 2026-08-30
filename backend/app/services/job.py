@@ -1,4 +1,5 @@
 import uuid
+from functools import partial
 from typing import Any
 
 from app.config import get_settings
@@ -13,6 +14,7 @@ from app.repositories.job_dependency import JobDependencyRepository
 from app.repositories.outbox import OutboxRepository
 from app.utils.cache import JobCache
 from app.utils.dag_pause import find_blocking_pause
+from app.utils.post_commit import register_post_commit
 from redis.asyncio import Redis
 from sqlalchemy.exc import IntegrityError
 
@@ -303,10 +305,20 @@ class JobService:
                     "replay refused while the pause holds"
                 )
 
+        # Snapshot everything the audit trail needs BEFORE the write
+        # (R2-23). `update_status` writes through the same identity-mapped
+        # `job` object this method is holding, so every read of `job.*`
+        # below the next statement returns the post-replay value. The
+        # `previous_status` read used to sit after it and therefore
+        # recorded "pending" — the status replayed *to* — on every replay
+        # the platform has ever done, and nothing else in the system
+        # remembers what the job was replayed *from*.
+        previous_retry_count = job.retry_count
+        previous_status = job.status
+
         # Reset retry_count so a DLQ replay actually gets fresh retries.
         # Without this, a job at retry_count==max_retries would dead-letter
         # again on the first failure of its replayed run.
-        previous_retry_count = job.retry_count
         updated = await self.job_repo.update_status(
             job_id,
             JobStatus.PENDING,
@@ -318,15 +330,19 @@ class JobService:
                 # fresh lifecycle, and a stale value would badge the row for
                 # a dead-letter that this run has not had (F2-16).
                 "dead_lettered_by": None,
+                # And the remediation category with it (R2-23). It is scoped
+                # to one dead-letter episode exactly as `dead_lettered_by`
+                # is, but nothing in production could ever clear it — so one
+                # classification governed how the agent routed every later,
+                # unrelated dead-letter of this job. That also keeps the
+                # `human_required` fence honest in both directions: the
+                # blind bulk replay skips the category (R2-22), and this is
+                # what stops that skip from becoming permanent. A job that
+                # dead-letters again arrives uncategorised, and triage (or a
+                # human) classifies the new episode on its own evidence.
+                "remediation_hint": None,
             },
         )
-        # Invalidate here, in the service, not in the REST wrapper (E2-02):
-        # this is the single choke point every replay path goes through —
-        # the three MCP replay tools, the scheduled DLQ-replay loop in
-        # workers/dispatcher.py, and POST /admin/jobs/{id}/replay. Doing it
-        # only in the REST wrapper left GET /jobs/{id} serving the pre-replay
-        # status for a whole TTL after any agent-driven replay.
-        await JobCache.delete(self.redis, job_id, tenant_id)
         audit_user_id: uuid.UUID | None
         if principal_type == "user":
             audit_user_id = requesting_user_id
@@ -345,7 +361,7 @@ class JobService:
             resource_id=str(job_id),
             request_id=request_id_var.get("") or None,
             extra_data={
-                "previous_status": job.status,
+                "previous_status": previous_status,
                 "previous_retry_count": previous_retry_count,
             },
         )
@@ -365,17 +381,40 @@ class JobService:
                 "trace_id": job.trace_id,
             },
         )
+        # Same snapshots as the audit row, for the same reason: both fields
+        # read post-write here too, so the log line said `previous_status:
+        # pending, retry_count: 0` for every replay ever logged — the one
+        # place an operator looks first when the audit row is not to hand.
         logger.info(
             "job.replayed",
             extra={
                 "job_id": str(job_id),
-                "previous_status": job.status,
-                "retry_count": job.retry_count,
+                "previous_status": previous_status,
+                "previous_retry_count": previous_retry_count,
                 "replayed_by": str(
                     principal_id if principal_id is not None else requesting_user_id
                 ),
                 "principal_type": principal_type,
             },
+        )
+        # Invalidate here, in the service, not in the REST wrapper (E2-02):
+        # this is the single choke point every replay path goes through —
+        # the three MCP replay tools, the scheduled DLQ-replay loop in
+        # workers/dispatcher.py, and POST /admin/jobs/{id}/replay. Doing it
+        # only in the REST wrapper left GET /jobs/{id} serving the pre-replay
+        # status for a whole TTL after any agent-driven replay.
+        #
+        # Deferred to post-commit (R2-23) rather than run inline: until this
+        # transaction commits the cached row is still what every other
+        # connection reads, so evicting it now would only invite a
+        # concurrent reader to miss, read the *unchanged* row from
+        # Postgres, and cache it again — landing the stale status behind
+        # our own commit. `JobCache.invalidate` closes the slot as well as
+        # clearing it, which is what stops the reader that started before
+        # the commit from winning the write after it.
+        register_post_commit(
+            self.job_repo.session,
+            partial(JobCache.invalidate, self.redis, job_id, tenant_id),
         )
         assert updated is not None
         return updated

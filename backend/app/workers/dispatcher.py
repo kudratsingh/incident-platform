@@ -42,6 +42,7 @@ from app.repositories.job_dependency import JobDependencyRepository
 from app.repositories.outbox import OutboxRepository
 from app.services import retry_policy
 from app.utils.dag_pause import find_blocking_pause
+from app.utils.post_commit import run_post_commit
 from app.workers import (
     async_tasks,
     cpu_processors,
@@ -1789,6 +1790,16 @@ async def _promote_dlq_replay_once(
                             principal_type="service_account",
                             principal_id=principal_id,
                         )
+                # This loop owns its own transaction boundary, so it
+                # drains the post-commit queue itself — the `get_db`
+                # dependency does it for the API and MCP processes but
+                # never runs here (R2-23). Inside the session block and
+                # before the ack: the commit has landed, so the cache
+                # invalidation is safe to publish, and doing it here
+                # keeps it on the same success path the ack acknowledges.
+                # `run_post_commit` cannot raise, so it cannot turn a
+                # committed replay into a logged "fire failed".
+                await run_post_commit(session)
             if held_by is not None:
                 await dlq_replay_scheduler.schedule_replay(
                     redis,
