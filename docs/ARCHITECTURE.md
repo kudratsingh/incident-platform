@@ -383,7 +383,7 @@ accordingly:
 | `ReadModelProjector` | All lifecycle topics | Redis sets | Per-message — drops events without `tenant_id` |
 | `DependencyResolver` | `job.completed` | `jobs` updates + outbox rows | Per-promotion — failure to promote one child doesn't affect siblings |
 | `SagaCoordinator` | `job.completed`, `job.dlq` | `sagas` updates + outbox rows | Per-saga — one saga's failure doesn't affect others |
-| `LlmTriageConsumer` | `job.dlq` | `job_triages` rows | Per-job — LLM failure is logged and skipped |
+| `LlmTriageConsumer` | `job.dlq` | `job_triages` rows | Per-job — an LLM failure is logged, no row is written, and the offset is committed ([ADR 0005](ADR/0005-llm-features-fail-open.md)). Only 429/5xx re-raise for redelivery; anything deterministic would otherwise loop on a billed call |
 | `_outbox_relay_loop` | `outbox_events` table | Kafka via `publish_raw` | Per-row — schema failures mark row failed, others retry next tick. Leader-gated: only one process relays at a time ([ADR 0020](ADR/0020-outbox-relay-single-writer.md)) |
 | `_promote_delayed_loop` | Redis `delayed_queue` zset | outbox row | Per-item — a failed job is re-pushed onto the zset; the rest of the batch still promotes |
 | `_requeue_stale_pending_loop` | `jobs` rows `PENDING` for >300s with no `delayed_queue` timer | outbox row | Per-tick — exception logged, loop continues |

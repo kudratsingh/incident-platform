@@ -4,14 +4,25 @@ LLM triage consumer.
 Subscribes to `job.dlq` and asks Claude to analyse each dead-lettered job.
 The result is persisted to `job_triages` (one row per job_id, unique).
 
-Failure modes:
+Failure modes (ADR 0005 — every LLM feature fails open):
   - LLM_TRIAGE_ENABLED=false → log + return (no-op). Tests run here.
-  - No ANTHROPIC_API_KEY → Anthropic SDK raises at first call; we let the
-    base-class `handle_message` raise so the offset isn't committed and the
-    message is re-delivered after fixing the credential.
-  - Transient Anthropic API errors → same: raise, don't commit.
-  - Schema validation failure on the returned payload → also raises out of
-    `messages.parse()`; same retry behavior.
+  - 429 / 5xx from Anthropic → raise, so the offset isn't committed and the
+    message is redelivered once the upstream recovers. This is the ONE case
+    that blocks, because the same request later is likely to succeed.
+  - Anything else — a refusal, a max_tokens truncation, a Pydantic
+    validation failure, a timeout, a 4xx (bad model id, oversized payload,
+    revoked key), a missing ANTHROPIC_API_KEY → log a WARNING, write no
+    triage row, and COMMIT the offset. The admin still sees the job in the
+    DLQ with its raw `error_message`; that is the documented fallback.
+
+Why the fallback is not "retry until it works": the base consumer seeks back
+to the failed offset and refetches on the next poll, with no attempt counter
+and no DLQ-of-the-DLQ anywhere in the class. A deterministic failure
+therefore redelivers about once a second forever, and every one of those
+deliveries is a full, billed model call with adaptive thinking. One poison
+message would head-of-line-block its `job.dlq` partition and spend without
+bound — which is exactly what ADR 0005 rejects when it rules out
+block-and-retry.
 
 Idempotency: handled at the repository layer via UNIQUE (job_id). Redelivery
 of the same DLQ event will overwrite the row with the latest analysis, which
@@ -30,6 +41,17 @@ from app.workers.kafka_consumer import BaseKafkaConsumer
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 logger = get_logger(__name__)
+
+
+def _is_transient(status_code: int) -> bool:
+    """Is this status worth redelivering the message for?
+
+    429 and 5xx are the upstream saying "not right now" — the same request
+    later is likely to succeed. Every other non-2xx is a property of the
+    request itself, and `APIStatusError` covers those too: the previous code
+    re-raised on all of them while its comment claimed "5xx / 529".
+    """
+    return status_code == 429 or status_code >= 500
 
 
 class LlmTriageConsumer(BaseKafkaConsumer):
@@ -91,12 +113,47 @@ class LlmTriageConsumer(BaseKafkaConsumer):
         except triage_service.TriageDisabledError:
             return
         except anthropic.APIStatusError as exc:
-            # 5xx / 529 — let the consumer commit fail so we re-deliver later.
+            if _is_transient(exc.status_code):
+                # The upstream is briefly unavailable, not this message being
+                # bad. Raising means no commit, so Kafka redelivers once the
+                # API recovers — the one carve-out from ADR 0005's fail-open
+                # rule, and the only one.
+                logger.warning(
+                    "triage Anthropic API error — will retry",
+                    extra={"job_id": str(job_id), "status": exc.status_code},
+                )
+                raise
+            # A 4xx is deterministic: a bad model id, an oversized payload, a
+            # revoked key. Redelivering re-sends the identical request and
+            # re-bills the identical failure, forever.
             logger.warning(
-                "triage Anthropic API error — will retry",
-                extra={"job_id": str(job_id), "status": exc.status_code},
+                "triage failed — no triage row written",
+                extra={
+                    "job_id": str(job_id),
+                    "status": exc.status_code,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc)[:400],
+                },
             )
-            raise
+            return
+        except Exception as exc:
+            # ADR 0005's stated fallback for DLQ triage: write no triage row
+            # and let the admin work from the job's raw error_message — the
+            # pre-Phase-10 experience. Returning commits the offset, which is
+            # the whole point: a refusal, a max_tokens truncation, a Pydantic
+            # validation failure or a timeout is a property of THIS message,
+            # and re-delivering it just repeats a billed call at ~1/s forever.
+            # `CancelledError` is a BaseException and is deliberately not
+            # caught here — worker shutdown must still unwind.
+            logger.warning(
+                "triage failed — no triage row written",
+                extra={
+                    "job_id": str(job_id),
+                    "error_type": type(exc).__name__,
+                    "error": str(exc)[:400],
+                },
+            )
+            return
 
         async with self.session_factory() as session:
             async with session.begin():

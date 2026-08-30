@@ -23,6 +23,7 @@ Implementation mirrors the other LLM services in this codebase:
     instructions cache across digests.
 """
 
+import asyncio
 import json
 import uuid
 from collections import Counter
@@ -154,8 +155,9 @@ async def generate_digest(
     fingerprint+truncate them internally so the model sees only the
     top recurring patterns.
 
-    Raises DigestDisabledError when the feature is off, anthropic /
-    network exceptions on real API failures.
+    Raises DigestDisabledError when the feature is off, anthropic / network
+    exceptions on real API failures, and asyncio.TimeoutError when the call
+    exceeds `llm_digest_timeout_seconds` (ADR 0005).
     """
     settings = get_settings()
     if not settings.llm_digest_enabled:
@@ -174,28 +176,33 @@ async def generate_digest(
         "top_errors": _top_errors(error_messages),
     }
 
-    response = await client.messages.parse(
-        model=settings.llm_digest_model,
-        max_tokens=2048,
-        thinking={"type": "adaptive"},
-        system=[
-            {
-                "type": "text",
-                "text": _SYSTEM_PROMPT,
-                "cache_control": {"type": "ephemeral"},
-            }
-        ],
-        messages=[
-            {
-                "role": "user",
-                "content": (
-                    "Write a digest for this window. Respond with an "
-                    "IncidentDigest.\n\n"
-                    f"```json\n{json.dumps(aggregates, indent=2, default=str)}\n```"
-                ),
-            }
-        ],
-        output_format=IncidentDigest,
+    async def _call() -> Any:
+        return await client.messages.parse(
+            model=settings.llm_digest_model,
+            max_tokens=2048,
+            thinking={"type": "adaptive"},
+            system=[
+                {
+                    "type": "text",
+                    "text": _SYSTEM_PROMPT,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+            messages=[
+                {
+                    "role": "user",
+                    "content": (
+                        "Write a digest for this window. Respond with an "
+                        "IncidentDigest.\n\n"
+                        f"```json\n{json.dumps(aggregates, indent=2, default=str)}\n```"
+                    ),
+                }
+            ],
+            output_format=IncidentDigest,
+        )
+
+    response = await asyncio.wait_for(
+        _call(), timeout=settings.llm_digest_timeout_seconds
     )
 
     digest = response.parsed_output
@@ -206,42 +213,43 @@ async def generate_digest(
     return digest, extract_usage(response), settings.llm_digest_model
 
 
-async def run_digest_for_tenant(
+async def collect_window_stats(
     session: AsyncSession,
     tenant: Tenant,
     window_start: datetime,
     window_end: datetime,
-) -> DigestRow | None:
-    """Generate one digest for one tenant and persist it.
+) -> tuple[dict[str, int], dict[str, int], list[str]] | None:
+    """The read half: aggregate the window. None when there is nothing to
+    summarize (no jobs), which is the caller's signal to skip the LLM call.
 
-    Returns the persisted row, or None if there was nothing to summarize
-    (empty window — no jobs). Caller manages the transaction boundary
-    and only commits when this returns non-None.
-
-    Raises DigestDisabledError when the feature is off; lets anthropic
-    exceptions propagate so the caller can decide whether to retry.
+    Split out of `run_digest_for_tenant` so the worker can finish this
+    transaction *before* the Anthropic round-trip — see
+    `run_digest_for_all_active_tenants`.
     """
-    repo = DigestRepository(session)
-    by_status, failed_by_type, errors = await repo.window_stats(
+    by_status, failed_by_type, errors = await DigestRepository(session).window_stats(
         tenant.id, window_start, window_end
     )
-    total_jobs = sum(by_status.values())
-    if total_jobs == 0:
+    if sum(by_status.values()) == 0:
         logger.info(
             "digest skipped — empty window",
             extra={"tenant_id": str(tenant.id), "tenant_slug": tenant.slug},
         )
         return None
+    return by_status, failed_by_type, errors
 
-    digest_obj, usage, model = await generate_digest(
-        tenant_slug=tenant.slug,
-        window_start=window_start,
-        window_end=window_end,
-        by_status_count=by_status,
-        by_type_failed_count=failed_by_type,
-        error_messages=errors,
-    )
 
+async def persist_digest(
+    session: AsyncSession,
+    tenant: Tenant,
+    window_start: datetime,
+    window_end: datetime,
+    by_status: dict[str, int],
+    failed_by_type: dict[str, int],
+    digest_obj: IncidentDigest,
+    usage: dict[str, Any],
+    model: str,
+) -> DigestRow:
+    """The write half. Caller owns the transaction boundary."""
     row = DigestRow(
         id=uuid.uuid4(),
         tenant_id=tenant.id,
@@ -265,12 +273,62 @@ async def run_digest_for_tenant(
             "tenant_id": str(tenant.id),
             "tenant_slug": tenant.slug,
             "window_start": window_start.isoformat(),
-            "total_jobs": total_jobs,
+            "total_jobs": sum(by_status.values()),
             "usage_input_tokens": usage["input_tokens"],
             "usage_cache_read": usage["cache_read_input_tokens"],
         },
     )
     return row
+
+
+async def run_digest_for_tenant(
+    session: AsyncSession,
+    tenant: Tenant,
+    window_start: datetime,
+    window_end: datetime,
+) -> DigestRow | None:
+    """Generate one digest for one tenant and persist it, on one session.
+
+    Returns the persisted row, or None if there was nothing to summarize
+    (empty window — no jobs). Caller manages the transaction boundary and
+    only commits when this returns non-None.
+
+    Raises DigestDisabledError when the feature is off; lets anthropic
+    exceptions and asyncio.TimeoutError propagate so the caller can decide
+    whether to retry.
+
+    NOTE: this composes all three steps on the caller's session, so the LLM
+    round-trip happens inside whatever transaction the caller holds. That is
+    acceptable for the admin route (`POST /admin/digests`), where a request is
+    already holding its own connection for its duration and the deadline above
+    bounds it — but it is NOT how the worker should do it. The digest loop
+    calls the three parts separately so it can close the read transaction
+    first; see `run_digest_for_all_active_tenants`.
+    """
+    stats = await collect_window_stats(session, tenant, window_start, window_end)
+    if stats is None:
+        return None
+    by_status, failed_by_type, errors = stats
+
+    digest_obj, usage, model = await generate_digest(
+        tenant_slug=tenant.slug,
+        window_start=window_start,
+        window_end=window_end,
+        by_status_count=by_status,
+        by_type_failed_count=failed_by_type,
+        error_messages=errors,
+    )
+    return await persist_digest(
+        session,
+        tenant,
+        window_start,
+        window_end,
+        by_status,
+        failed_by_type,
+        digest_obj,
+        usage,
+        model,
+    )
 
 
 async def run_digest_for_all_active_tenants(
@@ -291,13 +349,45 @@ async def run_digest_for_all_active_tenants(
 
     for tenant in active:
         try:
+            # Three phases, deliberately not one transaction. The Anthropic
+            # round-trip sits BETWEEN them, holding no connection: the old
+            # shape opened `session.begin()`, issued the aggregate query, and
+            # then awaited the API inside that transaction — pinning a pooled
+            # connection and an open read-write transaction, per tenant,
+            # serially, for as long as the API took. The deadline added above
+            # bounds that; not holding the transaction removes it.
             async with session_factory() as session:
                 async with session.begin():
-                    row = await run_digest_for_tenant(
+                    stats = await collect_window_stats(
                         session, tenant, window_start, window_end
                     )
-            if row is not None:
-                written += 1
+            if stats is None:
+                continue
+            by_status, failed_by_type, errors = stats
+
+            digest_obj, usage, model = await generate_digest(
+                tenant_slug=tenant.slug,
+                window_start=window_start,
+                window_end=window_end,
+                by_status_count=by_status,
+                by_type_failed_count=failed_by_type,
+                error_messages=errors,
+            )
+
+            async with session_factory() as session:
+                async with session.begin():
+                    await persist_digest(
+                        session,
+                        tenant,
+                        window_start,
+                        window_end,
+                        by_status,
+                        failed_by_type,
+                        digest_obj,
+                        usage,
+                        model,
+                    )
+            written += 1
         except DigestDisabledError:
             # Feature got toggled off mid-run; stop early.
             logger.info("digest run aborted — feature disabled")

@@ -19,6 +19,7 @@ Implementation notes
   dominated by the (small) per-job context.
 """
 
+import asyncio
 import json
 from typing import Any, Literal
 
@@ -149,8 +150,12 @@ async def triage_failure(
 ) -> tuple[TriageAnalysis, dict[str, Any], str]:
     """Call Claude and return (analysis, usage_dict, model_id).
 
-    Raises TriageDisabledError when triage is off, or anthropic exceptions
-    on real API failures so the caller can decide whether to retry or skip.
+    Raises TriageDisabledError when triage is off, anthropic / network
+    exceptions on real API failures, and asyncio.TimeoutError when the call
+    exceeds `llm_triage_timeout_seconds` (ADR 0005). As in `retry_policy`,
+    this service does not decide what a failure means — the caller owns the
+    fallback, because "no triage row" and "retry later" are the consumer's
+    call to make, not the prompt's.
     """
     settings = get_settings()
     if not settings.llm_triage_enabled:
@@ -171,28 +176,33 @@ async def triage_failure(
 
     # System prompt as a list so we can attach cache_control to the last
     # block — caches the taxonomy + platform description across all triages.
-    response = await client.messages.parse(
-        model=settings.llm_triage_model,
-        max_tokens=2000,
-        thinking={"type": "adaptive"},
-        system=[
-            {
-                "type": "text",
-                "text": _SYSTEM_PROMPT,
-                "cache_control": {"type": "ephemeral"},
-            }
-        ],
-        messages=[
-            {
-                "role": "user",
-                "content": (
-                    "A job has dead-lettered. Analyse it and respond with a "
-                    "TriageAnalysis.\n\n"
-                    f"```json\n{json.dumps(user_payload, indent=2, default=str)}\n```"
-                ),
-            }
-        ],
-        output_format=TriageAnalysis,
+    async def _call() -> Any:
+        return await client.messages.parse(
+            model=settings.llm_triage_model,
+            max_tokens=2000,
+            thinking={"type": "adaptive"},
+            system=[
+                {
+                    "type": "text",
+                    "text": _SYSTEM_PROMPT,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+            messages=[
+                {
+                    "role": "user",
+                    "content": (
+                        "A job has dead-lettered. Analyse it and respond with a "
+                        "TriageAnalysis.\n\n"
+                        f"```json\n{json.dumps(user_payload, indent=2, default=str)}\n```"
+                    ),
+                }
+            ],
+            output_format=TriageAnalysis,
+        )
+
+    response = await asyncio.wait_for(
+        _call(), timeout=settings.llm_triage_timeout_seconds
     )
 
     analysis = response.parsed_output

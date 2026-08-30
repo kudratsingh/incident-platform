@@ -181,6 +181,13 @@ class Settings(BaseSettings):
     # Anthropic API key (read from ANTHROPIC_API_KEY env var by the SDK).
     llm_triage_enabled: bool = False
     llm_triage_model: str = "claude-opus-4-7"
+    # Hard wall-clock limit on the LLM call, per ADR 0005 ("times out —
+    # configurable per feature; defaults to 10s"). This bounds the whole call,
+    # SDK-internal retries included: the Anthropic client's own `timeout` is
+    # per attempt and is retried `max_retries` times, so a 10s client timeout
+    # is really up to 30s of wall clock. Only an outer deadline is the
+    # deadline the ADR promises.
+    llm_triage_timeout_seconds: float = 10.0
 
     # LLM-guided retry policy. When enabled, after the first deterministic
     # retry the worker asks Claude whether to keep retrying (with what
@@ -201,12 +208,19 @@ class Settings(BaseSettings):
     # default. When disabled, the API returns 503.
     llm_nl_query_enabled: bool = False
     llm_nl_query_model: str = "claude-opus-4-7"
+    # See `llm_triage_timeout_seconds`. A user is waiting on this one, so the
+    # deadline is also the worst case for the request's latency.
+    llm_nl_query_timeout_seconds: float = 10.0
 
     # Periodic incident summaries. The digest worker runs every
     # `llm_digest_interval_hours` and writes one row per active tenant
     # summarising the trailing `llm_digest_window_hours` of failures.
     llm_digest_enabled: bool = False
     llm_digest_model: str = "claude-opus-4-7"
+    # See `llm_triage_timeout_seconds`. The digest loop runs tenants serially,
+    # so this is also the per-tenant ceiling on how long one slow API call can
+    # delay every tenant behind it.
+    llm_digest_timeout_seconds: float = 10.0
     llm_digest_interval_hours: int = 24
     llm_digest_window_hours: int = 24
     # Cap the number of error_message rows we fingerprint per tenant; the
