@@ -340,12 +340,11 @@ async def test_admin_slos_reflects_dead_letter_failures(
 
 async def test_admin_triage_returns_404_when_missing(
     client: AsyncClient,
+    db_session,  # type: ignore[no-untyped-def]
     admin_user,  # type: ignore[no-untyped-def]
     admin_headers: dict[str, str],
 ) -> None:
-    """No triage row → 404, not an empty success."""
-    import uuid as _uuid
-
+    """A dead-lettered job with no triage row → 404, not an empty success."""
     from app.models.enums import JobStatus, JobType
     from app.models.job import Job
 
@@ -359,20 +358,20 @@ async def test_admin_triage_returns_404_when_missing(
         priority=0,
         error_message="boom",
     )
+    # The same session the `client` fixture overrides get_db with, taken
+    # from the fixture rather than by re-driving the override generator
+    # through `client._transport.app` — that reached into httpx internals
+    # and left the async generator unclosed.
+    db_session.add(job)
+    await db_session.flush()
+    await db_session.refresh(job)
 
-    # Need a real db_session to insert — get one via the override.
-    from app.dependencies import get_db
-
-    async for db in client._transport.app.dependency_overrides[get_db]():  # type: ignore[attr-defined]
-        db.add(job)
-        await db.flush()
-        await db.refresh(job)
-        break
-    _ = _uuid  # silence unused import for the case where no insert succeeded
     resp = await client.get(
         f"/api/v1/admin/jobs/{job.id}/triage", headers=admin_headers
     )
     assert resp.status_code == 404
+    # 404 for the *stated* reason: the job resolves, its triage row does not.
+    assert resp.json()["error_code"] == "not_found"
 
 
 async def test_admin_triage_returns_row_when_present(

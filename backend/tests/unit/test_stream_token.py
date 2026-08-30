@@ -32,9 +32,19 @@ def test_stream_token_claims_bind_job_and_tenant() -> None:
 
 
 def test_stream_token_ttl_is_60_seconds() -> None:
-    """The token must die fast — it rides in a URL. 60s, not minutes/days."""
+    """The token must die fast — it rides in a URL. 60s, not minutes/days.
+
+    The mint clock is frozen rather than read twice. `_make_token` calls
+    `datetime.now(UTC)` separately for `exp` and for `iat`, and JWT
+    truncates both to whole seconds — so across a tick boundary the live
+    difference is 59, and the assertion below was flaky by one second.
+    Freezing makes the window exact, which is the property being pinned.
+    """
     assert STREAM_TOKEN_TTL_SECONDS == 60
-    token = create_stream_token(JOB_ID, TENANT_ID)
+    frozen = datetime.now(UTC)
+    with mock.patch("app.core.security.datetime") as fake_dt:
+        fake_dt.now.return_value = frozen
+        token = create_stream_token(JOB_ID, TENANT_ID)
     payload = decode_token(token, expected_type="stream")
     assert payload["exp"] - payload["iat"] == STREAM_TOKEN_TTL_SECONDS
 

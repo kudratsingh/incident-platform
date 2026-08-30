@@ -44,11 +44,19 @@ def test_missing_required_field_raises() -> None:
 
 
 def test_invalid_uuid_format_raises() -> None:
-    with pytest.raises(SchemaValidationError):
+    """Every required field is present except that `job_id` is malformed.
+
+    `tenant_id` is supplied deliberately: without it the payload is
+    missing a required field, so the call raises whether or not the
+    `format: uuid` check still exists, and deleting that check from
+    job_submitted.schema.json leaves this test green.
+    """
+    with pytest.raises(SchemaValidationError, match="not-a-uuid"):
         validate_schema(
             "job.submitted",
             {
                 "event": "job.submitted",
+                "tenant_id": str(uuid.uuid4()),
                 "job_id": "not-a-uuid",
                 "user_id": str(uuid.uuid4()),
                 "job_type": "csv_upload",
@@ -57,11 +65,13 @@ def test_invalid_uuid_format_raises() -> None:
 
 
 def test_wrong_event_const_raises() -> None:
-    with pytest.raises(SchemaValidationError):
+    """Same shape as the UUID case: complete payload, wrong `event` const."""
+    with pytest.raises(SchemaValidationError, match="'job.submitted' was expected"):
         validate_schema(
             "job.submitted",
             {
                 "event": "wrong",
+                "tenant_id": str(uuid.uuid4()),
                 "job_id": str(uuid.uuid4()),
                 "user_id": str(uuid.uuid4()),
                 "job_type": "csv_upload",
@@ -70,11 +80,18 @@ def test_wrong_event_const_raises() -> None:
 
 
 def test_progress_percent_out_of_range_raises() -> None:
-    with pytest.raises(SchemaValidationError):
+    """Complete payload, `percent` past the 0-100 bound.
+
+    `tenant_id` is required by job_progress.schema.json too — omitting it
+    made this raise for the missing field, so removing `maximum: 100`
+    left the test green.
+    """
+    with pytest.raises(SchemaValidationError, match="greater than the maximum"):
         validate_schema(
             "job.progress",
             {
                 "event": "job.progress",
+                "tenant_id": str(uuid.uuid4()),
                 "job_id": str(uuid.uuid4()),
                 "user_id": str(uuid.uuid4()),
                 "status": "running",

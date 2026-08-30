@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+import sys
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -39,6 +40,15 @@ from app.repositories.service_account import (
 from app.services.service_account import ServiceAccountService
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
+
+# `scripts/` is not an installed package, so the repo root goes on sys.path
+# for `test_seed_pins_manifest_shape` below. Guarded and module-level, the
+# same shape as tests/unit/test_eval_seed_boot.py — the previous version
+# ran an unguarded `sys.path.insert` inside the test body, appending a
+# duplicate entry every time the test ran and never removing it.
+_REPO_ROOT = str(pathlib.Path(__file__).resolve().parents[3])
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 
 class _RedisStub:
@@ -717,14 +727,20 @@ async def test_get_deploy_history_falls_back_to_env_on_db_error(
     assert "deploy_markers query failed" in entry["notes"]
 
 
-async def test_seed_pins_manifest_shape() -> None:
-    """The pin manifest that the seed script writes to
-    `/app/eval-fixtures-pins.json` — scenarios pin against these UUIDs,
-    so the shape needs to be stable."""
-    import sys
+def test_seed_pins_manifest_shape() -> None:
+    """The pin manifest the seed script writes — scenarios pin against
+    these UUIDs, so the shape needs to be stable.
 
-    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[3]))
-    from scripts.seed_eval_fixtures import collect_pins  # type: ignore
+    The location is `default_pins_path()`: `EVAL_PINS_PATH` if set, else
+    `<tempdir>/eval-fixtures-pins.json`. It is deliberately *not*
+    `/app/eval-fixtures-pins.json`, which this docstring used to name —
+    that path is root-owned in the shipped image and every boot died with
+    EACCES writing it. `backend/tests/unit/test_eval_seed_boot.py` owns
+    that rule; asserted here too so the two cannot drift apart silently.
+    """
+    from scripts.seed_eval_fixtures import collect_pins, default_pins_path
+
+    assert not default_pins_path().startswith("/app/")
 
     manifest = collect_pins()
     assert "seed_user_id" in manifest
