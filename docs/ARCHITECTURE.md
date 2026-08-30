@@ -391,9 +391,9 @@ accordingly:
 | `_requeue_stale_pending_loop` | `jobs` rows `PENDING` for >300s with no `delayed_queue` timer and no `requeued_at` inside the same window ([ADR 0023](ADR/0023-dispatcher-sweep-ownership.md)) | outbox row + `requeued_at` stamp, one transaction | Per-tick — exception logged, loop continues |
 | `_stale_running_sweep_loop` | `jobs` rows `RUNNING` for longer than `stale_running_threshold_seconds` whose lease (`heartbeat_at`) has lapsed, also skipping `dispatcher.in_flight_job_ids` until they are a further `_IN_FLIGHT_EXCLUSION_GRACE_SECONDS` stale ([ADR 0021](ADR/0021-bounded-execution-and-non-blocking-dispatch.md), [ADR 0023](ADR/0023-dispatcher-sweep-ownership.md)) | `dead_letter` status + `job.dead_letter` audit row + `job.dlq` outbox row ([ADR 0019](ADR/0019-stale-running-recovery-sweep.md)) | Per-job — each recovery is its own transaction and compare-and-sets on the observed `started_at`/`heartbeat_at`; one failure or refusal leaves that row `RUNNING` for the next pass |
 | `_renew_running_leases_loop` | `dispatcher.in_flight_job_ids` | `heartbeat_at` on this worker's `RUNNING` rows, every 20s, until the job is `stale_running_threshold_seconds + _IN_FLIGHT_EXCLUSION_GRACE_SECONDS` old ([ADR 0023](ADR/0023-dispatcher-sweep-ownership.md)) | Per-tick — exception logged; the TTL spans six intervals, and a sustained failure degrades to age-plus-local-set, not to anything worse |
-| `_slo_evaluation_loop` | `jobs` aggregates via `services/slo.compute_all` | `alerts` row + signed webhook on a ≥14.4× burn, de-duplicated per window by `alerts.dedup_key` (WO-R2-29) | Per-tick — exception logged, loop continues; each objective's alert is its own transaction, so one failing does not roll back the other |
+| `_slo_evaluation_loop` | `jobs` aggregates via `services/slo.compute_all` | `alerts` row, then a signed webhook once it commits (WO-R2-70), de-duplicated per window by `alerts.dedup_key` (WO-R2-29) | Per-tick — exception logged, loop continues; each objective's alert is its own transaction, so one failing does not roll back the other |
 | `_metrics_loop` | Dispatcher consumer + Redis | CloudWatch gauges | Per-tick — exception logged |
-| `_digest_loop` | DB + Anthropic API | `incident_summaries` rows | Per-tenant — one tenant's API failure doesn't stop the batch |
+| `_digest_loop` | DB + Anthropic API | `incident_summaries` rows | Per-tenant — one tenant's API failure doesn't stop the batch. Read / call / write are three phases on separate transactions (WO-R2-08), so no pooled connection is held `idle in transaction` across the round-trip; `tests/unit/test_incident_digest.py` asserts it |
 
 The "failure isolation" column is the most operationally important one — it documents what happens when something in the loop fails. Every loop catches at the top level and continues; nothing in the worker process is allowed to be fragile in a way that takes down the whole process.
 
@@ -528,13 +528,29 @@ The SLO state is also shown on the admin Overview tab — operators see the curr
 
 ### Scheduled evaluation (WO-R2-29)
 
-`_slo_evaluation_loop` in the worker computes both objectives every `SLO_EVALUATION_INTERVAL_SECONDS` (default 300s) and creates an `Alert` row — and therefore a signed webhook delivery — for any objective burning at or above 14.4×. That threshold is the same one the two CloudWatch alarms use, deliberately: the dashboard and the alert must not disagree about the same platform.
+`_slo_evaluation_loop` in the worker computes both objectives every `SLO_EVALUATION_INTERVAL_SECONDS` (default 300s) and creates an `Alert` row — and, once that row commits, a signed webhook delivery — for any objective burning at or above 14.4×. That threshold is the same one the two CloudWatch alarms use, deliberately: the dashboard and the alert must not disagree about the same platform.
 
 Before this, `compute_all` had exactly one caller — the read-only admin endpoint above — so the objectives were computed only when a human asked, and **no real platform condition created an alert at all**. The alert webhook is the incident commander's production trigger, and its only producer was the `bad_deploy` chaos tool; the commander could be woken by a human pretending, and by nothing else.
 
 De-duplication is by `alerts.dedup_key` under a unique constraint on `(tenant_id, dedup_key)`. The key carries a time bucket (`slo:<id>:fast_burn:<floor(now/window)>`), so a sustained burn produces one alert per `SLO_ALERT_DEDUP_WINDOW_SECONDS` (default 1h) rather than one per tick. Bucketing rather than a "was there a recent one?" lookup is what makes it safe across replicas: `worker_loop` runs in every API replica, so a check-then-insert is a race both replicas win, whereas the unique constraint lets the database settle it — one insert lands, the other raises `IntegrityError` and its loop moves on. Set the interval to `0` to disable evaluation entirely, for deployments that alert from CloudWatch alone.
 
 Alerts are raised against the **platform tenant**, because the objectives themselves are platform-wide — `compute_all` has no tenant filter, and neither do the CloudWatch alarms. Per-tenant objectives would need their own definitions and targets; see [ROADMAP.md](ROADMAP.md).
+
+### Alert delivery: committed first, signed over more than the body (WO-R2-70)
+
+The webhook is the commander's production trigger, so two properties of the delivery are part of the contract, not implementation detail:
+
+**It is sent after the transaction commits.** The POST used to be awaited from inside the caller's still-open transaction, which meant the commander was told about a row no other connection could see yet — and any rollback afterwards erased the alert while the agent was already working an `alert_id` that would never resolve. `AlertService.create_alert` now registers the emission on the session's post-commit queue (`utils/post_commit.py`, the mechanism cache invalidation already used) and the session owner drains it: `get_db` for the API and MCP surfaces, `_raise_fast_burn_alert` for the SLO loop. On rollback the queue is dropped and nothing is delivered. This composes with the de-duplication above: a `dedup_key` conflict raises out of the flush, the transaction unwinds, and the suppressed alert is structurally incapable of being delivered — rather than merely happening to raise before the old inline POST.
+
+**The signature covers the timestamp and a nonce, not just the body.** Headers:
+
+| Header | Meaning |
+|---|---|
+| `X-Alert-Timestamp` | unix ms at delivery |
+| `X-Alert-Nonce` | hex, unique per delivery (a retry is a new delivery) |
+| `X-Alert-Signature` | `sha256=` + HMAC-SHA256 over `{timestamp}.{nonce}.{body}` |
+
+The body remains `json.dumps(payload, sort_keys=True, separators=(",", ":"))`. Signing the body alone — the pre-WO-R2-70 scheme — left `X-Alert-Timestamp` unauthenticated, so the replay rejection the service promised consumers was defeated by restamping one header: a receiver's skew check is only as good as what the signature binds. Receivers should recompute the HMAC over the composed material, compare in constant time, reject a timestamp outside their skew window, and reject a nonce already seen inside it. `alerts.signed_material` / `alerts.sign_delivery` are the canonical composition; the receiving side is hardened in the commander repo's matching order.
 
 **Cancellations are not dispatch failures.** `job_dispatch_latency` counts only the statuses in `slo._DISPATCHED_STATUSES` (`running`, `completed`, `failed`, `dead_letter`). `CANCELLED` is excluded because those rows never left `PENDING` — they were cancelled while `WAITING`, by a saga rollback or by `cascade_cancel_blocked_children` stranding a dependency subtree — so each one arrived with `started_at IS NULL` and read as a job the platform failed to dispatch. A six-step rollback burnt six dispatches of error budget, and a wide DAG cascade could trip the fast-burn alarm on its own. Within the statuses that remain, `started_at IS NULL` *is* a genuine dispatch miss and still counts as a failure.
 

@@ -279,7 +279,7 @@ async def test_rebaseline_refreshes_stale_fixture_timestamps(
         )
     )
     # Two deploy markers whose 4-hour hotfix→latest spacing must survive.
-    deploy_specs = seed._deploy_rows(default_tenant.id)
+    deploy_specs = seed._deploy_rows()
     d_hotfix = next(s for s in deploy_specs if s["version"] == "v0.4.2")
     d_latest = next(
         s
@@ -373,7 +373,13 @@ async def test_rebaseline_is_noop_when_already_fresh(
     back-to-back resets keep the documented no-op idempotency."""
     seed = _seed_module()
     spec = seed._dlq_specs()[0]
-    created = datetime.now(UTC) - spec["created_offset"]
+    # Built through the same derivation the seeder uses: a row that is fresh
+    # in `created_at` but missing `started_at`/`completed_at` is not fresh,
+    # it is the incoherent shape WO-R2-69 fixed, and the re-baseline is
+    # supposed to notice.
+    created, started, completed = seed._lifecycle(
+        datetime.now(UTC), spec["created_offset"], spec["run_seconds"]
+    )
     db_session.add(
         Job(
             id=spec["job_id"],
@@ -387,7 +393,9 @@ async def test_rebaseline_is_noop_when_already_fresh(
             remediation_hint=spec.get("remediation_hint"),
             trace_id=str(seed.stable(f"dlq-trace-{spec['job_id']}")),
             created_at=created,
-            updated_at=created,
+            updated_at=completed,
+            started_at=started,
+            completed_at=completed,
         )
     )
     await db_session.flush()
@@ -1182,3 +1190,167 @@ async def test_seed_consumer_lag_writes_no_expiry() -> None:
             "answer lag: null for groups scenarios assert are non-null"
         )
     assert "worker-dispatcher" not in seed._CONSUMER_LAGS
+
+
+# ---------------------------------------------------------------------------
+# Fixture rows match the contracts that read them (WO-R2-69)
+#
+# `update_status` stamps `started_at` on the PENDING→RUNNING write and
+# `completed_at` on every terminal write, so a completed / failed /
+# dead_letter row the platform produced always has both. Seeded rows had
+# neither, and two readers take that literally: the dispatch-latency SLO
+# counts `started_at IS NULL` as a dispatch miss, and the DLQ listing's
+# `DEAD_LETTERED_AT` sort orders on `coalesce(completed_at, created_at)`.
+# ---------------------------------------------------------------------------
+
+
+def test_every_dispatched_fixture_spec_carries_a_run_duration() -> None:
+    """A terminal job with no run duration cannot be given a coherent
+    lifecycle, so the specs have to supply one."""
+    seed = _seed_module()
+    for spec in (*seed._dlq_specs(), *seed._failed_trace_specs()):
+        assert isinstance(spec["run_seconds"], int), spec["job_id"]
+    dag = {s["name"]: s for s in seed._dag_specs()}
+    assert dag["dag-parent-job"]["run_seconds"] is not None
+    # The waiting nodes were never dispatched and must stay that way.
+    assert dag["dag-seed-job"]["run_seconds"] is None
+    assert dag["dag-child-job"]["run_seconds"] is None
+
+
+def test_lifecycle_orders_created_started_completed() -> None:
+    seed = _seed_module()
+    now = datetime.now(UTC)
+
+    created, started, completed = seed._lifecycle(now, timedelta(minutes=40), 12)
+
+    assert started is not None and completed is not None
+    assert created <= started <= completed
+    # Dispatch latency stays well inside the SLO's 30s threshold, so a
+    # fixture never contributes a latency violation of its own.
+    assert (started - created).total_seconds() == 4
+
+    # Never-dispatched jobs keep NULLs rather than invented timestamps.
+    assert seed._lifecycle(now, timedelta(minutes=5), None)[1:] == (None, None)
+
+
+async def test_rebaseline_leaves_no_job_starting_before_it_was_created(
+    db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
+) -> None:
+    """THE assertion for finding 2.
+
+    The re-baseline moved `created_at` and left `started_at` where it was.
+    For the DAG trio — pinned at `now` by that loop — a start stamped by an
+    earlier run was then *earlier than the row's own creation*, i.e. a
+    negative dispatch latency in every tool that subtracts the two.
+    """
+    seed = _seed_module()
+    stale = timedelta(days=2)
+    now = datetime.now(UTC)
+
+    specs = [*seed._dlq_specs(), *seed._failed_trace_specs()]
+    for spec in specs:
+        created, started, completed = seed._lifecycle(
+            now - stale, spec["created_offset"], spec["run_seconds"]
+        )
+        db_session.add(
+            Job(
+                id=spec["job_id"],
+                tenant_id=default_tenant.id,
+                user_id=test_user.id,
+                type=spec["type"],
+                status=JobStatus.DEAD_LETTER.value,
+                payload={"eval_fixture": True},
+                retry_count=3,
+                error_message=spec["error_message"],
+                trace_id=str(seed.stable(f"seedtrace-{spec['job_id']}")),
+                created_at=created,
+                updated_at=completed,
+                started_at=started,
+                completed_at=completed,
+            )
+        )
+    # The DAG trio as an older run left it: the parent ran two days ago.
+    dag_ids = {}
+    for spec in seed._dag_specs():
+        job_id = seed.stable(spec["name"])
+        dag_ids[spec["name"]] = job_id
+        created, started, completed = seed._lifecycle(
+            now - stale, spec["created_offset"], spec["run_seconds"]
+        )
+        db_session.add(
+            Job(
+                id=job_id,
+                tenant_id=default_tenant.id,
+                user_id=test_user.id,
+                type=JobType.BULK_API_SYNC.value,
+                status=spec["status"],
+                payload={"eval_fixture": True},
+                retry_count=0,
+                created_at=created,
+                updated_at=completed or created,
+                started_at=started,
+                completed_at=completed,
+            )
+        )
+    await db_session.flush()
+
+    await seed._rebaseline_timestamps(db_session)
+
+    rows = (
+        (await db_session.execute(select(Job).where(Job.id.in_(
+            [s["job_id"] for s in specs] + list(dag_ids.values())
+        )))).scalars().all()
+    )
+    assert len(rows) == len(specs) + 3
+    for job in rows:
+        created = _utc(job.created_at)
+        started = _utc(job.started_at) if job.started_at is not None else None
+        completed = (
+            _utc(job.completed_at) if job.completed_at is not None else None
+        )
+        if started is not None:
+            assert started >= created, f"{job.id} started before it was created"
+        if completed is not None:
+            assert completed >= started or completed >= created
+        # And the whole lifecycle came forward, not just its first column.
+        assert created > now - stale + timedelta(hours=1)
+        if started is not None:
+            assert started > now - stale + timedelta(hours=1)
+
+    parent = next(j for j in rows if j.id == dag_ids["dag-parent-job"])
+    assert parent.started_at is not None, "a completed job must have a start"
+    assert parent.completed_at is not None
+    assert (
+        _utc(parent.started_at) - _utc(parent.created_at)
+    ).total_seconds() >= 0, "the DAG trio's dispatch latency went negative"
+
+    for waiting in ("dag-seed-job", "dag-child-job"):
+        job = next(j for j in rows if j.id == dag_ids[waiting])
+        assert job.started_at is None, "a waiting job was never dispatched"
+        assert job.completed_at is None
+
+
+async def test_seeded_deploy_markers_are_platform_wide(
+    db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
+) -> None:
+    """The model's contract — and the RLS policy built on it — is that a
+    deploy marker's tenant_id is always NULL. The seeder was the one writer
+    that broke it."""
+    from app.models.deploy_marker import DeployMarker
+
+    seed = _seed_module()
+
+    assert all(spec["tenant_id"] is None for spec in seed._deploy_rows())
+
+    # A stack seeded before this fix already holds tenant-stamped rows, and
+    # check-then-insert would skip past them forever.
+    stamped = seed._deploy_rows()[0]
+    db_session.add(DeployMarker(**{**stamped, "tenant_id": default_tenant.id}))
+    await db_session.flush()
+
+    await seed._seed_deploys(db_session)
+    await db_session.flush()
+
+    markers = (await db_session.execute(select(DeployMarker))).scalars().all()
+    assert len(markers) == len(seed._deploy_rows())
+    assert [m.tenant_id for m in markers] == [None] * len(markers)
