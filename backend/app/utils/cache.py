@@ -60,12 +60,34 @@ class JobCache:
         job_id: uuid.UUID | str,
         tenant_id: uuid.UUID | str,
     ) -> dict[str, Any] | None:
-        """Return the cached job dict, or None on miss / Redis error."""
+        """Return the cached job dict, or None on miss / Redis error /
+        unusable payload.
+
+        A cached value that is not a JSON object is treated as a miss
+        rather than handed to the caller (R2-20). `GET /jobs/{id}` feeds
+        this straight into `JobResponse.model_validate`, so anything
+        else — a JSON array, a scalar, a truncated write — surfaced as
+        an unhandled ValidationError and a 500 for as long as the entry
+        lived. A cache is an optimisation: when its contents are
+        unusable the honest behaviour is to miss and read Postgres, not
+        to fail the request.
+        """
         try:
             raw = await redis.get(cls._key(job_id, tenant_id))
             if raw is None:
                 return None
-            return json.loads(raw)  # type: ignore[no-any-return]
+            payload = json.loads(raw)
+            if not isinstance(payload, dict):
+                logger.warning(
+                    "cache_get_unexpected_shape",
+                    extra={
+                        "job_id": str(job_id),
+                        "tenant_id": str(tenant_id),
+                        "payload_type": type(payload).__name__,
+                    },
+                )
+                return None
+            return payload
         except Exception:
             logger.warning(
                 "cache_get_failed",

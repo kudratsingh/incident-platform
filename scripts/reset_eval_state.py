@@ -9,7 +9,10 @@ What gets cleared/reset:
      scenario-set chaos state. Same effect as running
      `restart_consumer_group` for every affected consumer, plus a
      scan-and-delete for any chaos keys the platform doesn't yet
-     have a Tier-1 compensator for.
+     have a Tier-1 compensator for. Plus `cache:job:*` — the one
+     namespace chaos residue could reach without a `chaos:` marker
+     (R2-20); it is a 10s read-through cache, so dropping it costs a
+     single Postgres read.
   2. **Eval fixtures** — delegates to `seed_eval_fixtures.seed(reset=True)`
      which restores DLQ job status/retry_count/hint, re-populates the
      consumer-lag keys, and seeds the `hot_set` fixture (FIX_PLAN #7,
@@ -130,6 +133,21 @@ _REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 # has ever written — D-13.)
 _CHAOS_KEY_PATTERNS = ("chaos:*",)
 
+# The one namespace chaos residue can reach WITHOUT wearing the `chaos:`
+# name (R2-20). `create_stale_cache` used to admit any `cache:` key,
+# including the live per-job read cache `cache:job:{tenant}:{job}` that
+# `app/utils/cache.py::JobCache` owns — so a poisoned entry carried no
+# marker the sweep above could key off and outlived the reset for the
+# rest of its TTL, 500-ing `GET /jobs/{id}` in the *next* scenario with
+# nothing to correlate it to.
+#
+# The hook now refuses those keys, so this sweep is belt-and-braces for
+# an entry poisoned before the fix or by hand. Clearing it costs
+# nothing: it is a 10s read-through cache that repopulates from Postgres
+# on the next request, which is also why it is swept rather than
+# rebaselined.
+_JOB_CACHE_PATTERN = "cache:job:*"
+
 # Tier-1 *action* residue, as opposed to chaos residue above. These are
 # effects the agent itself creates during a scenario; left in place they
 # fire or apply during the next one. Mirrors
@@ -150,19 +168,34 @@ def _empty_dlq_baseline() -> bool:
     }
 
 
+async def _scan_delete(redis: aioredis.Redis, pattern: str) -> int:
+    """Delete every key matching `pattern`. Uses SCAN over KEYS so a
+    large keyspace doesn't block Redis. Returns the number deleted."""
+    deleted = 0
+    cursor = 0
+    while True:
+        cursor, batch = await redis.scan(cursor=cursor, match=pattern, count=100)
+        if batch:
+            deleted += await redis.delete(*batch)
+        if cursor == 0:
+            break
+    return deleted
+
+
 async def _clear_chaos_keys(redis: aioredis.Redis) -> int:
-    """Scan + delete every key matching a chaos pattern. Uses SCAN over
-    KEYS so a large keyspace doesn't block Redis."""
+    """Scan + delete every key matching a chaos pattern."""
     deleted = 0
     for pattern in _CHAOS_KEY_PATTERNS:
-        cursor = 0
-        while True:
-            cursor, batch = await redis.scan(cursor=cursor, match=pattern, count=100)
-            if batch:
-                deleted += await redis.delete(*batch)
-            if cursor == 0:
-                break
+        deleted += await _scan_delete(redis, pattern)
     return deleted
+
+
+async def _clear_job_read_cache(redis: aioredis.Redis) -> int:
+    """Drop every live per-job read-cache entry — see `_JOB_CACHE_PATTERN`
+    for why chaos residue can land here without a `chaos:` marker.
+
+    Returns the number of entries removed."""
+    return await _scan_delete(redis, _JOB_CACHE_PATTERN)
 
 
 async def _clear_scheduled_replays(redis: aioredis.Redis) -> int:
@@ -192,17 +225,7 @@ async def _clear_dag_pauses(redis: aioredis.Redis) -> int:
     timers above.
 
     Returns the number of pause flags removed."""
-    deleted = 0
-    cursor = 0
-    while True:
-        cursor, batch = await redis.scan(
-            cursor=cursor, match="dag:paused:*", count=100
-        )
-        if batch:
-            deleted += await redis.delete(*batch)
-        if cursor == 0:
-            break
-    return deleted
+    return await _scan_delete(redis, "dag:paused:*")
 
 
 async def _purge_idempotency_records(session_factory: Any) -> int:
@@ -491,6 +514,7 @@ async def reset(
 
     try:
         chaos_cleared = await _clear_chaos_keys(redis)
+        job_cache_cleared = await _clear_job_read_cache(redis)
         timers_cleared = await _clear_scheduled_replays(redis)
         pauses_cleared = await _clear_dag_pauses(redis)
         # Order-independent of the seed: the seeded fixture alerts use
@@ -530,6 +554,7 @@ async def reset(
         "dlq_swept": dlq_swept,
         "timestamps_rebaselined": seed_summary["timestamps_rebaselined"],
         "empty_dlq_baseline": _empty_dlq_baseline(),
+        "job_cache_cleared": job_cache_cleared,
         "seeded_dlq_deleted": seeded_dlq_deleted,
         "idempotency_purged": idempotency_purged,
         "timers_cleared": timers_cleared,

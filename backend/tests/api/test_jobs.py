@@ -714,3 +714,38 @@ async def test_oversize_payload_is_rejected_for_unbounded_job_types(
         validate_processor_payload(
             "csv_upload.compensate", {"blob": "x" * (512 * 1024)}
         )
+
+
+async def test_get_job_falls_through_to_postgres_when_the_cache_is_poisoned(
+    client: AsyncClient, auth_headers: dict[str, str]
+) -> None:
+    """R2-20: a `cache:job:` entry holding something that is not a job
+    dict (what `create_stale_cache` writes: a JSON array) used to reach
+    `JobResponse.model_validate` and 500 the endpoint for the whole TTL.
+    A corrupt entry must degrade to a slower read, not an outage."""
+    import json
+    from unittest.mock import AsyncMock
+
+    from app.dependencies import get_redis
+
+    created = await client.post(
+        "/api/v1/jobs", json={"type": "doc_analysis"}, headers=auth_headers
+    )
+    job_id = created.json()["id"]
+
+    poisoned = json.dumps(["stale-fixture-deadbeef", "stale-fixture-c0ffee"])
+
+    async def _override_redis():  # type: ignore[no-untyped-def]
+        mock = AsyncMock()
+        mock.get = AsyncMock(return_value=poisoned)
+        yield mock
+
+    app = client._transport.app  # type: ignore[attr-defined]
+    app.dependency_overrides[get_redis] = _override_redis
+    try:
+        resp = await client.get(f"/api/v1/jobs/{job_id}", headers=auth_headers)
+    finally:
+        app.dependency_overrides.pop(get_redis, None)
+
+    assert resp.status_code == 200
+    assert resp.json()["id"] == job_id
