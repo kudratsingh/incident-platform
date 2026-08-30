@@ -4,9 +4,10 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from app.config import assert_chaos_gate, get_settings
+from app.core import metrics
 from app.core.exceptions import AppError
 from app.core.logging import get_logger, request_id_var, setup_logging
-from app.core.middleware import RequestContextMiddleware
+from app.core.middleware import RequestContextMiddleware, register_route_dimension
 from app.core.redis import close_redis_pool, get_redis_client
 from app.core.tracing import setup_tracing
 from fastapi import FastAPI, Request
@@ -143,6 +144,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     except Exception as exc:
         logger.error("kafka producer failed to start", extra={"error": str(exc)})
 
+    # Background CloudWatch flush task. Every emit_gauge/emit_count call in
+    # this process (request middleware, worker metrics loop) queues into it
+    # rather than making its own PutMetricData call. No-op outside production.
+    await metrics.start_metrics_emitter()
+
     redis = get_redis_client()
     session_factory = _session_factory
     worker_task = asyncio.create_task(worker_loop(session_factory, redis))
@@ -159,6 +165,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await stop_producer()
     except Exception as exc:
         logger.error("kafka producer failed to stop", extra={"error": str(exc)})
+
+    # Last flush before the loop closes, so the final window is not discarded.
+    await metrics.stop_metrics_emitter()
 
     await close_redis_pool()
     logger.info("shutdown")
@@ -299,6 +308,10 @@ def create_app() -> FastAPI:
             status_code=200 if healthy else 503,
             content={"status": "ok" if healthy else "degraded", **checks},
         )
+
+    # Every route is mounted by now, so the templated route table is the
+    # complete allow-list for the RequestLatency `Path` dimension.
+    register_route_dimension(app)
 
     FastAPIInstrumentor.instrument_app(app)
     return app

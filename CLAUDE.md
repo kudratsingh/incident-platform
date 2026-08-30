@@ -539,7 +539,7 @@ All four services use `client.messages.parse(..., output_format=SomePydanticMode
 
 ### Phase 6: Observability & Reliability ✅
 - **OpenTelemetry** distributed tracing — spans across API → worker → DB → Redis, exported to OTLP (AWS X-Ray or Jaeger).
-- **Custom metrics** — `JobCompleted`, `JobFailed`, `JobDeadLettered`, `QueueDepth`, `InFlightJobs`, `ConsumerLag` on the `IncidentPlatform` CloudWatch namespace.
+- **Custom metrics** — `JobCompleted`, `JobFailed`, `JobDeadLettered`, `QueueDepth`, `InFlightJobs`, `ConsumerLag`, `RequestLatency` on the `IncidentPlatform` CloudWatch namespace. `emit_count` / `emit_gauge` do no I/O — they sanitise dimensions and queue the datum; one background task per process flushes an aggregated `StatisticSet` every 60s. Dimension values are bounded by a declared allow-list plus a hard cap; anything else becomes `other`. See [Cost model (CloudWatch custom metrics)](docs/ARCHITECTURE.md#cost-model-cloudwatch-custom-metrics) before adding a metric or a dimension.
 - **SLOs + error budgets** ✅ — `job_completion_rate` ≥ 99% and `job_dispatch_latency` ≥ 95% within 30 s, both over rolling 24h. `GET /admin/slos` returns current state, budget remaining %, and burn rate.
 - **CloudWatch alarms** ✅ — five baseline alarms (`alb-5xx`, `backend-tasks-low`, `rds-cpu-high`, `redis-memory-low`, `queue-depth-high`) plus two SLO fast-burn alarms (14.4× over 1h windows). All notify via SNS topic `${app_name}-alarms`.
 - **Circuit breaker** ✅ — `app/utils/circuit_breaker.py` wraps external API calls; opens on N consecutive failures, half-open probe, auto-recover.

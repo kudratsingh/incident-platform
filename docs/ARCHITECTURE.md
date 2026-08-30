@@ -518,6 +518,70 @@ Total Phase-10 LLM spend in a representative dev setup: <$30/month. Cost telemet
 
 ---
 
+## Cost model (CloudWatch custom metrics)
+
+CloudWatch bills a custom metric per distinct **dimension combination**, and
+throttles `PutMetricData` on **call rate** — two independent limits that need
+two independent guards. Both live in `backend/app/core/metrics.py`.
+
+### Cardinality — what a dimension may contain
+
+`RequestLatency` used to be dimensioned on `request.url.path`, the raw URL. Every
+job, tenant and user id in a URL minted its own billable metric, and since
+`BaseHTTPMiddleware` wraps the router, 404s on arbitrary URLs were measured too —
+so anyone who could reach the load balancer could mint metrics at will. The
+dimension is now the route's templated path (`/jobs/{job_id}`), with the constant
+`unmatched` for anything that matched no route.
+
+Two guards keep it that way, so a future caller cannot reintroduce the problem:
+
+| Guard | Applies to | Effect |
+|---|---|---|
+| Allow-list (`register_dimension_values`) | dimensions a caller declared | anything outside the declared set becomes `other` |
+| Hard cap (`MAX_DIMENSION_VALUES`, 100) | dimensions nobody declared | the first 100 distinct values pass; later new values become `other` |
+
+The API and MCP processes register their templated route table at startup, which
+is exactly the set of `Path` values that can legitimately occur. Current bound:
+**41 `Path` values** (40 routes + `unmatched`), plus `other`. `StatusCode` has no
+declared allow-list and so falls to the hard cap — bounded at 100, realistically
+about a dozen. Worst case is therefore ~4,200 combinations and typically far
+fewer, against a raw-path version that was bounded only by the number of rows in
+the database.
+
+Note the `Path` value is the route's *declared* path, which for anything mounted
+via `include_router(prefix=...)` is router-relative — `/jobs/{job_id}`, not
+`/api/v1/jobs/{job_id}`. Recovering the full path needs FastAPI's private
+`_IncludedRouter.include_context.prefix`, which production code deliberately does
+not read. The short form is safe only while it is unique across the app;
+`test_route_labels_are_unique_per_route` fails the build if two routers ever
+declare the same relative path.
+
+### Call rate — how datums leave the process
+
+`emit_count` / `emit_gauge` do **no I/O**. They sanitise dimensions and
+`put_nowait` onto a bounded queue (`QUEUE_MAXSIZE`, 10,000); a background task
+started from the app lifespan drains it every `FLUSH_INTERVAL_SECONDS` (60s),
+folds the window into one `StatisticSet` per distinct (metric, unit, dimensions),
+and makes **one** `PutMetricData` call — chunked only if the aggregated datums
+exceed `MAX_DATUMS_PER_CALL`. A thousand requests against one route cost one
+datum, and CloudWatch still reconstructs Average / Sum / Min / Max / SampleCount.
+
+Overflow drops and counts rather than applying backpressure: blocking a request
+in order to record how fast that request was would be self-defeating. Shutdown
+flushes the final window so a clean stop does not discard up to 60s of data.
+
+This replaced a per-request `asyncio.create_task` around a blocking boto3 call on
+the default executor, whose retained task-handle set grew with in-flight emits —
+a slow CloudWatch was a memory leak on the hot path, on top of the worst possible
+call-rate ratio against a limit that counts calls.
+
+**Why `RequestLatency` is kept at all:** nothing consumes it today — no alarm in
+`infra/` references it. It stays because per-route latency is the one thing the
+ALB's aggregate `TargetResponseTime` cannot give you, and it is now bounded and
+cheap enough to be worth having before an alarm needs it.
+
+---
+
 ## Pointers
 
 - `backend/app/main.py` — API process entry point
