@@ -9,14 +9,14 @@ summary: |
   will perceive this as "I submitted a job and nothing's happening."
 
 symptoms:
-  - "QueueDepth metric trending up"
-  - "ConsumerLag metric > 0 and growing"
+  - "ConsumerLag metric > 0 and growing — this is the signal the alarm reads"
+  - "QueueDepth may look completely normal: it measures only the Redis delayed-retry set, not the Kafka backlog"
   - "API may start returning 503 backpressure"
 
 diagnosis_steps:
-  - id: queue-depth
-    description: "Is this throughput (depth growing) or a single stuck partition?"
-    command: "CloudWatch IncidentPlatform/QueueDepth + ConsumerLag"
+  - id: consumer-lag
+    description: "Is this throughput (lag growing across the board) or a single stuck partition?"
+    command: "CloudWatch IncidentPlatform/ConsumerLag"
   - id: in-flight
     description: "Are workers saturated (in_flight == MAX_CONCURRENT_JOBS)?"
     command: "CloudWatch IncidentPlatform/InFlightJobs"
@@ -30,7 +30,7 @@ mitigation:
   - "Reduce inbound rate by lowering the rate-limit on POST /jobs temporarily."
 
 escalation:
-  - "If queue depth doubles after scale-out, page on-call — likely a downstream block (DB pool, external API)."
+  - "If consumer lag doubles after scale-out, page on-call — likely a downstream block (DB pool, external API)."
   - "See rb-queue-depth-high for further triage."
 
 related_dashboards:

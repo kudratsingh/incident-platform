@@ -12,6 +12,19 @@
 # its own: `make test-integration PYTHON=/path/to/main/.venv/bin/python`.
 PYTHON ?= .venv/bin/python
 
+# Every pytest invocation goes through this. Borrowing another checkout's
+# interpreter also borrows its *editable install*: the .pth file in that venv
+# hardcodes the checkout it was created in, so from a worktree `import app`
+# reaches the MAIN tree while pytest reads this tree's test files — a green
+# run for a change you never tested. PYTHONPATH is scanned ahead of
+# site-packages, which puts the tree this Makefile lives in at the front of
+# the `app` namespace package's search path.
+#
+# Three separate agents hit this before it was fixed (R2-117). The guard is
+# backend/tests/unit/test_worktree_import_hygiene.py, which fails loudly if a
+# target is ever added that skips this prefix.
+PYTEST := PYTHONPATH=$(CURDIR)/backend $(PYTHON) -m pytest
+
 help:  ## Print this help
 	@awk 'BEGIN {FS = ":.*##"} /^[a-zA-Z_-]+:.*##/ {printf "  \033[36m%-28s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
@@ -25,7 +38,7 @@ logs:  ## Tail backend logs (Ctrl-C to exit)
 	docker compose logs -f app
 
 test:  ## Run unit + API tests via the host venv (fast, no coverage gate)
-	$(PYTHON) -m pytest backend/tests/unit backend/tests/api --no-cov
+	$(PYTEST) backend/tests/unit backend/tests/api --no-cov
 
 # Same command the `integration` CI job runs. Needs a reachable Docker
 # daemon — Testcontainers brings up Postgres 16 and Redpanda per module —
@@ -34,7 +47,7 @@ test:  ## Run unit + API tests via the host venv (fast, no coverage gate)
 # everyone else, so they are exported here rather than defaulted on.
 test-integration:  ## Run the Docker-gated integration tier (real Postgres + Redpanda)
 	RUN_RLS_TEST=1 RUN_EVAL_RESET_TEST=1 RUN_MIGRATION_LOCK_TEST=1 \
-	  $(PYTHON) -m pytest backend/tests/integration -v --no-cov $(PYTEST_ARGS)
+	  $(PYTEST) backend/tests/integration -v --no-cov $(PYTEST_ARGS)
 
 lint:  ## Run ruff via the host venv (same invocation as CI)
 	.venv/bin/ruff check backend/

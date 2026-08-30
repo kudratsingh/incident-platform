@@ -76,7 +76,12 @@ resource "aws_cloudwatch_metric_alarm" "rds_cpu" {
   treat_missing_data  = "notBreaching"
 
   dimensions = {
-    DBInstanceIdentifier = aws_db_instance.main.id
+    # `.identifier`, not `.id`: under the pinned AWS provider (~> 5.0)
+    # aws_db_instance.id is the DBI *resource* id ("db-ABC123…"), while the
+    # CloudWatch dimension carries the instance identifier ("incident-platform").
+    # Both are plausible-looking strings, so the wrong one produces a valid
+    # plan and an alarm that never receives a datapoint.
+    DBInstanceIdentifier = aws_db_instance.main.identifier
   }
 
   alarm_actions = [aws_sns_topic.alarms.arn]
@@ -97,6 +102,12 @@ resource "aws_cloudwatch_metric_alarm" "redis_memory" {
   period              = 60
   statistic           = "Average"
   threshold           = 52428800 # 50 MB in bytes
+  # Absence of datapoints is not evidence of low memory, so this matches its
+  # AWS-namespace siblings rather than the "breaching" the ECS task-count
+  # alarm uses (there, absence *is* the outage). Stated explicitly because the
+  # unset default is "missing", which pins the alarm to whatever state it last
+  # held — a node that stops reporting entirely would keep reading OK.
+  treat_missing_data = "notBreaching"
 
   dimensions = {
     # The replication group has exactly one member cluster (num_cache_clusters
@@ -110,16 +121,32 @@ resource "aws_cloudwatch_metric_alarm" "redis_memory" {
   ok_actions    = [aws_sns_topic.alarms.arn]
 }
 
-# ── Alarm 5: Job queue depth (custom metric) ──────────────────────────────────
-# The dispatcher emits QueueDepth to the IncidentPlatform namespace every ~60 s.
-# Fires when more than 50 jobs are waiting — worker may be overwhelmed.
+# ── Alarm 5: Job backlog (custom metric) ─────────────────────────────────────
+# Fires when more than 50 jobs are waiting — worker throughput may be
+# insufficient.
+#
+# Reads ConsumerLag, NOT QueueDepth. The dispatcher emits both every ~60 s from
+# _metrics_loop, but they measure different things: QueueDepth is
+# `queue.delayed_length(redis)`, the size of the Redis *delayed-retry* sorted
+# set, while the primary job queue moved to Kafka in Phase 7. A genuine
+# backlog — jobs produced faster than the consumer drains them — accumulates
+# as consumer lag and leaves the delayed set completely untouched, so the
+# QueueDepth version of this alarm read green through exactly the condition it
+# was named for.
+#
+# Caveat worth knowing at 3am: the dispatcher deliberately does not emit
+# ConsumerLag when lag is unknown (consumer not started, no partition
+# assignment, or the Kafka query errored) rather than emitting a fabricated 0.
+# So a *dead* consumer shows up as absent datapoints, not as a high value, and
+# notBreaching keeps this alarm quiet for it. That case belongs to the ECS
+# task-count alarm and to worker supervision, not here.
 
 resource "aws_cloudwatch_metric_alarm" "queue_depth" {
   alarm_name          = "${var.app_name}-queue-depth-high"
-  alarm_description   = "Job queue depth above 50. Runbook: rb-queue-depth-high (/admin/runbooks/rb-queue-depth-high). Worker throughput may be insufficient."
+  alarm_description   = "Job backlog above 50 (Kafka consumer lag). Runbook: rb-queue-depth-high (/admin/runbooks/rb-queue-depth-high). Worker throughput may be insufficient."
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 3
-  metric_name         = "QueueDepth"
+  metric_name         = "ConsumerLag"
   namespace           = "IncidentPlatform"
   period              = 60
   statistic           = "Maximum"
@@ -132,18 +159,42 @@ resource "aws_cloudwatch_metric_alarm" "queue_depth" {
 
 # ── Alarm 6: Job-completion SLO fast-burn ─────────────────────────────────────
 # Fires when the failure rate over the last hour would, if sustained, exhaust
-# the 30-day error budget in under 2 hours. The math: at a 1.0× burn rate the
+# the error budget in about 100 minutes. The math: at a 1.0× burn rate the
 # whole budget lasts the full window; the canonical fast-burn threshold is
-# 14.4× over a 1h sliding window. SLO target is 99% (budget = 1%), so
-# fast-burn failure rate threshold = 14.4 * 0.01 = 0.144 — i.e. 14.4% of jobs
-# in the last hour dead-lettering.
+# 14.4× over a 1h sliding window. `job_completion_rate` (app/services/slo.py)
+# targets 99% over a rolling 24h window, so budget = 1% and the fast-burn
+# failure-rate threshold = 14.4 * 0.01 = 0.144 — i.e. 14.4% of jobs in the last
+# hour dead-lettering. Exhaustion time is window/burn = 24h / 14.4 ≈ 1h40m.
+#
+# (This comment previously described a 30-day budget. Both SLOs are declared
+# over rolling 24h, and 14.4× against a 30-day budget would take ~50h to
+# exhaust it, not the "<2h" the comment claimed. The threshold was always
+# right for the real 24h window; only its stated basis was wrong.)
 #
 # Implemented as a math expression on the two custom metrics. CloudWatch
 # doesn't have a ratio aggregation natively, so we compute it here.
+#
+# Both legs are SUM(SEARCH(...)) rather than plain metric references because
+# the dispatcher only ever emits JobDeadLettered/JobCompleted with a JobType
+# dimension. A dimensionless metric reference is a *different* metric to
+# CloudWatch, not an aggregate of the dimensioned ones, so the previous shape
+# had no data source at all and — with notBreaching — sat in OK permanently.
+# SEARCH over the {IncidentPlatform,JobType} schema matches every job type
+# including ones added later, and SUM collapses the multiple series into the
+# single one an alarm requires. Rejected alternative: adding a JobType
+# dimension to the alarm, which yields one alarm per type and destroys the
+# cross-type ratio this SLO is defined on.
+#
+# Known gap: if an hour produces dead-letters and zero completions, the
+# JobCompleted search returns no series and the expression yields no data
+# rather than 1.0, so the total-failure case is caught by the backlog and
+# outbox alarms instead of here. Fixing that properly needs a dimensionless
+# rollup counter on the emitter side (backend/app/core/metrics.py), which is
+# out of scope for an infra-only change.
 
 resource "aws_cloudwatch_metric_alarm" "slo_job_completion_fast_burn" {
   alarm_name          = "${var.app_name}-slo-job-completion-fast-burn"
-  alarm_description   = "Job-completion SLO burning at 14.4× normal — will exhaust 30-day error budget in <2h. Runbook: rb-slo-job-completion (/admin/runbooks/rb-slo-job-completion)."
+  alarm_description   = "Job-completion SLO burning at 14.4× normal — will exhaust the 24h error budget in ~100 min. Runbook: rb-slo-job-completion (/admin/runbooks/rb-slo-job-completion)."
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 1
   threshold           = 0.144
@@ -152,28 +203,22 @@ resource "aws_cloudwatch_metric_alarm" "slo_job_completion_fast_burn" {
   metric_query {
     id          = "failure_rate"
     expression  = "IF((dl + ok) > 0, dl / (dl + ok), 0)"
-    label       = "Job dead-letter rate"
+    label       = "Job dead-letter rate (all job types)"
     return_data = true
   }
 
   metric_query {
-    id = "dl"
-    metric {
-      metric_name = "JobDeadLettered"
-      namespace   = "IncidentPlatform"
-      period      = 3600
-      stat        = "Sum"
-    }
+    id         = "dl"
+    expression = "SUM(SEARCH('{IncidentPlatform,JobType} MetricName=\"JobDeadLettered\"', 'Sum', 3600))"
+    label      = "Dead-lettered jobs, summed across JobType"
+    period     = 3600
   }
 
   metric_query {
-    id = "ok"
-    metric {
-      metric_name = "JobCompleted"
-      namespace   = "IncidentPlatform"
-      period      = 3600
-      stat        = "Sum"
-    }
+    id         = "ok"
+    expression = "SUM(SEARCH('{IncidentPlatform,JobType} MetricName=\"JobCompleted\"', 'Sum', 3600))"
+    label      = "Completed jobs, summed across JobType"
+    period     = 3600
   }
 
   alarm_actions = [aws_sns_topic.alarms.arn]
@@ -181,17 +226,26 @@ resource "aws_cloudwatch_metric_alarm" "slo_job_completion_fast_burn" {
 }
 
 # ── Alarm 7: Job-dispatch latency SLO fast-burn ──────────────────────────────
-# Approximation: if QueueDepth stays > 100 for 15 min, we're not meeting the
+# `job_dispatch_latency` (app/services/slo.py) targets 95% of jobs dispatched
+# within 30s, over a rolling 24h window.
+#
+# Approximation: if consumer lag stays > 100 for 15 min, we're not meeting the
 # 30-second dispatch SLO at any reasonable arrival rate. A precise version
 # would compute per-job started_at - created_at via CloudWatch Metric Math,
-# but QueueDepth is a good cheap proxy.
+# but the backlog is a good cheap proxy for it.
+#
+# Reads ConsumerLag for the same reason as alarm 5: this alarm was wired to
+# QueueDepth, which is the Redis delayed-retry set and not the pending-job
+# backlog. Time-to-dispatch is a function of how far behind the Kafka consumer
+# is, which is precisely what ConsumerLag measures; the delayed set says
+# nothing about it. See alarm 5 for the "lag is absent when unknown" caveat.
 
 resource "aws_cloudwatch_metric_alarm" "slo_dispatch_latency_fast_burn" {
   alarm_name          = "${var.app_name}-slo-dispatch-latency-fast-burn"
-  alarm_description   = "Job-dispatch latency SLO burning fast — queue is backed up. Runbook: rb-slo-dispatch-latency (/admin/runbooks/rb-slo-dispatch-latency)."
+  alarm_description   = "Job-dispatch latency SLO burning fast — the job backlog is growing. Runbook: rb-slo-dispatch-latency (/admin/runbooks/rb-slo-dispatch-latency)."
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 3
-  metric_name         = "QueueDepth"
+  metric_name         = "ConsumerLag"
   namespace           = "IncidentPlatform"
   period              = 300
   statistic           = "Average"
