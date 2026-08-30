@@ -28,16 +28,16 @@ promote the held descendants. Round-trip test:
 import uuid
 
 from app.core.exceptions import AppError, NotFoundError
-from app.core.logging import get_logger, request_id_var
+from app.core.logging import get_logger
 from app.core.scopes import Scope
 from app.mcp.registry import ToolContext, tool
+from app.mcp.tools.actions._scheduled_replay import schedule_one_audited
 from app.models.enums import JobStatus
 from app.repositories.audit import AuditRepository
 from app.repositories.job import JobRepository
 from app.repositories.job_dependency import JobDependencyRepository
 from app.repositories.outbox import OutboxRepository
 from app.services.job import JobService
-from app.workers import dlq_replay_scheduler
 from pydantic import BaseModel, ConfigDict, Field
 
 logger = get_logger(__name__)
@@ -172,7 +172,11 @@ async def replay_dlq_by_ids(
                 )
             continue
 
-        # Scheduled branch — pre-validate then push onto the ZSET.
+        # Scheduled branch — pre-validate, then audit-then-arm inside a
+        # savepoint (`_scheduled_replay.schedule_one_audited`). Both
+        # excepts are load-bearing: catching only AppError, as this
+        # branch used to, let any other mid-loop error abort the whole
+        # tool and discard the audit rows for replays already armed.
         try:
             execute_at = await _schedule_one(
                 job_id=job_id,
@@ -189,6 +193,16 @@ async def replay_dlq_by_ids(
             logger.warning(
                 "replay_dlq_by_ids scheduled per-id failure",
                 extra={"job_id": str(job_id), "error": exc.message},
+            )
+            continue
+        except Exception as exc:
+            failed += 1
+            results.append(
+                ReplayResult(id=str(job_id), ok=False, error=str(exc))
+            )
+            logger.exception(
+                "replay_dlq_by_ids scheduled per-id crashed",
+                extra={"job_id": str(job_id), "error": str(exc)},
             )
             continue
 
@@ -219,12 +233,15 @@ async def _schedule_one(
     job_repo: JobRepository,
     audit_repo: AuditRepository,
 ) -> float:
-    """Validate + push a single job onto the DLQ-replay ZSET.
+    """Validate + arm a single job on the DLQ-replay ZSET.
 
     Same pre-check `JobService.replay_job` does (existence + state).
-    Writes a `job.replay_scheduled` audit row so operators can see
-    what was scheduled before it fires; the eventual promote loop
-    writes the normal `job.replayed` row when it actually runs.
+    The `job.replay_scheduled` audit row lets operators see what was
+    scheduled before it fires; the eventual promote loop writes the
+    normal `job.replayed` row when it actually runs. Ordering,
+    savepoint and compensation live in
+    `_scheduled_replay.schedule_one_audited` — shared with
+    `replay_dlq_by_category` so the two branches cannot diverge again.
     """
     job = await job_repo.get_for_tenant(job_id, ctx.principal.tenant_id)
     if job is None:
@@ -236,28 +253,9 @@ async def _schedule_one(
             f"Only failed/dead_letter jobs can be replayed, got: {job.status}"
         )
 
-    execute_at = await dlq_replay_scheduler.schedule_replay(
-        ctx.redis,
-        tenant_id=ctx.principal.tenant_id,
-        principal_id=ctx.principal.id,
+    return await schedule_one_audited(
+        ctx=ctx,
+        audit_repo=audit_repo,
         job_id=job_id,
         delay_seconds=delay_seconds,
     )
-    await audit_repo.log(
-        "job.replay_scheduled",
-        tenant_id=ctx.principal.tenant_id,
-        user_id=(
-            ctx.principal.user.id if ctx.principal.user is not None else None
-        ),
-        principal_type=ctx.principal.kind,
-        principal_id=ctx.principal.id,
-        job_id=job_id,
-        resource_type="job",
-        resource_id=str(job_id),
-        request_id=request_id_var.get("") or None,
-        extra_data={
-            "delay_seconds": delay_seconds,
-            "execute_at": execute_at,
-        },
-    )
-    return execute_at

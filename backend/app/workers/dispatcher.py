@@ -1534,6 +1534,121 @@ async def _stale_running_sweep_loop(
         await asyncio.sleep(_STALE_RUNNING_SWEEP_INTERVAL)
 
 
+async def _promote_dlq_replay_once(
+    session_factory: async_sessionmaker[AsyncSession],
+    redis: Any,
+) -> None:
+    """One pass of scheduled-DLQ-replay promotion: claim the due entries
+    and fire each one.
+
+    Each claimed entry hits `JobService.replay_job`, which writes the
+    canonical `job.replayed` audit row and republishes via the outbox —
+    so the eventual execution is indistinguishable from an immediate
+    replay, aside from the paired `job.replay_scheduled` row written at
+    scheduling time.
+
+    A due entry whose DAG is paused is re-scheduled (E1-08) instead of
+    fired, keeping the remediation alive until the pause lifts.
+
+    Claim/ack, not pop (R2-21). `claim_ready` moves due members into
+    `jobs:dlq_replay_inflight` rather than deleting them, and every
+    outcome this pass can *observe* — fired, deferred, or failed — acks
+    the claim. Failure still does not re-enqueue: the operator sees the
+    `job.replay_scheduled` row with no matching `job.replayed` row and
+    re-issues, and auto-retrying would mask a permanent problem like
+    "job was deleted". What the ack does buy is the case this pass
+    cannot observe: a worker killed mid-replay never reaches the ack, so
+    the claim lapses and a later tick recovers the entry instead of
+    losing it. `CancelledError` (the shutdown signal) is a
+    BaseException, so it bypasses the `except Exception` and its ack by
+    construction.
+    """
+    # Local imports keep the module-level graph flat and match the
+    # style of other supporting loops in this file.
+    from app.repositories.job_dependency import JobDependencyRepository
+    from app.services.job import JobService
+
+    ready = await dlq_replay_scheduler.claim_ready(redis)
+    for tenant_id, principal_id, job_id in ready:
+        try:
+            held_by: uuid.UUID | None = None
+            async with session_factory() as session:
+                async with session.begin():
+                    # E1-08: probe the pause BEFORE the replay
+                    # rather than letting `replay_job`'s JobError
+                    # be the mechanism. This loop deliberately does
+                    # not re-enqueue a failure, so a refusal here
+                    # would silently discard the `wait_and_replay`
+                    # remediation the operator (or the agent)
+                    # scheduled.
+                    held_by = await find_blocking_pause(
+                        redis, JobDependencyRepository(session), job_id
+                    )
+                    if held_by is None:
+                        service = JobService(
+                            JobRepository(session),
+                            AuditRepository(session),
+                            OutboxRepository(session),
+                            redis,
+                            dep_repo=JobDependencyRepository(session),
+                        )
+                        # Scheduled DLQ replays only come from SA
+                        # callers today (Tier-1 tools). If we grow a
+                        # human path we'd carry principal_type in
+                        # the ZSET member; for now, assume SA.
+                        await service.replay_job(
+                            job_id=job_id,
+                            tenant_id=tenant_id,
+                            principal_type="service_account",
+                            principal_id=principal_id,
+                        )
+            if held_by is not None:
+                await dlq_replay_scheduler.schedule_replay(
+                    redis,
+                    tenant_id=tenant_id,
+                    principal_id=principal_id,
+                    job_id=job_id,
+                    delay_seconds=_PAUSED_REPLAY_DEFER_SECONDS,
+                )
+                logger.info(
+                    "dlq replay deferred (dag paused)",
+                    extra={
+                        "job_id": str(job_id),
+                        "tenant_id": str(tenant_id),
+                        "paused_by": str(held_by),
+                        "delay_seconds": _PAUSED_REPLAY_DEFER_SECONDS,
+                    },
+                )
+            else:
+                logger.info(
+                    "dlq replay scheduled fired",
+                    extra={
+                        "job_id": str(job_id),
+                        "tenant_id": str(tenant_id),
+                    },
+                )
+        except Exception as exc:
+            logger.error(
+                "dlq replay scheduled fire failed",
+                extra={
+                    "job_id": str(job_id),
+                    "tenant_id": str(tenant_id),
+                    "error": str(exc),
+                },
+            )
+
+        # Reached on success, on a paused-DAG deferral (the entry is
+        # armed again on the scheduled set, so holding the claim too
+        # would replay it twice) and on a logged failure. Skipped only
+        # when the worker is going down mid-item — the reclaim case.
+        await dlq_replay_scheduler.ack_replay(
+            redis,
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            job_id=job_id,
+        )
+
+
 async def _promote_dlq_replay_loop(
     session_factory: async_sessionmaker[AsyncSession],
     redis: Any,
@@ -1542,100 +1657,15 @@ async def _promote_dlq_replay_loop(
     Fire operator-scheduled DLQ replays whose delay window has elapsed.
 
     Distinct from `_promote_delayed_loop` (which handles the retry-cycle
-    ZSET `jobs:delayed`). This one drains
-    `jobs:dlq_replay_delayed` — entries the agent's Tier-1 tools
-    scheduled via `replay_dlq_by_ids(delay_seconds=…)` or
-    `replay_dlq_by_category(delay_seconds=…)`.
-
-    Each due entry hits `JobService.replay_job`, which writes the
-    canonical `job.replayed` audit row and republishes via the outbox
-    — so the eventual execution is indistinguishable from an
-    immediate replay, aside from the paired `job.replay_scheduled`
-    row written at scheduling time.
-
-    A due entry whose DAG is paused is re-scheduled (E1-08) instead of
-    fired, keeping the remediation alive until the pause lifts.
+    ZSET `jobs:delayed`). This one drains `jobs:dlq_replay_delayed` —
+    entries the agent's Tier-1 tools scheduled via
+    `replay_dlq_by_ids(delay_seconds=…)` or
+    `replay_dlq_by_category(delay_seconds=…)`. See
+    `_promote_dlq_replay_once` for the per-pass semantics.
     """
-    # Local imports keep the module-level graph flat and match the
-    # style of other supporting loops in this file.
-    from app.repositories.job_dependency import JobDependencyRepository
-    from app.services.job import JobService
-
     while True:
         try:
-            ready = await dlq_replay_scheduler.pop_ready(redis)
-            for tenant_id, principal_id, job_id in ready:
-                try:
-                    held_by: uuid.UUID | None = None
-                    async with session_factory() as session:
-                        async with session.begin():
-                            # E1-08: probe the pause BEFORE the replay
-                            # rather than letting `replay_job`'s JobError
-                            # be the mechanism. This loop's except
-                            # deliberately does not re-enqueue, so a
-                            # refusal here would silently discard the
-                            # `wait_and_replay` remediation the operator
-                            # (or the agent) scheduled.
-                            held_by = await find_blocking_pause(
-                                redis, JobDependencyRepository(session), job_id
-                            )
-                            if held_by is None:
-                                service = JobService(
-                                    JobRepository(session),
-                                    AuditRepository(session),
-                                    OutboxRepository(session),
-                                    redis,
-                                    dep_repo=JobDependencyRepository(session),
-                                )
-                                # Scheduled DLQ replays only come from SA
-                                # callers today (Tier-1 tools). If we grow a
-                                # human path we'd carry principal_type in
-                                # the ZSET member; for now, assume SA.
-                                await service.replay_job(
-                                    job_id=job_id,
-                                    tenant_id=tenant_id,
-                                    principal_type="service_account",
-                                    principal_id=principal_id,
-                                )
-                    if held_by is not None:
-                        await dlq_replay_scheduler.schedule_replay(
-                            redis,
-                            tenant_id=tenant_id,
-                            principal_id=principal_id,
-                            job_id=job_id,
-                            delay_seconds=_PAUSED_REPLAY_DEFER_SECONDS,
-                        )
-                        logger.info(
-                            "dlq replay deferred (dag paused)",
-                            extra={
-                                "job_id": str(job_id),
-                                "tenant_id": str(tenant_id),
-                                "paused_by": str(held_by),
-                                "delay_seconds": _PAUSED_REPLAY_DEFER_SECONDS,
-                            },
-                        )
-                        continue
-                    logger.info(
-                        "dlq replay scheduled fired",
-                        extra={
-                            "job_id": str(job_id),
-                            "tenant_id": str(tenant_id),
-                        },
-                    )
-                except Exception as exc:
-                    # Don't re-enqueue on failure — the operator can
-                    # see the missed replay in the audit trail (the
-                    # scheduled row is there, no matching replayed row)
-                    # and re-issue. Auto-retrying could mask a
-                    # permanent problem like "job was deleted."
-                    logger.error(
-                        "dlq replay scheduled fire failed",
-                        extra={
-                            "job_id": str(job_id),
-                            "tenant_id": str(tenant_id),
-                            "error": str(exc),
-                        },
-                    )
+            await _promote_dlq_replay_once(session_factory, redis)
         except asyncio.CancelledError:
             break
         except Exception as exc:

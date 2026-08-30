@@ -4,6 +4,7 @@ import asyncio
 import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 from app.models.enums import JobStatus, JobType
 from app.models.job import Job
 from app.schemas import job_events
@@ -987,7 +988,7 @@ async def test_promote_dlq_replay_loop_defers_a_paused_replay() -> None:
     replay = AsyncMock()
 
     with patch(
-        "app.workers.dispatcher.dlq_replay_scheduler.pop_ready",
+        "app.workers.dispatcher.dlq_replay_scheduler.claim_ready",
         new=AsyncMock(
             side_effect=[
                 [(tenant_id, principal_id, job_id)],
@@ -999,6 +1000,10 @@ async def test_promote_dlq_replay_loop_defers_a_paused_replay() -> None:
              "app.workers.dispatcher.dlq_replay_scheduler.schedule_replay",
              new=AsyncMock(return_value=1_900_000_000.0),
          ) as mock_schedule, \
+         patch(
+             "app.workers.dispatcher.dlq_replay_scheduler.ack_replay",
+             new=AsyncMock(),
+         ) as mock_ack, \
          patch(
              "app.workers.dispatcher.find_blocking_pause",
              new=AsyncMock(return_value=uuid.uuid4()),
@@ -1015,6 +1020,122 @@ async def test_promote_dlq_replay_loop_defers_a_paused_replay() -> None:
         == dispatcher._PAUSED_REPLAY_DEFER_SECONDS
         == 30
     )
+    # The deferred entry is re-armed on the scheduled set, so the claim
+    # must be released — otherwise it sits in the in-flight set until the
+    # TTL lapses and gets replayed a second time.
+    mock_ack.assert_awaited_once_with(
+        redis, tenant_id=tenant_id, principal_id=principal_id, job_id=job_id
+    )
+
+
+async def test_promote_dlq_replay_once_acks_the_claim_after_a_fired_replay() -> None:
+    """R2-21: the happy path releases its claim, so the in-flight set does
+    not accumulate entries that a later tick would replay again."""
+    tenant_id = uuid.uuid4()
+    principal_id = uuid.uuid4()
+    job_id = uuid.uuid4()
+    redis = AsyncMock()
+    factory = MagicMock(return_value=_make_session())
+
+    with patch(
+        "app.workers.dispatcher.dlq_replay_scheduler.claim_ready",
+        new=AsyncMock(return_value=[(tenant_id, principal_id, job_id)]),
+    ), \
+         patch(
+             "app.workers.dispatcher.dlq_replay_scheduler.ack_replay",
+             new=AsyncMock(),
+         ) as mock_ack, \
+         patch(
+             "app.workers.dispatcher.find_blocking_pause",
+             new=AsyncMock(return_value=None),
+         ), \
+         patch("app.services.job.JobService.replay_job", new=AsyncMock()) as replay:
+        await dispatcher._promote_dlq_replay_once(factory, redis)
+
+    replay.assert_awaited_once()
+    mock_ack.assert_awaited_once_with(
+        redis, tenant_id=tenant_id, principal_id=principal_id, job_id=job_id
+    )
+
+
+async def test_promote_dlq_replay_once_acks_a_permanently_failed_replay() -> None:
+    """A replay that raises is NOT re-enqueued (unchanged policy — the
+    operator sees the `job.replay_scheduled` row with no matching
+    `job.replayed` row and re-issues). That policy only holds if the claim
+    is released; leaving it in-flight would turn "logged and dropped" into
+    "retried forever once the TTL lapses"."""
+    tenant_id = uuid.uuid4()
+    principal_id = uuid.uuid4()
+    job_id = uuid.uuid4()
+    redis = AsyncMock()
+    factory = MagicMock(return_value=_make_session())
+
+    with patch(
+        "app.workers.dispatcher.dlq_replay_scheduler.claim_ready",
+        new=AsyncMock(return_value=[(tenant_id, principal_id, job_id)]),
+    ), \
+         patch(
+             "app.workers.dispatcher.dlq_replay_scheduler.ack_replay",
+             new=AsyncMock(),
+         ) as mock_ack, \
+         patch(
+             "app.workers.dispatcher.dlq_replay_scheduler.schedule_replay",
+             new=AsyncMock(),
+         ) as mock_schedule, \
+         patch(
+             "app.workers.dispatcher.find_blocking_pause",
+             new=AsyncMock(return_value=None),
+         ), \
+         patch(
+             "app.services.job.JobService.replay_job",
+             new=AsyncMock(side_effect=RuntimeError("job was deleted")),
+         ):
+        await dispatcher._promote_dlq_replay_once(factory, redis)
+
+    mock_schedule.assert_not_awaited()
+    mock_ack.assert_awaited_once_with(
+        redis, tenant_id=tenant_id, principal_id=principal_id, job_id=job_id
+    )
+
+
+async def test_promote_dlq_replay_once_leaves_the_claim_held_when_the_worker_dies() -> None:
+    """R2-21 crash window. The old `pop_ready` ZREM'd the whole due batch
+    up front, so a worker killed between the pop and the replay discarded
+    every remaining entry with no record of the loss.
+
+    A worker death is modelled here as `CancelledError` mid-replay — the
+    shutdown signal the dispatcher actually receives. It is a
+    BaseException, so it bypasses the per-item `except Exception` and the
+    ack that follows it: the entry stays in the in-flight set and a later
+    tick reclaims it once the claim TTL lapses. (The reclaim half is
+    proven end-to-end against an emulated ZSET in
+    `tests/api/test_mcp_dlq_categorization.py`.)"""
+    tenant_id = uuid.uuid4()
+    principal_id = uuid.uuid4()
+    job_id = uuid.uuid4()
+    redis = AsyncMock()
+    factory = MagicMock(return_value=_make_session())
+
+    with patch(
+        "app.workers.dispatcher.dlq_replay_scheduler.claim_ready",
+        new=AsyncMock(return_value=[(tenant_id, principal_id, job_id)]),
+    ), \
+         patch(
+             "app.workers.dispatcher.dlq_replay_scheduler.ack_replay",
+             new=AsyncMock(),
+         ) as mock_ack, \
+         patch(
+             "app.workers.dispatcher.find_blocking_pause",
+             new=AsyncMock(return_value=None),
+         ), \
+         patch(
+             "app.services.job.JobService.replay_job",
+             new=AsyncMock(side_effect=asyncio.CancelledError()),
+         ):
+        with pytest.raises(asyncio.CancelledError):
+            await dispatcher._promote_dlq_replay_once(factory, redis)
+
+    mock_ack.assert_not_awaited()
 
 
 async def test_run_job_defers_a_paused_job_before_claiming_it() -> None:
