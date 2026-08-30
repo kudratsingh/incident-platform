@@ -64,6 +64,42 @@ SERVER_VERSION = "0.1.0"
 SUPPORTED_PROTOCOL_VERSION = "2025-03-26"
 
 
+class AuditWriteFailedError(Exception):
+    """The audit row for this tool call could not be written.
+
+    Raised — never returned — so the request transaction unwinds. See
+    `_audit` for why that is the outcome we want.
+    """
+
+
+async def _audit(audit_repo: AuditRepository, **kwargs: Any) -> None:
+    """Write the tool-invocation audit row, or fail the whole request.
+
+    `record_tool_invocation` is savepoint-wrapped and never raises, which
+    is what lets it run on paths that are already returning an error. The
+    cost of that shape was silence: if the row could not be written, the
+    call still returned 200 and the request transaction still committed,
+    so a Tier-1 action took effect with no record that it ever ran. A
+    caller-controlled `X-Request-ID` longer than `audit_logs.request_id`
+    was enough to trigger it on demand (R2-51).
+
+    Raising here converts that into the honest outcome. The exception
+    leaves `handle_tools_call` deliberately unconverted, so `get_db`'s
+    `session.begin()` block rolls the request back — the tool's own DB
+    writes go with it — and the standalone app's catch-all handler
+    returns a JSON-RPC internal error. An action whose audit row cannot
+    be written does not get to commit quietly.
+
+    Non-DB side effects (a Redis `DEL`, say) have already happened and
+    cannot be unwound; the client sees an error for a call that partly
+    landed, which is exactly what an unauditable action *is*. Retrying
+    under the same idempotency key is safe: the claim is released on
+    every path that does not complete.
+    """
+    if not await record_tool_invocation(audit_repo, **kwargs):
+        raise AuditWriteFailedError(str(kwargs.get("tool_name")))
+
+
 def _error(
     request_id: str | int | None, code: int, message: str, data: dict[str, Any] | None = None
 ) -> p.JsonRpcResponse:
@@ -143,7 +179,10 @@ async def handle_tools_call(
 ) -> p.JsonRpcResponse:
     """Transaction envelope around a single tool call.
 
-    Nothing gets out of here except a `JsonRpcResponse`. The work is in
+    Nothing gets out of here except a `JsonRpcResponse` — with one
+    deliberate exception, `AuditWriteFailedError`, which has to escape in
+    order to roll the request back rather than commit an action nothing
+    recorded. The standalone app converts it to an envelope. The work is in
     `_run_tool_call`; this wrapper exists so that *every* step of it —
     argument validation, execution, the audit write, the idempotency
     store — is covered by one handler. It used to be that the
@@ -158,6 +197,16 @@ async def handle_tools_call(
     """
     try:
         return await _run_tool_call(request_id, params, ctx=ctx)
+    except AuditWriteFailedError:
+        # The one exception this envelope does not convert. Returning a
+        # response here would commit the request transaction, which is
+        # the behaviour being fixed: the audit row is missing, so the
+        # work must not stand. Letting it out rolls the transaction back
+        # in `get_db` and the standalone app's catch-all turns it into a
+        # JSON-RPC internal error — still an envelope, still parseable,
+        # but 500 rather than a 200 that claims a clean run.
+        logger.exception("mcp tools/call not audited; failing the request")
+        raise
     except Exception:
         # Deliberately last-resort. Every *expected* failure is handled
         # inside with an audit row attached; reaching here means an
@@ -195,7 +244,7 @@ async def _run_tool_call(
     if tool_def is None:
         # Audit even unknown tool attempts — useful for spotting a
         # misconfigured agent.
-        await record_tool_invocation(
+        await _audit(
             audit_repo,
             principal=ctx.principal,
             tool_name=call_params.name,
@@ -221,7 +270,7 @@ async def _run_tool_call(
     # missing the specific scope hits this branch.
     if tool_def.required_scope is not None:
         if tool_def.required_scope.value not in ctx.principal.scopes:
-            await record_tool_invocation(
+            await _audit(
                 audit_repo,
                 principal=ctx.principal,
                 tool_name=tool_def.name,
@@ -244,7 +293,7 @@ async def _run_tool_call(
     try:
         parsed_input = tool_def.input_model.model_validate(call_params.arguments)
     except ValidationError as exc:
-        await record_tool_invocation(
+        await _audit(
             audit_repo,
             principal=ctx.principal,
             tool_name=tool_def.name,
@@ -279,7 +328,7 @@ async def _run_tool_call(
         idempotency_service = IdempotencyService(IdempotencyRepository(ctx.db))
         idempotency_key = _extract_idempotency_key(call_params.arguments)
         if idempotency_key is None:
-            await record_tool_invocation(
+            await _audit(
                 audit_repo,
                 principal=ctx.principal,
                 tool_name=tool_def.name,
@@ -313,7 +362,7 @@ async def _run_tool_call(
                 ttl=_IDEMPOTENCY_TTL,
             )
         except (IdempotencyKeyReusedError, IdempotencyKeyInFlightError) as exc:
-            await record_tool_invocation(
+            await _audit(
                 audit_repo,
                 principal=ctx.principal,
                 tool_name=tool_def.name,
@@ -333,7 +382,7 @@ async def _run_tool_call(
             )
         if isinstance(acquired, Replay):
             hit = acquired.hit
-            await record_tool_invocation(
+            await _audit(
                 audit_repo,
                 principal=ctx.principal,
                 tool_name=tool_def.name,
@@ -370,7 +419,7 @@ async def _run_tool_call(
         executed = True
     except AuthenticationError as exc:
         latency_ms = (time.perf_counter() - start) * 1000
-        await record_tool_invocation(
+        await _audit(
             audit_repo,
             principal=ctx.principal,
             tool_name=tool_def.name,
@@ -385,7 +434,7 @@ async def _run_tool_call(
         return _error(request_id, p.MCP_UNAUTHORIZED, exc.message)
     except AuthorizationError as exc:
         latency_ms = (time.perf_counter() - start) * 1000
-        await record_tool_invocation(
+        await _audit(
             audit_repo,
             principal=ctx.principal,
             tool_name=tool_def.name,
@@ -400,7 +449,7 @@ async def _run_tool_call(
         return _error(request_id, p.MCP_FORBIDDEN, exc.message)
     except AppError as exc:
         latency_ms = (time.perf_counter() - start) * 1000
-        await record_tool_invocation(
+        await _audit(
             audit_repo,
             principal=ctx.principal,
             tool_name=tool_def.name,
@@ -429,7 +478,7 @@ async def _run_tool_call(
         # "Can't operate on closed transaction inside context manager",
         # so the audit write below — savepoint-wrapped and silent on
         # failure (#6) — was dropped to the log on every crashed call.
-        await record_tool_invocation(
+        await _audit(
             audit_repo,
             principal=ctx.principal,
             tool_name=tool_def.name,
@@ -464,7 +513,7 @@ async def _run_tool_call(
             )
 
     latency_ms = (time.perf_counter() - start) * 1000
-    await record_tool_invocation(
+    await _audit(
         audit_repo,
         principal=ctx.principal,
         tool_name=tool_def.name,
@@ -634,6 +683,7 @@ __all__ = [
     "SERVER_NAME",
     "SERVER_VERSION",
     "SUPPORTED_PROTOCOL_VERSION",
+    "AuditWriteFailedError",
     "dispatch",
     "handle_initialize",
     "handle_tools_call",

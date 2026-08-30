@@ -22,12 +22,12 @@ Requires `telemetry:read`.
 import os
 from datetime import UTC, datetime
 
+from app.core.db_degrade import degrade_on_db_error
 from app.core.logging import get_logger
 from app.core.scopes import Scope
 from app.mcp.registry import ToolContext, tool
 from app.repositories.deploy_marker import DeployMarkerRepository
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy.exc import SQLAlchemyError
 
 logger = get_logger(__name__)
 
@@ -113,17 +113,19 @@ async def get_deploy_history(
     rows: list[DeployMarker] = []
     total = 0
     db_error_note: str | None = None
-    try:
+    # SAVEPOINT, not a bare `try`. The failure this fallback exists for —
+    # `deploy_markers` absent on a staged rollout — aborts the whole
+    # Postgres transaction, so before R2-59 the fallback returned happily
+    # and the envelope's audit write for this very call was then dropped
+    # on the floor. Rolling back to the savepoint keeps the session usable
+    # for everything that runs after the tool returns.
+    async with degrade_on_db_error(ctx.db, what="deploy_markers") as probe:
         repo = DeployMarkerRepository(ctx.db)
         rows, total = await repo.list_recent(
             limit=inp.limit, environment=inp.environment
         )
-    except SQLAlchemyError as exc:
-        db_error_note = f"deploy_markers query failed: {type(exc).__name__}"
-        logger.warning(
-            "get_deploy_history db query failed — falling back to env",
-            extra={"error_type": type(exc).__name__, "error": str(exc)[:200]},
-        )
+    if probe.failed:
+        db_error_note = f"deploy_markers query failed: {probe.error_type}"
 
     if rows:
         return GetDeployHistoryOutput(

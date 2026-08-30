@@ -169,7 +169,7 @@ Append-only log of every meaningful action (job creation, replay, incident resol
 | `job_id` | UUID NULLABLE FK → jobs.id ON DELETE SET NULL | Nullable because not every audit event is job-related. |
 | `action` | String(100) NOT NULL | Indexed. Snake_case verb, e.g. `job.created`, `job.replayed`, `saga.completed`, `tenant.created`, `tenant.limits_updated`. |
 | `resource_type`, `resource_id` | String(100), String(255) | Free-form. The convention is `resource_type=job, resource_id=<uuid>` etc. |
-| `request_id` | String(255) | The HTTP request that triggered the action. Used to correlate audit events across services. |
+| `request_id` | String(255) | The HTTP request that triggered the action. Used to correlate audit events across services. Caller-supplied via `X-Request-ID`, so the width is a correctness bound, not a formatting one — a value the column cannot hold makes the row fail to insert, and the MCP audit writer is savepoint-wrapped and silent. `app.core.middleware` validates the header down to 128 chars of a bounded charset before it ever reaches here, and `AuditRepository.log` truncates to `REQUEST_ID_MAX_LENGTH` as a last resort (WO-R2-51). |
 | `ip_address` | String(50) | |
 | `extra_data` | JSONB NULLABLE | Per-event freeform. e.g. `{retry_count: 5, error: "..."}` for `job.dead_letter`. |
 | `kafka_topic` | String(128) NULLABLE | Set only on consumer-written `event.*` rows; NULL for inline application writes. |

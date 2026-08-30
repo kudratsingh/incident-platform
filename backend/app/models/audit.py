@@ -25,6 +25,15 @@ if TYPE_CHECKING:
 PRINCIPAL_TYPE_USER = "user"
 PRINCIPAL_TYPE_SERVICE_ACCOUNT = "service_account"
 
+#: Width of `audit_logs.request_id`. Named because it is a *correctness*
+#: bound, not a formatting one: an over-long value makes the row fail to
+#: insert, and every audit writer on the MCP path is savepoint-wrapped and
+#: silent on failure, so a value this column cannot hold suppresses the
+#: audit record for an action that ran (R2-51). `AuditRepository.log`
+#: enforces it as a last resort; `app.core.middleware` refuses to mint one
+#: this long in the first place.
+REQUEST_ID_MAX_LENGTH = 255
+
 
 class AuditLog(Base):
     """Immutable append-only record of every significant action in the system.
@@ -79,7 +88,7 @@ class AuditLog(Base):
     # Indexed: the MCP `get_trace` tool looks rows up by correlation id
     # (request_id == trace_id in this platform's middleware).
     request_id: Mapped[str | None] = mapped_column(
-        String(255), nullable=True, index=True
+        String(REQUEST_ID_MAX_LENGTH), nullable=True, index=True
     )
     ip_address: Mapped[str | None] = mapped_column(String(50), nullable=True)
     extra_data: Mapped[dict[str, Any] | None] = mapped_column(PortableJSON, nullable=True)

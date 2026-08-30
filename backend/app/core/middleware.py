@@ -1,3 +1,4 @@
+import re
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
@@ -11,6 +12,61 @@ from starlette.requests import Request
 from starlette.responses import Response
 
 logger = get_logger(__name__)
+
+#: Longest caller-supplied correlation id we will carry. Deliberately far
+#: below `audit_logs.request_id`'s `String(255)`: the id is written to that
+#: column on every audited action, and a value the column cannot hold makes
+#: the *insert* fail, not the request — which on the MCP path meant the
+#: tool ran, committed, and left no audit row, because the audit write is
+#: savepoint-wrapped and never raises (R2-51). The column is the hard
+#: limit; this is the bound we actually enforce, with room to spare so a
+#: future column narrowing cannot re-open the gap silently.
+#: `test_correlation_id_bound_fits_the_audit_column` pins the relation.
+CORRELATION_ID_MAX_LENGTH = 128
+
+#: Charset for an acceptable correlation id: what every id format we
+#: actually see is built from — UUIDs, W3C `traceparent`, X-Ray trace ids,
+#: hex digests, base64url tokens. Control characters are the ones that
+#: matter to exclude (a newline in a value that lands in a log line and an
+#: audit row is a log-injection primitive), but an allow-list is the safer
+#: shape than a deny-list for a header this far upstream.
+_CORRELATION_ID_RE = re.compile(rf"\A[A-Za-z0-9._:+=-]{{1,{CORRELATION_ID_MAX_LENGTH}}}\Z")
+
+
+def sanitise_correlation_id(raw: str | None, *, header: str) -> str:
+    """The caller-supplied `raw` if it is usable as a correlation id, else
+    a fresh UUID.
+
+    Substitution rather than truncation, deliberately. A truncated 4KB id
+    is not the caller's id and correlates with nothing, and an attacker
+    can mint any number of distinct over-long headers that truncate to
+    one prefix — every one of their actions would then share a
+    `request_id`, which is worse for the audit trail than an id they did
+    not choose. The value actually used is echoed back in the response
+    headers, so a caller whose id was rejected can see the one in force.
+
+    The rejected value is never logged: it is attacker-controlled, up to
+    the client's whole header budget, and may contain exactly the control
+    characters we are refusing.
+    """
+    if not raw:
+        return str(uuid.uuid4())
+    if _CORRELATION_ID_RE.fullmatch(raw):
+        return raw
+
+    logger.warning(
+        "rejected caller-supplied correlation id; generated a fresh one",
+        extra={
+            "header": header,
+            "supplied_length": len(raw),
+            "reason": (
+                "too_long"
+                if len(raw) > CORRELATION_ID_MAX_LENGTH
+                else "illegal_characters"
+            ),
+        },
+    )
+    return str(uuid.uuid4())
 
 #: Path dimension for a request that matched no route. `BaseHTTPMiddleware`
 #: wraps the router, so this middleware also sees 404s for arbitrary URLs —
@@ -93,7 +149,9 @@ def register_route_dimension(app: Starlette) -> None:
 class RequestContextMiddleware(BaseHTTPMiddleware):
     """
     Runs on every request:
-      1. Reads or generates X-Request-ID and X-Trace-ID headers.
+      1. Reads or generates X-Request-ID and X-Trace-ID headers, and
+         validates anything the caller supplied (see
+         `sanitise_correlation_id` — the header reaches `audit_logs`).
       2. Binds them to contextvars so all log lines in this request carry them.
       3. Times the request and emits a structured access log.
       4. Queues a RequestLatency metric, dimensioned on the templated route.
@@ -110,8 +168,18 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
     async def dispatch(
         self, request: Request, call_next: Callable[[Request], Awaitable[Response]]
     ) -> Response:
-        request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
-        trace_id = request.headers.get("X-Trace-ID") or request_id
+        request_id = sanitise_correlation_id(
+            request.headers.get("X-Request-ID"), header="X-Request-ID"
+        )
+        # An absent trace header still mirrors the request id, as before;
+        # a present one is validated on its own terms. Both land in
+        # structured logs, and the request id lands in `audit_logs`.
+        raw_trace = request.headers.get("X-Trace-ID")
+        trace_id = (
+            sanitise_correlation_id(raw_trace, header="X-Trace-ID")
+            if raw_trace
+            else request_id
+        )
 
         token_req = request_id_var.set(request_id)
         token_trace = trace_id_var.set(trace_id)
