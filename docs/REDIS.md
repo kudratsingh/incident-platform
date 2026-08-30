@@ -46,12 +46,24 @@ Any key under `cache:` / `jobs:cache:` / `kafka:consumer_lag:` / `read_model:` �
 
 ### Rate limits (`rate:*`)
 
-Sliding-window counters. Two scopes:
+**Fixed**-window counters, keyed on `int(time.time()) // window`. Named
+"sliding" here and in three `app/utils/rate_limit.py` docstrings until
+WO-R2-30, which promised a bound the code has never enforced: because the
+bucket resets on absolute boundaries rather than moving with the caller, a
+client that spends its allowance just before a boundary gets a fresh one
+immediately after. **The enforced ceiling is `2 * limit` across a
+boundary instant**, and every caller's limit is sized against that doubled
+figure. Pinned by
+`backend/tests/api/test_rate_limit_surfaces.py::test_fixed_window_admits_2x_across_a_boundary`.
+
+Four scopes:
 
 - **Per-client (IP + endpoint)** — defends against a single noisy client. Defined in `app/utils/rate_limit.py`. Used as a FastAPI dependency on every mutating endpoint (login, register, job create, etc.). `POST /jobs` and `POST /sagas` deliberately share ONE bucket (`JOB_CREATE_RATE_BUCKET` in `app/utils/admission.py`): separate buckets would let a caller refused by one keep creating job rows through the other. The client identity is the rightmost `X-Forwarded-For` hop — the one the trusted ALB appends — so rotating the caller-supplied part of the header cannot mint fresh buckets.
+- **Per-principal (MCP)** — defends the MCP process against a tool-call storm from one machine principal. Defined as `check_identity_rate_limit` in `app/utils/rate_limit.py`, keyed on `Principal.id` under the `mcp:principal` bucket, enforced in `app/mcp/standalone.py` between JSON-RPC parsing and dispatch. Keyed on the principal rather than the IP because every agent reaches the process from the same address, so an IP bucket would let one noisy principal throttle the others. Ceiling: `MCP_RATE_LIMIT_PER_PRINCIPAL` (default 120/min), sized to stop a runaway loop from exhausting the MCP process's DB pool (SQLAlchemy defaults: 5 + 10 overflow = 15 connections) without touching a legitimate eval run. Refusals come back as a JSON-RPC error with code `MCP_RATE_LIMITED` (-32003) and HTTP 429.
+- **Per-admin, per paid endpoint** — bounds *spend*, not load. `POST /admin/query` (~$0.006 an Anthropic call) and `POST /admin/digests/generate` (~$0.018) each make one paid call per request and had no limiter at all before WO-R2-30. Keyed on the admin user id under the `admin:nl_query` and `admin:digest` buckets — separate, so exhausting one never blocks the other — and checked immediately before the paid call, so a validation error or a disabled feature flag costs no allowance. Ceilings: `ADMIN_NL_QUERY_RATE_LIMIT` (10/min) and `ADMIN_DIGEST_RATE_LIMIT` (5/min).
 - **Per-tenant** — defends against a noisy *tenant* (multiple users / multiple processes from the same customer). Defined in `app/utils/quota.py` as `_check_tenant_rate`. Checked after the per-client check by `check_job_admission`, which every job-creating endpoint runs. Counted in *requests*: one saga is one request no matter how many steps it has — its step count is weighed against the monthly job quota instead, whose unit is jobs.
 
-Both fail open if Redis is unreachable: `logger.warning` and let the request through. The rationale: a Redis outage is bad enough; turning it into a 100% outage by blocking all traffic makes it worse.
+All four fail open if Redis is unreachable: `logger.warning` and let the request through. The rationale: a Redis outage is bad enough; turning it into a 100% outage by blocking all traffic makes it worse.
 
 Configuration:
 

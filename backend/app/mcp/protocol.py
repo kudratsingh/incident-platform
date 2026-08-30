@@ -31,6 +31,11 @@ JSONRPC_INVALID_PARAMS = -32602
 JSONRPC_INTERNAL_ERROR = -32603
 MCP_UNAUTHORIZED = -32001
 MCP_FORBIDDEN = -32002
+# Per-principal rate limit exceeded (WO-R2-30). Its own code rather
+# than folding into JSONRPC_INVALID_REQUEST: the request was well
+# formed and the right answer is to back off and retry, which a
+# client can only decide if it can tell this case apart.
+MCP_RATE_LIMITED = -32003
 MCP_TOOL_NOT_FOUND = -32010
 MCP_TOOL_ERROR = -32011
 

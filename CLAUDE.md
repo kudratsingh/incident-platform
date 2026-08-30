@@ -125,7 +125,7 @@ Phase 12 — Multi-tenancy:
 
 ## Agent-facing surface
 
-The platform exposes an MCP server for machine principals such as `incident-commander`. The code lives at `backend/app/mcp/` and deploys as a standalone process from the same image, with handlers calling the service layer directly. Every MCP request authenticates as a scoped service account, is rate-limited per principal, and writes an immutable audit record. Topology rationale and rejected alternatives (mounted sub-app, API-proxy à la Sentry, separate repo) are in [ADR 0006](docs/ADR/0006-mcp-server-standalone-process.md). Tool changes always start with a PR here, never in the agent repo.
+The platform exposes an MCP server for machine principals such as `incident-commander`. The code lives at `backend/app/mcp/` and deploys as a standalone process from the same image, with handlers calling the service layer directly. Every MCP request authenticates as a scoped service account, is rate-limited per principal (`MCP_RATE_LIMIT_PER_PRINCIPAL`, default 120/min, keyed on `Principal.id` and enforced in `standalone.py` between parsing and dispatch — refusals return JSON-RPC `MCP_RATE_LIMITED` with HTTP 429), and writes an immutable audit record. Topology rationale and rejected alternatives (mounted sub-app, API-proxy à la Sentry, separate repo) are in [ADR 0006](docs/ADR/0006-mcp-server-standalone-process.md). Tool changes always start with a PR here, never in the agent repo.
 
 ### Repo boundary
 
@@ -409,7 +409,7 @@ Logs must be queryable by trace ID end-to-end: browser → API → worker → re
 | Hash maps/sets | Deduplication, membership checks, idempotency keys, **CQRS read-model sets in Redis** |
 | Queues | Job processing pipeline (Kafka topics), outbox |
 | Priority queues / heaps | Redis sorted set for the priority queue (legacy path, still used by delayed-retry) |
-| Sliding window / ring buffer | Rate limiting (Redis INCR + EX) |
+| Fixed window (counter + TTL) | Rate limiting (Redis INCR + EX) — per client IP, per MCP principal, per admin on the paid endpoints, per tenant. `2 * limit` is reachable across a window boundary; ceilings are sized for it |
 | Sorting | Result ordering, pagination, ordering events by `(recorded_at, kafka_offset)` |
 | Caching (LRU, TTL) | Redis cache layer (`JobCache`) |
 | Binary search | Time-series pagination helpers (`Job.created_at` indexed) |

@@ -1,5 +1,5 @@
 """
-Sliding-window rate limiter backed by Redis.
+Fixed-window rate limiter backed by Redis.
 
 Algorithm
 ---------
@@ -7,8 +7,31 @@ Each request increments a counter stored in a Redis key scoped to
 ``(identifier, window_start_second)``.  The key expires automatically after
 the window passes, so no cleanup is needed.
 
-Usage (as a FastAPI dependency)
---------------------------------
+**This is a fixed window, not a sliding one.** The bucket is chosen by
+``int(time.time()) // window``, so it resets on absolute window
+boundaries rather than moving with the caller. The guarantee this
+limiter actually provides is therefore:
+
+    at most ``limit`` requests per window, and at most ``2 * limit``
+    across any instant that straddles a window boundary
+
+— a caller who sends ``limit`` requests just before the boundary and
+``limit`` more just after has sent ``2 * limit`` in a moment while
+staying inside the rule. Three docstrings here, ``docs/REDIS.md`` and
+``docs/ARCHITECTURE.md`` all described this as a *sliding* window, which
+promised a bound the code has never enforced (WO-R2-30).
+
+The naming is corrected rather than the algorithm because ``2 * limit``
+is a real bound, not an absence of one, and every caller's ceiling is
+chosen with headroom well past a factor of two. A true sliding window
+needs a sorted set and a MULTI/EXEC round trip per request; that is a
+worthwhile change on its own merits, but it is a behaviour change for
+every existing caller and it is not what makes the unlimited surfaces
+in this order safe. **Size ceilings against ``2 * limit``,** not
+``limit``.
+
+Usage (as a FastAPI dependency, keyed on client IP)
+---------------------------------------------------
     from app.utils.rate_limit import rate_limiter
 
     @router.post("/login")
@@ -16,6 +39,14 @@ Usage (as a FastAPI dependency)
         request: Request,
         _: None = Depends(rate_limiter(limit=10, window=60)),
     ): ...
+
+Usage (inline, keyed on an identity the handler has already resolved)
+----------------------------------------------------------------------
+    from app.utils.rate_limit import check_identity_rate_limit
+
+    await check_identity_rate_limit(
+        redis, identity=principal.id, limit=120, window=60, bucket="mcp"
+    )
 """
 
 import time
@@ -63,7 +94,7 @@ async def _check(
     limit: int,
     window: int,
 ) -> None:
-    """Increment the sliding-window counter and raise if over limit."""
+    """Increment the fixed-window counter and raise if over limit."""
     window_start = int(time.time()) // window
     redis_key = f"rate:{key}:{window_start}"
 
@@ -85,7 +116,8 @@ def rate_limiter(
     key_prefix: str = "",
 ) -> Callable[..., Coroutine[Any, Any, None]]:
     """
-    Return a FastAPI dependency that enforces a sliding-window rate limit.
+    Return a FastAPI dependency that enforces a fixed-window rate limit,
+    keyed on the client IP (see `_client_key` for the trust model).
 
     Args:
         limit:      Maximum number of requests allowed in the window.
@@ -107,3 +139,49 @@ def rate_limiter(
             logger.warning("rate_limit_check_failed", extra={"key": key})
 
     return dependency
+
+
+async def check_identity_rate_limit(
+    redis: Redis,
+    *,
+    identity: object,
+    limit: int,
+    window: int,
+    bucket: str,
+) -> None:
+    """Rate-limit on an identity the caller has already authenticated.
+
+    The `rate_limiter()` dependency above keys on client IP, which is the
+    right scope for anonymous traffic and the wrong one for everything in
+    this module's other two callers:
+
+      * the **MCP surface**, where every request carries a service-account
+        bearer token. Keying on IP would put every principal behind one
+        ECS task's egress address into a single bucket — one noisy agent
+        would throttle the others, and an agent that reconnects from a
+        new address would get a fresh allowance. `CLAUDE.md` has claimed
+        "rate-limited per principal" since the MCP server shipped; before
+        WO-R2-30 there was no rate limiting on that surface at all.
+      * the **paid admin endpoints**, where the thing worth bounding is
+        spend attributable to an admin token, not to an address.
+
+    `identity` is stringified, so a `uuid.UUID` principal id, a user id or
+    a service-account id all work. `bucket` namespaces the counter so a
+    principal's MCP allowance and its digest allowance are independent.
+
+    Fail-open on a Redis error, matching `rate_limiter`, the backpressure
+    check and the per-tenant quota check: no signal is not a reason to
+    reject ([ADR 0005](../../../docs/ADR/0005-llm-features-fail-open.md)).
+    A `RateLimitError` is re-raised — that is a decision, not a failure.
+
+    Remember the window is **fixed**, so the enforced ceiling is
+    `2 * limit` across a boundary instant (module docstring). Callers
+    size against that.
+    """
+    key = f"{bucket}:{identity}"
+    try:
+        await _check(redis, key, limit, window)
+    except RateLimitError:
+        raise
+    except Exception:
+        logger.warning("rate_limit_check_failed", extra={"key": key})
