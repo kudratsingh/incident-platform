@@ -237,6 +237,56 @@ class JobRepository(BaseRepository[Job]):
             payload=payload,
         )
 
+    async def set_remediation_hint_if_unset(
+        self,
+        *,
+        job_id: uuid.UUID,
+        tenant_id: uuid.UUID,
+        hint: str,
+    ) -> bool:
+        """Fill in `remediation_hint` only if the job has none (R2-24).
+
+        Emits the conditional UPDATE
+
+            UPDATE jobs SET remediation_hint=:hint
+            WHERE id=:id AND tenant_id=:t AND remediation_hint IS NULL
+
+        and returns True only when THIS caller filled it. "Only if unset"
+        is the whole contract: a value already there was put there by
+        somebody making a statement about this dead-letter episode — an
+        operator's or agent's `mark_dlq_permanent`, the eval seed, a
+        chaos hook, or an earlier triage of the same episode — and
+        arriving later is not a reason to overwrite it. The
+        `human_required` case is the one that matters most: that fence is
+        what keeps a job out of `replay_dlq_messages`' blind batch
+        (R2-22), and a re-triage downgrading it to `replay_safe` would
+        lower a fence somebody raised on purpose.
+
+        Predicate, not read-then-write, for the same reason
+        `claim_for_running` is: the triage consumer and an agent's
+        `mark_dlq_permanent` can land in the same window, and Postgres
+        arbitrating on the row is the only version of this that does not
+        have a race in it.
+
+        Deliberately not routed through `update_status` — this changes no
+        status and must emit no lifecycle event. The episode is already
+        `dead_letter` and announced; this only labels it.
+
+        Note the column is reset to NULL on replay (R2-23), so "unset" is
+        per-episode rather than once-per-job: a job that dead-letters
+        again is categorised again, on the new failure's own evidence.
+        """
+        result = await self.session.execute(
+            update(Job)
+            .where(
+                Job.id == job_id,
+                Job.tenant_id == tenant_id,
+                Job.remediation_hint.is_(None),
+            )
+            .values(remediation_hint=hint)
+        )
+        return cast(CursorResult[Any], result).rowcount == 1
+
     async def claim_for_running(self, job_id: uuid.UUID) -> bool:
         """Atomically claim a PENDING job for execution (E1-04).
 

@@ -26,6 +26,7 @@ from typing import Any, Literal
 import anthropic
 from app.config import get_settings
 from app.core.logging import get_logger
+from app.models.enums import RemediationHint
 from app.services._llm_usage import extract_usage
 from pydantic import BaseModel, Field
 
@@ -80,6 +81,54 @@ class TriageAnalysis(BaseModel):
         ge=0.0,
         le=1.0,
     )
+
+
+# ---------------------------------------------------------------------------
+# Analysis → remediation category
+# ---------------------------------------------------------------------------
+
+# Below this, the analysis is a guess and gets no category (R2-24). NULL
+# already means "not categorised, treat as unknown, not replay-safe", which
+# is the honest reading of a guess — and it is what every DLQ tool already
+# advertises, so declining to write costs nothing in contract terms.
+#
+# Both directions are gated, not just the replayable ones. A low-confidence
+# `replay_safe` feeds `replay_dlq_by_category` a job that re-fails; a
+# low-confidence `human_required` over-claims a persistent bug and escalates
+# a job nobody needed to look at. The column is for what triage knows, not
+# for what it suspects.
+_MIN_HINT_CONFIDENCE = 0.5
+
+# Retryable, but not *yet* — something else has to come back first, which is
+# exactly the distinction `wait_and_replay` exists to carry. Replaying these
+# immediately is not wrong so much as early: it burns the retry against a
+# dependency that is still down.
+_DEPENDENCY_CATEGORIES = frozenset({"external_api_failure", "infrastructure"})
+
+
+def remediation_hint_for(analysis: TriageAnalysis) -> str | None:
+    """Map a `TriageAnalysis` onto a `RemediationHint`, or None.
+
+    None is a real answer and the default one: the caller writes no
+    category rather than a placeholder, because NULL is the value every
+    DLQ tool already treats as "unknown, not replay-safe". Returning a
+    category is a claim, and this only makes claims it can support.
+
+    `is_retryable` is read before the root cause because it is the
+    narrower question — the model is asked directly whether replaying
+    as-is is likely to work, and the taxonomy only refines the yes.
+    """
+    if analysis.confidence < _MIN_HINT_CONFIDENCE:
+        return None
+    if analysis.root_cause_category == "unknown":
+        # "Too generic to classify confidently", by the taxonomy's own
+        # definition. Any category derived from it would be invented.
+        return None
+    if not analysis.is_retryable:
+        return RemediationHint.HUMAN_REQUIRED.value
+    if analysis.root_cause_category in _DEPENDENCY_CATEGORIES:
+        return RemediationHint.WAIT_AND_REPLAY.value
+    return RemediationHint.REPLAY_SAFE.value
 
 
 # ---------------------------------------------------------------------------

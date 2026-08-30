@@ -49,11 +49,23 @@ class RemediationHint(StrEnum):
     strategy. Persisted on `jobs.remediation_hint`. Never inferred
     from the raw error message at read time — treat the column as the
     canonical source. Set by:
-      - the LLM triage service (Phase 10) when it classifies a DLQ
+      - the LLM triage service (Phase 10) when it classifies a DLQ —
+        but ONLY when `LLM_TRIAGE_ENABLED` is on, and it is off by
+        default (ADR 0005). With triage off nothing categorises an
+        organically dead-lettered job, and every value in the column
+        comes from one of the three writers below. Said out loud
+        because this list previously named triage as a setter that
+        wrote nothing at all: it persisted a `job_triages` row and
+        never touched this column (R2-24).
       - the eval seed script (see scripts/seed_eval_fixtures.py)
       - chaos hooks that produce DLQ entries (poison_message,
         create_bad_data_job)
       - the `mark_dlq_permanent` Tier-1 tool (agent-driven)
+
+    Scoped to one dead-letter episode: cleared on replay (R2-23), so a
+    job that dead-letters again is categorised afresh. NULL means "not
+    categorised", which the tools read as unknown — explicitly NOT as
+    replay-safe.
     """
 
     REPLAY_SAFE = "replay_safe"          # transient / poison — replay OK

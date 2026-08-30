@@ -49,8 +49,13 @@ class Job(TimestampMixin, Base):
     #   `replay_safe`      — transient / poison; replay after fix
     #   `wait_and_replay`  — external dep down; retry after recovery
     #   `human_required`   — persistent bug; do NOT replay
-    # Set by the LLM triage service (Phase 10) and by the seed script /
-    # chaos hooks. Nullable — only DLQ entries carry a value today.
+    # Set by the LLM triage service (Phase 10) when `LLM_TRIAGE_ENABLED`
+    # is on — it is off by default, so on a stock deployment the only
+    # writers are the seed script, the chaos hooks and `mark_dlq_permanent`
+    # (R2-24). Nullable — only DLQ entries carry a value today, and NULL
+    # reads as "not categorised", not as "safe to replay".
+    # Cleared on replay (R2-23): the value describes one dead-letter
+    # episode, not the job.
     # Kept as a plain string (no CHECK constraint) so new categories can
     # be added without a schema change.
     remediation_hint: Mapped[str | None] = mapped_column(String(32), nullable=True)
