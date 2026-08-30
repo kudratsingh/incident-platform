@@ -116,3 +116,49 @@ The gap the Verification section admitted — "the supervisor itself does not ha
 - `test_supervise_consumer_does_not_resurrect_on_orderly_stop` — the third exit reason still exits, with no extra `start()`.
 
 The crash branch (`run()` raises) is still covered only by the live eval scenario.
+
+## Amendment — 2026-08-30 (WO-R2-10)
+
+*The accepted decision above stands unchanged; this note extends supervision one level up, to the task that hosts every supervisor.*
+
+### The worker task is supervised too
+
+This ADR made supervisors "the unit of consumer lifecycle" and then left the thing holding all of them unsupervised. `worker_loop` was started from the API lifespan with a bare `asyncio.create_task`, and nothing ever looked at the task again: no done-callback, no restart, no liveness signal. The phantom-supervisor shape one level up — this time with a larger blast radius, because a dead `worker_loop` is not one consumer group, it is all eight plus all nine background loops.
+
+Every loop catches `Exception` around its body, so only two paths escape:
+
+- **the deferred imports before a loop's `while True`** (`_promote_dlq_replay_loop`, `_digest_loop`, `_idempotency_reaper_loop`) — an import regression raises outside every guard, and `asyncio.gather` propagates it out of `worker_loop`;
+- **a `CancelledError` reaching `_supervise_consumer`**, which re-raises it by design (the table above); `worker_loop` unwinds and the task ends *cancelled*, with no exception stored anywhere.
+
+`backend/app/workers/supervisor.py` now owns that task. Policy deliberately mirrors the consumer supervisor: log, restart, capped exponential backoff, unbounded attempts. Two deviations, both stated here because they differ from the table above:
+
+- **The first restart is immediate** (the consumer path sleeps 2s first). At this level a one-off crash costs *all* job processing, so the ladder starts at the second consecutive failure: 0s, then 1s → 30s.
+- **A run of 60s or more resets the ladder**, so next month's transient does not inherit today's backoff.
+
+### The deep health check now means something different
+
+Restarting a dead worker is only half of it — the half that fails when the worker cannot come back. The other half is admitting it, and the metric that should have carried that signal cannot: `ConsumerLag`, which both backlog alarms read, is emitted by `_metrics_loop` — a loop *inside* the dead worker — and is deliberately not emitted when the lag is unknown, so a dead worker produces absent datapoints rather than high ones. Both alarms treat missing data as `notBreaching`; `infra/cloudwatch.tf` states this and assigns the dead-worker case to "the ECS task-count alarm and to worker supervision, not here". This is that supervision. Worker death silenced exactly the metrics that would have detected it.
+
+So the liveness lands on `GET /api/v1/health`, which both the ECS container check (`infra/ecs.tf`) and the ALB target group (`infra/alb.tf`) already probe every 30s with a 3-failure threshold. **A green answer there no longer means "this process can reach Postgres and Redis" — it means "…and it is processing jobs."** That is a deliberate widening, and it is only correct because `worker_loop` runs *inside* the API process (see "More than one process runs this" in ARCHITECTURE.md); the day a separate worker deployable exists, this probe has to move with it.
+
+Liveness is answered from three sources, cheapest first, with no I/O:
+
+1. the supervisor's state (`not_started` / `running` / `restarting` / `stopped`);
+2. `worker_task.done()` — the truth, and true the instant the worker dies, so there is no window where a stale recorded state reads healthy;
+3. two heartbeats sharing one staleness bound (`worker_heartbeat_stale_seconds`, default 60s), the backstop for what the first two cannot see.
+
+The heartbeats sit on **separate timestamps**, which is the point of having two. `heartbeat()` is refreshed by the supervisor's own watchdog: its silence means the supervisor stopped being scheduled, the one failure `task.done()` cannot report because the reporter is what died. `worker_tick()` is called from `_promote_delayed_loop` (dispatcher.py), which turns every `POLL_INTERVAL` (0.5s) and touches both Redis and Postgres: its silence means the gather is alive but the loops are wedged. On a shared timestamp the watchdog would keep refreshing on behalf of loops that had stopped turning — the exact case worth catching — so merging them would have quietly cost the second signal.
+
+The tick bound is enforced only once a tick has been observed in the process, so a build without the dispatcher-side call degrades to the supervisor-only signal rather than reporting every task in the fleet unhealthy over a deleted line. A health check must not be able to fail the thing it measures.
+
+The backoff ceiling (30s) sits well inside the probes' 3 × 30s unhealthy window on purpose: a worker that can recover does so in-process, and only one that cannot gets its task recycled.
+
+The one line this adds to `dispatcher.py` — `worker_tick()` at the top of `_promote_delayed_loop`'s body — is the whole of the worker-side contract. It is deliberately a call *into* the supervisor rather than a callback registered by it: no signature changes, no lifecycle to keep in sync, and a loop that knows nothing about who is reading. Moving the tick to a different loop later is a one-line move.
+
+### Shutdown cannot be aborted by the worker's stored exception
+
+`await worker_task` on a task that already stored an exception re-raises it. In the old lifespan that await ran *before* `stop_producer()` and both Redis pool closes, so every shutdown following a worker crash skipped all of them. `supervisor.stop()` cannot raise, and the metrics-emitter stop below it is now guarded for the same reason.
+
+### Verification
+
+`backend/tests/unit/test_worker_supervision.py` — eight tests driving the *real* lifespan (nothing else in the suite does; `httpx.ASGITransport` skips startup/shutdown, which is why a dead worker had no test that could see it): the done-callback logs the death, a crashed worker restarts, a *cancelled* worker restarts, an orderly shutdown does not resurrect it, `/api/v1/health` reports 503 with a dead worker and 200 with a live one, a stale heartbeat is unhealthy on its own, and shutdown still closes the producer and both pools after a worker crash.

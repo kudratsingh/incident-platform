@@ -135,6 +135,20 @@ class Settings(BaseSettings):
     # stale-RUNNING threshold re-opens the finding, so keep the ordering.
     job_execution_timeout_seconds: float = 600.0
 
+    # Worker liveness, as reported by `GET /api/v1/health` (WO-R2-10). The
+    # supervisor refreshes the heartbeat on this interval while the worker
+    # task is alive; the health check calls the worker dead once the last
+    # heartbeat is older than the staleness bound.
+    #
+    # The bound has to clear several intervals — one missed tick under load is
+    # not a dead worker — while staying inside the probes' own 3 × 30s
+    # unhealthy window, so a wedged worker is caught within one ECS cycle
+    # rather than two. 15s/60s gives four ticks of slack on both counts. Note
+    # the staleness bound is only the *backstop*: a worker task that has
+    # actually ended is reported unhealthy immediately, not after 60s.
+    worker_heartbeat_interval_seconds: float = 15.0
+    worker_heartbeat_stale_seconds: float = 60.0
+
     # How many failed publish attempts an outbox row gets before the relay
     # dead-letters it (ADR 0001 Decision item 3 / its 2026 Q3 addendum).
     # The relay ticks once a second and retries every unpublished row every

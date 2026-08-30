@@ -17,6 +17,17 @@ symptoms:
   - "POST /api/v1/jobs returning 503 backpressure responses"
 
 diagnosis_steps:
+  - id: check-worker-alive
+    description: >-
+      First: is the worker running at all? ConsumerLag and every metric below
+      it are emitted by loops inside the worker, and ConsumerLag is not
+      emitted when the lag is unknown — so a dead worker makes them absent
+      rather than high, and this alarm treats missing data as notBreaching.
+      It will not fire for the worst case, which is why this step comes
+      first. A `"worker": "error"` answer means job processing has stopped
+      entirely; `worker_detail` carries the state, restart count, last error
+      and how long since the worker's loops last turned.
+    command: "curl -s -o /dev/null -w '%{http_code}' http://<task>:8000/api/v1/health; curl -s http://<task>:8000/api/v1/health | jq '{worker, worker_detail}'"
   - id: check-consumer-lag
     description: "How far behind is the dispatcher consumer?"
     command: "CloudWatch metric IncidentPlatform/ConsumerLag"

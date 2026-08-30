@@ -11,7 +11,7 @@ For per-component reference, see [`docs/DATA_MODEL.md`](DATA_MODEL.md), [`docs/K
 The platform runs as **three logical processes**:
 
 1. **API process** — FastAPI behind an ALB. Serves `/api/v1/*`. One ECS task with autoscaling target on CPU.
-2. **Worker process** — runs `worker_loop` from `app/workers/dispatcher.py`. Hosts eight Kafka consumer groups + nine background loops. One ECS task today (autoscaling on queue depth is a Phase 8 item).
+2. **Worker** — `worker_loop` from `app/workers/dispatcher.py`. Hosts eight Kafka consumer groups + nine background loops. Logically separate, but **not a separate deployable yet**: it runs as a supervised task inside every API process (see "More than one process runs this" below; the dedicated worker deployable and queue-depth autoscaling are Phase 8 items). That is why worker liveness is reported on the API's own `/api/v1/health` — a dead worker is a degraded *API task*, and the probe that governs restarts has to be able to say so ([ADR 0009](ADR/0009-consumer-lifecycle-and-supervision.md), 2026-08-30 amendment).
 3. **Frontend** — Nginx serving the React SPA. Same ALB, different listener rule.
 
 External dependencies, all managed:
@@ -393,6 +393,8 @@ accordingly:
 
 The "failure isolation" column is the most operationally important one — it documents what happens when something in the loop fails. Every loop catches at the top level and continues; nothing in the worker process is allowed to be fragile in a way that takes down the whole process.
 
+Two paths still escape those top-level guards — a loop's deferred imports, which sit *before* its `while True`, and a `CancelledError` reaching `_supervise_consumer`, which re-raises by design. Both end `worker_loop` itself, so the task is supervised in turn by `app/workers/supervisor.py`: the death is logged, the worker is restarted (immediately, then 1s → 30s), and its liveness is reported on `GET /api/v1/health`. `_promote_delayed_loop` also calls `worker_tick()` on every pass, which extends that liveness from "the task exists" to "its loops are turning". This matters more than the per-loop isolation, because `ConsumerLag` — the metric both backlog alarms read — is emitted by `_metrics_loop`, a loop inside the worker, and is absent rather than high when the worker is dead. Without the health signal, worker death silences the metrics that would detect it.
+
 ---
 
 ## Auth & tenant matrix
@@ -472,8 +474,8 @@ What happens when a component dies, in priority order.
 ### Worker process
 
 **Symptom:** no new job processing; no events flowing. The API still accepts new jobs (they queue in the outbox).
-**Detection:** `backend-tasks-low` alarm (if ECS service replica count drops); queue-depth alarm climbs.
-**Recovery:** ECS auto-restarts the task. On restart it rebuilds consumer-group state and resumes from committed offsets.
+**Detection:** `GET /api/v1/health` reports `"worker": "error"` and 503, with a `worker_detail` giving the state, restart count and last error. Do **not** wait on the backlog alarm for this one: `ConsumerLag` is emitted by a loop inside the worker and is not emitted at all when lag is unknown, so a dead worker makes the datapoints *absent* and the alarm reads missing data as `notBreaching` — `infra/cloudwatch.tf` hands this case to worker supervision explicitly. `backend-tasks-low` only fires if the whole ECS task drops, which a dead worker task inside a live API process does not do.
+**Recovery:** the supervisor restarts the worker in-process first (immediately, then 1s → 30s); if it cannot stay up, the 503 fails the ECS container check and the ALB target, and the task is recycled after 3 × 30s. On restart it rebuilds consumer-group state and resumes from committed offsets.
 **Data loss:** in-flight jobs may double-execute if they had side effects before the crash. Mitigated by idempotency keys.
 **Stranded jobs:** offsets are committed at dispatch time, so jobs the dead worker was executing stay `RUNNING` with nothing left to redeliver them. Once a worker is back, `_stale_running_sweep_loop` dead-letters them within `stale_running_threshold_seconds` (default 900s) plus one 60s pass — they land in the DLQ with `reason: worker_crash_recovery` rather than being re-published, because a partially-executed job is unsafe to re-run ([ADR 0019](ADR/0019-stale-running-recovery-sweep.md)).
 **Runbook:** `runbooks/rb-ecs-tasks-low.yaml`.
@@ -594,7 +596,8 @@ cheap enough to be worth having before an alarm needs it.
 ## Pointers
 
 - `backend/app/main.py` — API process entry point
-- `backend/app/workers/dispatcher.py` — `worker_loop` (the worker process entry point)
+- `backend/app/workers/dispatcher.py` — `worker_loop` (the worker entry point)
+- `backend/app/workers/supervisor.py` — supervises that task; the liveness `/api/v1/health` reports
 - `backend/app/dependencies.py` — shared FastAPI dependencies
 - `backend/app/api/*.py` — HTTP routers
 - `backend/app/services/*.py` — business logic

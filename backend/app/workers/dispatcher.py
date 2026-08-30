@@ -57,6 +57,7 @@ from app.workers.read_model import ReadModelProjector
 from app.workers.saga_coordinator import SagaCoordinator
 from app.workers.schema_registry import SchemaValidationError
 from app.workers.sse_consumer import SseConsumer
+from app.workers.supervisor import worker_tick
 from app.workers.triage_consumer import LlmTriageConsumer
 from opentelemetry import trace
 from opentelemetry.trace import SpanKind
@@ -1017,6 +1018,10 @@ async def _promote_delayed_loop(
     are handled inside `_promote_delayed_once`.
     """
     while True:
+        # Liveness for the deep health check: this loop turns twice a second
+        # and touches Redis and Postgres, so its silence is the closest thing
+        # the worker has to "the loops are wedged" (`workers/supervisor.py`).
+        worker_tick()
         try:
             await _promote_delayed_once(session_factory, redis)
         except asyncio.CancelledError:
