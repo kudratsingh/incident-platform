@@ -66,13 +66,14 @@ The three processes share nothing in-process but coordinate via Postgres, Redis,
                 │   saga-coord     │
                 │   llm-triage     │
                 │                  │
-                │  9 loops:        │
+                │  10 loops:       │
                 │   outbox-relay   │
                 │   promote-delayed│
                 │   promote-replay │
                 │   resume-waiting │
                 │   stale-pending  │
                 │   stale-running  │
+                │   lease-renewal  │
                 │   metrics-loop   │
                 │   digest-loop    │
                 │   idem-reaper    │
@@ -386,8 +387,9 @@ accordingly:
 | `LlmTriageConsumer` | `job.dlq` | `job_triages` rows | Per-job — an LLM failure is logged, no row is written, and the offset is committed ([ADR 0005](ADR/0005-llm-features-fail-open.md)). Only 429/5xx re-raise for redelivery; anything deterministic would otherwise loop on a billed call |
 | `_outbox_relay_loop` | `outbox_events` table | Kafka via `publish_raw` | Per-row — schema failures mark row failed, others retry next tick. Leader-gated: only one process relays at a time ([ADR 0020](ADR/0020-outbox-relay-single-writer.md)) |
 | `_promote_delayed_loop` | Redis `delayed_queue` zset | outbox row | Per-item — a failed job is re-pushed onto the zset; the rest of the batch still promotes |
-| `_requeue_stale_pending_loop` | `jobs` rows `PENDING` for >300s with no `delayed_queue` timer | outbox row | Per-tick — exception logged, loop continues |
-| `_stale_running_sweep_loop` | `jobs` rows `RUNNING` for longer than `stale_running_threshold_seconds`, skipping `dispatcher.in_flight_job_ids` until they are a further `_IN_FLIGHT_EXCLUSION_GRACE_SECONDS` stale ([ADR 0021](ADR/0021-bounded-execution-and-non-blocking-dispatch.md)) | `dead_letter` status + `job.dead_letter` audit row + `job.dlq` outbox row ([ADR 0019](ADR/0019-stale-running-recovery-sweep.md)) | Per-job — each recovery is its own transaction; one failure leaves that row `RUNNING` for the next pass |
+| `_requeue_stale_pending_loop` | `jobs` rows `PENDING` for >300s with no `delayed_queue` timer and no `requeued_at` inside the same window ([ADR 0023](ADR/0023-dispatcher-sweep-ownership.md)) | outbox row + `requeued_at` stamp, one transaction | Per-tick — exception logged, loop continues |
+| `_stale_running_sweep_loop` | `jobs` rows `RUNNING` for longer than `stale_running_threshold_seconds` whose lease (`heartbeat_at`) has lapsed, also skipping `dispatcher.in_flight_job_ids` until they are a further `_IN_FLIGHT_EXCLUSION_GRACE_SECONDS` stale ([ADR 0021](ADR/0021-bounded-execution-and-non-blocking-dispatch.md), [ADR 0023](ADR/0023-dispatcher-sweep-ownership.md)) | `dead_letter` status + `job.dead_letter` audit row + `job.dlq` outbox row ([ADR 0019](ADR/0019-stale-running-recovery-sweep.md)) | Per-job — each recovery is its own transaction and compare-and-sets on the observed `started_at`/`heartbeat_at`; one failure or refusal leaves that row `RUNNING` for the next pass |
+| `_renew_running_leases_loop` | `dispatcher.in_flight_job_ids` | `heartbeat_at` on this worker's `RUNNING` rows, every 20s, until the job is `stale_running_threshold_seconds + _IN_FLIGHT_EXCLUSION_GRACE_SECONDS` old ([ADR 0023](ADR/0023-dispatcher-sweep-ownership.md)) | Per-tick — exception logged; the TTL spans six intervals, and a sustained failure degrades to age-plus-local-set, not to anything worse |
 | `_metrics_loop` | Dispatcher consumer + Redis | CloudWatch gauges | Per-tick — exception logged |
 | `_digest_loop` | DB + Anthropic API | `incident_summaries` rows | Per-tenant — one tenant's API failure doesn't stop the batch |
 
@@ -477,7 +479,7 @@ What happens when a component dies, in priority order.
 **Detection:** `GET /api/v1/health` reports `"worker": "error"` and 503, with a `worker_detail` giving the state, restart count and last error. Do **not** wait on the backlog alarm for this one: `ConsumerLag` is emitted by a loop inside the worker and is not emitted at all when lag is unknown, so a dead worker makes the datapoints *absent* and the alarm reads missing data as `notBreaching` — `infra/cloudwatch.tf` hands this case to worker supervision explicitly. `backend-tasks-low` only fires if the whole ECS task drops, which a dead worker task inside a live API process does not do.
 **Recovery:** the supervisor restarts the worker in-process first (immediately, then 1s → 30s); if it cannot stay up, the 503 fails the ECS container check and the ALB target, and the task is recycled after 3 × 30s. On restart it rebuilds consumer-group state and resumes from committed offsets.
 **Data loss:** in-flight jobs may double-execute if they had side effects before the crash. Mitigated by idempotency keys.
-**Stranded jobs:** offsets are committed at dispatch time, so jobs the dead worker was executing stay `RUNNING` with nothing left to redeliver them. Once a worker is back, `_stale_running_sweep_loop` dead-letters them within `stale_running_threshold_seconds` (default 900s) plus one 60s pass — they land in the DLQ with `reason: worker_crash_recovery` rather than being re-published, because a partially-executed job is unsafe to re-run ([ADR 0019](ADR/0019-stale-running-recovery-sweep.md)).
+**Stranded jobs:** offsets are committed at dispatch time, so jobs the dead worker was executing stay `RUNNING` with nothing left to redeliver them. The dead worker also stops renewing their lease, so `heartbeat_at` lapses within `_RUNNING_LEASE_TTL_SECONDS` (120s) and any surviving replica can tell those rows apart from the ones it is executing itself. `_stale_running_sweep_loop` dead-letters them within `stale_running_threshold_seconds` (default 900s) plus one 60s pass — they land in the DLQ with `reason: worker_crash_recovery` rather than being re-published, because a partially-executed job is unsafe to re-run ([ADR 0019](ADR/0019-stale-running-recovery-sweep.md), [ADR 0023](ADR/0023-dispatcher-sweep-ownership.md)).
 **Runbook:** `runbooks/rb-ecs-tasks-low.yaml`.
 
 ### API process

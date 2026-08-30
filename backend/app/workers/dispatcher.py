@@ -62,7 +62,7 @@ from app.workers.supervisor import worker_tick
 from app.workers.triage_consumer import LlmTriageConsumer
 from opentelemetry import trace
 from opentelemetry.trace import SpanKind
-from sqlalchemy import literal, select, tuple_
+from sqlalchemy import literal, or_, select, tuple_, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import aliased
 
@@ -113,6 +113,19 @@ _PAUSED_REPLAY_DEFER_SECONDS = 30
 # minute of scan latency on top of it is noise, and the scan stays cheap.
 _STALE_RUNNING_SWEEP_INTERVAL = 60.0  # seconds between passes
 _STALE_RUNNING_SWEEP_LIMIT = 100  # RUNNING rows examined per pass
+
+# WO-R2-28. The lease that tells one replica's sweep that another replica is
+# still executing a job. `jobs.heartbeat_at` is renewed every
+# `_RUNNING_LEASE_RENEW_INTERVAL` and read as live for
+# `_RUNNING_LEASE_TTL_SECONDS` after the last renewal.
+#
+# The ratio is what matters: six renewal attempts fit inside one TTL, so a
+# transient database blip, a slow pass or a GC pause cannot expire a lease on
+# a healthy worker. Widening the TTL further only delays real crash recovery,
+# which the age threshold (900s) already dominates; narrowing it towards the
+# renewal interval trades a false `job.dlq` for nothing.
+_RUNNING_LEASE_RENEW_INTERVAL = 20.0  # seconds between check-ins
+_RUNNING_LEASE_TTL_SECONDS = 120.0  # how long a check-in vouches for a job
 
 MAX_CONCURRENT_JOBS = 10  # cap on simultaneously running jobs
 
@@ -1268,7 +1281,8 @@ async def _requeue_stale_pending_once(
     `JobRepository.list_jobs`.
     """
     settings = get_settings()
-    cutoff = datetime.now(UTC) - timedelta(seconds=_STALE_PENDING_AGE_SECONDS)
+    now = datetime.now(UTC)
+    cutoff = now - timedelta(seconds=_STALE_PENDING_AGE_SECONDS)
     async with session_factory() as session:
         async with session.begin():
             outbox_repo = OutboxRepository(session)
@@ -1278,6 +1292,18 @@ async def _requeue_stale_pending_once(
                     .where(
                         Job.status == JobStatus.PENDING,
                         Job.updated_at < cutoff,
+                        # WO-R2-28: and not already re-published inside this
+                        # window. Without it the row stayed inside its own
+                        # predicate — nothing about a re-publish changed the
+                        # row — so a dispatcher that was behind got the same
+                        # job re-published every 60s for as long as the lag
+                        # lasted. `IS NULL` keeps rows that predate the
+                        # column, and every row that has never been swept,
+                        # eligible on the first pass.
+                        or_(
+                            Job.requeued_at.is_(None),
+                            Job.requeued_at < cutoff,
+                        ),
                     )
                     .limit(_STALE_PENDING_LIMIT)
                 )
@@ -1295,6 +1321,21 @@ async def _requeue_stale_pending_once(
                     topic=settings.kafka_topic_job_submitted,
                     key=f"{job.tenant_id}:{job.user_id}",
                     payload=_job_submitted_payload(job),
+                )
+                # Stamped in the SAME transaction as the outbox insert, which
+                # is the whole de-duplication guarantee: either both land or
+                # neither does, so the sweep can never publish a job it will
+                # not remember publishing (nor mark one it did not publish).
+                #
+                # `updated_at` is pinned to its own value so the ORM's
+                # `onupdate` does not fire. Re-publishing is not progress —
+                # if it were recorded as progress the operator-visible age
+                # would reset every window and a job stuck for an hour would
+                # read as five minutes old.
+                await session.execute(
+                    update(Job)
+                    .where(Job.id == job.id)
+                    .values(requeued_at=now, updated_at=Job.updated_at)
                 )
                 logger.info(
                     "stale PENDING re-published",
@@ -1343,8 +1384,20 @@ async def _sweep_stale_running_once(
     (DLQ tab, LLM triage, saga compensation, Tier-1 replay). ADR 0019
     records the revisit trigger.
 
-    Two exclusions, both load-bearing:
+    Three exclusions, all load-bearing:
 
+      * the **lease** — `jobs.heartbeat_at`, renewed by
+        `_renew_running_leases_loop` in whichever replica is executing the
+        job (WO-R2-28). A job whose lease was renewed within
+        `_RUNNING_LEASE_TTL_SECONDS` is someone's live work and is skipped.
+        This is the only one of the three that works across replicas, and
+        its absence was the finding: `in_flight_job_ids` lives in one
+        process's memory, so replica A read every job replica B was
+        executing as an orphan and dead-lettered it — firing a real
+        `job.dlq` for a job that was running fine. A leader gate would not
+        have fixed that, only chosen which replica did it.
+        `heartbeat_at IS NULL` reads as stale, because a crash before the
+        first check-in is exactly what this sweep exists to reclaim.
       * `dispatcher.in_flight_job_ids` — this process's own live work,
         excluded for `_IN_FLIGHT_EXCLUSION_GRACE_SECONDS` past the threshold
         rather than forever. Reaping a job out from under its own processor
@@ -1354,6 +1407,12 @@ async def _sweep_stale_running_once(
         cover more than that: an unconditional exclusion (ADR 0019 as
         originally written) made a hung local job the one state nothing in
         the tree could reclaim, which is half of WO-R2-07.
+
+        It is kept alongside the lease rather than replaced by it: it needs
+        no database round-trip and it still answers correctly when the
+        renewal loop itself is the thing that is wedged. The two agree in
+        the ordinary case, and where they disagree the local set is the
+        more conservative answer for our own rows.
       * the age cutoff, which is compared **in SQL**. `started_at` is
         TIMESTAMP WITH TIME ZONE but SQLite hands back naive datetimes, so
         aware-vs-naive Python math raises TypeError (the same trap
@@ -1363,9 +1422,22 @@ async def _sweep_stale_running_once(
     Each survivor is settled in its OWN session and transaction, mirroring
     `_promote_dlq_replay_loop`'s per-item isolation: one row that fails to
     recover must not roll back the recoveries beside it (the E1-03
-    antipattern). Returns the number of jobs dead-lettered.
+    antipattern).
+
+    The recovery write is a compare-and-set against the `started_at` and
+    `heartbeat_at` this pass observed during its scan (`guard=` on
+    `JobRepository.update_status`). Between the scan and the write — two
+    separate transactions, with per-row Redis and Postgres work in between —
+    the executing replica can renew its lease, or the job can settle and be
+    replayed into a fresh RUNNING attempt. Re-reading the row is not enough
+    to see that: the check and the write have to be one statement. On a
+    refusal the row is left alone and the next pass re-evaluates it.
+
+    Returns the number of jobs dead-lettered.
     """
-    cutoff = datetime.now(UTC) - timedelta(seconds=threshold_seconds)
+    now_scan = datetime.now(UTC)
+    cutoff = now_scan - timedelta(seconds=threshold_seconds)
+    lease_cutoff = now_scan - timedelta(seconds=_RUNNING_LEASE_TTL_SECONDS)
 
     # Scan in its own read-only session; the recoveries below each open
     # their own. `started_at IS NOT NULL` is belt-and-braces — the RUNNING
@@ -1384,11 +1456,20 @@ async def _sweep_stale_running_once(
                     Job.payload,
                     Job.trace_id,
                     Job.started_at,
+                    Job.heartbeat_at,
                 )
                 .where(
                     Job.status == JobStatus.RUNNING,
                     Job.started_at.is_not(None),
                     Job.started_at < cutoff,
+                    # The cross-replica exclusion (WO-R2-28). In SQL for the
+                    # same reason the age cutoff is: it decides which rows
+                    # are candidates at all, and doing it in Python would
+                    # spend the 100-row page on jobs that are plainly alive.
+                    or_(
+                        Job.heartbeat_at.is_(None),
+                        Job.heartbeat_at < lease_cutoff,
+                    ),
                 )
                 .limit(_STALE_RUNNING_SWEEP_LIMIT)
             )
@@ -1433,11 +1514,6 @@ async def _sweep_stale_running_once(
             async with session_factory() as session:
                 async with session.begin():
                     repo = JobRepository(session)
-                    job = await repo.get_by_id(row.id)
-                    if job is None or job.status != JobStatus.RUNNING:
-                        # Settled between the scan and now — its own
-                        # processor won. Leave the terminal state alone.
-                        continue
                     # retry_count is deliberately NOT touched. Replay resets
                     # it on purpose; a crash recovery is not a replay, and
                     # zeroing it here would erase the attempt history triage
@@ -1449,11 +1525,40 @@ async def _sweep_stale_running_once(
                     # the saga coordinator and the event log exactly like a
                     # `_run_job` dead-letter, and a key the producer omits
                     # degrades those consumers silently.
-                    await repo.update_status(
+                    #
+                    # `guard` makes it a compare-and-set against what the
+                    # scan saw. The scan and this write are different
+                    # transactions, so between them the executing replica
+                    # may have renewed its lease (the row is alive after
+                    # all) or the job may have settled and been replayed
+                    # into a new RUNNING attempt (`started_at` moved). A
+                    # re-read cannot close that gap — only doing the check
+                    # and the write in one statement can.
+                    settled = await repo.update_status(
                         row.id,
                         JobStatus.DEAD_LETTER,
                         extra={"error_message": error},
+                        guard=(
+                            Job.status == JobStatus.RUNNING,
+                            Job.started_at == row.started_at,
+                            Job.heartbeat_at.is_(None)
+                            if row.heartbeat_at is None
+                            else Job.heartbeat_at == row.heartbeat_at,
+                        ),
                     )
+                    if settled is None:
+                        # Refused: the row moved under us. Someone else owns
+                        # its outcome — leave it, and let the next pass
+                        # re-evaluate from a fresh scan.
+                        logger.info(
+                            "stale RUNNING recovery refused — row changed "
+                            "under the sweep",
+                            extra={
+                                "job_id": job_id_str,
+                                "observed_started_at": started_at.isoformat(),
+                            },
+                        )
+                        continue
                     await AuditRepository(session).log(
                         "job.dead_letter",
                         tenant_id=row.tenant_id,
@@ -1503,6 +1608,88 @@ async def _sweep_stale_running_once(
         )
 
     return recovered
+
+
+async def _renew_running_leases_once(
+    session_factory: async_sessionmaker[AsyncSession],
+    dispatcher: JobDispatcherConsumer,
+    threshold_seconds: int,
+) -> int:
+    """One check-in on behalf of the jobs this process is executing (WO-R2-28).
+
+    The counterpart to `_sweep_stale_running_once`: that one reads the lease,
+    this one writes it. Together they replace "is this job in *my* in-flight
+    set?" — a question only the process holding the set can answer — with "has
+    *anyone* checked in on this job lately?", which every replica can answer
+    from the same row. Without it, a second replica read every job the first
+    was executing as a crash orphan and dead-lettered it, `job.dlq` and all.
+
+    Snapshot the id set before awaiting: it is mutated by `handle_message` and
+    `_run_and_release` on the same event loop, and iterating it across an await
+    would risk "set changed size during iteration". A job that finishes during
+    the write is renewed harmlessly — the status predicate in
+    `renew_running_leases` drops anything no longer RUNNING.
+
+    The renewal deliberately does not cover a job past
+    `threshold_seconds + _IN_FLIGHT_EXCLUSION_GRACE_SECONDS`. A worker that
+    hangs still runs this loop, so an unconditional renewal would let it
+    defend its own stuck job forever — re-creating, through the lease, the
+    single unreclaimable state WO-R2-07 removed. Past that age the check-ins
+    stop, the lease lapses, and the job is reclaimable by this replica or any
+    other. The bound is the same one the in-flight exclusion uses, so the two
+    mechanisms lapse together rather than leaving a window where one defends
+    a job the other has given up on.
+
+    Returns the number of leases renewed.
+    """
+    job_ids: list[uuid.UUID] = []
+    for job_id_str in list(dispatcher.in_flight_job_ids):
+        try:
+            job_ids.append(uuid.UUID(job_id_str))
+        except ValueError:
+            # A malformed id never reached a real row, so it has no lease to
+            # renew. `handle_message` accepts whatever the message carried.
+            continue
+    if not job_ids:
+        return 0
+
+    async with session_factory() as session:
+        async with session.begin():
+            return await JobRepository(session).renew_running_leases(
+                job_ids,
+                max_age_seconds=(
+                    threshold_seconds + _IN_FLIGHT_EXCLUSION_GRACE_SECONDS
+                ),
+            )
+
+
+async def _renew_running_leases_loop(
+    session_factory: async_sessionmaker[AsyncSession],
+    dispatcher: JobDispatcherConsumer,
+) -> None:
+    """Keep this worker's RUNNING jobs vouched for — see
+    `_renew_running_leases_once` for what the lease is and why it stops.
+
+    Failure posture matches every other loop here: log and keep turning. A
+    missed check-in is not immediately harmful, because the TTL spans six
+    intervals; a *sustained* failure lets the lease lapse, which degrades to
+    exactly the pre-fix behaviour (the sweep falls back on the age threshold
+    and the local in-flight set) rather than to anything worse.
+    """
+    settings = get_settings()
+    while True:
+        try:
+            await _renew_running_leases_once(
+                session_factory,
+                dispatcher,
+                settings.stale_running_threshold_seconds,
+            )
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            logger.error("lease renewal error", extra={"error": str(exc)})
+
+        await asyncio.sleep(_RUNNING_LEASE_RENEW_INTERVAL)
 
 
 async def _stale_running_sweep_loop(
@@ -2063,7 +2250,7 @@ async def worker_loop(
     sticks. The corollary is that a permanently unreachable broker leaves all
     8 supervisors retrying rather than disabling the worker.
 
-    Concurrent tasks that make up the worker — 8 Kafka consumers + 9 loops:
+    Concurrent tasks that make up the worker — 8 Kafka consumers + 10 loops:
 
       Kafka consumers (each its own group, so failure of one doesn't
       affect the others):
@@ -2092,6 +2279,10 @@ async def worker_loop(
                                         (ADR 0010's "no reaper" follow-up).
         9. _stale_running_sweep_loop  — dead-letters RUNNING jobs orphaned by a
                                         hard worker crash (ADR 0019).
+       10. _renew_running_leases_loop — checks in on this worker's RUNNING jobs
+                                        so another replica's sweep can tell
+                                        them apart from crash orphans
+                                        (WO-R2-28, ADR 0023).
 
     Cancel signal: cancel all, wait for in-flight jobs, stop all consumers.
     """
@@ -2134,6 +2325,9 @@ async def worker_loop(
             asyncio.create_task(_idempotency_reaper_loop(session_factory)),
             asyncio.create_task(
                 _stale_running_sweep_loop(session_factory, dispatcher)
+            ),
+            asyncio.create_task(
+                _renew_running_leases_loop(session_factory, dispatcher)
             ),
         ]
     )
