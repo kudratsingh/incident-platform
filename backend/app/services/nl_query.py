@@ -19,8 +19,10 @@ Pattern matches `triage.py` and `retry_policy.py`:
   * frozen system prompt with cache_control: ephemeral
 """
 
+import asyncio
 import json
 from datetime import UTC, datetime
+from typing import Any
 
 import anthropic
 from app.config import get_settings
@@ -137,8 +139,10 @@ def is_enabled() -> bool:
 async def parse_question(question: str) -> tuple[JobFilterSpec, dict[str, int], str]:
     """Call Claude and return (filter_spec, usage, model_id).
 
-    Raises NLQueryDisabledError when the feature is off, anthropic /
-    network exceptions on real API failures.
+    Raises NLQueryDisabledError when the feature is off, anthropic / network
+    exceptions on real API failures, and asyncio.TimeoutError when the call
+    exceeds `llm_nl_query_timeout_seconds` (ADR 0005). The admin route turns
+    all three into the documented 503 `nl_query_unavailable`.
     """
     settings = get_settings()
     if not settings.llm_nl_query_enabled:
@@ -151,27 +155,32 @@ async def parse_question(question: str) -> tuple[JobFilterSpec, dict[str, int], 
     now = datetime.now(UTC).isoformat()
     user_payload = {"now": now, "question": question}
 
-    response = await client.messages.parse(
-        model=settings.llm_nl_query_model,
-        max_tokens=1024,
-        thinking={"type": "adaptive"},
-        system=[
-            {
-                "type": "text",
-                "text": _SYSTEM_PROMPT,
-                "cache_control": {"type": "ephemeral"},
-            }
-        ],
-        messages=[
-            {
-                "role": "user",
-                "content": (
-                    "Convert this question into a JobFilterSpec.\n\n"
-                    f"```json\n{json.dumps(user_payload, indent=2)}\n```"
-                ),
-            }
-        ],
-        output_format=JobFilterSpec,
+    async def _call() -> Any:
+        return await client.messages.parse(
+            model=settings.llm_nl_query_model,
+            max_tokens=1024,
+            thinking={"type": "adaptive"},
+            system=[
+                {
+                    "type": "text",
+                    "text": _SYSTEM_PROMPT,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+            messages=[
+                {
+                    "role": "user",
+                    "content": (
+                        "Convert this question into a JobFilterSpec.\n\n"
+                        f"```json\n{json.dumps(user_payload, indent=2)}\n```"
+                    ),
+                }
+            ],
+            output_format=JobFilterSpec,
+        )
+
+    response = await asyncio.wait_for(
+        _call(), timeout=settings.llm_nl_query_timeout_seconds
     )
 
     spec = response.parsed_output
