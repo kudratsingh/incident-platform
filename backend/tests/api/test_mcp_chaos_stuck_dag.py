@@ -39,6 +39,7 @@ from app.mcp.registry import _restore_for_tests, _snapshot_for_tests
 from app.models.enums import JobStatus
 from app.models.job import Job
 from app.models.outbox import OutboxEvent
+from app.models.tenant import Tenant
 from app.repositories.audit import AuditRepository
 from app.repositories.job import JobRepository
 from app.repositories.job_dependency import JobDependencyRepository
@@ -588,5 +589,119 @@ async def test_create_stuck_dag_repeat_is_idempotent_until_drift(
             )
         assert body["error"]["code"] == protocol.MCP_TOOL_ERROR
         assert body["error"]["data"]["error_code"] == "stuck_chain_name_in_use"
+    finally:
+        teardown()
+
+
+async def test_same_chain_name_in_two_tenants_yields_distinct_chains(
+    db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
+) -> None:
+    """Two tenants asking for the same `chain_name` each get their own
+    chain.
+
+    Ids used to derive from `chain_name` alone, so both tenants computed
+    the *same* uuid5 set. Under RLS the probe could not see the sibling
+    tenant's rows, so the second call fell through to an INSERT that
+    collided on the primary key instead of raising the documented 409;
+    without RLS (this suite runs on SQLite) the probe saw them and the
+    second tenant was refused with `stuck_chain_name_in_use`. Both are
+    wrong for the same reason — the id space was global. Deriving it per
+    tenant makes a cross-tenant collision unrepresentable."""
+    other = Tenant(
+        id=uuid.uuid4(),
+        slug=f"other-{uuid.uuid4().hex[:8]}",
+        name="Other Tenant",
+        is_active=True,
+    )
+    db_session.add(other)
+    await db_session.flush()
+
+    redis_stub = _RedisStub()
+    app, teardown = _mcp_app_with_chaos_enabled(db_session, redis_stub)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app, raise_app_exceptions=False),
+            base_url="http://test",
+        ) as ac:
+            here = await _token(
+                db_session, default_tenant.id, [Scope.CHAOS_INVOKE.value]
+            )
+            there = await _token(
+                db_session, other.id, [Scope.CHAOS_INVOKE.value]
+            )
+            mine = _content(
+                await _call(ac, here, "create_stuck_dag", {"chain_name": "shared"})
+            )
+            theirs = _content(
+                await _call(ac, there, "create_stuck_dag", {"chain_name": "shared"})
+            )
+
+        assert mine["created"] is True
+        assert theirs["created"] is True
+        assert mine["root_job_id"] != theirs["root_job_id"]
+        assert mine["completed_parent_id"] != theirs["completed_parent_id"]
+        assert not set(mine["waiting_job_ids"]) & set(theirs["waiting_job_ids"])
+
+        # Each chain lands in its own tenant, and both survive together.
+        for job_id in (mine["root_job_id"], *mine["waiting_job_ids"]):
+            assert (await _job(db_session, job_id)).tenant_id == default_tenant.id
+        for job_id in (theirs["root_job_id"], *theirs["waiting_job_ids"]):
+            assert (await _job(db_session, job_id)).tenant_id == other.id
+    finally:
+        teardown()
+
+
+async def test_repeat_with_fewer_waiting_steps_is_not_intact(
+    db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
+) -> None:
+    """A shorter repeat must be refused, not reported intact.
+
+    `_assert_intact` only checked that the rows the *current* call
+    expects are present, so a repeat with a smaller `waiting_steps`
+    returned `created=false` while silently omitting the descendants it
+    did not know about — the caller then reasoned about a three-node
+    chain that is really five nodes long."""
+    redis_stub = _RedisStub()
+    app, teardown = _mcp_app_with_chaos_enabled(db_session, redis_stub)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app, raise_app_exceptions=False),
+            base_url="http://test",
+        ) as ac:
+            first = _content(
+                await _call(
+                    ac,
+                    await _token(
+                        db_session, default_tenant.id, [Scope.CHAOS_INVOKE.value]
+                    ),
+                    "create_stuck_dag",
+                    {"chain_name": "shrink", "waiting_steps": 4},
+                )
+            )
+            assert len(first["waiting_job_ids"]) == 4
+
+            chaos = await _token(
+                db_session, default_tenant.id, [Scope.CHAOS_INVOKE.value]
+            )
+            body = await _call(
+                ac,
+                chaos,
+                "create_stuck_dag",
+                {"chain_name": "shrink", "waiting_steps": 2},
+            )
+            assert body["error"]["data"]["error_code"] == "stuck_chain_name_in_use"
+            assert "unexpected" in body["error"]["message"]
+
+            # The same length is still an idempotent no-op.
+            same = _content(
+                await _call(
+                    ac,
+                    chaos,
+                    "create_stuck_dag",
+                    {"chain_name": "shrink", "waiting_steps": 4},
+                )
+            )
+            assert same["created"] is False
+            assert same["waiting_job_ids"] == first["waiting_job_ids"]
     finally:
         teardown()
