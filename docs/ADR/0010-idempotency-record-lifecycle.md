@@ -23,7 +23,7 @@ Every idempotency record carries `expires_at = now() + 24h`. Rationale for the n
 - **Lower bound: multi-hop retry windows.** The commander's transport layer retries with exponential backoff up to ~5 minutes; the outer agent loop can retry a plan across ~30 minutes; a human operator resurrecting yesterday's session is at most a working day away. 24h absorbs all of these.
 - **Chosen number** falls comfortably above the operational retry window and below "same key means something different now" territory.
 
-Lookups treat expired records as absent — the caller re-executes and stores fresh. Background cleanup runs hourly via `_idempotency_reaper_loop` in the worker process (v0.4.8) — `DELETE FROM idempotency_records WHERE expires_at IS NOT NULL AND expires_at < now()`. Interval matches the TTL cadence: a record expires at t+24h, gets reaped no later than t+25h. That bounded 1h window of "expired but still in the table" is invisible to callers because the lookup's own `expires_at < now()` check treats them as absent.
+Lookups treat expired records as absent — the caller re-executes and stores fresh. Background cleanup runs hourly via `_idempotency_reaper_loop` in the worker process (v0.4.8) — `DELETE FROM idempotency_records WHERE expires_at IS NOT NULL AND expires_at < now()`. Interval matches the TTL cadence: a record expires at t+24h, gets reaped no later than t+25h. That bounded 1h window of "expired but still in the table" is invisible to callers because the lookup's own `expires_at < now()` check treats them as absent. *(2026-08-30: this last claim was wrong. The lookup treats an expired record as absent; `uq_idempotency_scope` does not, so `store()` collides with a row the caller was just told did not exist. See the addendum below.)*
 
 ### 2. Arguments-hash contract (cross-repo)
 
@@ -147,27 +147,88 @@ Two-part fix. The pre-v0.4.6 shape had `IdempotencyService.store()` executing in
 Fix:
 
 - **SAVEPOINT per item.** Each per-item call in `replay_dlq_messages`, `replay_dlq_by_ids`, and `replay_dlq_by_category` is wrapped in `async with ctx.db.begin_nested():`. Both `AppError` and non-`AppError` exceptions per item are caught, counted as `failed`, and logged. The savepoint rolls back only that item; the batch continues. Success shape (`replayed=N failed=M`) accurately reflects reality.
-- **Explicit rollback in the `except Exception` handler.** When something raises outside the per-item savepoints (or a tool that doesn't use them at all), `handle_tools_call` now `await ctx.db.rollback()`s before recording the error audit — so the outer cleanup doesn't commit half-executed writes behind the error response. The audit itself is savepoint-wrapped ([#6](../postmortems/0002-phantom-supervisor.md)) so a rollback-broken session can still log without propagating.
-- **`await ctx.db.flush()` before response build.** Success-path only. Sends pending SQL to the DB so deferred errors (FK drift, constraint violations — the class that sank [PR #70](https://github.com/kudratsingh/incident-platform/pull/70)) surface here as exceptions rather than silently at the outer commit. A flush failure lands in the `except Exception` above and the whole tx rolls back.
+- **Explicit rollback in the `except Exception` handler.** When something raises outside the per-item savepoints (or a tool that doesn't use them at all), `handle_tools_call` now `await ctx.db.rollback()`s before recording the error audit — so the outer cleanup doesn't commit half-executed writes behind the error response. The audit itself is savepoint-wrapped ([#6](../postmortems/0002-phantom-supervisor.md)) so a rollback-broken session can still log without propagating. *(2026-08-30: the last sentence was wrong and the rollback is gone — a closed context-managed transaction refuses every later statement, so the audit row was never written. Replaced by a savepoint around the handler; see the addendum below.)*
+- **`await ctx.db.flush()` before response build.** Success-path only. Sends pending SQL to the DB so deferred errors (FK drift, constraint violations — the class that sank [PR #70](https://github.com/kudratsingh/incident-platform/pull/70)) surface here as exceptions rather than silently at the outer commit. A flush failure lands in the `except Exception` above and the whole tx rolls back. *(2026-08-30: it did not — the flush sat outside every `except`. The flush now runs inside the handler's savepoint, where a failure genuinely does reach the crash path.)*
 
-Together these give: **a success response means the DB has the pending writes, and the writes will commit as a unit; an error response means nothing committed for that call.** The per-item semantics for replay tools are additive: partial success is a first-class outcome, distinguishable from partial failure.
+Together these give: **a success response means the DB has the pending writes, and the writes will commit as a unit; an error response means nothing committed for that call.** The per-item semantics for replay tools are additive: partial success is a first-class outcome, distinguishable from partial failure. *(2026-08-30: true as of the addendum below, and not before it — the post-execution block was unreachable by any handler.)*
 
 Contract test: `test_replay_dlq_messages_mid_loop_crash_isolates_via_savepoint` in `tests/api/test_mcp_wave3_tier1_actions.py` injects a `RuntimeError` on the 2nd of 3 jobs and asserts `replayed=2 failed=1` + the second job's status unchanged.
 
 ### Reservations
 
-Nothing outstanding at v0.4.6.
+Nothing outstanding at v0.4.6. *(2026-08-30: superseded — see "What this does not do" in the addendum below.)*
+
+---
+
+## Addendum — 2026-08-30 (WO-R2-06) — the expiry window is visible to callers, and the envelope meant to contain it did not exist
+
+*The decision above is unchanged: 24h TTL, expired-means-absent on lookup, hourly reaper. What follows corrects three claims about the code around it, all of which described behaviour the code did not have.*
+
+### The expired-record window is not invisible to callers
+
+The Decision says the 1h "expired but still in the table" window is invisible because the lookup treats such records as absent. The lookup does. The unique index does not. An expired record still occupies `(tenant_id, principal_id, idempotency_key)`, so:
+
+1. `lookup()` reads the expired record, applies `expires_at < now()`, returns `None` — the caller is told the key is free.
+2. The tool executes. The Tier-1 effect happens for real.
+3. `store()` INSERTs and hits `uq_idempotency_scope`, which the expired row still holds.
+
+The same collision arrives without any expiry at all, from two concurrent calls carrying one key: both lookups miss, both execute, the second INSERT loses the race. Either way the caller was on the far side of an action that had already run.
+
+### The `except Exception` rollback closed the transaction it was about to write into
+
+The Commit-before-response section above specifies `await ctx.db.rollback()` in the crash path, "so the outer cleanup doesn't commit half-executed writes behind the error response", and notes the audit that follows is savepoint-wrapped so "a rollback-broken session can still log". It cannot. `get_db()` opens the request transaction as a context manager (`async with session.begin():`), and SQLAlchemy refuses every later statement on a session whose context-managed transaction was closed underneath it:
+
+> `InvalidRequestError: Can't operate on closed transaction inside context manager. Please complete the context manager before emitting further commands.`
+
+`record_tool_invocation` is three lines further down and swallows its own failures by contract, so the error went to the log and the row went nowhere: **every crashed MCP tool call was deterministically missing from `agent.tool_invoked`** — the table `evals/guards.py::assert_no_tier1_successes` grades the agent's safety on. A stage that crashed mid-effect read as a stage that never acted.
+
+### The flush was not inside the `try`
+
+Same section: "A flush failure lands in the `except Exception` above and the whole tx rolls back." The `except Exception` block ended at the `return` above it; the success audit, `store()` and `flush()` all sat past it. Nothing there could land in a handler, so an `IntegrityError` from step 3 unwound out of `handle_tools_call`, out of `dispatch`, and out of the endpoint. `get_db` saw the exception on the way through and rolled the request transaction back — discarding the success audit row for the action that *had* executed — and Starlette answered with plain-text `Internal Server Error`. To an MCP client that is not a response at all, so it retried, and the Tier-1 effect ran a second time with no audit row for either attempt.
+
+### Enforcement (amended)
+
+One `try/except` now spans the whole of `handle_tools_call` and every exit from it is a JSON-RPC envelope. Inside it, three nested transactions with three different jobs:
+
+| Region | Boundary | On failure |
+| --- | --- | --- |
+| Tool handler + its flush | `async with ctx.db.begin_nested()` | The tool's own writes roll back; the request transaction stays open and committable, so the error audit row can still be written. Replaces the transaction-closing `rollback()`. |
+| Audit write | `begin_nested()` inside `record_tool_invocation` (unchanged) | Only the audit row is lost, and to the log. |
+| `store()` | `async with ctx.db.begin_nested()` | Only the cache write is lost. The audit row was written before this savepoint opened and is untouched by its rollback. |
+
+The ordering is the point: **the audit row outranks the cache write.** A store that fails must never take down the record of an action that already happened.
+
+Two side effects of the first row worth naming. It applies to `AppError` too, not just the crash path the v0.4.6 fix covered: a tool that refuses partway through no longer leaves its half-written state to be committed behind a `MCP_TOOL_ERROR` response. And every tool call now costs a `SAVEPOINT`/`RELEASE` pair, read-only ones included — two round trips on a surface whose calls already do several, and the price of the transaction being recoverable at all.
+
+A collision is resolved by reading the key back, not by failing:
+
+- **A live record exists** — a concurrent call won the race. Its recorded response is returned. One key, one answer, whichever caller asks.
+- **A live record exists under different arguments** — the same `IdempotencyKeyReusedError` (409-shaped `MCP_TOOL_ERROR`) the pre-execution lookup would have raised. A retry now meets it at the lookup and does not re-execute.
+- **Only an expired record exists** — there is no live outcome to defer to, so the caller gets its own result, uncached, plus a warning log. Returning an error here would be a lie about an action that succeeded, and would invite exactly the retry this order exists to prevent.
+
+The MCP app also registers a catch-all `Exception` handler (`app/mcp/standalone.py`), so anything escaping the dispatch layer entirely — a failing commit during dependency teardown, a middleware bug — still leaves the process as an envelope rather than a plain-text 500.
+
+### What this does not do
+
+- **`store()` does not reclaim an expired row.** The colliding caller is answered correctly and audited, but its response is not cached, so a further retry of that key re-executes. Closing that needs `store()` to overwrite a record its own `lookup()` already declared absent — a change to the service's semantics, tracked as the follow-up order that depends on this one.
+- **It does not deduplicate the execution itself.** Two concurrent calls on one key still both run the tool; only the *answer* is deduplicated. Preventing the double execution needs the key reserved before the handler runs, not after.
+- **The 24h TTL and the reaper are untouched.** Only the claim about what the leftover row does to a caller changes.
+
+Verification: `backend/tests/api/test_mcp_transaction_envelope.py` (crash path leaves an `outcome=error` row while the tool's own writes roll back; collision returns an envelope; nothing escapes as a bare 500) and `backend/tests/integration/test_mcp_envelope_postgres.py` (the same two facts against a real `uq_idempotency_scope` violation, which is the only place the savepoint's necessity is observable — Postgres aborts the whole transaction on a constraint violation, SQLite does not).
 
 ## Verification
 
 - `test_idempotency_service.py` — canonical-JSON invariance (same dict, different insertion orders → same hash), expiry (records past `expires_at` return `None`), same-key-different-args (raises 409), cross-tool collision (raises 409).
 - `test_mcp_wave3_tier1_actions.py::test_restart_consumer_group_replay_returns_cached_response` — end-to-end replay through a Tier-1 action; second call returns the first response, doesn't re-execute.
+- `test_mcp_transaction_envelope.py` — the envelope contract (WO-R2-06): crash path returns an envelope *and* persists an `outcome=error` row, the crashed tool's own writes roll back, a `store()` collision on an expired key returns an envelope with the success row committed, a duplicate in flight returns the recorded outcome.
+- `tests/integration/test_mcp_envelope_postgres.py` — the same against a real `uq_idempotency_scope` violation. Postgres aborts the transaction on a constraint violation and its COMMIT then degrades to a ROLLBACK, so this is the only tier where losing the savepoint is observable; SQLite passes either way.
 - **Deferred (item #26)**: cross-repo hash contract test pinning a fixed argument dict on both platform and commander sides.
 
 ## Pointers
 
 - `backend/app/services/idempotency.py` — the service; `_hash_arguments` is the contract function.
-- `backend/app/mcp/handlers.py` — `_IDEMPOTENCY_TTL = timedelta(hours=24)`; passed into `store(...)` at line ~385.
+- `backend/app/mcp/handlers.py` — `_IDEMPOTENCY_TTL = timedelta(hours=24)`, passed into `store(...)` by `_store_response`, which owns the savepoint and the collision resolution.
+- `backend/app/mcp/standalone.py` — the catch-all `Exception` handler that keeps every failure a JSON-RPC envelope.
 - `backend/app/repositories/idempotency.py` — `IdempotencyRecord` table (`expires_at` column, indexed).
 - `backend/tests/unit/test_idempotency_service.py` — hash + expiry + collision unit tests.
 - Related: [ADR 0007 — Machine-principal scope model](0007-machine-principal-scope-model.md) (Tier-1 vs Tier-2 action tiering).
