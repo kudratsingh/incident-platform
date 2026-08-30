@@ -8,11 +8,12 @@ For per-component reference, see [`docs/DATA_MODEL.md`](DATA_MODEL.md), [`docs/K
 
 ## Runtime topology
 
-The platform runs as **three logical processes**:
+The platform runs as **four logical processes**, three of them separate deployables:
 
 1. **API process** — FastAPI behind an ALB. Serves `/api/v1/*`. One ECS task with autoscaling target on CPU.
 2. **Worker** — `worker_loop` from `app/workers/dispatcher.py`. Hosts eight Kafka consumer groups + nine background loops. Logically separate, but **not a separate deployable yet**: it runs as a supervised task inside every API process (see "More than one process runs this" below; the dedicated worker deployable and queue-depth autoscaling are Phase 8 items). That is why worker liveness is reported on the API's own `/healthz/worker` — a dead worker is a degraded *API task*, and the probe that governs restarts has to be able to say so ([ADR 0009](ADR/0009-consumer-lifecycle-and-supervision.md), 2026-08-30 amendment: the signal moved off the deep check so that a Redis outage could not recycle every task with it).
-3. **Frontend** — Nginx serving the React SPA. Same ALB, different listener rule.
+3. **MCP server** — `app/mcp/standalone.py` under uvicorn on port 8001, serving the agent-facing tool surface at `/mcp`. Its own ECS service and task definition, its own security group, target group and `mcp-tasks-low` alarm, from the **same image as the API with a different command** ([ADR 0006](ADR/0006-mcp-server-standalone-process.md); provisioned in WO-R2-68 — before that the ADR described a topology `infra/` did not contain). Same ALB, `/mcp*` listener rule, so `PLATFORM_MCP_URL` is a distinct URL from `PLATFORM_REST_URL` without a second load balancer. It runs no worker and no consumers, and deliberately does not carry the owner database credential: it never migrates.
+4. **Frontend** — Nginx serving the React SPA. Same ALB, different listener rule.
 
 External dependencies, all managed:
 
@@ -24,7 +25,7 @@ External dependencies, all managed:
 - **AWS Secrets Manager** — DB password, JWT secret, Anthropic API key
 - **Anthropic API** (Phase 10 features only) — Claude
 
-The three processes share nothing in-process but coordinate via Postgres, Redis, and Kafka.
+These processes share nothing in-process but coordinate via Postgres, Redis, and Kafka.
 
 ```
                             ┌───────────────┐

@@ -49,6 +49,28 @@ resource "aws_lb_target_group" "frontend" {
   }
 }
 
+# The MCP standalone process (ADR 0006). Shallow liveness for the same
+# reason as the backend group (WO-R2-65): a target group decides who gets
+# traffic, and the MCP process's dependencies are shared with the API, so
+# failing its targets over them would remove the agent's only entry point
+# without fixing anything. There is no worker in this process, so there is
+# no second probe to add — `/healthz` is the whole liveness question here.
+resource "aws_lb_target_group" "mcp" {
+  name        = "${var.app_name}-mcp"
+  port        = 8001
+  protocol    = "HTTP"
+  vpc_id      = aws_vpc.main.id
+  target_type = "ip"
+
+  health_check {
+    path                = "/healthz"
+    healthy_threshold   = 2
+    unhealthy_threshold = 3
+    interval            = 30
+    timeout             = 5
+  }
+}
+
 # ── Listener + Rules ──────────────────────────────────────────────────────────
 
 resource "aws_lb_listener" "http" {
@@ -60,6 +82,28 @@ resource "aws_lb_listener" "http" {
   default_action {
     type             = "forward"
     target_group_arn = aws_lb_target_group.frontend.arn
+  }
+}
+
+# Route /mcp* to the MCP server. This is what makes PLATFORM_MCP_URL a
+# separate URL from PLATFORM_REST_URL (ADR 0006) without a second load
+# balancer: same listener, different path, different target group, and a
+# different process behind it. `/mcp` is the protocol endpoint
+# (`app/mcp/standalone.py`); `/healthz` on the same task is reached by the
+# target-group probe directly, not through this rule.
+resource "aws_lb_listener_rule" "mcp" {
+  listener_arn = aws_lb_listener.http.arn
+  priority     = 20
+
+  condition {
+    path_pattern {
+      values = ["/mcp", "/mcp/*"]
+    }
+  }
+
+  action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.mcp.arn
   }
 }
 

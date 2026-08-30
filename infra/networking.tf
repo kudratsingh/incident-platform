@@ -124,28 +124,59 @@ resource "aws_security_group" "frontend" {
   }
 }
 
-resource "aws_security_group" "rds" {
-  name        = "${var.app_name}-rds"
-  description = "Allow Postgres from backend tasks only"
+# The MCP standalone process (ADR 0006 — its own deployable, same image,
+# different command). Its own security group rather than sharing the
+# backend's: the two services front different audiences (agent traffic vs
+# human traffic), and giving them one group would mean any future rule
+# written for one silently applies to the other.
+resource "aws_security_group" "mcp" {
+  name        = "${var.app_name}-mcp"
+  description = "Allow traffic from ALB to the MCP server on port 8001"
   vpc_id      = aws_vpc.main.id
 
+  ingress {
+    from_port       = 8001
+    to_port         = 8001
+    protocol        = "tcp"
+    security_groups = [aws_security_group.alb.id]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+resource "aws_security_group" "rds" {
+  name        = "${var.app_name}-rds"
+  description = "Allow Postgres from the backend and MCP tasks only"
+  vpc_id      = aws_vpc.main.id
+
+  # Both application deployables. The MCP handlers call the service layer
+  # directly (ADR 0006), so the process holds real database sessions — as
+  # the non-owner incident_app role, like the backend runtime.
   ingress {
     from_port       = 5432
     to_port         = 5432
     protocol        = "tcp"
-    security_groups = [aws_security_group.backend.id]
+    security_groups = [aws_security_group.backend.id, aws_security_group.mcp.id]
   }
 }
 
 resource "aws_security_group" "redis" {
   name        = "${var.app_name}-redis"
-  description = "Allow Redis from backend tasks only"
+  description = "Allow Redis from the backend and MCP tasks only"
   vpc_id      = aws_vpc.main.id
 
+  # The MCP surface reads and writes Redis on the same paths the REST
+  # surface does: per-principal rate limits, the job cache, the chaos
+  # keys where CHAOS_ENABLED permits them.
   ingress {
     from_port       = 6379
     to_port         = 6379
     protocol        = "tcp"
-    security_groups = [aws_security_group.backend.id]
+    security_groups = [aws_security_group.backend.id, aws_security_group.mcp.id]
   }
 }

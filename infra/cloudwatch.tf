@@ -60,6 +60,35 @@ resource "aws_cloudwatch_metric_alarm" "ecs_backend_tasks" {
   ok_actions    = [aws_sns_topic.alarms.arn]
 }
 
+# ── Alarm 2b: MCP tasks running ───────────────────────────────────────────────
+# The agent-facing surface has its own service, so it needs its own
+# task-count alarm (ADR 0006 listed alarms among the accepted costs of the
+# second deployable). `backend-tasks-low` cannot cover it: they are separate
+# ECS services, and RunningTaskCount is dimensioned per service — a dead MCP
+# service leaves the backend alarm perfectly green while the incident
+# commander has no way to reach the platform at all.
+
+resource "aws_cloudwatch_metric_alarm" "ecs_mcp_tasks" {
+  alarm_name          = "${var.app_name}-mcp-tasks-low"
+  alarm_description   = "No MCP ECS tasks are running — the agent-facing tool surface is down (the REST API may be fine). Runbook: rb-ecs-tasks-low (/admin/runbooks/rb-ecs-tasks-low). The service may be crash-looping."
+  comparison_operator = "LessThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "RunningTaskCount"
+  namespace           = "ECS/ContainerInsights"
+  period              = 60
+  statistic           = "Average"
+  threshold           = 1
+  treat_missing_data  = "breaching"
+
+  dimensions = {
+    ClusterName = aws_ecs_cluster.main.name
+    ServiceName = aws_ecs_service.mcp.name
+  }
+
+  alarm_actions = [aws_sns_topic.alarms.arn]
+  ok_actions    = [aws_sns_topic.alarms.arn]
+}
+
 # ── Alarm 3: RDS CPU ──────────────────────────────────────────────────────────
 # Fires when Postgres CPU exceeds 80% for 3 consecutive minutes.
 

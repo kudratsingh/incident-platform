@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import pytest_asyncio
 from app.config import Settings
-from app.models.alert import Alert
+from app.models.alert import ALLOWED_SEVERITIES, Alert
 from app.models.base import Base
 from app.models.tenant import DEFAULT_TENANT_ID, Tenant
 from app.repositories.alert import AlertRepository
@@ -56,11 +56,82 @@ async def test_create_rejects_unknown_severity() -> None:
     with pytest.raises(AlertValidationError, match="Unknown severity"):
         await svc.create_alert(
             tenant_id=uuid.uuid4(),
-            severity="urgent",  # not one of info/warning/critical
+            severity="urgent",  # not one of low/info/warning/critical
             source="whatever",
             title="hi",
         )
     repo.create.assert_not_called()
+
+
+def test_the_accepted_severities_are_exactly_these_four() -> None:
+    """The vocabulary is a contract with the commander, so it is asserted
+    as a set rather than sampled (WO-R2-124).
+
+    `low` was added by user decision; `medium`, `high` and `unknown` were
+    declined in the same decision — the first two because they duplicate
+    `warning`/`critical`, and `unknown` because it is a receiver's default
+    for a malformed payload rather than something a producer may assert.
+    See ADR 0025.
+    """
+    assert ALLOWED_SEVERITIES == {"low", "info", "warning", "critical"}
+
+
+@pytest.mark.parametrize("severity", ["medium", "high", "unknown", "sev1", ""])
+async def test_the_declined_values_are_still_refused(severity: str) -> None:
+    """Widening by one value must not read as widening in general."""
+    svc, repo = _make_repo()
+    with pytest.raises(AlertValidationError, match="Unknown severity"):
+        await svc.create_alert(
+            tenant_id=uuid.uuid4(),
+            severity=severity,
+            source="whatever",
+            title="hi",
+        )
+    repo.create.assert_not_called()
+
+
+async def test_a_low_alert_is_accepted_and_reaches_the_webhook_signed(
+    alert_session: AsyncSession,
+) -> None:
+    """The half a severity constant alone does not prove.
+
+    A value the service accepts but the emitter drops or mangles is not a
+    supported severity — the commander classifies on what arrives in the
+    body. This asserts the whole path: accepted, persisted, delivered after
+    the commit, and covered by the signature scheme as it stands today
+    (`{timestamp}.{nonce}.{body}`, WO-R2-70) rather than the body-only
+    scheme it replaced.
+    """
+    recorder = _Recorder()
+    svc = AlertService(AlertRepository(alert_session))
+
+    with patch("app.services.alerts.get_settings", return_value=_webhook_on()), patch(
+        "app.services.alerts.httpx.AsyncClient", recorder
+    ):
+        async with alert_session.begin():
+            alert = await svc.create_alert(
+                tenant_id=DEFAULT_TENANT_ID,
+                severity="low",
+                source="noise:analytics",
+                title="Analytics backlog is mildly elevated",
+            )
+        await run_post_commit(alert_session)
+
+    assert alert.severity == "low"
+    stored = (await alert_session.execute(select(Alert))).scalars().all()
+    assert [a.severity for a in stored] == ["low"]
+
+    delivered = recorder.posts[0]
+    body = json.loads(delivered["body"])
+    assert body["severity"] == "low", "the emitter dropped or rewrote the value"
+
+    headers = delivered["headers"]
+    assert headers["X-Alert-Signature"] == sign_delivery(
+        "s3cr3t",
+        headers["X-Alert-Timestamp"],
+        headers["X-Alert-Nonce"],
+        delivered["body"],
+    )
 
 
 async def test_create_rejects_empty_title() -> None:
