@@ -4,6 +4,7 @@ from typing import Any
 from app.core.logging import request_id_var
 from app.dependencies import (
     get_db,
+    get_effective_tenant,
     get_redis,
     require_platform_admin,
     require_role,
@@ -249,9 +250,27 @@ async def system_stats(
 async def user_stats(
     user_id: uuid.UUID,
     current_user: User = Depends(_require_support_or_admin),
+    effective_tenant: uuid.UUID = Depends(get_effective_tenant),
+    db: AsyncSession = Depends(get_db),
     redis: Redis = Depends(get_redis),
 ) -> dict[str, dict[str, int]]:
-    """Per-user job counts by status, served from the CQRS read model."""
+    """Per-user job counts by status, served from the CQRS read model.
+
+    The target user is resolved in Postgres under the caller's effective
+    tenant *before* the cache is read. That ordering is the whole point
+    (WO-R2-50): this endpoint took any user UUID and answered straight out
+    of Redis, where there is no RLS backstop to catch a cross-tenant miss —
+    and a cache read must never be the authorisation boundary. Every sibling
+    endpoint here already resolved its tenant; this one simply never did.
+
+    404 for a user in another tenant, same as for a user who does not exist:
+    the caller learns nothing either way.
+    """
+    from app.core.exceptions import NotFoundError
+
+    target = await UserRepository(db).get_for_tenant(user_id, effective_tenant)
+    if target is None:
+        raise NotFoundError(f"User {user_id} not found")
     return {"by_status": await read_user_stats(redis, str(user_id))}
 
 

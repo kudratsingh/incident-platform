@@ -1015,3 +1015,188 @@ async def test_get_incident_unknown_id_returns_not_found(
     )
     assert body["error"]["code"] == protocol.MCP_TOOL_ERROR
     assert body["error"]["data"]["error_code"] == "not_found"
+
+
+# ---------------------------------------------------------------------------
+# Result-window honesty (WO-R2-53)
+#
+# The agent cannot read the docs — the tool description IS the interface — so
+# a description that does not match the query behind it is a functional
+# defect, not a documentation nit.
+# ---------------------------------------------------------------------------
+
+
+def _dlq_job(tenant_id, user_id, *, name: str, created, dead_lettered) -> Job:  # type: ignore[no-untyped-def]
+    return Job(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        type=JobType.CSV_UPLOAD.value,
+        status=JobStatus.DEAD_LETTER.value,
+        error_message=name,
+        retry_count=3,
+        created_at=created,
+        completed_at=dead_lettered,
+    )
+
+
+async def test_list_dlq_messages_orders_by_dead_letter_time_not_submission(
+    mcp_client, db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
+) -> None:
+    """"Most recent first" has to mean most recently dead-lettered.
+
+    Ordering by `created_at` is job *submission* time: a long-running job
+    submitted yesterday that died a minute ago sorted below a job submitted
+    an hour ago that died three hours ago. With no offset, the newest
+    dead-letters were invisible on the only page the agent could fetch.
+    """
+    now = datetime.now(UTC)
+    ac, _ = mcp_client
+    db_session.add(
+        _dlq_job(
+            default_tenant.id,
+            test_user.id,
+            name="oldest-submission-newest-death",
+            created=now - timedelta(hours=10),
+            dead_lettered=now - timedelta(minutes=1),
+        )
+    )
+    db_session.add(
+        _dlq_job(
+            default_tenant.id,
+            test_user.id,
+            name="middle",
+            created=now - timedelta(hours=5),
+            dead_lettered=now - timedelta(hours=2),
+        )
+    )
+    db_session.add(
+        _dlq_job(
+            default_tenant.id,
+            test_user.id,
+            name="newest-submission-oldest-death",
+            created=now - timedelta(hours=1),
+            dead_lettered=now - timedelta(hours=3),
+        )
+    )
+    await db_session.flush()
+
+    token = await _token(
+        db_session, default_tenant.id, [Scope.INCIDENTS_READ.value]
+    )
+    payload = _content(await _call(ac, token, "list_dlq_messages", {}))
+    assert [i["error_message"] for i in payload["items"]] == [
+        "oldest-submission-newest-death",
+        "middle",
+        "newest-submission-oldest-death",
+    ]
+
+    # And the page after the first is reachable at all.
+    page_two = _content(
+        await _call(ac, token, "list_dlq_messages", {"limit": 1, "offset": 1})
+    )
+    assert page_two["total"] == 3
+    assert [i["error_message"] for i in page_two["items"]] == ["middle"]
+
+
+async def test_search_traces_does_not_spend_its_limit_on_untraced_jobs(
+    mcp_client, db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
+) -> None:
+    """The limit was applied in SQL and NULL trace_ids dropped afterwards, so
+    on a table dominated by untraced jobs the matching traced rows were never
+    returned — the tool answered "no traces" for a trace that exists."""
+    now = datetime.now(UTC)
+    ac, _ = mcp_client
+    for n in range(2):
+        db_session.add(
+            Job(
+                tenant_id=default_tenant.id,
+                user_id=test_user.id,
+                type=JobType.CSV_UPLOAD.value,
+                status=JobStatus.DEAD_LETTER.value,
+                trace_id=f"trace-wanted-{n}",
+                created_at=now - timedelta(hours=5),
+            )
+        )
+    # Ten untraced jobs, all newer, so they win every created_at DESC race.
+    for n in range(10):
+        db_session.add(
+            Job(
+                tenant_id=default_tenant.id,
+                user_id=test_user.id,
+                type=JobType.CSV_UPLOAD.value,
+                status=JobStatus.DEAD_LETTER.value,
+                trace_id=None,
+                created_at=now - timedelta(minutes=n),
+            )
+        )
+    await db_session.flush()
+
+    token = await _token(
+        db_session, default_tenant.id, [Scope.INCIDENTS_READ.value]
+    )
+    payload = _content(
+        await _call(
+            ac,
+            token,
+            "search_traces",
+            {"status": JobStatus.DEAD_LETTER.value, "limit": 5},
+        )
+    )
+    assert {m["trace_id"] for m in payload["matches"]} == {
+        "trace-wanted-0",
+        "trace-wanted-1",
+    }
+
+
+async def test_get_trace_reports_truncation_with_the_real_total(
+    mcp_client, db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
+) -> None:
+    """`get_trace` promised "every artifact carrying a given trace_id" while
+    hard-capping at 50 jobs with nothing to say it had stopped short."""
+    ac, _ = mcp_client
+    for _ in range(51):
+        db_session.add(
+            Job(
+                tenant_id=default_tenant.id,
+                user_id=test_user.id,
+                type=JobType.CSV_UPLOAD.value,
+                status=JobStatus.COMPLETED.value,
+                trace_id="trace-crowded",
+            )
+        )
+    await db_session.flush()
+
+    token = await _token(
+        db_session, default_tenant.id, [Scope.INCIDENTS_READ.value]
+    )
+    payload = _content(
+        await _call(ac, token, "get_trace", {"trace_id": "trace-crowded"})
+    )
+    assert len(payload["jobs"]) == 50
+    assert payload["truncated"] is True
+    assert payload["total_jobs"] == 51
+
+
+async def test_get_trace_is_not_truncated_when_everything_fits(
+    mcp_client, db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
+) -> None:
+    ac, _ = mcp_client
+    db_session.add(
+        Job(
+            tenant_id=default_tenant.id,
+            user_id=test_user.id,
+            type=JobType.CSV_UPLOAD.value,
+            status=JobStatus.COMPLETED.value,
+            trace_id="trace-roomy",
+        )
+    )
+    await db_session.flush()
+
+    token = await _token(
+        db_session, default_tenant.id, [Scope.INCIDENTS_READ.value]
+    )
+    payload = _content(
+        await _call(ac, token, "get_trace", {"trace_id": "trace-roomy"})
+    )
+    assert payload["truncated"] is False
+    assert payload["total_jobs"] == 1

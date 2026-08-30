@@ -351,3 +351,122 @@ async def test_idempotency_key_reusable_across_tenants(
     assert a_resp.status_code == 201
     assert b_resp.status_code == 201
     assert a_resp.json()["id"] != b_resp.json()["id"]
+
+
+# ---------------------------------------------------------------------------
+# Saga + admin read paths (WO-R2-50)
+#
+# These three handlers had no application-layer tenant check at all. Postgres
+# RLS covered two of them on a correctly-configured stack; the Redis-served
+# stats path had no backstop of any kind, because a cache read cannot be an
+# authorisation boundary. RLS is a backstop for the check below, not a
+# substitute for it.
+# ---------------------------------------------------------------------------
+
+
+@pytest_asyncio.fixture
+async def tenant_a_saga(db_session, test_user: User):  # type: ignore[no-untyped-def]
+    """A saga in tenant A whose step payload is something tenant B must not see."""
+    from app.models.enums import SagaStatus
+    from app.models.saga import Saga
+
+    saga = Saga(
+        id=uuid.uuid4(),
+        tenant_id=test_user.tenant_id,
+        name="tenant-a-pipeline",
+        status=SagaStatus.RUNNING,
+    )
+    db_session.add(saga)
+    await db_session.flush()
+    db_session.add(
+        Job(
+            tenant_id=test_user.tenant_id,
+            user_id=test_user.id,
+            type=JobType.CSV_UPLOAD,
+            status=JobStatus.DEAD_LETTER,
+            retry_count=3,
+            max_retries=3,
+            priority=0,
+            saga_id=saga.id,
+            payload={"customer": "tenant A confidential"},
+            error_message="tenant A secret failure detail",
+        )
+    )
+    await db_session.flush()
+    return saga
+
+
+async def test_admin_cannot_get_saga_from_other_tenant(
+    client: AsyncClient,
+    tenant_a_saga,  # type: ignore[no-untyped-def]
+    other_tenant_admin_headers: dict[str, str],
+) -> None:
+    """GET /sagas/{id} returned any saga — plus every step job's payload,
+    result and error_message — to any authenticated caller."""
+    resp = await client.get(
+        f"/api/v1/sagas/{tenant_a_saga.id}", headers=other_tenant_admin_headers
+    )
+    # 404, not 403 — same posture as the job endpoints above.
+    assert resp.status_code == 404
+    assert "tenant A confidential" not in json.dumps(resp.json())
+    assert "tenant A secret failure detail" not in json.dumps(resp.json())
+
+
+async def test_user_cannot_get_another_users_saga_in_their_own_tenant(
+    client: AsyncClient,
+    db_session,  # type: ignore[no-untyped-def]
+    tenant_a_saga,  # type: ignore[no-untyped-def]
+    default_tenant,  # type: ignore[no-untyped-def]
+) -> None:
+    """The tenant check is not the whole check: an ordinary user sees only
+    their own sagas, which is what GET /sagas has always claimed."""
+    other = User(
+        tenant_id=default_tenant.id,
+        email="neighbour@test.example.com",
+        hashed_password=hash_password("password123"),
+        role=UserRole.USER,
+        is_active=True,
+    )
+    db_session.add(other)
+    await db_session.flush()
+    token = create_access_token(
+        {
+            "sub": str(other.id),
+            "tenant_id": str(other.tenant_id),
+            "role": other.role,
+        }
+    )
+
+    resp = await client.get(
+        f"/api/v1/sagas/{tenant_a_saga.id}",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 404
+
+
+async def test_saga_list_excludes_other_tenants_for_privileged_callers(
+    client: AsyncClient,
+    tenant_a_saga,  # type: ignore[no-untyped-def]
+    other_tenant_admin_headers: dict[str, str],
+) -> None:
+    """GET /sagas passed `user_id=None` for admin/support callers with no
+    tenant filter, so a privileged caller listed every tenant's sagas."""
+    resp = await client.get("/api/v1/sagas", headers=other_tenant_admin_headers)
+    assert resp.status_code == 200
+    assert str(tenant_a_saga.id) not in {
+        item["id"] for item in resp.json()["items"]
+    }
+
+
+async def test_admin_user_stats_rejects_a_user_from_another_tenant(
+    client: AsyncClient,
+    test_user: User,
+    other_tenant_admin_headers: dict[str, str],
+) -> None:
+    """GET /admin/users/{id}/stats accepted any user UUID and answered from
+    Redis, where there is no RLS backstop to catch the miss."""
+    resp = await client.get(
+        f"/api/v1/admin/users/{test_user.id}/stats",
+        headers=other_tenant_admin_headers,
+    )
+    assert resp.status_code == 404

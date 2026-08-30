@@ -269,3 +269,33 @@ async def resolve_admin_tenant(
                 {"tid": str(requested)},
             )
     return requested
+
+
+async def get_effective_tenant(
+    tenant_id: uuid.UUID | None = None,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> uuid.UUID:
+    """The tenant a read handler must scope itself to — as a dependency.
+
+    `resolve_admin_tenant` already computed this, but only where a handler
+    remembered to call it, and three read paths did not (WO-R2-50):
+    `GET /sagas/{id}` served any saga to any authenticated caller,
+    `GET /sagas` passed `user_id=None` for privileged callers with no tenant
+    filter at all, and `GET /admin/users/{id}/stats` answered any user UUID
+    out of Redis. Declaring the scope as a dependency rather than as three
+    remembered calls is the point: the next read endpoint inherits it by
+    typing `Depends(get_effective_tenant)`, and forgetting it is visible in
+    the signature rather than buried in a body.
+
+    The value is the caller's own tenant, except that a platform admin may
+    ask for another via `?tenant_id=` — the existing, deliberate override,
+    which also retargets `app.tenant_id` so RLS admits the query. Everyone
+    else's `?tenant_id=` is silently ignored, so exposing the parameter on
+    these endpoints grants nobody anything they did not already have.
+
+    RLS remains the backstop underneath this, not the substitute for it: it
+    is inert on SQLite, inert for a superuser connection, and — as the stats
+    path showed — absent entirely from a Redis read.
+    """
+    return await resolve_admin_tenant(current_user, db, tenant_id)
