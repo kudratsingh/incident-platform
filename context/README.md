@@ -14,7 +14,8 @@ detail that was too specific to promote into a summary but too expensive to work
 context/
 ├── README.md      # this file — the convention
 ├── INDEX.md       # the map. A new session reads this, not the archives.
-├── pack.sh        # makes an archive: scrub → verify → zip
+├── pack.sh        # makes an archive: scrub → verify (different patterns) → zip
+├── pack-selftest.sh  # proves pack.sh still scrubs and still catches; runs in a temp dir
 └── archives/      # the archives themselves — NOT committed, see below
     └── 2026-08-16-audit-campaign.zip
 ```
@@ -108,16 +109,27 @@ in git. If the archives matter, they need to exist somewhere other than this mac
 
 ## Do not trust the scrubber's word for it
 
-`pack.sh` reports "clean" when none of *its* patterns survive, which is a narrower claim than "no
-secrets survive." Both bugs found on its first real run were of exactly that shape:
+A scrubber that checks its own work with its own patterns cannot fail — it can only report that
+it did what it does. Three bugs of exactly that shape have been found here:
 
 - the scheme list named `postgres://` and `postgresql://` and therefore sailed past
   `postgresql+asyncpg://` — the scheme this project actually uses — and `https://user:token@`;
 - the `s///` delimiter was unescaped, so the `//` inside `postgres://` closed the expression and
-  the whole pattern list failed to compile.
+  the whole pattern list failed to compile;
+- the private-key pattern matched the `-----BEGIN…-----` line only, so the key body and the END
+  line survived — and the verifier, which reused that same pattern, called the result clean.
 
-Both were caught by scanning the finished archive with *different* patterns than the ones that
-built it. Do that when you add a pattern, and do it from outside the script:
+The first two were caught by scanning the finished archive with *different* patterns than the
+ones that built it. The third is why `pack.sh` now does that itself: `REDACT_PATTERNS` names
+vendor shapes to remove, `VERIFY_PATTERNS` is a separate list that looks for what a secret *is*
+— key material, URL userinfo, a labelled quoted value — and some of it describes things the
+redactor deliberately does not scrub. A hit there stops the archive rather than being cleaned up
+silently. `./context/pack-selftest.sh` exercises both halves against a fixture (a multi-line PEM
+key, a symlinked out-of-stage secret, two extras sharing a basename) in a temp directory; run it
+after touching either list.
+
+None of that makes the archive *safe*, only checked twice by two different readers. Still scan
+from outside the script when you add a pattern:
 
 ```bash
 unzip -qq context/archives/<name>.zip -d /tmp/check
