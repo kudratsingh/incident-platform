@@ -38,6 +38,7 @@ This file (`CLAUDE.md`) is the high-signal index. Treat it as the entry point �
   - [0012 — The lab is invisible to the agent](docs/ADR/0012-the-lab-is-invisible-to-the-agent.md) — rule 1 shipped v0.4.9; rule 2 deferred to post-rerun
   - [0018 — Production Kafka is not provisioned](docs/ADR/0018-production-kafka-posture.md) — no broker in `infra/`, ECS deploy gated off, `KAFKA_BOOTSTRAP_SERVERS` omitted unless set
   - [0019 — Stale-RUNNING recovery sweep dead-letters, never re-publishes](docs/ADR/0019-stale-running-recovery-sweep.md) — worker-crash orphans go to the DLQ, not back onto `job.submitted`; revisit once a job can prove it did not partially execute
+  - [0022 — Promotable-only resume sweep, and a stranded parent cascades CANCELLED](docs/ADR/0022-promotable-only-resume-sweep-and-dependency-cascade.md) — amends 0011; the sweep's limit now bounds promotable work, and `CANCELLED` gains a second, non-saga writer
 - [`docs/postmortems/`](docs/postmortems/) — one file per incident (backfilled or written at the time). Format: Impact / Timeline / Root cause / Detection gap / Fix / Prevention rule adopted.
   - [0009 — Consumer lifecycle and supervision](docs/ADR/0009-consumer-lifecycle-and-supervision.md)
 - [`docs/ROADMAP.md`](docs/ROADMAP.md) — open extension ideas, sized + categorized
@@ -89,7 +90,7 @@ What's actually shipped (as of the most recent merge):
   - **Outbox relay** — polls `outbox_events` every second and publishes to Kafka
   - **Delayed-retry promote** — moves exponentially-backed-off retries from a Redis sorted-set back into Kafka via the outbox
   - **DLQ replay promote** — fires operator-scheduled DLQ replays whose delay window has elapsed
-  - **Resume-unblocked-waiting sweep** — promotes `WAITING` children once their DAG pause lifts; backstops missed promotions
+  - **Resume-unblocked-waiting sweep** — promotes `WAITING` children once their DAG pause lifts; backstops missed promotions. Selects only rows with no unmet parent, oldest first behind a rotating cursor, so permanently-blocked children cannot starve it ([ADR 0022](docs/ADR/0022-promotable-only-resume-sweep-and-dependency-cascade.md))
   - **Stale-PENDING backstop** — re-publishes `PENDING` jobs left with no `jobs:delayed` timer by a crash window
   - **Stale-RUNNING sweep** — dead-letters `RUNNING` jobs orphaned by a hard worker crash, after `STALE_RUNNING_THRESHOLD_SECONDS` (default 900). Never re-publishes them ([ADR 0019](docs/ADR/0019-stale-running-recovery-sweep.md)). Its exclusion for this process's own in-flight jobs is time-bounded, not permanent — a local job stuck past its execution deadline is reclaimed too ([ADR 0021](docs/ADR/0021-bounded-execution-and-non-blocking-dispatch.md))
   - **Metrics loop** — emits CloudWatch gauges (`QueueDepth`, `InFlightJobs`, `ConsumerLag`) and caches the lag in Redis for the backpressure check

@@ -67,7 +67,7 @@ Eight consumer groups run concurrently inside the worker process (`worker_loop` 
 | `sse-broadcaster` | All lifecycle topics | Bridges Kafka events to Redis Pub/Sub channels that SSE clients read from `GET /jobs/{id}/stream`. | Live UI updates. | Browser progress bars freeze; user reloads page to see latest. |
 | `event-log` | All lifecycle topics | Appends every event to the immutable `job_events` table (event sourcing). | `GET /admin/jobs/{id}/timeline`. | The job timeline view stops growing. |
 | `read-model` | All lifecycle topics | Maintains Redis-backed denormalized per-tenant + per-user sets keyed by status (CQRS read side). | `GET /admin/stats` returns stale numbers. | Numbers stop updating; reads still work. |
-| `dependency-resolver` | `job.completed` | Promotes child jobs from `WAITING` to `PENDING` when their parents complete. | DAG progression. | Jobs with deps get stuck in `WAITING`. |
+| `dependency-resolver` | `job.completed` | Promotes child jobs from `WAITING` to `PENDING` when their parents complete. | DAG progression. | Jobs with deps sit in `WAITING` until the dispatcher's 10s resume sweep picks them up — the sweep is the backstop for exactly this. Children of a *failed* parent are cancelled by the dependency cascade, not by this consumer ([ADR 0022](ADR/0022-promotable-only-resume-sweep-and-dependency-cascade.md)). |
 | `saga-coordinator` | `job.completed`, `job.dlq` | Marks sagas complete or kicks off compensation. | Saga lifecycle. | Sagas stall; compensation doesn't fire. |
 | `llm-triage` | `job.dlq` | Calls Claude to classify the failure, writes a `job_triages` row. | DLQ triage column in admin UI shows no analysis. | Triage rows stop appearing; raw error_message still visible to admins. |
 
