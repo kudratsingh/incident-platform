@@ -11,6 +11,13 @@ the test instead of silently orphaning the tool again.
 
 import uuid
 
+import pytest
+from app.core.exceptions import AppError
+from app.mcp.tools import cache_key_info as cache_key_info_module
+from app.mcp.tools._cache_scope import assert_key_in_tenant, tenant_segment
+from app.mcp.tools.actions import (
+    invalidate_cache_key as invalidate_cache_key_module,
+)
 from app.mcp.tools.actions.invalidate_cache_key import _ALLOWED_PREFIXES
 from app.mcp.tools.cache_key_info import _READABLE_PREFIXES
 from app.mcp.tools.chaos.create_stale_cache import (
@@ -107,3 +114,66 @@ def test_the_hot_set_fixture_key_stays_chaos_writable() -> None:
     """The exclusion above must not cost the hook its own fixture key —
     `remediate_stale_cache_success` is unwinnable without it."""
     assert _chaos_writable(_DEFAULT_HOT_SET_KEY)
+
+
+# ---------------------------------------------------------------------------
+# R2-54 — the tenant half of the same decision
+# ---------------------------------------------------------------------------
+
+
+def test_the_tenant_segment_is_read_out_of_the_real_job_cache_key() -> None:
+    """Same tripwire shape as the reachability tests above, for the other
+    guardrail: `_cache_scope` locates the tenant by position, so a change
+    to `JobCache._key`'s layout must break a test rather than silently
+    leave the namespace unscoped."""
+    tenant_id = uuid.uuid4()
+    key = JobCache._key(uuid.uuid4(), tenant_id)
+    assert tenant_segment(key) == str(tenant_id)
+
+
+def test_the_job_cache_key_is_tenant_scoped_at_all() -> None:
+    """The precondition R2-54 rests on: `cache:job:` is allowlisted, so
+    the only thing keeping one tenant off another's entry is the segment
+    check. A key family with no tenant in it could not be scoped."""
+    key = JobCache._key(uuid.uuid4(), uuid.uuid4())
+    assert _reachable(key), "precondition: the compensator reaches it"
+    assert tenant_segment(key) is not None, (
+        "the per-job cache key no longer carries a tenant segment — "
+        "invalidate_cache_key and get_cache_key_info have nothing to check"
+    )
+
+
+def test_platform_global_keys_carry_no_tenant_segment() -> None:
+    """The other side: these have no tenant to compare, and scoping them
+    would break the metrics-cache and hot_set remediations."""
+    for key in (
+        _DEFAULT_HOT_SET_KEY,
+        BACKPRESSURE_LAG_KEY,
+        "read_model:something",
+    ):
+        assert tenant_segment(key) is None, key
+
+
+def test_a_cross_tenant_key_is_refused_and_an_own_tenant_key_is_not() -> None:
+    """The decision itself, without a request around it."""
+    mine = uuid.uuid4()
+    theirs = uuid.uuid4()
+
+    assert_key_in_tenant(
+        JobCache._key(uuid.uuid4(), mine), tenant_id=mine, error=AppError
+    )
+
+    with pytest.raises(AppError):
+        assert_key_in_tenant(
+            JobCache._key(uuid.uuid4(), theirs), tenant_id=mine, error=AppError
+        )
+
+
+def test_both_cache_tools_share_one_scope_check() -> None:
+    """The drift guard the spec asks for: the read tool is the before/after
+    half of the delete tool's remediation, so a gap in either is the same
+    leak. Same function object, not two copies of the rule."""
+    assert (
+        invalidate_cache_key_module.assert_key_in_tenant
+        is cache_key_info_module.assert_key_in_tenant
+    )

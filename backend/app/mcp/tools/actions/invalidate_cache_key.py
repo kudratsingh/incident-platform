@@ -1,11 +1,21 @@
 """
 `invalidate_cache_key` — delete one Redis key.
 
-Guardrail: only keys under the allowlisted prefixes below can be
-deleted. This is a load-bearing check — an unrestricted DEL against
-a shared Redis is an availability-affecting action; scoping the
-tool to cache-y prefixes keeps it safe by construction. Adding a
-new prefix is a code change and a PR review.
+Two guardrails, and both are load-bearing.
+
+*Namespace*: only keys under the allowlisted prefixes below can be
+deleted. An unrestricted DEL against a shared Redis is an
+availability-affecting action; scoping the tool to cache-y prefixes
+keeps it safe by construction. Adding a new prefix is a code change and
+a PR review.
+
+*Tenant* (R2-54): the allowlist says a key is a platform cache
+namespace, not that it is *yours*. `cache:job:{tenant}:{job_id}` is
+deliberately deletable — force-refreshing a stale job read is what this
+tool is for — so without a tenant check a service account in one tenant
+could evict another tenant's cached reads. The tenant segment comes from
+the authenticated principal; see `app/mcp/tools/_cache_scope.py`, shared
+with `get_cache_key_info` so the two cannot drift.
 
 `actions:execute` + idempotent.
 """
@@ -14,6 +24,7 @@ from app.core.exceptions import AppError
 from app.core.logging import get_logger
 from app.core.scopes import Scope
 from app.mcp.registry import ToolContext, tool
+from app.mcp.tools._cache_scope import assert_key_in_tenant
 from pydantic import BaseModel, ConfigDict, Field
 
 logger = get_logger(__name__)
@@ -61,7 +72,9 @@ class InvalidateCacheKeyInput(BaseModel):
         min_length=1,
         max_length=512,
         description="Exact Redis key to delete. Must start with one of "
-        f"{list(_ALLOWED_PREFIXES)}.",
+        f"{list(_ALLOWED_PREFIXES)}. Tenant-scoped keys "
+        "(`cache:job:{tenant_id}:{job_id}`) are deletable only within the "
+        "calling principal's own tenant.",
     )
     idempotency_key: str = Field(min_length=8, max_length=255)
 
@@ -77,10 +90,10 @@ class InvalidateCacheKeyOutput(BaseModel):
 @tool(
     "invalidate_cache_key",
     description=(
-        "Delete one Redis key (allowlisted prefixes only). Use to "
-        "force refresh of a stale cache after fixing the underlying "
-        "data. Idempotent — a follow-up call finds nothing to delete "
-        "and returns `deleted=false`."
+        "Delete one Redis key (allowlisted prefixes only, and within "
+        "your own tenant). Use to force refresh of a stale cache after "
+        "fixing the underlying data. Idempotent — a follow-up call finds "
+        "nothing to delete and returns `deleted=false`."
     ),
     input_model=InvalidateCacheKeyInput,
     output_model=InvalidateCacheKeyOutput,
@@ -95,6 +108,16 @@ async def invalidate_cache_key(
             f"Key {inp.key!r} is not under an allowlisted prefix. "
             f"Allowed: {list(_ALLOWED_PREFIXES)}"
         )
+    # Second gate, and the one that makes the first sufficient: the
+    # allowlist says this is a platform cache namespace, this says the
+    # entry is the caller's. `cache:job:{tenant}:{job}` is deliberately
+    # deletable, so without it one tenant's service account could evict
+    # another tenant's cached reads (R2-54).
+    assert_key_in_tenant(
+        inp.key,
+        tenant_id=ctx.principal.tenant_id,
+        error=InvalidateCacheKeyError,
+    )
 
     deleted_count = await ctx.redis.delete(inp.key)
     deleted = bool(deleted_count)
