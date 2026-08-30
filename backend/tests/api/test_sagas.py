@@ -158,6 +158,27 @@ async def test_create_saga_rejects_oversized_step_payload(
     assert "page_count" in resp.text
 
 
+async def test_create_saga_rejects_an_unbounded_chunk_count_step(
+    client: AsyncClient, auth_headers: dict[str, str]
+) -> None:
+    """WO-R2-07's chunk-count bound has to hold on this surface too, for the
+    same reason every other payload bound does: SagaStepRequest does not go
+    through JobCreate, so enforcing it on one surface leaves the other as a
+    one-line bypass."""
+    resp = await client.post(
+        "/api/v1/sagas",
+        json={
+            "name": "slow-step",
+            "steps": [
+                {"type": "csv_upload", "payload": {"row_count": 1_000_000, "chunk_size": 1}},
+            ],
+        },
+        headers=auth_headers,
+    )
+    assert resp.status_code == 422
+    assert "chunk" in resp.text
+
+
 async def test_create_saga_allows_compensation_step_types(
     client: AsyncClient, auth_headers: dict[str, str]
 ) -> None:

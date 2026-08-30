@@ -185,9 +185,15 @@ async def test_in_flight_and_fresh_running_jobs_are_untouched(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     """Two exclusions, both mandatory: this process's own live work, and
-    anything younger than the threshold."""
+    anything younger than the threshold.
+
+    The in-flight exclusion is bounded rather than permanent since WO-R2-07
+    (ADR 0021), so the live job here is aged just past the threshold — inside
+    `_IN_FLIGHT_EXCLUSION_GRACE_SECONDS`. The lapse itself is covered by
+    `test_processor_timeout_and_poll_loop.py`.
+    """
     live_id = await _seed_running_job(
-        session_factory, age_seconds=2 * THRESHOLD_SECONDS
+        session_factory, age_seconds=THRESHOLD_SECONDS + 60
     )
     fresh_id = await _seed_running_job(
         session_factory, age_seconds=THRESHOLD_SECONDS / 2

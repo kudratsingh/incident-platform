@@ -35,12 +35,44 @@ class BulkApiSyncPayload(BaseModel):
     endpoint_count: int = Field(default=5, ge=0, le=100)
 
 
+# Largest number of chunks a csv_upload may be split into (WO-R2-07).
+#
+# `row_count` and `chunk_size` were bounded separately and their *relationship*
+# was not, which is the gap: `process_csv_upload` iterates
+# `range(0, row_count, chunk_size)`, so the work is the chunk COUNT —
+# `ceil(row_count / chunk_size)` — at ~0.08s of blocking read each across a
+# 4-thread pool. `{row_count: 1_000_000, chunk_size: 1}` passed both field
+# bounds and bought a million chunks: hours of execution from a payload that
+# costs nothing to submit, and ten of them sit comfortably inside the rate
+# limit.
+#
+# Note it is the quotient, not the product. Bounding `row_count * chunk_size`
+# would have been exactly backwards — it is smallest for the pathological
+# shape (10**6) and largest for the cheapest legitimate one (10**11).
+#
+# 10_000 is the documented maximum `row_count` at the default `chunk_size`, so
+# every shape that was reasonable before still validates, and the worst
+# accepted job is ~200s — comfortably inside `job_execution_timeout_seconds`,
+# which is the backstop for the processors whose cost this cannot predict.
+MAX_CSV_CHUNKS = 10_000
+
+
 class CsvUploadPayload(BaseModel):
     model_config = _PAYLOAD_BOUNDS
 
     row_count: int = Field(default=500, ge=0, le=1_000_000)
     # ge=1, not ge=0: chunk_size is a divisor in process_csv_upload.
     chunk_size: int = Field(default=100, ge=1, le=100_000)
+
+    @model_validator(mode="after")
+    def _bound_chunk_count(self) -> "CsvUploadPayload":
+        chunks = -(-self.row_count // self.chunk_size)  # ceil, no float math
+        if chunks > MAX_CSV_CHUNKS:
+            raise ValueError(
+                f"row_count / chunk_size yields {chunks} chunks, which exceeds "
+                f"the {MAX_CSV_CHUNKS}-chunk limit; raise chunk_size"
+            )
+        return self
 
 
 class DocAnalysisPayload(BaseModel):

@@ -314,7 +314,7 @@ So each knob is bounded twice:
 | Job type | Knob | Bound |
 | --- | --- | --- |
 | `bulk_api_sync` | `endpoint_count` | 0–100 |
-| `csv_upload` | `row_count` / `chunk_size` | 0–1,000,000 / 1–100,000 |
+| `csv_upload` | `row_count` / `chunk_size` | 0–1,000,000 / 1–100,000, **and** `ceil(row_count / chunk_size)` ≤ 10,000 chunks |
 | `doc_analysis` | `page_count` | 0–1000 |
 | `report_gen` | `row_count` / `group_count` | 0–1,000,000 / 1–1000 |
 
@@ -322,6 +322,10 @@ So each knob is bounded twice:
 2. **Inside the processors** — as clamps. Replays (`JobService.replay_job`) republish the *stored* payload without revalidating, so rows written before the bounds existed still reach a processor. The clamps are load-bearing, not belt-and-braces.
 
 The `chunk_size` and `group_count` floors are `1`, not `0`: both are divisors, and zero was a `ZeroDivisionError` and a silently-empty report respectively.
+
+Bounding knobs one at a time is not enough when the cost is a *relationship* between two of them. `process_csv_upload` iterates `range(0, row_count, chunk_size)`, so its cost is the chunk count — and `{row_count: 1_000_000, chunk_size: 1}` satisfied both field bounds while buying ~22 hours of execution for one HTTP request. Hence the third `csv_upload` bound above, on the quotient (**not** the product, which is smallest for exactly that shape and largest for the cheapest legitimate one). See [ADR 0021](ADR/0021-bounded-execution-and-non-blocking-dispatch.md).
+
+Payload bounds can only ever cover processors whose cost model the schema knows. The backstop for the rest is `job_execution_timeout_seconds` (default 600s): a processor that overruns it is cancelled and its job dead-letters with `dead_lettered_by: execution_timeout`, releasing the concurrency slot. Note the deadline frees the *slot*, not necessarily the worker — a processor cancelled inside `run_in_executor` leaves its thread or process running to completion, since Python cannot preempt either.
 
 These caps are conservative and deliberately defensive — the simulated processors have no real resource envelope to derive limits from. Real processors should replace them with limits derived from their actual memory and CPU cost.
 
@@ -372,7 +376,7 @@ accordingly:
 
 | Task | Source | Sink | Failure isolation |
 |---|---|---|---|
-| `JobDispatcherConsumer` | `job.submitted` Kafka | spawns `_run_job` per message | Per-job — one bad job doesn't poison the group |
+| `JobDispatcherConsumer` | `job.submitted` Kafka | spawns `_run_job` per message; the concurrency slot is taken *inside* the spawned task so a saturated worker keeps polling ([ADR 0021](ADR/0021-bounded-execution-and-non-blocking-dispatch.md)) | Per-job — one bad job doesn't poison the group |
 | `AuditConsumer` | All lifecycle topics | `audit_logs` rows | Per-row — caught at message level |
 | `SseConsumer` | All lifecycle topics | Redis Pub/Sub | Per-message — drops on broker error |
 | `EventLogConsumer` | All lifecycle topics | `job_events` rows | Per-row — `IntegrityError` (dedup) is silently swallowed |
@@ -383,7 +387,7 @@ accordingly:
 | `_outbox_relay_loop` | `outbox_events` table | Kafka via `publish_raw` | Per-row — schema failures mark row failed, others retry next tick. Leader-gated: only one process relays at a time ([ADR 0020](ADR/0020-outbox-relay-single-writer.md)) |
 | `_promote_delayed_loop` | Redis `delayed_queue` zset | outbox row | Per-item — a failed job is re-pushed onto the zset; the rest of the batch still promotes |
 | `_requeue_stale_pending_loop` | `jobs` rows `PENDING` for >300s with no `delayed_queue` timer | outbox row | Per-tick — exception logged, loop continues |
-| `_stale_running_sweep_loop` | `jobs` rows `RUNNING` for longer than `stale_running_threshold_seconds` and not in `dispatcher.in_flight_job_ids` | `dead_letter` status + `job.dead_letter` audit row + `job.dlq` outbox row ([ADR 0019](ADR/0019-stale-running-recovery-sweep.md)) | Per-job — each recovery is its own transaction; one failure leaves that row `RUNNING` for the next pass |
+| `_stale_running_sweep_loop` | `jobs` rows `RUNNING` for longer than `stale_running_threshold_seconds`, skipping `dispatcher.in_flight_job_ids` until they are a further `_IN_FLIGHT_EXCLUSION_GRACE_SECONDS` stale ([ADR 0021](ADR/0021-bounded-execution-and-non-blocking-dispatch.md)) | `dead_letter` status + `job.dead_letter` audit row + `job.dlq` outbox row ([ADR 0019](ADR/0019-stale-running-recovery-sweep.md)) | Per-job — each recovery is its own transaction; one failure leaves that row `RUNNING` for the next pass |
 | `_metrics_loop` | Dispatcher consumer + Redis | CloudWatch gauges | Per-tick — exception logged |
 | `_digest_loop` | DB + Anthropic API | `incident_summaries` rows | Per-tenant — one tenant's API failure doesn't stop the batch |
 

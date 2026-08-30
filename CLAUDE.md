@@ -91,7 +91,7 @@ What's actually shipped (as of the most recent merge):
   - **DLQ replay promote** — fires operator-scheduled DLQ replays whose delay window has elapsed
   - **Resume-unblocked-waiting sweep** — promotes `WAITING` children once their DAG pause lifts; backstops missed promotions
   - **Stale-PENDING backstop** — re-publishes `PENDING` jobs left with no `jobs:delayed` timer by a crash window
-  - **Stale-RUNNING sweep** — dead-letters `RUNNING` jobs orphaned by a hard worker crash, after `STALE_RUNNING_THRESHOLD_SECONDS` (default 900). Never re-publishes them ([ADR 0019](docs/ADR/0019-stale-running-recovery-sweep.md))
+  - **Stale-RUNNING sweep** — dead-letters `RUNNING` jobs orphaned by a hard worker crash, after `STALE_RUNNING_THRESHOLD_SECONDS` (default 900). Never re-publishes them ([ADR 0019](docs/ADR/0019-stale-running-recovery-sweep.md)). Its exclusion for this process's own in-flight jobs is time-bounded, not permanent — a local job stuck past its execution deadline is reclaimed too ([ADR 0021](docs/ADR/0021-bounded-execution-and-non-blocking-dispatch.md))
   - **Metrics loop** — emits CloudWatch gauges (`QueueDepth`, `InFlightJobs`, `ConsumerLag`) and caches the lag in Redis for the backpressure check
   - **Digest loop** (Phase 10) — every `LLM_DIGEST_INTERVAL_HOURS` (default 24), generates a per-tenant incident summary via Claude and persists it to `incident_summaries`
   - **Idempotency reaper** — hourly DELETE of expired `idempotency_records` rows (closes ADR 0010's "no reaper" follow-up)
