@@ -104,7 +104,17 @@ The metrics loop calls `dispatcher.consumer_lag()` every 60 seconds and writes t
 
 `check_backpressure` in `app/utils/backpressure.py` reads this key from the `POST /jobs` hot path. If the value is above `backpressure_lag_threshold`, the request is rejected with `BackpressureError` (503). The API never round-trips to Kafka.
 
-If the key is missing (Redis down, or the metrics loop hasn't run yet), the backpressure check treats it as "no lag" and lets the request through. Fail-open on purpose — same logic as rate limits.
+"Lag unknown" has three causes and they all resolve to "let the request through" — fail-open on purpose, same logic as rate limits:
+
+| Cause | Handled by |
+|---|---|
+| Key missing or expired (metrics loop hasn't run, or Redis is down and returning nothing) | `raw is None` → return |
+| Value unparseable | `except (TypeError, ValueError)` → return |
+| **The GET itself raised** (Redis unreachable, pool exhausted, timeout) | `except Exception` → `logger.warning("backpressure_check_failed")`, return |
+
+The third row was unhandled until the fail-open fix. That made `check_backpressure` the only Redis touch on `POST /jobs` that failed *closed*: an unreachable Redis raised out of the endpoint and every job submission became a 500, contradicting both this document and the "What happens when Redis is down" table below. Losing an advisory signal is not grounds for refusing work the durable path (Postgres + outbox) can still accept.
+
+The degradation is logged at WARNING (`backpressure_check_failed`) rather than swallowed silently, so a Redis outage is visible as a burst of these rather than as a mysterious absence of 503s. Pinned by `test_redis_error_fails_open` (unit) and `test_job_create_still_works_when_redis_is_down` (API).
 
 ### Priority queue + delayed queue (sorted sets)
 
