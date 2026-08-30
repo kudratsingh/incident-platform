@@ -18,7 +18,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from app.models.base import Base, PortableJSON
-from sqlalchemy import DateTime, ForeignKey, String, func
+from sqlalchemy import DateTime, ForeignKey, String, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -63,8 +63,24 @@ class Alert(Base):
         PortableJSON, nullable=True
     )
     request_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # De-duplication identity for producers that fire repeatedly on one
+    # sustained condition (WO-R2-29). NULL for producers that don't need it —
+    # a human firing a chaos tool means it every time — and NULLs do not
+    # collide under the unique constraint below, on Postgres or SQLite.
+    #
+    # The uniqueness is what makes de-duplication safe rather than merely
+    # likely: `worker_loop` runs in every API replica, so a check-then-insert
+    # would let two replicas both find nothing and both alert. Here the second
+    # one gets an IntegrityError and stops. Producers therefore put the window
+    # *into* the key (see `services/slo._fast_burn_dedup_key`) instead of
+    # keeping it in a query.
+    dedup_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
     tenant: Mapped["Tenant"] = relationship("Tenant", lazy="noload")
+
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "dedup_key", name="uq_alerts_tenant_dedup_key"),
+    )
 
     def __repr__(self) -> str:
         return f"<Alert id={self.id} severity={self.severity} source={self.source}>"

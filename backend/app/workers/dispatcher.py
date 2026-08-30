@@ -2104,7 +2104,58 @@ async def _digest_loop(session_factory: async_sessionmaker[AsyncSession]) -> Non
             logger.error("digest loop error", extra={"error": str(exc)})
 
 
+# How often a disabled SLO loop re-reads its own setting. Short enough that
+# re-enabling evaluation does not need a redeploy, long enough to be free.
+_SLO_DISABLED_RECHECK_SECONDS = 60.0
+
 _IDEMPOTENCY_REAPER_INTERVAL_SECONDS = 3600.0  # 1h — matches the TTL cadence
+
+
+async def _slo_evaluation_loop(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Evaluate the SLOs on a schedule and alert on a fast burn (WO-R2-29).
+
+    `services/slo.compute_all` had exactly one caller before this — a
+    read-only admin endpoint — so the objectives were only ever computed when
+    a human asked, and no real platform condition created an Alert. The alert
+    webhook is the incident commander's production trigger, and its only
+    producer was a chaos tool: the commander could be woken by a human
+    pretending there was an incident, and by nothing else.
+
+    Deliberately NOT leader-gated, for the same reason as the dispatcher
+    sweeps (ADR 0020 applies to the outbox relay, not to everything): the
+    de-duplication is a unique constraint on `(tenant_id, dedup_key)`, so a
+    second replica evaluating the same window loses the insert and stops.
+    Concurrent evaluation costs redundant aggregate queries, not duplicate
+    alerts — and unlike a gate, that guarantee also holds across a
+    leader handover.
+
+    The interval is read every pass rather than captured once, matching
+    `_digest_loop`: 0 disables evaluation without a redeploy, for
+    deployments that alert from CloudWatch alone and want no second producer.
+    """
+    from app.services import slo
+
+    while True:
+        try:
+            interval = get_settings().slo_evaluation_interval_seconds
+            if interval <= 0:
+                # Disabled. Still sleep, so the loop doesn't busy-wait, and
+                # still re-read the setting on the next pass.
+                await asyncio.sleep(_SLO_DISABLED_RECHECK_SECONDS)
+                continue
+            await asyncio.sleep(interval)
+            created = await slo.run_evaluation(session_factory)
+            if created:
+                logger.warning(
+                    "SLO evaluation raised fast-burn alerts",
+                    extra={"alert_ids": [str(a) for a in created]},
+                )
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            logger.error("slo evaluation loop error", extra={"error": str(exc)})
 
 
 async def _idempotency_reaper_loop(
@@ -2291,7 +2342,7 @@ async def worker_loop(
     sticks. The corollary is that a permanently unreachable broker leaves all
     8 supervisors retrying rather than disabling the worker.
 
-    Concurrent tasks that make up the worker — 8 Kafka consumers + 10 loops:
+    Concurrent tasks that make up the worker — 8 Kafka consumers + 11 loops:
 
       Kafka consumers (each its own group, so failure of one doesn't
       affect the others):
@@ -2324,6 +2375,10 @@ async def worker_loop(
                                         so another replica's sweep can tell
                                         them apart from crash orphans
                                         (WO-R2-28, ADR 0023).
+       11. _slo_evaluation_loop      — computes the SLOs on an interval and
+                                        raises a de-duplicated Alert on a
+                                        fast burn — the alert webhook's only
+                                        non-chaos producer (WO-R2-29).
 
     Cancel signal: cancel all, wait for in-flight jobs, stop all consumers.
     """
@@ -2370,6 +2425,7 @@ async def worker_loop(
             asyncio.create_task(
                 _renew_running_leases_loop(session_factory, dispatcher)
             ),
+            asyncio.create_task(_slo_evaluation_loop(session_factory)),
         ]
     )
 
