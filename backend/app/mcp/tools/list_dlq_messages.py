@@ -18,7 +18,7 @@ from typing import Any
 from app.core.scopes import Scope
 from app.mcp.registry import ToolContext, tool
 from app.models.enums import JobStatus
-from app.repositories.job import JobRepository
+from app.repositories.job import JobRepository, JobSort
 from app.repositories.triage import TriageRepository
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -37,6 +37,12 @@ class ListDlqMessagesInput(BaseModel):
         "Omit for all categories (including uncategorized).",
     )
     limit: int = Field(default=50, ge=1, le=200)
+    offset: int = Field(
+        default=0,
+        ge=0,
+        description="Rows to skip, for paging past the first `limit`. "
+        "Compare against `total` to know whether more remain.",
+    )
 
 
 class DlqTriageSummary(BaseModel):
@@ -60,7 +66,16 @@ class DlqEntry(BaseModel):
         "platform hasn't categorized this entry yet — agent should "
         "treat as unknown, not as replay-safe.",
     )
-    created_at: datetime
+    created_at: datetime = Field(
+        description="When the job was SUBMITTED, not when it died. See "
+        "`dead_lettered_at` for the latter — they can be days apart."
+    )
+    dead_lettered_at: datetime | None = Field(
+        default=None,
+        description="When the job reached its terminal state. This is the "
+        "field the list is sorted by. Null only for rows that predate the "
+        "column being stamped.",
+    )
     updated_at: datetime | None = None
     trace_id: str | None = None
     triage: DlqTriageSummary | None = None
@@ -75,7 +90,10 @@ class ListDlqMessagesOutput(BaseModel):
 @tool(
     "list_dlq_messages",
     description=(
-        "List jobs currently in the dead-letter state, most recent first. "
+        "List jobs currently in the dead-letter state, most recently "
+        "DEAD-LETTERED first — ordered by when each job died, not by when it "
+        "was submitted, so a long-running job that failed a minute ago sorts "
+        "above one submitted after it that failed hours earlier. "
         "Each entry carries `remediation_hint` (`replay_safe`, "
         "`wait_and_replay`, `human_required`, or null) so the agent can "
         "pick a strategy without re-reasoning about the error string. "
@@ -91,6 +109,9 @@ class ListDlqMessagesOutput(BaseModel):
         "UNKNOWN, not replay-safe: do not feed those to a categorised "
         "replay. Read the error, then replay by explicit id, or fence it "
         "with `mark_dlq_permanent`.\n"
+        "PAGING: `total` is the full count matching the filters, which can "
+        "exceed the `limit` returned. Page with `offset` — `total` greater "
+        "than `limit + offset` means there is more to fetch.\n"
         "FRESHNESS: live read from Postgres — reflects the moment of "
         "the call, no cache. Note that entries scheduled for a delayed "
         "replay still appear here until their `execute_at` passes, so "
@@ -108,11 +129,15 @@ async def list_dlq_messages(
 
     jobs, total = await job_repo.list_jobs(
         tenant_id=ctx.principal.tenant_id,
-        offset=0,
+        offset=inp.offset,
         limit=inp.limit,
         status=JobStatus.DEAD_LETTER.value,
         job_type=inp.job_type,
         remediation_hint=inp.remediation_hint,
+        # Dead-letter time, not submission time — see the tool description.
+        # With no offset either, the newest dead-letters could sit past the
+        # end of the only page the agent was able to fetch (WO-R2-53).
+        sort=JobSort.DEAD_LETTERED_AT,
     )
 
     items: list[DlqEntry] = []
@@ -135,6 +160,7 @@ async def list_dlq_messages(
                 retry_count=job.retry_count,
                 remediation_hint=job.remediation_hint,
                 created_at=job.created_at,
+                dead_lettered_at=job.completed_at,
                 updated_at=job.updated_at,
                 trace_id=job.trace_id,
                 triage=triage_summary,

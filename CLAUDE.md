@@ -157,6 +157,14 @@ Same mental model as Sentry / GitHub / Stripe / Linear: the MCP server ships ins
 
 **Tool names** — verb-first `snake_case`, one function per tool. Examples: `get_consumer_lag`, `list_dlq_messages`, `list_audit_events`, `restart_consumer_group`, `replay_dlq_messages`, `pause_dag`, `invalidate_cache_key`, `kill_consumer`, `poison_message`, `saturate_redis`, `inject_latency`, `bad_deploy`, `create_stuck_dag`. `snake_case` matches Pydantic field style and serializes cleanly through the MCP `tools/list` response.
 
+**Tool descriptions** — normative, and treated as code. The agent cannot read this file or the docstrings; the `description` string in the `@tool` decorator *is* the whole interface. A description that does not match the query behind it is therefore a functional defect, not a documentation nit, and it fails in the worst possible way: silently, with a confident-looking answer. Three rules, all learned from WO-R2-53:
+
+- **Say which clock.** "Most recent first" is ambiguous where a row has more than one timestamp. `list_dlq_messages` claimed it while ordering by job *submission* time, so the newest dead-letters could sit past the end of the only page the agent could fetch. It now orders by dead-letter time and says so, and emits `created_at` and `dead_lettered_at` as separate fields.
+- **Never promise completeness you cap.** `get_trace` promised "every artifact carrying a given trace_id" and hard-capped at 50 jobs / 200 audit rows with nothing to signal it had stopped short — an agent reading 50 of 4000 and concluding anything about the trace was misled by the tool. Either return everything, or state the cap in the description AND return a `truncated` flag with the true total. A capped result the caller knows is capped is useful; one it does not is worse than an error.
+- **Filter before the limit, not after.** `search_traces` applied `limit` in SQL and dropped NULL-trace rows in Python afterwards, so untraced jobs spent the result budget and the tool answered "no traces" for traces that existed. Any predicate that decides whether a row belongs in the answer belongs in the query.
+
+State pagination explicitly too: whether an `offset` exists, and whether `total` can exceed what was returned. "No offset" is a fine answer — an unstated one is not.
+
 **Scopes** — `<domain>:<verb>`, fixed enum. Adding a scope is a decision; renaming or splitting one is a token migration. The five scopes:
 
 | Scope | Grants |

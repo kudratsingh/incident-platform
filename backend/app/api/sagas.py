@@ -3,7 +3,12 @@
 import uuid
 from typing import Any
 
-from app.dependencies import get_current_user, get_db, get_redis
+from app.dependencies import (
+    get_current_user,
+    get_db,
+    get_effective_tenant,
+    get_redis,
+)
 from app.models.user import User
 from app.repositories.audit import AuditRepository
 from app.repositories.job import JobRepository
@@ -94,15 +99,21 @@ async def list_sagas(
     page: int = 1,
     page_size: int = 20,
     current_user: User = Depends(get_current_user),
+    effective_tenant: uuid.UUID = Depends(get_effective_tenant),
     db: AsyncSession = Depends(get_db),
 ) -> SagaListResponse:
     from app.models.enums import UserRole
 
     repo = SagaRepository(db)
-    # Admins/support see all sagas, regular users see only their own.
+    # Admins/support see all sagas IN THEIR TENANT, regular users see only
+    # their own. "All sagas" used to mean all sagas anywhere: the handler
+    # passed user_id=None and applied no tenant filter, leaving Postgres RLS
+    # as the only barrier — and RLS is a backstop for this check, not a
+    # replacement for it (WO-R2-50).
     privileged = current_user.role in (UserRole.ADMIN, UserRole.SUPPORT)
     sagas, total = await repo.list_for_user(
         user_id=None if privileged else current_user.id,
+        tenant_id=effective_tenant,
         offset=(page - 1) * page_size,
         limit=page_size,
     )
@@ -173,11 +184,33 @@ async def create_saga(
 async def get_saga(
     saga_id: uuid.UUID,
     current_user: User = Depends(get_current_user),
+    effective_tenant: uuid.UUID = Depends(get_effective_tenant),
     db: AsyncSession = Depends(get_db),
 ) -> SagaResponse:
-    from app.core.exceptions import NotFoundError
+    """One saga and its steps.
 
-    saga = await SagaRepository(db).get_by_id(saga_id)
+    Scoped twice, because this response carries every step job's `payload`,
+    `result` and `error_message` and used to be readable by any authenticated
+    caller who knew a saga id (WO-R2-50):
+
+      * to the caller's effective tenant — a privileged caller is privileged
+        inside their own tenant, and a platform admin's `?tenant_id=` is the
+        only way across;
+      * to the caller themselves, unless they are admin/support — the same
+        ownership rule `GET /sagas` has always applied to the list.
+
+    404 rather than 403 on both, matching the job endpoints: a caller who is
+    not entitled to the row is not entitled to learn that it exists.
+    """
+    from app.core.exceptions import NotFoundError
+    from app.models.enums import UserRole
+
+    privileged = current_user.role in (UserRole.ADMIN, UserRole.SUPPORT)
+    saga = await SagaRepository(db).get_for_tenant(
+        saga_id,
+        tenant_id=effective_tenant,
+        user_id=None if privileged else current_user.id,
+    )
     if saga is None:
         raise NotFoundError(f"Saga {saga_id} not found")
     jobs = await SagaRepository(db).jobs(saga_id)

@@ -104,13 +104,52 @@ A SQLAlchemy event listener that rewrites every query to inject `WHERE tenant_id
 
 `ALTER TABLE jobs DISABLE ROW LEVEL SECURITY` is one DDL statement per table. The application code that sets the variable is unconditional and harmless on SQLite (no-op) so removing it is purely cleanup.
 
+## Addendum (2026-08-30, WO-R2-50) — the failure mode this ADR predicted, three times
+
+> "One mode of failure: a future contributor writes a new query, forgets the filter, and ships it."
+
+That is what happened, and it is worth recording because the outcome is exactly what this ADR
+argued for and exactly what it warned against being relied on.
+
+Three read paths carried no application-layer tenant filter at all:
+
+| Path | What it served | What was underneath |
+|---|---|---|
+| `GET /sagas/{id}` | Any saga, plus every step job's `payload`, `result` and `error_message`, to any authenticated caller | RLS on `sagas` — a real backstop, but the only one |
+| `GET /sagas` | `user_id=None` for admin/support callers, no tenant predicate — every tenant's sagas | RLS on `sagas` |
+| `GET /admin/users/{id}/stats` | Any user UUID, answered from Redis | **Nothing.** Not an RLS table, not a table at all |
+
+The third is the one that matters most for this ADR. RLS is a property of Postgres, so it protects
+Postgres queries; a handler that answers out of the cache has left the layer where the backstop
+exists. **A cache read cannot be an authorisation boundary** — the read model is keyed by an id the
+caller supplied, and Redis has no opinion about who is allowed to ask. The fix resolves the target
+user in Postgres, under the caller's effective tenant, *before* touching the cache — and it 404s on
+a miss, so a cross-tenant id is indistinguishable from a nonexistent one.
+
+The other two are the case this ADR describes: RLS did hold on a correctly-configured stack, which
+is why these were exposures rather than incidents. But "correctly configured" is load-bearing — RLS
+is inert on SQLite, inert for a superuser connection, and permissive whenever `app.tenant_id` is
+unset (see above) — and defense-in-depth means two layers, not one layer and an assumption.
+
+The scope is now a **dependency** rather than a remembered call: `get_effective_tenant` in
+`backend/app/dependencies.py` wraps `resolve_admin_tenant`, so a read handler declares its tenant
+scope in its signature and the next one inherits the behaviour by asking for it. Forgetting it is
+now visible where the reviewer already looks.
+
+Two things this deliberately does not change. A platform admin can still cross tenants via
+`?tenant_id=` — that is the existing, explicit override, and the application check honours the same
+effective tenant that `set_config` retargets, so the two layers agree rather than one silently
+outranking the other. And ordinary admins and support users remain privileged *within* their
+tenant, which is what "admins see all sagas" was always meant to say.
+
 ## Verification
 
+- `backend/tests/api/test_tenant_isolation.py` — an admin in tenant B gets 404 from tenant A's saga, does not see it in `GET /sagas`, and gets 404 from a tenant-A user's stats page; an ordinary user gets 404 from a co-tenant's saga (WO-R2-50).
 - `backend/tests/integration/test_rls_enforcement.py` — Testcontainers Postgres, non-superuser role, three assertions: scoped to A sees A's rows only; scoped to B sees B's only; unset sees both (proves the bootstrap escape works).
 - `backend/alembic/versions/c4f8e9a52340_row_level_security.py` — the migration with inline documentation.
 
 ## Pointers
 
-- `backend/app/dependencies.py` — `get_current_user` issues `set_config('app.tenant_id', …)`
+- `backend/app/dependencies.py` — `get_current_user` issues `set_config('app.tenant_id', …)`; `resolve_admin_tenant` / `get_effective_tenant` compute the tenant a read handler scopes to
 - `backend/alembic/versions/c4f8e9a52340_row_level_security.py` — policy definitions
 - `backend/tests/integration/test_rls_enforcement.py` — integration verification

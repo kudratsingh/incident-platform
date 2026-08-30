@@ -1,6 +1,7 @@
 import uuid
 from collections.abc import Collection, Sequence
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from typing import Any, cast
 
 from app.config import get_settings
@@ -42,6 +43,22 @@ _CASCADE_SOURCE_STATUSES = (JobStatus.DEAD_LETTER, JobStatus.CANCELLED)
 _CASCADE_MAX_DEPTH = 50
 
 
+class JobSort(StrEnum):
+    """Which clock `list_jobs` sorts on.
+
+    `CREATED_AT` is submission time — when the caller asked for the work.
+    `DEAD_LETTERED_AT` is when the job stopped, which for a DLQ listing is
+    the question actually being asked: a job submitted yesterday that died a
+    minute ago is a *newer* dead-letter than one submitted an hour ago that
+    died three hours ago (WO-R2-53). Backed by `completed_at`, which
+    `update_status` stamps on every terminal write, falling back to
+    `created_at` for the rows old enough to have neither.
+    """
+
+    CREATED_AT = "created_at"
+    DEAD_LETTERED_AT = "dead_lettered_at"
+
+
 class JobRepository(BaseRepository[Job]):
     model = Job
 
@@ -80,6 +97,8 @@ class JobRepository(BaseRepository[Job]):
         retry_count_max: int | None = None,
         remediation_hint: str | None = None,
         exclude_remediation_hints: Sequence[str] | None = None,
+        require_trace_id: bool = False,
+        sort: JobSort = JobSort.CREATED_AT,
     ) -> tuple[list[Job], int]:
         filters: list[Any] = [Job.tenant_id == tenant_id]
         if user_id is not None:
@@ -114,13 +133,27 @@ class JobRepository(BaseRepository[Job]):
                 )
             )
 
+        if require_trace_id:
+            # In SQL, ahead of the LIMIT — not in Python afterwards. A caller
+            # that filtered after the fact spent its result budget on rows it
+            # was about to discard, so on a table dominated by untraced jobs
+            # it returned nothing while matching traced rows sat just past the
+            # window (WO-R2-53). Empty string is as untraced as NULL.
+            filters.append(Job.trace_id.is_not(None))
+            filters.append(Job.trace_id != "")
+
         where = and_(*filters)
         total = await self._count(where)
 
+        sort_key = (
+            func.coalesce(Job.completed_at, Job.created_at)
+            if sort is JobSort.DEAD_LETTERED_AT
+            else Job.created_at
+        )
         stmt = (
             select(Job)
             .where(where)
-            .order_by(Job.created_at.desc())
+            .order_by(sort_key.desc())
             .offset(offset)
             .limit(limit)
         )
