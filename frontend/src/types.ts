@@ -217,6 +217,14 @@ export interface ProgressEvent {
   message: string
   retry_count: number
   timestamp: string
+  // Provenance the backend attaches so it can order the retained snapshot
+  // (backend/app/workers/progress.py). `source` is the Kafka topic and
+  // `sequence` the offset within it. They are the SERVER's ordering keys —
+  // offsets from different topics are not comparable, so the client must not
+  // use them to sort or dedupe. Carried here only so the type matches the
+  // wire. Absent on events published outside the consumer.
+  source?: string
+  sequence?: number | null
 }
 
 export interface JobCreateRequest {

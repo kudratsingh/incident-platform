@@ -167,12 +167,35 @@ Browser                          API process              Worker process        
   │                                 │                          │                       │       reads & PUBLISH ──►│
   │                                 │ on PUBLISH:              │                       │              │
   │                                 │   format SSE frame       │                       │              │
+  │  event: running                 │                          │                       │              │
   │  data: {status: running, 47%}   │                          │                       │              │
   │ ◄──────────────────────────────│                          │                       │              │
+  │  event: completed               │                          │                       │              │
   │  data: {status: completed,100%}│                          │                       │              │
   │ ◄──────────────────────────────│                          │                       │              │
   │                                 │ close                    │                       │              │
 ```
+
+**Every frame is a named event, and the name is the status.** Both yield sites
+in `api/streaming.py` emit `{"data": ..., "event": event.status}`, so the wire
+carries `event: running`, `event: retrying`, `event: completed`,
+`event: failed`, `event: dead_letter` or `event: cancelled` — never
+`event: message`. This matters to clients: a browser `EventSource` routes a
+named event **only** to `addEventListener(<name>, …)`, and `onmessage` fires
+for unnamed frames alone. A client that listens on `onmessage` connects
+successfully, sees `onopen`, and then receives nothing at all — which is
+exactly what `frontend/src/hooks/useJobStream.ts` did until it began
+registering a listener per status name.
+
+Ordering and de-duplication are the server's job, not the client's. `publish`
+drops superseded events before they reach a subscriber, and the endpoint
+discards a retained snapshot that the `jobs` row has moved past
+(`_snapshot_is_stale`). The `sequence`/`source` fields on a `ProgressEvent` are
+the publisher's own ordering keys — a Kafka offset and the topic it belongs
+to — and offsets from different topics are not comparable, so clients must not
+sort or dedupe on them. Clients append what they receive; the only repetition
+they may see is the retained snapshot arriving twice around a (re)connect,
+which is safe to collapse by comparing against the previous event.
 
 The browser first POSTs for a **stream token**: native `EventSource` cannot set an `Authorization` header, so the stream GET authenticates with a short-lived (60s), single-purpose token in its query string instead of the primary JWT ([ADR 0014](ADR/0014-sse-stream-token-transport.md)). The mint endpoint is where authorization happens — it loads the job tenant-scoped (404 cross-tenant, 403 non-owner) and binds the job id into the token, so a token minted for job X cannot open job Y's stream. The GET validates that token, joins the process-wide fan-out broker for that job's Redis Pub/Sub channel, and forwards every received message as an SSE frame. The broker holds **one** Pub/Sub connection for the whole process on a Redis pool dedicated to streaming, so viewers no longer consume a connection each out of the pool the request path and worker loops share — see [REDIS.md](REDIS.md#connection-budget--why-streaming-has-its-own-pool-and-its-own-cap). Concurrent streams are capped per process (`SSE_MAX_CONCURRENT_STREAMS`); past the cap the GET answers 503 with `Retry-After` rather than competing for a finite resource, and idle/maximum-duration timeouts reclaim slots from parked tabs. On reconnect the client mints a fresh token (the previous one has expired by then). The worker publishes progress directly to Kafka (the only direct-publish path, see [KAFKA.md](KAFKA.md)); the `sse-broadcaster` consumer republishes to Redis Pub/Sub.
 

@@ -8,9 +8,19 @@ import { jobsApi } from '../api/jobs'
 import { adminApi } from '../api/admin'
 import { lastMeta } from '../api/client'
 import { useAuth } from '../hooks/useAuth'
-import { useJobStream } from '../hooks/useJobStream'
+import { useJobStream, TERMINAL_STATUSES } from '../hooks/useJobStream'
 import type { Job, JobEvent, JobTriage } from '../types'
 import { formatDate, formatDuration, JOB_TYPE_LABELS } from '../utils/format'
+
+/**
+ * How often to re-read the job row while it is live but not being streamed.
+ *
+ * The stream is the primary channel; this is the floor under it, for the gap
+ * before the first connect and for any window where the connection is down and
+ * the hook is backing off. Without it a job whose stream never opened sat
+ * frozen at its load-time snapshot indefinitely.
+ */
+const POLL_MS = 5000
 
 function JsonBlock({ label, data }: { label: string; data: unknown }) {
   if (data == null) return null
@@ -37,9 +47,13 @@ export default function JobDetailPage() {
   const [triage, setTriage] = useState<JobTriage | null>(null)
   const isPrivileged = user?.role === 'admin' || user?.role === 'support'
 
-  const { latest, events, connected } = useJobStream(
-    job?.status === 'running' || job?.status === 'pending' ? id ?? null : null,
-  )
+  // Stream every NON-terminal job, not just running/pending. `waiting` (held
+  // on a dependency) and `retrying` (between attempts) are live states that
+  // move on their own; opening the stream only for running/pending left a job
+  // viewed in either of them frozen at its load-time snapshot forever.
+  const jobStatus = job?.status
+  const isLive = jobStatus !== undefined && !TERMINAL_STATUSES.has(jobStatus)
+  const { latest, events, connected } = useJobStream(isLive ? id ?? null : null)
 
   useEffect(() => {
     if (!id) return
@@ -53,11 +67,21 @@ export default function JobDetailPage() {
       .finally(() => setLoading(false))
   }, [id])
 
-  // Refresh job record when SSE reports terminal state
+  // Poll the row whenever the job is live but the stream is not carrying it.
+  // Keyed on primitives so a fresh job object does not re-arm the interval.
   useEffect(() => {
-    if (!latest) return
-    const terminal = ['completed', 'failed', 'dead_letter']
-    if (terminal.includes(latest.status) && id) {
+    if (!id || !isLive || connected) return
+    const t = setInterval(() => {
+      void jobsApi.get(id).then(setJob).catch(() => {})
+    }, POLL_MS)
+    return () => clearInterval(t)
+  }, [id, isLive, connected])
+
+  // Refresh the job record when SSE reports a terminal state, so the row's
+  // durable fields (result, error, completed_at) replace the live snapshot.
+  useEffect(() => {
+    if (!latest || !id) return
+    if (TERMINAL_STATUSES.has(latest.status)) {
       jobsApi.get(id).then(setJob).catch(() => {})
     }
   }, [latest, id])
