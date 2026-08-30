@@ -1,10 +1,11 @@
-from app.dependencies import get_current_user, get_db
+from app.dependencies import get_current_user, get_db, require_role
+from app.models.enums import UserRole
 from app.models.user import User
 from app.repositories.audit import AuditRepository
 from app.repositories.tenant import TenantRepository
 from app.repositories.user import UserRepository
 from app.schemas.auth import LoginRequest, RefreshRequest, TokenResponse
-from app.schemas.user import UserCreate, UserResponse
+from app.schemas.user import TenantMemberCreate, UserCreate, UserResponse
 from app.services.auth import AuthService
 from app.utils.rate_limit import rate_limiter
 from fastapi import APIRouter, Depends, Request
@@ -32,6 +33,35 @@ async def register(
         password=body.password,
         tenant_slug=body.tenant_slug,
         new_tenant_name=body.new_tenant_name,
+        ip_address=request.client.host if request.client else None,
+    )
+    return UserResponse.model_validate(user)
+
+
+@router.post(
+    "/tenant/members", response_model=UserResponse, status_code=201
+)
+async def add_tenant_member(
+    body: TenantMemberCreate,
+    request: Request,
+    current_user: User = Depends(require_role(UserRole.ADMIN)),
+    db: AsyncSession = Depends(get_db),
+    _rl: None = Depends(rate_limiter(limit=10, window=60, key_prefix="enrol")),
+) -> UserResponse:
+    """Enrol a user into the caller's own tenant.
+
+    The authenticated way into an existing tenant, and since WO-R2-25 the
+    only way: public registration may create a brand-new tenant or join the
+    shared default one, and nothing else (ADR 0024).
+
+    The tenant is taken from `current_user`, so there is no tenant parameter
+    to tamper with, and the new account is always `role=user`.
+    """
+    svc = _auth_service(db)
+    user = await svc.add_tenant_member(
+        admin=current_user,
+        email=body.email,
+        password=body.password,
         ip_address=request.client.host if request.client else None,
     )
     return UserResponse.model_validate(user)

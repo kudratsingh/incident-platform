@@ -1,6 +1,11 @@
 import uuid
 
-from app.core.exceptions import AuthenticationError, ConflictError, NotFoundError
+from app.core.exceptions import (
+    AuthenticationError,
+    AuthorizationError,
+    ConflictError,
+    NotFoundError,
+)
 from app.core.logging import get_logger, request_id_var, user_id_var
 from app.core.security import (
     create_access_token,
@@ -57,6 +62,29 @@ class AuthService:
                 slug=tenant_slug, name=new_tenant_name, is_active=True
             )
             role = "admin"
+        elif tenant is not None and tenant_slug != DEFAULT_TENANT_SLUG:
+            # WO-R2-25 / ADR 0024. This endpoint is unauthenticated, and
+            # `tenant_slug` is a free-form string from the request body, so
+            # before this branch existed anyone could name any tenant they
+            # liked and be enrolled into it. No auth, no invite, no domain
+            # check — the founder branch above only fires when the slug is
+            # *free*, so naming a slug that already existed was precisely the
+            # path that joined someone else's tenant.
+            #
+            # Public self-enrolment is therefore allowed into exactly two
+            # places: a brand-new tenant (the founder branch above, where
+            # there is nobody to harm) and the shared default tenant (which
+            # is open by design — it is the demo/self-serve pool). Joining
+            # any *other* existing tenant now requires an authenticated admin
+            # of that tenant to do it, via `AuthService.add_tenant_member`.
+            #
+            # 403 rather than 404: the caller is being refused, not told the
+            # tenant is missing. ADR 0024 records why that (small) disclosure
+            # is accepted rather than papered over with a lie.
+            raise AuthorizationError(
+                f"Registration into tenant {tenant_slug!r} requires an "
+                "invitation from one of its administrators"
+            )
         if tenant is None or not tenant.is_active:
             raise NotFoundError(f"Tenant {tenant_slug} not found or inactive")
 
@@ -78,6 +106,73 @@ class AuthService:
         logger.info(
             "user registered",
             extra={"email": email, "role": role, "tenant_id": str(tenant.id)},
+        )
+        return user
+
+    async def add_tenant_member(
+        self,
+        admin: User,
+        email: str,
+        password: str,
+        ip_address: str | None = None,
+    ) -> User:
+        """Enrol a user into the admin's own tenant (WO-R2-25, ADR 0024).
+
+        The authenticated counterpart to `register`, and the reason closing
+        public self-enrolment is not a functional regression: without it a
+        founder could create a tenant and then never add a single colleague
+        to it, because the only enrolment path in the system was the one this
+        order shuts.
+
+        Two properties do the security work, and both are about where the
+        inputs come from rather than what they contain:
+
+        * `tenant_id` is read off the **authenticated admin**, never off the
+          request. There is deliberately no tenant field to supply, so this
+          endpoint cannot be pointed at a tenant the caller does not
+          administer — the defect being fixed was exactly a tenant identifier
+          that the caller got to choose.
+        * `role` is hard-coded to `user`, exactly as in `register`. An admin
+          may grow their own tenant; they may not mint a second admin here,
+          and no request body can ask for one (X-01 / F1-04).
+
+        The audit row names both parties: `user_id` is the admin who acted,
+        because that is the accountable identity, and `resource_id` is the
+        account created. A row that recorded only the new user would say a
+        stranger appeared and not who let them in.
+
+        This is admin provisioning with a chosen initial password, not a real
+        invite: no token, no email round-trip, no expiry. ADR 0024 records
+        that as the deliberate interim, and why a half-built invite flow
+        would have been worse than an honest small one.
+        """
+        existing = await self.user_repo.get_by_email(email)
+        if existing:
+            raise ConflictError(f"Email already registered: {email}")
+
+        user = await self.user_repo.create(
+            email=email,
+            hashed_password=hash_password(password),
+            role="user",
+            tenant_id=admin.tenant_id,
+        )
+        await self.audit_repo.log(
+            "user.enrolled",
+            user_id=admin.id,
+            tenant_id=admin.tenant_id,
+            resource_type="user",
+            resource_id=str(user.id),
+            request_id=request_id_var.get("") or None,
+            ip_address=ip_address,
+            extra_data={"email": email, "role": "user"},
+        )
+        logger.info(
+            "tenant member enrolled",
+            extra={
+                "email": email,
+                "tenant_id": str(admin.tenant_id),
+                "enrolled_by": str(admin.id),
+            },
         )
         return user
 

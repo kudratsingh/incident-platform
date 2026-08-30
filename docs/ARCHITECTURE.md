@@ -413,6 +413,7 @@ Three role tiers, with `is_platform_admin` as an additive cross-tenant flag:
 | See sibling tenants' jobs | — | — | — | ✓ (via `?tenant_id=`) |
 | Admin tabs (overview, jobs, dlq, runbooks, audit) | — | ✓ | ✓ | ✓ |
 | List users in own tenant | — | — | ✓ | ✓ |
+| Enrol a user into own tenant (`POST /auth/tenant/members`) | — | — | ✓ | ✓ |
 | List ALL tenants | — | — | — | ✓ |
 | Create tenant | — | — | — | ✓ |
 | Patch tenant limits | — | — | — | ✓ |
@@ -422,6 +423,21 @@ Three role tiers, with `is_platform_admin` as an additive cross-tenant flag:
 | Run NL admin query | — | ✓ | ✓ | ✓ |
 | Get triage analysis for a job | — | ✓ | ✓ | ✓ |
 | Get cross-tenant digest by ID | — | — | — (403) | ✓ |
+
+### Who may join a tenant (ADR 0024)
+
+Registration is unauthenticated, so `tenant_slug` is an untrusted string and is treated as a request rather than an instruction. It can reach exactly two destinations:
+
+| `tenant_slug` names… | Outcome |
+|---|---|
+| a slug nobody holds, with `new_tenant_name` | **201** — tenant created, registrant becomes its `admin` (never `is_platform_admin`) |
+| the default tenant | **201** — open by design; this is the self-serve pool |
+| any other existing tenant | **403** — needs an invitation from one of its admins |
+| a slug nobody holds, without `new_tenant_name` | **404** — unchanged |
+
+Before [ADR 0024](ADR/0024-tenant-enrolment-policy.md) the third row was a **201**: the founder branch only fires when the slug is free, so naming a slug that already existed fell straight through to "create the user in that tenant". Anyone who could read a tenant slug could put an account inside that organisation.
+
+Existing-tenant enrolment now lives at `POST /auth/tenant/members` (admin only). The destination tenant is read off the authenticated admin and the body has no tenant field at all — a tenant identifier the caller chooses was the defect, so the fix is to not have one. The new account is always `role=user`.
 
 The "own tenant" rows are enforced by:
 - **Application layer:** `JobService.list_jobs` filters by `requesting_user_id` when the role is `user`.
