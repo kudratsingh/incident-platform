@@ -95,6 +95,7 @@ What's actually shipped (as of the most recent merge):
   - **Stale-PENDING backstop** — re-publishes `PENDING` jobs left with no `jobs:delayed` timer by a crash window. Stamps `requeued_at` in the same transaction as the outbox insert, so a job is re-published at most once per 300s window instead of every pass for as long as the dispatcher is behind ([ADR 0023](docs/ADR/0023-dispatcher-sweep-ownership.md))
   - **Stale-RUNNING sweep** — dead-letters `RUNNING` jobs orphaned by a hard worker crash, after `STALE_RUNNING_THRESHOLD_SECONDS` (default 900). Never re-publishes them ([ADR 0019](docs/ADR/0019-stale-running-recovery-sweep.md)). Skips any job whose lease (`heartbeat_at`) is still live, so one replica cannot dead-letter another's running job, and compare-and-sets the recovery write against what its scan observed ([ADR 0023](docs/ADR/0023-dispatcher-sweep-ownership.md)). Its exclusion for this process's own in-flight jobs is time-bounded, not permanent — a local job stuck past its execution deadline is reclaimed too ([ADR 0021](docs/ADR/0021-bounded-execution-and-non-blocking-dispatch.md))
   - **Lease renewal** — checks in every 20s on the `RUNNING` jobs this worker holds, which is what makes the sweep above able to tell live work from a crash orphan across replicas. Stops renewing once a job is past its deadline plus grace, so a wedged worker cannot defend its own stuck job forever ([ADR 0023](docs/ADR/0023-dispatcher-sweep-ownership.md))
+  - **SLO evaluation** — computes both objectives every `SLO_EVALUATION_INTERVAL_SECONDS` (default 300) and raises a `critical` Alert, and therefore a signed webhook, on a ≥14.4× error-budget burn. De-duplicated per window by `alerts.dedup_key` under a unique constraint, so a sustained burn pages once an hour rather than once a tick, and two replicas evaluating the same window cannot both alert. This is the alert webhook's only non-chaos producer — before it, `compute_all` had exactly one caller (a read-only admin endpoint) and no real platform condition ever created an alert (WO-R2-29)
   - **Metrics loop** — emits CloudWatch gauges (`QueueDepth`, `InFlightJobs`, `ConsumerLag`) and caches the lag in Redis for the backpressure check
   - **Digest loop** (Phase 10) — every `LLM_DIGEST_INTERVAL_HOURS` (default 24), generates a per-tenant incident summary via Claude and persists it to `incident_summaries`
   - **Idempotency reaper** — hourly DELETE of expired `idempotency_records` rows (closes ADR 0010's "no reaper" follow-up)
@@ -475,7 +476,7 @@ Concrete implementation pointers for each pattern this project demonstrates end-
 | **Distributed locking** | Redis `SETNX` for job deduplication (open opportunity in the rate-limit code path) | Idempotency key is the primary dedup mechanism today |
 | **Connection pool sizing** | SQLAlchemy `pool_pre_ping=True`; pool tuning is a Phase 8 item (PgBouncer) | — |
 | **Time-series partitioning** | Phase 8 item: partition `audit_logs` by month | — |
-| **SLOs + error budgets** | `app/services/slo.py` computes from `jobs` table; `GET /admin/slos` returns budget remaining + burn rate | 14.4× fast-burn alarms in `infra/cloudwatch.tf` |
+| **SLOs + error budgets** | `app/services/slo.py` computes from `jobs` table; `GET /admin/slos` returns budget remaining + burn rate; `_slo_evaluation_loop` evaluates on a schedule and raises a de-duplicated Alert on a 14.4× burn | 14.4× fast-burn alarms in `infra/cloudwatch.tf`, matching the in-app threshold |
 | **Structured runbooks** | `runbooks/*.yaml` at repo root; `GET /admin/runbooks{,/{id}}`; CloudWatch alarm descriptions reference runbook URLs | Admin UI surfaces them next to the SLO scorecards |
 
 ---
@@ -545,7 +546,7 @@ All four services use `client.messages.parse(..., output_format=SomePydanticMode
 ### Phase 6: Observability & Reliability ✅
 - **OpenTelemetry** distributed tracing — spans across API → worker → DB → Redis, exported to OTLP (AWS X-Ray or Jaeger).
 - **Custom metrics** — `JobCompleted`, `JobFailed`, `JobDeadLettered`, `QueueDepth`, `InFlightJobs`, `ConsumerLag`, `RequestLatency` on the `IncidentPlatform` CloudWatch namespace. `emit_count` / `emit_gauge` do no I/O — they sanitise dimensions and queue the datum; one background task per process flushes an aggregated `StatisticSet` every 60s. Dimension values are bounded by a declared allow-list plus a hard cap; anything else becomes `other`. See [Cost model (CloudWatch custom metrics)](docs/ARCHITECTURE.md#cost-model-cloudwatch-custom-metrics) before adding a metric or a dimension.
-- **SLOs + error budgets** ✅ — `job_completion_rate` ≥ 99% and `job_dispatch_latency` ≥ 95% within 30 s, both over rolling 24h. `GET /admin/slos` returns current state, budget remaining %, and burn rate.
+- **SLOs + error budgets** ✅ — `job_completion_rate` ≥ 99% and `job_dispatch_latency` ≥ 95% within 30 s, both over rolling 24h. `GET /admin/slos` returns current state, budget remaining %, and burn rate; the worker also evaluates them on a schedule and alerts on a fast burn. Cancelled jobs are excluded from both objectives — a saga rollback or a dependency cascade is a decision not to dispatch, not a failure to.
 - **CloudWatch alarms** ✅ — five baseline alarms (`alb-5xx`, `backend-tasks-low`, `rds-cpu-high`, `redis-memory-low`, `queue-depth-high`) plus two SLO fast-burn alarms (14.4× over 1h windows). All notify via SNS topic `${app_name}-alarms`.
 - **Circuit breaker** ✅ — `app/utils/circuit_breaker.py` wraps external API calls; opens on N consecutive failures, half-open probe, auto-recover.
 - **Structured runbooks** ✅ — `runbooks/*.yaml` at repo root; one per alarm + one per SLO breach (7 total). Each has summary, symptoms, diagnosis steps (with copy-pasteable shell commands), mitigation, escalation, related dashboards. Alarm descriptions reference `/admin/runbooks/{id}` so on-call has a one-click path from PagerDuty.
@@ -747,7 +748,7 @@ Deferred until the incident-commander agent is wired up and driving eval scenari
 │   │   │   └── incident_digest.py  # Phase 10 — periodic per-tenant digests
 │   │   │
 │   │   ├── workers/
-│   │   │   ├── dispatcher.py       # JobDispatcherConsumer + worker_loop (starts all 8 consumers + 10 loops)
+│   │   │   ├── dispatcher.py       # JobDispatcherConsumer + worker_loop (starts all 8 consumers + 11 loops)
 │   │   │   ├── async_tasks.py      # asyncio — bulk_api_sync
 │   │   │   ├── thread_adapters.py  # threading — csv_upload
 │   │   │   ├── cpu_processors.py   # multiprocessing — doc_analysis, report_gen

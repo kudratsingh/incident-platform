@@ -298,6 +298,27 @@ class Settings(BaseSettings):
     alert_webhook_secret: str | None = None
     alert_webhook_timeout_seconds: float = 5.0
 
+    # ------------------------------------------------------------------
+    # Scheduled SLO evaluation (WO-R2-29). `_slo_evaluation_loop` computes
+    # the objectives in `services/slo.py` on this interval and raises an
+    # Alert on a fast burn — the alert webhook's only non-chaos producer.
+    #
+    # 300s is well inside the shortest exhaustion time the fast-burn
+    # threshold describes (~100 min for the completion objective), so a
+    # burn is noticed with plenty of budget left, while costing two
+    # aggregate queries over `jobs` per replica per five minutes.
+    #
+    # The de-dup window is what a sustained burn costs in alerts: one per
+    # hour per objective, rather than one per tick. It is a *bucket* width,
+    # not a cooldown — see `slo._fast_burn_dedup_key` for why that
+    # distinction is what makes de-duplication safe across replicas.
+    #
+    # 0 disables evaluation entirely, for deployments that drive alerting
+    # from CloudWatch alone and want no second producer.
+    # ------------------------------------------------------------------
+    slo_evaluation_interval_seconds: float = 300.0
+    slo_alert_dedup_window_seconds: float = 3600.0
+
     # Tracing — set to http://localhost:4318 locally (Jaeger), or X-Ray OTLP endpoint in prod
     otlp_endpoint: str | None = None
 

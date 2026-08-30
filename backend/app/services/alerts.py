@@ -49,7 +49,24 @@ class AlertService:
         title: str,
         description: str | None = None,
         extra_data: dict[str, Any] | None = None,
+        dedup_key: str | None = None,
     ) -> Alert:
+        """Persist an alert and push it to the webhook.
+
+        `dedup_key` is optional and, when given, is enforced by the unique
+        constraint on `(tenant_id, dedup_key)`: a second alert with the same
+        key raises `IntegrityError` out of the flush inside `create` — before
+        the webhook fires, which is the ordering that matters, since a
+        suppressed alert must not still be delivered.
+
+        The conflict is deliberately raised rather than swallowed here. A
+        producer that de-duplicates has to decide what a conflict *means* to
+        it (for the SLO loop it means "this window is already alerted, carry
+        on"), and a service that quietly returned someone else's row would
+        make that decision invisible at the call site. Callers that pass a
+        key are expected to catch it; callers that pass none cannot hit it,
+        because NULL keys do not collide.
+        """
         if severity not in ALLOWED_SEVERITIES:
             raise AlertValidationError(
                 f"Unknown severity {severity!r}; allowed: {sorted(ALLOWED_SEVERITIES)}"
@@ -65,6 +82,7 @@ class AlertService:
             description=description,
             extra_data=extra_data,
             request_id=request_id_var.get("") or None,
+            dedup_key=dedup_key,
         )
         logger.info(
             "alert created",
