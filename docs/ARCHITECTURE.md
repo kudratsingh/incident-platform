@@ -182,7 +182,10 @@ Browser                           API process                              DB
   │  POST /sagas                     │                                       │
   │  {name, steps: [...]}            │                                       │
   │ ───────────────────────────────► │                                       │
-  │                                  │  validate steps                       │
+  │                                  │  rate limit (shared jobs:create)      │
+  │                                  │  validate steps (<= MAX_SAGA_STEPS)   │
+  │                                  │  check_job_admission(N=len(steps))    │
+  │                                  │    backpressure + tenant quota        │
   │                                  │                                       │
   │                                  │  SagaService.create_saga              │
   │                                  │    BEGIN TRANSACTION                  │
@@ -198,6 +201,8 @@ Browser                           API process                              DB
   │  201 (SagaResponse)              │                                       │
   │ ◄─────────────────────────────── │                                       │
 ```
+
+Admission control is identical to `POST /jobs` and runs through the same guard (`app/utils/admission.py`), because this endpoint creates `jobs` rows exactly as that one does — it just creates several. The saga is weighed as its **step count**: `_check_monthly_quota` counts every `Job` row, so saga steps already consumed the cap that blocks `POST /jobs` while this endpoint was never blocked by it, which made the per-tenant billing cap unenforceable rather than merely leaky. Checking the batch up front also means a saga is refused whole instead of committing part of its chain and meeting the cap mid-loop. `steps` is bounded by `MAX_SAGA_STEPS` so one request cannot create an unbounded number of rows.
 
 All steps after the first are inserted as `JobStatus.WAITING`. They get promoted to `PENDING` (and a `job.submitted` event emitted) by the `dependency-resolver` consumer when their parent completes.
 
@@ -313,7 +318,7 @@ So each knob is bounded twice:
 | `doc_analysis` | `page_count` | 0–1000 |
 | `report_gen` | `row_count` / `group_count` | 0–1,000,000 / 1–1000 |
 
-1. **At every creation surface** — `schemas/job.py` defines per-type payload models (`extra="allow"`, so `__traceparent` and arbitrary caller keys pass through) and `validate_processor_payload()` applies them from *both* `JobCreate` (POST /jobs) and `SagaStepRequest` (POST /sagas). The saga path builds jobs through `SagaService` → `JobService.create_job` and never constructs a `JobCreate`, so validating only the latter would leave POST /sagas as an open bypass.
+1. **At every creation surface** — `schemas/job.py` defines per-type payload models (`extra="allow"`, so `__traceparent` and arbitrary caller keys pass through) and `validate_processor_payload()` applies them from *both* `JobCreate` (POST /jobs) and `SagaStepRequest` (POST /sagas). The saga path builds jobs through `SagaService` → `JobService.create_job` and never constructs a `JobCreate`, so validating only the latter would leave POST /sagas as an open bypass. The same reasoning applies to admission control, which is why the rate limit, backpressure check and tenant quota live behind one shared guard both endpoints call rather than three calls each endpoint has to remember (`app/utils/admission.py`).
 2. **Inside the processors** — as clamps. Replays (`JobService.replay_job`) republish the *stored* payload without revalidating, so rows written before the bounds existed still reach a processor. The clamps are load-bearing, not belt-and-braces.
 
 The `chunk_size` and `group_count` floors are `1`, not `0`: both are divisors, and zero was a `ZeroDivisionError` and a silently-empty report respectively.

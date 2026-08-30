@@ -13,12 +13,22 @@ from app.repositories.saga import SagaRepository
 from app.schemas.job import JobResponse, validate_processor_payload
 from app.services.job import JobService
 from app.services.saga import SagaService, SagaStep
+from app.utils.admission import JOB_CREATE_RATE_BUCKET, check_job_admission
+from app.utils.rate_limit import rate_limiter
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field, model_validator
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
 router = APIRouter(prefix="/sagas", tags=["sagas"])
+
+# Upper bound on steps in one saga. Every step is a `jobs` row, so without a
+# bound a single request creates an unbounded number of them — and the request
+# is admitted or refused as a batch, so the bound is also what keeps the quota
+# pre-check from having to reason about an arbitrarily large N. Generous
+# against real chains (the longest shipped saga is 3 steps) and small enough
+# that one request can never be a bulk-insert vector.
+MAX_SAGA_STEPS = 50
 
 
 class SagaStepRequest(BaseModel):
@@ -40,7 +50,7 @@ class SagaStepRequest(BaseModel):
 
 class SagaCreateRequest(BaseModel):
     name: str = Field(min_length=1, max_length=255)
-    steps: list[SagaStepRequest] = Field(min_length=1)
+    steps: list[SagaStepRequest] = Field(min_length=1, max_length=MAX_SAGA_STEPS)
 
 
 class SagaResponse(BaseModel):
@@ -118,7 +128,26 @@ async def create_saga(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
     redis: Redis = Depends(get_redis),
+    _rl: None = Depends(
+        rate_limiter(limit=30, window=60, key_prefix=JOB_CREATE_RATE_BUCKET)
+    ),
 ) -> SagaResponse:
+    """Create a saga and its chain of dependent jobs.
+
+    Admission control is the same as `POST /jobs` and runs through the same
+    guard, because this endpoint creates `jobs` rows just as that one does —
+    it just creates several. Counting the saga as its steps is what makes the
+    monthly cap enforceable: `_check_monthly_quota` counts every `Job` row, so
+    saga steps were already consuming the cap that blocks `POST /jobs` while
+    this endpoint was never blocked by it (WO-R2-12).
+
+    The check runs before `create_saga` opens its transaction, so a saga is
+    refused whole rather than committing part of its chain and then meeting
+    the cap mid-loop.
+    """
+    await check_job_admission(
+        db, redis, current_user.tenant_id, job_count=len(body.steps)
+    )
     svc = _saga_service(db, redis)
     saga = await svc.create_saga(
         user_id=current_user.id,

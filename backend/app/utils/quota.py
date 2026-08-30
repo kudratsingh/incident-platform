@@ -7,6 +7,8 @@ Two enforcement mechanisms, both scoped to the authenticated tenant:
     `tenants.rate_limit_per_minute`; 0 disables.
   * Monthly quota: total jobs the tenant created in the current UTC
     calendar month. The cap is `tenants.quota_jobs_per_month`; 0 disables.
+    Checked against the number of jobs the request is about to create
+    (`job_count`), so a 50-step saga is weighed as 50 jobs rather than one.
 
 The quota is a per-request SQL count rather than a Redis counter:
 
@@ -66,7 +68,19 @@ async def _check_tenant_rate(redis: Redis, tenant: Tenant) -> None:
         )
 
 
-async def _check_monthly_quota(session: AsyncSession, tenant: Tenant) -> None:
+async def _check_monthly_quota(
+    session: AsyncSession, tenant: Tenant, job_count: int = 1
+) -> None:
+    """Refuse the request if the `job_count` rows it creates cross the cap.
+
+    Checked as a batch rather than per row, and *before* the first INSERT:
+    `POST /sagas` creates one job per step, so a saga that ran this check as
+    a single job could overshoot the cap by N-1 rows, and one that ran it per
+    step would commit part of its chain before meeting the cap mid-loop.
+
+    `job_count=1` is exactly the `used >= cap` rule this replaced —
+    `used + 1 > cap` is the same predicate — so `POST /jobs` does not move.
+    """
     if tenant.quota_jobs_per_month <= 0:
         return
     since = _month_start()
@@ -77,18 +91,41 @@ async def _check_monthly_quota(session: AsyncSession, tenant: Tenant) -> None:
             .where(Job.tenant_id == tenant.id, Job.created_at >= since)
         )
     ).scalar_one()
-    if used >= tenant.quota_jobs_per_month:
+    if used + job_count > tenant.quota_jobs_per_month:
+        requested = (
+            f" This request would create {job_count} jobs." if job_count != 1 else ""
+        )
         raise QuotaExceededError(
             f"Monthly job quota reached for tenant {tenant.slug} "
-            f"({used} / {tenant.quota_jobs_per_month}). "
-            "Quota resets at the start of next month."
+            f"({used} / {tenant.quota_jobs_per_month})."
+            f"{requested} "
+            "Quota resets at the start of next month.",
+            details={
+                "limit": tenant.quota_jobs_per_month,
+                "used": used,
+                "requested": job_count,
+            },
         )
 
 
 async def check_tenant_limits(
-    session: AsyncSession, redis: Redis, tenant_id: uuid.UUID
+    session: AsyncSession,
+    redis: Redis,
+    tenant_id: uuid.UUID,
+    *,
+    job_count: int = 1,
 ) -> None:
-    """Single entry point used at the top of POST /jobs.
+    """The per-tenant half of admission control, for every job-creating surface.
+
+    Reached through `utils/admission.check_job_admission`, which both
+    `POST /jobs` and `POST /sagas` call.
+
+    `job_count` is how many `jobs` rows this request will create — 1 for
+    `POST /jobs`, `len(steps)` for `POST /sagas`. It applies to the monthly
+    quota only, whose unit is jobs. The per-minute limit is deliberately left
+    at one increment per request: its column is `tenants.rate_limit_per_minute`
+    and its unit is requests, so multiplying it there would silently redefine
+    a configured value. Bounding volume is the quota's job, and it does it.
 
     Raises RateLimitError (429) when the per-minute cap is hit,
     QuotaExceededError (429, error_code=quota_exceeded) when the monthly cap is hit.
@@ -99,4 +136,4 @@ async def check_tenant_limits(
     if tenant is None:
         raise QuotaExceededError(f"Tenant {tenant_id} not found")
     await _check_tenant_rate(redis, tenant)
-    await _check_monthly_quota(session, tenant)
+    await _check_monthly_quota(session, tenant, job_count)

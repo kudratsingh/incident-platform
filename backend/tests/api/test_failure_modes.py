@@ -411,3 +411,121 @@ async def test_get_nonexistent_job_returns_404(
     )
     assert resp.status_code == 404
     assert resp.json()["error_code"] == "not_found"
+
+
+# ---------------------------------------------------------------------------
+# The same Redis posture on POST /sagas (WO-R2-12)
+#
+# `POST /sagas` creates N job rows and used to run none of the three
+# preconditions `POST /jobs` runs. Adding them has to add the *whole* posture,
+# not just the rejection half: a check that rejects on signal but 500s on a
+# Redis outage would make the saga endpoint strictly worse than the bypass it
+# replaced. These mirror the `POST /jobs` tests above, assertion rule and all
+# (a fail-open path is pinned to 201, never to "!= 503").
+# ---------------------------------------------------------------------------
+
+
+async def test_saga_create_still_works_when_redis_is_down(
+    redis_down_client: AsyncClient, auth_headers: dict[str, str]
+) -> None:
+    """Redis fully down must not block saga creation either.
+
+    The durable path is identical to `POST /jobs`: Postgres rows plus an
+    outbox row in one transaction. Every Redis touch the new admission guard
+    adds is advisory, so an outage degrades to "no signal, accept the work".
+    """
+    resp = await redis_down_client.post(
+        "/api/v1/sagas",
+        json={"name": "redis-is-down", "steps": [{"type": "csv_upload"}]},
+        headers=auth_headers,
+    )
+
+    assert resp.status_code == 201, resp.text
+    assert len(resp.json()["steps"]) == 1
+
+
+async def test_saga_backpressure_fails_open_when_redis_get_raises(
+    redis_down_client: AsyncClient, auth_headers: dict[str, str]
+) -> None:
+    """Narrow version, aimed at the backpressure GET the saga path now makes.
+
+    The other Redis touches are stubbed out so a regression can only be
+    attributed to `check_backpressure` — the shared helper from PR #150,
+    reused rather than reimplemented, which is what makes this pass without
+    the saga path needing its own fail-open logic.
+    """
+    with (
+        patch("app.utils.rate_limit._check"),
+        patch("app.utils.quota._check_tenant_rate"),
+    ):
+        resp = await redis_down_client.post(
+            "/api/v1/sagas",
+            json={"name": "backpressure-open", "steps": [{"type": "csv_upload"}]},
+            headers=auth_headers,
+        )
+
+    assert resp.status_code == 201, resp.text
+
+
+async def test_saga_create_is_refused_when_redis_reports_high_lag(
+    redis_lagging_client: AsyncClient, auth_headers: dict[str, str]
+) -> None:
+    """THE backpressure half of WO-R2-12: sagas are refused when jobs are.
+
+    Pre-fix this returned 201 while `POST /jobs` returned 503 against the very
+    same Redis — the backpressure signal applied to one job-creating surface
+    and not the other.
+    """
+    resp = await redis_lagging_client.post(
+        "/api/v1/sagas",
+        json={"name": "too-much-lag", "steps": [{"type": "csv_upload"}]},
+        headers=auth_headers,
+    )
+
+    assert resp.status_code == 503, resp.text
+    assert resp.json()["error_code"] == "backpressure"
+
+
+class _RedisCountingKeys(AsyncMock):
+    """A reachable Redis that records which keys were INCR'd."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.incr_keys: list[str] = []
+
+    async def incr(self, key: str) -> int:
+        self.incr_keys.append(key)
+        return 1
+
+    async def get(self, key: str) -> bytes | None:
+        return None
+
+
+async def test_jobs_and_sagas_share_one_job_creation_rate_bucket(
+    db_session: AsyncSession, default_tenant: Any, auth_headers: dict[str, str]
+) -> None:
+    """Both job-creating endpoints draw on the SAME per-IP budget.
+
+    A separate bucket would leave the bypass half-open: a caller refused by
+    `POST /jobs` could carry on creating job rows through `POST /sagas` at the
+    full rate. Asserted on the key the limiter touches rather than by sending
+    31 requests, so the test does not depend on a wall-clock window.
+    """
+    redis = _RedisCountingKeys()
+    async with _client_with_redis(db_session, redis) as ac:
+        await ac.post("/api/v1/jobs", json={"type": "csv_upload"}, headers=auth_headers)
+        job_keys = [k for k in redis.incr_keys if k.startswith("rate:jobs:create:")]
+
+        redis.incr_keys.clear()
+        await ac.post(
+            "/api/v1/sagas",
+            json={"name": "same-bucket", "steps": [{"type": "csv_upload"}]},
+            headers=auth_headers,
+        )
+        saga_keys = [k for k in redis.incr_keys if k.startswith("rate:jobs:create:")]
+
+    assert job_keys, "POST /jobs did not touch a jobs:create rate key"
+    assert saga_keys == job_keys, (
+        f"POST /sagas rate-limits on {saga_keys}, POST /jobs on {job_keys} — "
+        "separate buckets leave the job-creation rate limit bypassable"
+    )
