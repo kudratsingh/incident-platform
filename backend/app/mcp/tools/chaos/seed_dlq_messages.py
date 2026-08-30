@@ -25,7 +25,9 @@ not history.
 """
 
 import uuid
+from typing import Literal
 
+from app.core.exceptions import AppError
 from app.core.logging import get_logger
 from app.mcp.chaos import BlastRadius, chaos_tool
 from app.mcp.registry import ToolContext
@@ -62,14 +64,37 @@ _DEFAULT_ERRORS: dict[str, str] = {
 }
 
 
+class SeedDlqHintError(AppError):
+    """An unknown `remediation_hint` reached the handler body.
+
+    The `Literal` on the input model should make this unreachable over
+    MCP — it exists so a *direct* Python caller (the seed script, a
+    test) still gets a typed refusal rather than the bare `ValueError`
+    the handler used to render as `-32603 internal tool error` with an
+    `mcp tool crashed` log line (R2-16)."""
+
+    status_code = 400
+    error_code = "unknown_remediation_hint"
+
+
+# Spelled out rather than derived from `RemediationHint`, because these
+# strings are baked verbatim into the tool's inputSchema — the agent
+# reads them there and nowhere else, so a change must be visible in this
+# file's diff. `test_seed_dlq_hint_literal_matches_the_enum` fails if the
+# enum ever gains or loses a member.
+_HINT_VALUES = Literal["replay_safe", "wait_and_replay", "human_required"]
+
+
 class SeedDlqMessagesInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    remediation_hint: str = Field(
+    remediation_hint: _HINT_VALUES = Field(
         description=(
             "Category stamped on every row: `replay_safe`, "
             "`wait_and_replay`, or `human_required`. Drives which "
-            "branch of the agent's remediation logic the rows exercise."
+            "branch of the agent's remediation logic the rows exercise. "
+            "An unrecognised value is rejected at parse time as an "
+            "invalid-params error, not a tool crash."
         )
     )
     count: int = Field(
@@ -159,12 +184,15 @@ async def seed_dlq_messages(
 
 def _validated_hint(raw: str) -> str:
     """Reject an unknown hint loudly rather than writing a row the
-    agent's category filters would silently never match."""
+    agent's category filters would silently never match.
+
+    Defence in depth behind the input model's `Literal` — see
+    `SeedDlqHintError` for why the exception type matters."""
     try:
         return RemediationHint(raw).value
     except ValueError:
         valid = ", ".join(sorted(h.value for h in RemediationHint))
-        raise ValueError(
+        raise SeedDlqHintError(
             f"unknown remediation_hint {raw!r}; expected one of: {valid}"
         ) from None
 
