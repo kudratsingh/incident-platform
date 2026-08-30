@@ -43,6 +43,7 @@ from datetime import UTC, datetime
 from app.core.exceptions import AuthenticationError, AuthorizationError
 from app.core.redis import get_redis
 from app.core.security import create_stream_token, decode_token
+from app.core.tenant_scope import declare_tenant_scope
 from app.dependencies import get_current_user, get_db
 from app.models.enums import JobStatus
 from app.models.job import Job
@@ -199,6 +200,15 @@ async def stream_job_progress(
         tenant_id = uuid.UUID(str(payload.get("tenant_id")))
     except ValueError as exc:
         raise AuthenticationError("Stream token carries no usable tenant") from exc
+
+    # Give the read below the same RLS backstop every other authenticated
+    # path has. This endpoint authenticates on the `?token=` stream token
+    # rather than `get_current_user`, so nothing had set `app.tenant_id`
+    # and the lookup ran unscoped — carried by the policy's bootstrap
+    # branch until WO-R2-129 removed it. The tenant comes from the signed
+    # token that was already checked against this job_id, so this narrows
+    # the query, it does not widen it.
+    await declare_tenant_scope(db, tenant_id)
 
     # Read the row here, not inside the generator: the get_db session is torn
     # down when this function returns, before a single SSE byte is streamed.

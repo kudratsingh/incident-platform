@@ -26,7 +26,12 @@ from fastapi import Depends
 from fastapi.security import OAuth2PasswordBearer
 from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
 _settings = get_settings()
 _engine = create_async_engine(
@@ -107,8 +112,24 @@ get_redis = _get_redis
 
 
 def get_session_factory() -> async_sessionmaker[AsyncSession]:
-    """Return the shared session factory — used by the worker (no HTTP context)."""
+    """Return the shared, tenant-scoped session factory.
+
+    Sessions from this factory carry no cross-tenant privilege: since
+    WO-R2-129 a statement that has not set `app.tenant_id` is refused by
+    the `tenant_isolation` policies. Request paths get their tenant from
+    `get_current_user` / `_apply_tenant_context`; the boot probes use it
+    for catalog reads that touch no tenant table. Code that legitimately
+    spans tenants asks for it explicitly — see
+    `app.core.tenant_scope.platform_session_factory` (ADR 0026).
+    """
     return _async_session
+
+
+def get_engine() -> AsyncEngine:
+    """The one shared engine. Exposed so `platform_session_factory` can
+    build a cross-tenant factory over the *same* pool rather than opening
+    a second one (ADR 0015 rejected a second pool; ADR 0026 keeps that)."""
+    return _engine
 
 
 def require_role(*roles: UserRole) -> "type[User]":

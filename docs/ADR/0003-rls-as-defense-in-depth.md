@@ -2,6 +2,16 @@
 
 **Status:** Accepted (Phase 12 PR #37) · **Date:** 2026 Q2 · **Owner:** Platform
 
+> **Superseded in part by [ADR 0026](0026-strict-tenant-isolation-and-declared-platform-scope.md)
+> (2026-08-30):** the unset-tenant escape hatch described below as deliberate is **gone**. It
+> made every `tenant_isolation` policy fail *open* — any statement that had not set
+> `app.tenant_id` was admitted unconditionally on all eleven tenant tables, which plat #192
+> proved live. The bootstrap need this section argues for is real but names `users`, which
+> carries no policy at all, so on the other ten tables the branch was protecting nothing.
+> Policies now match on the tenant alone; cross-tenant work declares itself with
+> `app.tenant_scope = 'platform'`. Read the "intentionally permissive" section below as
+> history.
+>
 > **Amended by [ADR 0015](0015-force-rls-and-nonowner-app-role.md) (2026-08-09):** FORCE row-level
 > security and full tenant-table policy coverage shipped (migration `a7e3d9c41f28`); the "FORCE
 > would break Alembic" claim below is corrected there, and the non-owner `incident_app` runtime
@@ -34,7 +44,7 @@ The `get_current_user` dependency issues `SELECT set_config('app.tenant_id', :ti
 
 Tables covered: `jobs`, `audit_logs`, `outbox_events`, `job_events`, `sagas`, `job_triages`. (Not `users` — auth needs to read users *before* the tenant context is set; see "Consequences → bootstrap" below.)
 
-## The policy is intentionally permissive when the setting is unset
+## The policy is intentionally permissive when the setting is unset *(reversed by ADR 0026)*
 
 The `IS NULL OR = ''` branch means "if `app.tenant_id` is unset, all rows are visible." This looks like it defeats the policy. It's deliberate:
 
@@ -97,7 +107,7 @@ A SQLAlchemy event listener that rewrites every query to inject `WHERE tenant_id
 - **Bootstrap complication.** `users` table can't have RLS because auth reads it before setting the context. Documented; tested.
 - **SQLite test environment doesn't see RLS.** All unit + API tests run against SQLite, which has no concept of RLS. The integration test covers the gap, but day-to-day development can't catch RLS-specific bugs.
 - **Performance.** Each query's WHERE clause grows by the policy predicate. The predicate is on an indexed column (`tenant_id`); EXPLAIN ANALYZE shows it folds into existing index scans. Measured negligible.
-- **Operational footgun.** Forgetting to set `app.tenant_id` in a new code path means *all rows visible*, not "no rows visible". The fallout is silent. Mitigated by: only `get_current_user` is supposed to set it; new code paths inherit from that dependency.
+- **Operational footgun.** ~~Forgetting to set `app.tenant_id` in a new code path means *all rows visible*, not "no rows visible". The fallout is silent.~~ *(2026-08-30, ADR 0026: this is the defect, not a footgun to mitigate — it is now inverted. Forgetting means no rows visible and writes refused.)*
 - **Production deployment still requires a non-owner DB role to fully enforce.** Documented in the migration; ~~not yet wired in Terraform. Tracked.~~ *(2026-08-09: overtaken by [ADR 0015](0015-force-rls-and-nonowner-app-role.md) — `FORCE ROW LEVEL SECURITY` now binds the owner connection, so the policies enforce in production without the role split; the non-owner `incident_app` role remains phase 2 there.)*
 
 ### Reversibility

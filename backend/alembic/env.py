@@ -136,6 +136,42 @@ def assert_role_can_migrate(connection: object) -> None:
         )
 
 
+def _declare_platform_scope(connection: object) -> None:
+    """Let this migration run touch every tenant's rows (ADR 0026).
+
+    Since `e2a9c4f70b31` the `tenant_isolation` policies match on
+    `app.tenant_id` alone; a session that sets nothing is refused rather
+    than admitted. Migrations legitimately span tenants, so the run says
+    so once, here, instead of every data migration remembering to.
+
+    This is not hypothetical for *past* migrations either. Four already
+    merged revisions run DML against policy-covered tables, and three of
+    them land after `a7e3d9c41f28` turned FORCE on, which binds the owner
+    the migrations connect as: `b1f39d7c2a84` (UPDATE jobs), the
+    `d1f6a2b940c7` saga_step_index backfill, `c9e41a7b62d5`'s downgrade
+    (DELETE FROM idempotency_records) and `a5c19d3f7e42`'s audit_logs
+    backfill. Without this they would match no rows and report
+    `UPDATE 0` — a silent no-op, which for a backfill is worse than an
+    error. The integration fixture replays the whole chain from empty on
+    every CI run, so the guarantee is exercised rather than assumed.
+
+    Session-level `SET`, not the transaction-local `set_config(..., true)`
+    used everywhere else: alembic may open a transaction per migration,
+    and this connection is a dedicated one from the migration engine —
+    never a pooled runtime connection a request could inherit. Issued
+    inside `context.begin_transaction()` deliberately; executing before it
+    would autobegin a transaction and silently turn alembic's own
+    `begin_transaction()` into a null context (see
+    `assert_role_can_migrate`, which had to learn this the hard way).
+    """
+    dialect = getattr(getattr(connection, "dialect", None), "name", "")
+    if dialect != "postgresql":
+        return
+    connection.exec_driver_sql(  # type: ignore[attr-defined]
+        "SET app.tenant_scope = 'platform'"
+    )
+
+
 def do_run_migrations(connection: object) -> None:
     """Run the migrations on a SYNC connection, holding the advisory lock.
 
@@ -157,6 +193,7 @@ def do_run_migrations(connection: object) -> None:
             compare_type=True,
         )
         with context.begin_transaction():
+            _declare_platform_scope(connection)
             context.run_migrations()
     finally:
         if locked:

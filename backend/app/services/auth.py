@@ -14,6 +14,7 @@ from app.core.security import (
     hash_password,
     verify_password,
 )
+from app.core.tenant_scope import declare_tenant_scope
 from app.models.tenant import DEFAULT_TENANT_SLUG
 from app.models.user import User
 from app.repositories.audit import AuditRepository
@@ -94,6 +95,12 @@ class AuthService:
             role=role,
             tenant_id=tenant.id,
         )
+        # RLS context for the audit write below. Registration is
+        # unauthenticated, so nothing has set `app.tenant_id` on this
+        # transaction — before WO-R2-129 the INSERT was carried by the
+        # policy's bootstrap branch, i.e. written with no isolation at
+        # all. The tenant is known here; name it.
+        await declare_tenant_scope(self.audit_repo.session, tenant.id)
         await self.audit_repo.log(
             "user.registered",
             user_id=user.id,
@@ -195,6 +202,9 @@ class AuthService:
         refresh_token = create_refresh_token(token_data)
 
         user_id_var.set(str(user.id))
+        # Same reason as register(): login authenticates itself, so this
+        # audit INSERT had no tenant context and no RLS backstop.
+        await declare_tenant_scope(self.audit_repo.session, user.tenant_id)
         await self.audit_repo.log(
             "user.login",
             user_id=user.id,
