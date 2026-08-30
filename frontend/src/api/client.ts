@@ -3,7 +3,9 @@
  *
  * Handles:
  *  - Auth header injection
- *  - Automatic access-token refresh on 401
+ *  - Automatic access-token refresh on 401 — except from the auth endpoints
+ *    themselves, whose 401 is an answer ("wrong password", "refresh token
+ *    spent") rather than an expired session, and must reach the caller
  *  - Consistent error parsing (ApiError shape from backend)
  *  - X-Request-ID / X-Trace-ID echoed in every response → shown in UI
  *  - X-Trace-ID sent on every request so the backend logger ties browser
@@ -44,32 +46,58 @@ export class AppError extends Error {
   }
 }
 
+/**
+ * Endpoints whose 401 IS the answer, not a symptom of an expired session.
+ *
+ * A wrong password comes back 401 from /auth/login. Running that through the
+ * session-expiry branch cleared the tokens and hard-navigated to /login, which
+ * reloaded the page and destroyed the "Invalid email or password" message the
+ * login form had just rendered — the user saw a blank form and no explanation.
+ * /auth/refresh is here for the same reason: its 401 means the refresh token
+ * is spent, which tryRefresh already reports by returning false.
+ */
+const AUTH_ENDPOINTS = ['/auth/login', '/auth/refresh']
+
+function isAuthEndpoint(path: string): boolean {
+  return AUTH_ENDPOINTS.some((p) => path === p || path.startsWith(`${p}?`))
+}
+
 // Track in-flight refresh to avoid parallel refresh storms
 let _refreshPromise: Promise<boolean> | null = null
+
+async function performRefresh(): Promise<boolean> {
+  const refreshToken = getRefreshToken()
+  if (!refreshToken) return false
+
+  try {
+    const res = await fetch(`${BASE_URL}/auth/refresh`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ refresh_token: refreshToken }),
+    })
+    if (!res.ok) return false
+    const data: TokenResponse = await res.json()
+    setTokens(data.access_token, data.refresh_token)
+    return true
+  } catch {
+    return false
+  }
+}
 
 async function tryRefresh(): Promise<boolean> {
   if (_refreshPromise) return _refreshPromise
 
-  _refreshPromise = (async () => {
-    const refreshToken = getRefreshToken()
-    if (!refreshToken) return false
-
-    try {
-      const res = await fetch(`${BASE_URL}/auth/refresh`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ refresh_token: refreshToken }),
-      })
-      if (!res.ok) return false
-      const data: TokenResponse = await res.json()
-      setTokens(data.access_token, data.refresh_token)
-      return true
-    } catch {
-      return false
-    } finally {
-      _refreshPromise = null
-    }
-  })()
+  // The reset is chained onto the attempt from OUT HERE, not written as a
+  // `finally` inside it. `if (!refreshToken) return false` returns
+  // synchronously, so an inner `finally` would run before the assignment below
+  // and the assignment would immediately re-latch the resolved promise —
+  // exactly the bug this replaces, where one refresh attempt made with no
+  // stored refresh token left `_refreshPromise` holding `false` forever and
+  // every later 401 short-circuited to that cached answer instead of trying.
+  const attempt = performRefresh()
+  _refreshPromise = attempt.finally(() => {
+    _refreshPromise = null
+  })
 
   return _refreshPromise
 }
@@ -101,7 +129,9 @@ async function request<T>(
   lastMeta.requestId = res.headers.get('X-Request-ID') ?? undefined
   lastMeta.traceId = res.headers.get('X-Trace-ID') ?? undefined
 
-  if (res.status === 401 && !isRetry) {
+  // A 401 from the auth endpoints themselves falls through to the normal error
+  // path below, so the calling component receives the server's message.
+  if (res.status === 401 && !isRetry && !isAuthEndpoint(path)) {
     const refreshed = await tryRefresh()
     if (refreshed) return request<T>(path, options, true)
     clearTokens()

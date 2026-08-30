@@ -177,17 +177,19 @@ describe('useJobStream', () => {
     expect(second).not.toBe(first)
 
     // Second failure: 2.5s is no longer enough — the delay has doubled.
-    // (onerror closes the source, and MockEventSource.close() drops it from
-    // `instances`, so "no reconnect yet" reads as an empty instance list.)
+    // "No reconnect yet" is a socket count that has not grown; closed sockets
+    // stay in `instances` so that the terminal-event test can still reach the
+    // one it needs to fire an error on.
+    const countAfterSecond = MockEventSource.instances.length
     act(() => { second.simulateError() })
     await act(async () => { vi.advanceTimersByTime(2500) })
     await act(async () => {})
-    expect(latest()).toBeUndefined()
+    expect(MockEventSource.instances).toHaveLength(countAfterSecond)
 
     // It does reconnect, just later.
     await act(async () => { vi.advanceTimersByTime(2000) })
     await act(async () => {})
-    expect(latest()).toBeDefined()
+    expect(MockEventSource.instances).toHaveLength(countAfterSecond + 1)
     expect(streamTokenMock).toHaveBeenCalledTimes(3)
   })
 
@@ -228,8 +230,16 @@ describe('useJobStream', () => {
     const countAfterTerminal = MockEventSource.instances.length
     const mintsAfterTerminal = streamTokenMock.mock.calls.length
 
-    // Error fires after terminal — should NOT spawn a new connection
-    act(() => { latest()?.simulateError() })
+    // Error fires after terminal — should NOT spawn a new connection.
+    // The terminal event closed this socket; it is still reachable because the
+    // mock keeps closed instances, so this genuinely calls the hook's onerror.
+    // (When the mock dropped closed sockets, `latest()` was undefined here and
+    // the optional-chained call did nothing at all: the assertions below held
+    // no matter what the hook did.)
+    const terminalSource = latest()
+    expect(terminalSource).toBeDefined()
+    expect(terminalSource.closed).toBe(true)
+    act(() => { terminalSource.simulateError() })
     await act(async () => { vi.advanceTimersByTime(2500) })
 
     expect(MockEventSource.instances.length).toBe(countAfterTerminal)
@@ -241,7 +251,9 @@ describe('useJobStream', () => {
     act(() => { latest().simulateOpen() })
 
     act(() => {
-      // Bypass simulateMessage to send raw bad data
+      // Raw bad data on a named event, which is how it would really arrive…
+      latest().dispatch('running', '{not valid json')
+      // …and on an unnamed one, which the hook still handles.
       latest().onmessage?.(new MessageEvent('message', { data: '{not valid json' }))
     })
 
@@ -277,6 +289,118 @@ describe('useJobStream', () => {
     expect(streamTokenMock).not.toHaveBeenCalled()
   })
 
+  // --- the wire contract the backend actually speaks ---
+
+  it('receives events sent as `event: <status>`, which is all the server sends', async () => {
+    // backend/app/api/streaming.py yields {"data": ..., "event": event.status}
+    // at both sites, so every event on the wire is NAMED. EventSource routes a
+    // named event only to a listener registered for that name — `onmessage`
+    // fires for unnamed/`message` events and nothing else — so a hook wired to
+    // `onmessage` alone opened the stream fine and then received nothing.
+    const { result } = await renderStream()
+    act(() => { latest().simulateOpen() })
+
+    act(() => {
+      latest().dispatch(
+        'running',
+        JSON.stringify({
+          job_id: JOB_ID, status: 'running', progress: 40,
+          message: 'Working', retry_count: 0, timestamp: '2026-08-13T10:00:00Z',
+        }),
+      )
+    })
+
+    expect(result.current.events).toHaveLength(1)
+    expect(result.current.latest?.progress).toBe(40)
+  })
+
+  it('handles the retrying status, which only ever arrives as a named event', async () => {
+    // `retrying` is the job.failed / dead_lettered=false branch in
+    // workers/sse_consumer.py. It is not terminal: the job comes back.
+    const { result } = await renderStream()
+    act(() => { latest().simulateOpen() })
+
+    act(() => {
+      latest().simulateMessage({
+        job_id: JOB_ID, status: 'retrying', progress: 0,
+        message: 'Attempt 2 of 3', retry_count: 1, timestamp: new Date().toISOString(),
+      })
+    })
+
+    expect(result.current.latest?.status).toBe('retrying')
+    expect(result.current.done).toBe(false)
+    expect(result.current.connected).toBe(true)
+  })
+
+  it('does not log the retained snapshot twice when it is re-delivered', async () => {
+    // The endpoint replays its retained snapshot to every subscriber and the
+    // broker subscribes just before reading it, so the same event can arrive
+    // twice in a row. `latest` is unaffected; the event log would double up.
+    const { result } = await renderStream()
+    act(() => { latest().simulateOpen() })
+
+    const event = {
+      job_id: JOB_ID, status: 'running', progress: 60,
+      message: 'Halfway', retry_count: 0, timestamp: '2026-08-13T10:00:01Z',
+    }
+    act(() => { latest().simulateMessage(event) })
+    act(() => { latest().simulateMessage(event) })
+
+    expect(result.current.events).toHaveLength(1)
+    expect(result.current.latest?.progress).toBe(60)
+  })
+
+  // --- reset semantics ---
+
+  it('clears the previous job\'s events when jobId changes', async () => {
+    const { result, rerender } = renderHook(({ id }: { id: string }) => useJobStream(id), {
+      initialProps: { id: JOB_ID },
+    })
+    await act(async () => {})
+
+    act(() => { latest().simulateOpen() })
+    act(() => {
+      latest().simulateMessage({
+        job_id: JOB_ID, status: 'completed', progress: 100,
+        message: 'First job done', retry_count: 0, timestamp: new Date().toISOString(),
+      })
+    })
+    expect(result.current.events).toHaveLength(1)
+    expect(result.current.done).toBe(true)
+
+    // Switching jobs must not leave the previous job's log, progress or
+    // done flag on screen — not even for one frame.
+    rerender({ id: 'job-def-456' })
+    expect(result.current.events).toHaveLength(0)
+    expect(result.current.latest).toBeNull()
+    expect(result.current.done).toBe(false)
+    expect(result.current.connected).toBe(false)
+
+    await act(async () => {})
+    expect(latest().url).toContain('/jobs/job-def-456/stream')
+  })
+
+  it('clears state when the consumer stops streaming (jobId goes null)', async () => {
+    const { result, rerender } = renderHook(
+      ({ id }: { id: string | null }) => useJobStream(id),
+      { initialProps: { id: JOB_ID as string | null } },
+    )
+    await act(async () => {})
+
+    act(() => { latest().simulateOpen() })
+    act(() => {
+      latest().simulateMessage({
+        job_id: JOB_ID, status: 'running', progress: 10,
+        message: 'Started', retry_count: 0, timestamp: new Date().toISOString(),
+      })
+    })
+    expect(result.current.events).toHaveLength(1)
+
+    rerender({ id: null })
+    expect(result.current.events).toHaveLength(0)
+    expect(result.current.connected).toBe(false)
+  })
+
   // --- lifecycle discipline (F2-02) ---
 
   it('cancels a pending reconnect on unmount (no zombie loop)', async () => {
@@ -310,8 +434,10 @@ describe('useJobStream', () => {
     await act(async () => { vi.advanceTimersByTime(2500) })
     await act(async () => {})
 
-    // The errored socket closed (-1) and exactly one replacement opened (+1).
-    expect(MockEventSource.instances.length).toBe(instancesBefore)
+    // Exactly one replacement opened, and exactly one socket is live: the
+    // errored one closed, so a double-scheduled reconnect would show up as two.
+    expect(MockEventSource.instances.length).toBe(instancesBefore + 1)
+    expect(MockEventSource.openInstances).toHaveLength(1)
     expect(streamTokenMock.mock.calls.length).toBe(mintsBefore + 1)
   })
 })

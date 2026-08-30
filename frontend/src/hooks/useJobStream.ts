@@ -13,8 +13,42 @@ interface StreamState {
 // belongs here: the server closes the stream on it (saga rollbacks cancel
 // jobs), so treating it as non-terminal would turn every close into a
 // reconnect that immediately receives the same event again.
-const TERMINAL = new Set(['completed', 'failed', 'dead_letter', 'cancelled'])
+//
+// Exported because the job detail page has to make the same call — it opens a
+// stream for every NON-terminal status, and a second copy of this list would
+// be a second thing to forget to update.
+export const TERMINAL_STATUSES = new Set(['completed', 'failed', 'dead_letter', 'cancelled'])
+
+/**
+ * The SSE event names the backend emits.
+ *
+ * The stream does NOT send unnamed messages: both yield sites in
+ * backend/app/api/streaming.py set `"event": event.status`, so the wire
+ * carries `event: running`, `event: completed`, and so on. EventSource routes
+ * a named event only to a listener registered for that name — `onmessage`
+ * fires for `event: message` and nothing else — so a hook that listened on
+ * `onmessage` alone connected successfully and then received nothing at all.
+ *
+ * `running`/`completed` come from _EVENT_TO_STATUS in workers/sse_consumer.py,
+ * `retrying`/`dead_letter` from the job.failed split there, and `failed`/
+ * `cancelled` from the synthetic terminal event the endpoint builds off the
+ * job row. `onmessage` is still wired up, so an unnamed event would also be
+ * handled if the server ever sends one.
+ */
+const STREAM_EVENT_NAMES = [
+  'running',
+  'retrying',
+  'completed',
+  'failed',
+  'dead_letter',
+  'cancelled',
+] as const
+
 const BASE_URL = import.meta.env.VITE_API_URL ?? '/api/v1'
+
+function emptyState(): StreamState {
+  return { events: [], latest: null, connected: false, done: false }
+}
 
 // Reconnect backoff. The first retry stays at 2s — a dropped connection on a
 // live job should recover promptly — but consecutive failures back off to a
@@ -45,6 +79,10 @@ const RECONNECT_MAX_MS = 30000
  * ceiling, so a server at its concurrent-stream cap is not hammered by the
  * viewers it just refused; a successful open resets the delay.
  *
+ * Switching `jobId` resets everything: events, latest, done and connected all
+ * go back to empty before the new job's first event arrives, so a mounted
+ * consumer that moves between jobs never shows the previous job's log.
+ *
  * Lifecycle: everything the effect owns (disposal flag, pending reconnect
  * timer, live EventSource, terminal-seen flag) lives in closure variables
  * scoped to a single effect invocation, so StrictMode's dev mount → unmount →
@@ -54,12 +92,18 @@ const RECONNECT_MAX_MS = 30000
  * updater, which StrictMode double-invokes.
  */
 export function useJobStream(jobId: string | null): StreamState {
-  const [state, setState] = useState<StreamState>({
-    events: [],
-    latest: null,
-    connected: false,
-    done: false,
-  })
+  const [state, setState] = useState<StreamState>(emptyState)
+  const [streamedJobId, setStreamedJobId] = useState<string | null>(jobId)
+
+  // Reset on job change. Done during render — React's documented pattern for
+  // "a prop changed, derived state must follow" — rather than in an effect,
+  // so a consumer that switches jobs never renders the previous job's event
+  // log, done flag or progress, not even for the single frame between the
+  // change and the effect running.
+  if (streamedJobId !== jobId) {
+    setStreamedJobId(jobId)
+    setState(emptyState)
+  }
 
   useEffect(() => {
     if (!jobId) return
@@ -107,27 +151,47 @@ export function useJobStream(jobId: string | null): StreamState {
         setState((s) => ({ ...s, connected: true }))
       }
 
-      source.onmessage = (e) => {
+      const handleEvent = (e: MessageEvent) => {
         let event: ProgressEvent
         try {
           event = JSON.parse(e.data as string) as ProgressEvent
         } catch {
           return // ignore malformed events
         }
-        const isTerminal = TERMINAL.has(event.status)
+        const isTerminal = TERMINAL_STATUSES.has(event.status)
         if (isTerminal) {
           // Recorded in the closure, not read back out of state: deciding a
           // side effect inside an updater is the bug this hook used to have.
           sawTerminal = true
           source.close()
         }
-        setState((s) => ({
-          events: [...s.events, event],
-          latest: event,
-          connected: !isTerminal,
-          done: isTerminal,
-        }))
+        setState((s) => {
+          // The endpoint replays its retained snapshot to every subscriber,
+          // including on reconnect, and the broker subscribes fractionally
+          // before reading it — so the same event can legitimately arrive
+          // twice in a row. `latest` is unaffected either way, but the event
+          // log would show the line twice.
+          const previous = s.events[s.events.length - 1]
+          const isRepeat =
+            previous !== undefined &&
+            previous.timestamp === event.timestamp &&
+            previous.status === event.status &&
+            previous.progress === event.progress
+          return {
+            events: isRepeat ? s.events : [...s.events, event],
+            latest: event,
+            connected: !isTerminal,
+            done: isTerminal,
+          }
+        })
       }
+
+      // Named events are how the backend actually speaks; onmessage covers an
+      // unnamed one. See STREAM_EVENT_NAMES.
+      for (const name of STREAM_EVENT_NAMES) {
+        source.addEventListener(name, handleEvent as EventListener)
+      }
+      source.onmessage = handleEvent
 
       source.onerror = () => {
         source.close()
