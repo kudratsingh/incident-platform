@@ -108,9 +108,17 @@ def _alembic(database_url: str, *args: str) -> None:
     Uses the current interpreter and an absolute -c path so the call
     works regardless of cwd and PATH; env.py routes on the URL's dialect
     (postgresql+asyncpg here, so the async engine path).
+
+    ALEMBIC_DATABASE_URL is popped, not just overridden: `env.py::_get_url`
+    prefers it over DATABASE_URL (ADR 0015's two-URL scheme), so an
+    inherited value from the developer's shell or a CI job env would
+    silently redirect this fixture's destructive `upgrade / downgrade -1 /
+    upgrade` cycle at whatever database that variable names instead of the
+    throwaway container.
     """
     env = os.environ.copy()
     env["DATABASE_URL"] = database_url
+    env.pop("ALEMBIC_DATABASE_URL", None)
     subprocess.check_call(
         [sys.executable, "-m", "alembic", "-c", str(REPO_ROOT / "alembic.ini"), *args],
         env=env,

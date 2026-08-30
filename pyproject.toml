@@ -57,9 +57,14 @@ packages = ["backend/app"]
 asyncio_mode = "auto"
 testpaths = ["backend/tests/unit", "backend/tests/api"]
 addopts = "--cov=backend/app --cov-report=term-missing --cov-fail-under=70"
-# Integration tests live in backend/tests/integration/. They require Docker and
-# are opt-in: `pytest backend/tests/integration/` to run them locally or in a
-# dedicated CI job.
+# Integration tests live in backend/tests/integration/ and are deliberately
+# outside testpaths: they require Docker, so a bare `pytest` stays fast and
+# service-free. They are NOT optional coverage — the `integration` job in
+# .github/workflows/ci.yml runs them on every PR (and fails if any of the five
+# files skips). Locally: `make test-integration`, which exports the three
+# RUN_* gates. Running `pytest backend/tests/integration/` by hand without
+# those variables collects the files and skips most of them while still
+# exiting 0.
 
 [tool.mypy]
 strict = true

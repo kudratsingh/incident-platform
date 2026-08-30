@@ -1,10 +1,16 @@
 # Convenience targets for local dev + agent-facing eval workflows.
 # test/lint/typecheck run on the host venv (.venv), same as CI — no stack
-# needed. The container targets (up/down/logs/migrate/seed-*/mcp-probe)
-# assume `docker compose up -d` has been run.
+# needed. test-integration also runs on the host venv but needs a reachable
+# Docker daemon: Testcontainers starts its own Postgres and Redpanda, so it
+# does not need the compose stack either. The container targets
+# (up/down/logs/migrate/seed-*/mcp-probe) assume `docker compose up -d`.
 
-.PHONY: help up down logs test lint typecheck seed-incident-commander \
-        seed-eval-fixtures mcp-probe migrate
+.PHONY: help up down logs test test-integration lint typecheck \
+        seed-incident-commander seed-eval-fixtures mcp-probe migrate
+
+# Overridable so the target works from a git worktree, which has no .venv of
+# its own: `make test-integration PYTHON=/path/to/main/.venv/bin/python`.
+PYTHON ?= .venv/bin/python
 
 help:  ## Print this help
 	@awk 'BEGIN {FS = ":.*##"} /^[a-zA-Z_-]+:.*##/ {printf "  \033[36m%-28s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -19,7 +25,16 @@ logs:  ## Tail backend logs (Ctrl-C to exit)
 	docker compose logs -f app
 
 test:  ## Run unit + API tests via the host venv (fast, no coverage gate)
-	.venv/bin/python -m pytest backend/tests/unit backend/tests/api --no-cov
+	$(PYTHON) -m pytest backend/tests/unit backend/tests/api --no-cov
+
+# Same command the `integration` CI job runs. Needs a reachable Docker
+# daemon — Testcontainers brings up Postgres 16 and Redpanda per module —
+# but NOT `docker compose up`: these containers are the tests' own and are
+# torn down with them. The three RUN_* gates keep the tier opt-in for
+# everyone else, so they are exported here rather than defaulted on.
+test-integration:  ## Run the Docker-gated integration tier (real Postgres + Redpanda)
+	RUN_RLS_TEST=1 RUN_EVAL_RESET_TEST=1 RUN_MIGRATION_LOCK_TEST=1 \
+	  $(PYTHON) -m pytest backend/tests/integration -v --no-cov $(PYTEST_ARGS)
 
 lint:  ## Run ruff via the host venv (same invocation as CI)
 	.venv/bin/ruff check backend/

@@ -95,7 +95,7 @@ The effect is **at-least-once delivery with effectively-once consumer effects**.
 
 ## Local dev: Redpanda
 
-Local dev uses **Redpanda** in `docker-compose.yml`, a Kafka-API-compatible broker. Compose starts it on `localhost:9092`. The integration test (`backend/tests/integration/test_kafka_e2e.py`) uses `testcontainers-redpanda` to spin up an ephemeral broker per test run on a pre-allocated host port.
+Local dev uses **Redpanda** in `docker-compose.yml`, a Kafka-API-compatible broker. Compose starts it on `localhost:9092`. The integration test (`backend/tests/integration/test_kafka_e2e.py`) uses `testcontainers-redpanda` to spin up an ephemeral broker on a pre-allocated host port. It runs on every PR in the `integration` CI job (and locally via `make test-integration`); without a reachable Docker daemon it skips.
 
 Useful commands:
 
@@ -185,6 +185,6 @@ The base class handles schema validation, offset management, error handling, and
 - `backend/app/workers/schema_registry.py` — JSON Schema loading + format checker setup
 - `backend/app/workers/dispatcher.py` — `worker_loop` (orchestrates all 8 groups)
 - `backend/app/schemas/kafka/*.schema.json` — schema definitions
-- `backend/tests/integration/test_kafka_e2e.py` — Testcontainers round-trip
+- `backend/tests/integration/test_kafka_e2e.py` — Testcontainers round-trip (3 tests; runs in the `integration` CI job)
 - `docker-compose.yml` — Redpanda for local dev
 - [`docs/ADR/0018`](ADR/0018-production-kafka-posture.md) — why there is no production broker, and what to do when one is wanted

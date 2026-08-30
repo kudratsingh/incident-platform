@@ -127,7 +127,7 @@ These are sized at "phase" level in the milestone plan. Not repeated here, but r
 |---|---|---|
 | CLI tool (`incidentd jobs list ...`) | M | Use the public API (when shipped). Click for the CLI framework. Auto-generated from the OpenAPI spec. |
 | Devcontainer | S | `.devcontainer/devcontainer.json` so VS Code Remote opens with the full toolchain in <5 min. |
-| Make targets | S | `make test`, `make lint`, `make dev` — the convention every senior project ends up with. |
+| Make targets | S | `make test`, `make test-integration`, `make lint` and `make typecheck` all ship; `make dev` is the remaining gap. |
 | Code generators | M | `./scripts/new_processor.py csv_export` scaffolds processor + tests + DLQ runbook. Cuts new-job-type ramp from 30 min to 5. |
 | Pre-commit hooks | S | ruff, mypy on changed files, frontend lint. Catches the easy mistakes before CI. |
 | Storybook | S | (also under Frontend) |

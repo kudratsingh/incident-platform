@@ -24,6 +24,8 @@ An archive listed as *transcript only* means the raw session data is on disk und
 | 2026-08-21 | *transcript only* | **`get_cache_key_info` read tool.** Closes the readiness-sweep finding that `create_stale_cache` writes a Redis key no read tool can see. Exact-key existence / TTL / type / size (never the value), `telemetry:read`, allowlisted to the same four prefixes `invalidate_cache_key` may delete; subset relations tripwired in `test_cache_key_allowlist.py`. Chaos-enabled MCP surface 27 → 28 — the next re-pin's rebless diff gains `+get_cache_key_info`. |
 | 2026-08-21 | *transcript only* | **`create_stuck_dag` chaos hook.** `remediate_runaway_saga_success` could not run honestly live: the boot-seeded DAG auto-completes ~10s after boot, so a live run graded alert-credulity, not remediation. The hook manufactures `upstream (completed) → root (dead_letter) → N (waiting)` — stuck by the platform's own rules, since the resolver promotes only when every parent is `completed` and `dead_letter` is terminal. Observable via `get_dag_state`; compensators `replay_dlq_by_ids` (unsticks) and `pause_dag` (stabilizes) per the ADR 0008 pairing rule. Chaos-enabled MCP surface 28 → 29 — the rebless diff gains `+create_stuck_dag`. |
 
+| 2026-08-30 | *transcript only* | **The integration tier was never running.** `testpaths` scoped bare `pytest` to unit+api and the three `RUN_*` gates were exported nowhere, so all 25 tests in `backend/tests/integration/` — the only proofs of RLS tenant isolation, audit-log immutability and outbox single-writer exclusivity — had never executed in CI. Added the `integration` job (Testcontainers, all gates set, census step that fails on any skip) + `make test-integration`, and popped `ALEMBIC_DATABASE_URL` in both `_alembic()` helpers so an inherited value can't redirect the destructive migration cycle. Also deleted the `test` job's Postgres/Redis service containers, which nothing collected had ever read. |
+
 ## Things a future session should not have to rediscover
 
 - **The digest that matters is the index digest, not the child.** `docker manifest inspect -v`
@@ -58,6 +60,13 @@ An archive listed as *transcript only* means the raw session data is on disk und
   worktree root imports `app` from `master` instead of your branch. It looks like a test-ordering
   bug — new tests pass when run from `backend/`, then fail or vanish on the full run — and it cost
   one session its whole budget. CI is unaffected: it checks out a single tree.
+- **A green pytest run is not evidence the tier ran.** pytest exits 0 on a fully-skipped module,
+  which is how `backend/tests/integration/` stayed invisible for the whole campaign. Three of the
+  five files skip unless `RUN_RLS_TEST` / `RUN_EVAL_RESET_TEST` / `RUN_MIGRATION_LOCK_TEST` are
+  set; the other two skip without a Docker daemon. Run them with `make test-integration`, never
+  bare `pytest backend/tests/integration/`. The `integration` CI job parses its own JUnit report
+  and fails if any test skipped — keep that step, it is the only thing standing between this tier
+  and a second silent decade.
 - **The demo stack is shared state.** `docker compose -f demo/compose.yml down` keeps volumes;
   only `make demo-destroy CONFIRM=1` deletes them. An agent trimming a Kafka topic here once
   crash-looped three consumer groups.
