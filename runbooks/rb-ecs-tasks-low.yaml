@@ -14,13 +14,13 @@ symptoms:
 diagnosis_steps:
   - id: check-stop-reason
     description: "Why did the most recent tasks stop?"
-    command: "aws ecs describe-tasks --cluster incident-platform --tasks $(aws ecs list-tasks --cluster incident-platform --service-name backend --desired-status STOPPED --query 'taskArns[0]' --output text)"
+    command: "aws ecs describe-tasks --cluster incident-platform --tasks $(aws ecs list-tasks --cluster incident-platform --service-name incident-platform-backend --desired-status STOPPED --query 'taskArns[0]' --output text)"
   - id: check-image
     description: "Does the configured image tag exist in ECR?"
-    command: "aws ecr describe-images --repository-name incident-platform-backend"
+    command: "aws ecr describe-images --repository-name incident-platform/backend"
   - id: tail-startup-logs
     description: "Look at the failed container's startup logs."
-    command: "aws logs tail /ecs/incident-platform-backend --since 30m"
+    command: "aws logs tail /ecs/incident-platform/backend --since 30m"
 
 mitigation:
   - "If image missing: redeploy a known-good image tag via Terraform or ECS console."

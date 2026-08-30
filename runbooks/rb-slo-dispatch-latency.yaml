@@ -25,7 +25,10 @@ diagnosis_steps:
     command: "psql -c \"SELECT id, type, started_at FROM jobs WHERE status = 'running' AND started_at < now() - interval '10 minutes'\""
 
 mitigation:
-  - "Scale the worker ECS service horizontally."
+  - "Raise the desired count of the `incident-platform-backend` ECS service.
+    Workers run in-process inside the backend task — there is no separate
+    worker service — so this is what scales dispatch throughput. Each task
+    adds MAX_CONCURRENT_JOBS (10) job slots."
   - "If RUNNING jobs are stuck from a crashed worker: mark them FAILED and replay from admin UI."
   - "Reduce inbound rate by lowering the rate-limit on POST /jobs temporarily."
 

@@ -15,13 +15,13 @@ symptoms:
 diagnosis_steps:
   - id: check-ecs-tasks
     description: "Are backend ECS tasks actually running?"
-    command: "aws ecs describe-services --cluster incident-platform --services backend"
+    command: "aws ecs describe-services --cluster incident-platform --services incident-platform-backend"
   - id: tail-app-logs
     description: "Recent error logs from the backend container"
-    command: "aws logs tail /ecs/incident-platform-backend --since 10m --filter-pattern ERROR"
+    command: "aws logs tail /ecs/incident-platform/backend --since 10m --filter-pattern ERROR"
   - id: check-db-pool
     description: "Is the connection pool exhausted? Look for 'pool timeout' in logs."
-    command: "aws logs tail /ecs/incident-platform-backend --since 10m --filter-pattern 'pool'"
+    command: "aws logs tail /ecs/incident-platform/backend --since 10m --filter-pattern 'pool'"
   - id: check-deploy
     description: "Did a deploy just go out?"
     command: "git log --oneline --since='30 minutes ago'"

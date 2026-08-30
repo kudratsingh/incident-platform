@@ -4,9 +4,10 @@ severity: high
 alarm: incident-platform-slo-job-completion-fast-burn
 
 summary: |
-  The job-completion SLO (≥99% over 24h) is burning at 14× normal or faster.
-  Too many jobs are dead-lettering relative to the error budget. If sustained
-  this will exhaust the full 30-day budget in under 2 hours.
+  The job-completion SLO (≥99% over a rolling 24h window) is burning at 14.4×
+  normal or faster. Too many jobs are dead-lettering relative to the error
+  budget. The budget is the 1% of that 24h window, not a 30-day allowance: at
+  14.4× it is gone in 24h / 14.4 ≈ 1h40m.
 
 symptoms:
   - "JobDeadLettered count climbing on the IncidentPlatform CloudWatch namespace"
@@ -27,7 +28,12 @@ diagnosis_steps:
 
 mitigation:
   - "If a single root cause: deploy the fix, then bulk-replay the affected DLQ jobs from the admin UI."
-  - "If a flaky external dependency: increase max_retries on that job type temporarily."
+  - "If a flaky external dependency: confirm the circuit breaker is shedding
+    load, then bulk-replay the affected DLQ jobs once it recovers. There is no
+    per-type retry knob to turn — `max_retries` is a per-row column on `jobs`
+    (default 3), fixed when the row is created and read per job by the
+    dispatcher, so it cannot be raised for a job type at runtime. Rows already
+    dead-lettered do not re-read it either; replay is the path."
   - "If a code regression: roll back the most recent backend deploy."
 
 escalation:
