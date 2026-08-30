@@ -72,7 +72,9 @@ async def test_generate_digest_round_trips_when_enabled(
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     get_settings.cache_clear()
 
-    # Force a non-empty window by stubbing run_digest_for_tenant.
+    # Force a non-empty window, then stub the paid call. The route composes
+    # the three phases itself (WO-R2-127) rather than calling the combined
+    # `run_digest_for_tenant`, so the stubs go on the parts.
     fake_digest_row = DigestRow(
         id=uuid.uuid4(),
         tenant_id=uuid.UUID("d3fa17de-7a17-de7a-17de-7a17de7a17de"),
@@ -85,12 +87,18 @@ async def test_generate_digest_round_trips_when_enabled(
                "cache_creation_input_tokens": 0,
                "cache_read_input_tokens": 1200},
     )
-    fake = AsyncMock(return_value=fake_digest_row)
     fake_digest_row.created_at = datetime.now(UTC)  # not set by SQLAlchemy default in this stub
 
     try:
         with patch(
-            "app.services.incident_digest.run_digest_for_tenant", new=fake
+            "app.services.incident_digest.collect_window_stats",
+            new=AsyncMock(return_value=({"completed": 1}, {}, [])),
+        ), patch(
+            "app.services.incident_digest.generate_digest",
+            new=AsyncMock(return_value=(object(), {"input_tokens": 200}, "claude-opus-4-7")),
+        ), patch(
+            "app.services.incident_digest.persist_digest",
+            new=AsyncMock(return_value=fake_digest_row),
         ):
             resp = await client.post(
                 "/api/v1/admin/digests/generate",
@@ -129,13 +137,16 @@ async def test_generate_digest_clamps_hours(
 ) -> None:
     """`hours` is clamped to 1..168, junk falls back to the default.
 
-    The clamp is only observable in the *window* handed to
-    `run_digest_for_tenant`, so this inspects the arguments the stub was
-    actually called with. Stubbing the function and asserting only that
-    it was awaited — which is what this test used to do, with a single
-    unparseable input — passes with the clamp deleted outright.
+    The clamp is only observable in the *window* the route hands to the
+    read phase, so this inspects the arguments the stub was actually called
+    with. Stubbing the call and asserting only that it was awaited — which
+    is what this test used to do, with a single unparseable input — passes
+    with the clamp deleted outright.
 
-    `run_digest_for_tenant` is still stubbed: it is the paid LLM call.
+    The stub moved from `run_digest_for_tenant` to `collect_window_stats`
+    when WO-R2-127 split the route into read / call / write phases; the
+    window is now an argument to the read, and `generate_digest` is the
+    paid call that must not happen at all when the window comes back empty.
     """
     from datetime import timedelta
 
@@ -144,11 +155,12 @@ async def test_generate_digest_clamps_hours(
     get_settings.cache_clear()
 
     fake = AsyncMock(return_value=None)
+    paid = AsyncMock()
     body: dict[str, object] = {} if requested is None else {"hours": requested}
     try:
         with patch(
-            "app.services.incident_digest.run_digest_for_tenant", new=fake
-        ):
+            "app.services.incident_digest.collect_window_stats", new=fake
+        ), patch("app.services.incident_digest.generate_digest", new=paid):
             resp = await client.post(
                 "/api/v1/admin/digests/generate",
                 json=body,
@@ -159,7 +171,7 @@ async def test_generate_digest_clamps_hours(
 
     assert resp.status_code == 201
     fake.assert_awaited_once()
-    _db, _tenant, window_start, window_end = fake.await_args.args
+    _session, _tenant, window_start, window_end = fake.await_args.args
     assert window_end - window_start == timedelta(hours=expected_hours)
 
     # The same window is what the caller is told it got, so a clamp that
@@ -167,6 +179,11 @@ async def test_generate_digest_clamps_hours(
     payload = resp.json()
     assert payload["window_start"] == window_start.isoformat()
     assert payload["window_end"] == window_end.isoformat()
+
+    # And an empty window must not reach the paid call at all — the read
+    # phase is what decides that, and it now runs before the round-trip
+    # rather than inside the same composed call (WO-R2-127).
+    paid.assert_not_awaited()
 
 
 async def test_cross_tenant_get_denied_without_platform_flag(
@@ -225,3 +242,160 @@ async def test_cross_tenant_get_denied_without_platform_flag(
         headers={"Authorization": f"Bearer {token}"},
     )
     assert resp.status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# WO-R2-127 — the digest write runs under a re-established tenant context
+# ---------------------------------------------------------------------------
+
+
+async def test_generate_digest_reestablishes_rls_context_for_the_write(
+    client: AsyncClient,
+    admin_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`app.tenant_id` is a transaction-local GUC, so the INSERT's transaction
+    has to set it for itself.
+
+    R2-63 moved the worker's digest onto read / call / write transactions so
+    the Anthropic round-trip holds no connection; the route kept the composed
+    single-transaction form, which is the residue #183 documented and could
+    not fix. Splitting the route the same way is what creates the hazard this
+    asserts: `get_current_user` set the GUC on the *request's* transaction, and
+    the write phase is not that transaction. An unscoped INSERT is not
+    rejected — every `tenant_isolation` policy's bootstrap branch
+    (`current_setting(...) IS NULL OR ... = ''`) admits it — so the row lands
+    with RLS not standing behind it at all. That silence is the hazard;
+    `tests/integration/test_rls_enforcement.py` proves both halves on a live
+    server.
+
+    Asserted on the call rather than on Postgres behaviour because the unit
+    tier runs on SQLite, where `_set_rls_tenant` is a deliberate no-op;
+    `tests/integration/test_rls_enforcement.py` is where the policy itself is
+    proven against a live server.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    monkeypatch.setenv("LLM_DIGEST_ENABLED", "true")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    get_settings.cache_clear()
+
+    from app.api import admin as admin_mod
+
+    scoped: list[object] = []
+    real_set_rls = admin_mod._set_rls_tenant
+
+    async def _spy(db, tenant_id):  # type: ignore[no-untyped-def]
+        scoped.append((db, tenant_id))
+        return await real_set_rls(db, tenant_id)
+
+    persisted_on: list[object] = []
+
+    async def _fake_persist(session, *a, **kw):  # type: ignore[no-untyped-def]
+        persisted_on.append(session)
+        row = DigestRow(
+            id=uuid.uuid4(),
+            tenant_id=uuid.UUID("d3fa17de-7a17-de7a-17de-7a17de7a17de"),
+            window_start=datetime.now(UTC) - timedelta(hours=1),
+            window_end=datetime.now(UTC),
+            summary="s",
+            highlights={},
+            model_used="m",
+            usage={},
+        )
+        row.created_at = datetime.now(UTC)
+        return row
+
+    try:
+        with patch.object(admin_mod, "_set_rls_tenant", new=_spy), patch(
+            "app.services.incident_digest.collect_window_stats",
+            new=AsyncMock(return_value=({"completed": 1}, {}, [])),
+        ), patch(
+            "app.services.incident_digest.generate_digest",
+            new=AsyncMock(return_value=(object(), {}, "m")),
+        ), patch(
+            "app.services.incident_digest.persist_digest", new=_fake_persist
+        ):
+            resp = await client.post(
+                "/api/v1/admin/digests/generate",
+                json={"hours": 1},
+                headers=admin_headers,
+            )
+    finally:
+        get_settings.cache_clear()
+
+    assert resp.status_code == 201, resp.json()
+    assert persisted_on, "persist_digest was never reached"
+    write_session = persisted_on[0]
+
+    # The context was established on the very session the INSERT used, not
+    # merely somewhere in the request.
+    assert any(
+        db is write_session for db, _tid in scoped
+    ), "the write session never had app.tenant_id set"
+
+    # And it was scoped to the caller's tenant, not left at whatever the
+    # previous transaction happened to hold.
+    tenant_ids = {tid for db, tid in scoped if db is write_session}
+    assert tenant_ids == {uuid.UUID("d3fa17de-7a17-de7a-17de-7a17de7a17de")}
+
+
+async def test_generate_digest_does_not_hold_the_read_open_across_the_paid_call(
+    client: AsyncClient,
+    admin_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other half of R2-63, applied to the route.
+
+    The aggregate read and the INSERT are separate transactions with the
+    Anthropic round-trip between them, so a slow model does not pin the
+    digest's connection `idle in transaction`. Pinned by observing that the
+    read and the write are handed different sessions — the property that
+    re-composing them into one would destroy.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    monkeypatch.setenv("LLM_DIGEST_ENABLED", "true")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    get_settings.cache_clear()
+
+    seen: dict[str, object] = {}
+
+    async def _fake_collect(session, *a, **kw):  # type: ignore[no-untyped-def]
+        seen["read"] = session
+        return ({"completed": 1}, {}, [])
+
+    async def _fake_persist(session, *a, **kw):  # type: ignore[no-untyped-def]
+        seen["write"] = session
+        row = DigestRow(
+            id=uuid.uuid4(),
+            tenant_id=uuid.UUID("d3fa17de-7a17-de7a-17de-7a17de7a17de"),
+            window_start=datetime.now(UTC) - timedelta(hours=1),
+            window_end=datetime.now(UTC),
+            summary="s",
+            highlights={},
+            model_used="m",
+            usage={},
+        )
+        row.created_at = datetime.now(UTC)
+        return row
+
+    try:
+        with patch(
+            "app.services.incident_digest.collect_window_stats", new=_fake_collect
+        ), patch(
+            "app.services.incident_digest.generate_digest",
+            new=AsyncMock(return_value=(object(), {}, "m")),
+        ), patch(
+            "app.services.incident_digest.persist_digest", new=_fake_persist
+        ):
+            resp = await client.post(
+                "/api/v1/admin/digests/generate",
+                json={"hours": 1},
+                headers=admin_headers,
+            )
+    finally:
+        get_settings.cache_clear()
+
+    assert resp.status_code == 201, resp.json()
+    assert seen["read"] is not seen["write"]

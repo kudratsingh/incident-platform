@@ -214,6 +214,7 @@ async def test_idempotent_under_redelivery() -> None:
         "completed": 1,
         "failed": 0,
         "dead_letter": 0,
+        "cancelled": 0,
     }
 
 
@@ -293,7 +294,13 @@ async def test_missing_tenant_id_skips_projection() -> None:
 async def test_read_global_stats_returns_counts_per_tenant() -> None:
     redis = _FakeRedis()
     tenant_id = str(uuid.uuid4())
-    for status, n in (("running", 3), ("completed", 7), ("failed", 1), ("dead_letter", 2)):
+    for status, n in (
+        ("running", 3),
+        ("completed", 7),
+        ("failed", 1),
+        ("dead_letter", 2),
+        ("cancelled", 4),
+    ):
         for _ in range(n):
             await redis.zadd(
                 f"jobs:tenant:{tenant_id}:status:{status}", {str(uuid.uuid4()): 1.0}
@@ -301,7 +308,16 @@ async def test_read_global_stats_returns_counts_per_tenant() -> None:
 
     stats = await read_model.read_global_stats(redis, tenant_id)  # type: ignore[arg-type]
 
-    assert stats == {"running": 3, "completed": 7, "failed": 1, "dead_letter": 2}
+    # `cancelled` joined the tracked set with WO-R2-113: an id the projector
+    # does not track is an id `_move` never removes from its old set, so
+    # tracking it is what makes the cancellation event mean anything.
+    assert stats == {
+        "running": 3,
+        "completed": 7,
+        "failed": 1,
+        "dead_letter": 2,
+        "cancelled": 4,
+    }
 
 
 async def test_read_user_stats_uses_user_keys() -> None:
@@ -454,7 +470,13 @@ async def test_rebuild_restores_a_wiped_read_model(
         str(j.id) for j in completed
     }
     stats = await read_model.read_global_stats(redis, str(tenant_id))  # type: ignore[arg-type]
-    assert stats == {"running": 0, "completed": 3, "failed": 0, "dead_letter": 1}
+    assert stats == {
+        "running": 0,
+        "completed": 3,
+        "failed": 0,
+        "dead_letter": 1,
+        "cancelled": 0,
+    }
 
 
 async def test_rebuild_drops_ids_the_table_no_longer_backs(
@@ -509,3 +531,79 @@ async def test_rebuild_scoped_to_one_tenant_leaves_siblings_alone(
     await rebuild_read_model(db_session, redis, tenant_id=test_user.tenant_id)  # type: ignore[arg-type]
 
     assert redis.members(other_key) == {"sibling-job"}
+
+
+async def test_cancelled_event_moves_the_id_out_of_its_previous_set() -> None:
+    """WO-R2-113, the finding itself: without a `job.cancelled` event the
+    projector never heard that the job stopped, so its id sat in the `running`
+    set forever and `GET /admin/stats` counted a job nothing was executing."""
+    redis = _FakeRedis()
+    projector = ReadModelProjector(redis)  # type: ignore[arg-type]
+    tenant_id, user_id, job_id = str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4())
+
+    await projector.handle_message(
+        topic="job.progress",
+        key=user_id,
+        value={
+            "event": "job.progress",
+            "tenant_id": tenant_id,
+            "user_id": user_id,
+            "job_id": job_id,
+            "status": "running",
+        },
+    )
+    assert job_id in redis.zsets[f"jobs:tenant:{tenant_id}:status:running"]
+
+    await projector.handle_message(
+        topic="job.cancelled",
+        key=user_id,
+        value={
+            "event": "job.cancelled",
+            "tenant_id": tenant_id,
+            "user_id": user_id,
+            "job_id": job_id,
+            "job_type": "csv_upload",
+            "reason": "saga rollback",
+        },
+    )
+
+    assert job_id not in redis.zsets.get(
+        f"jobs:tenant:{tenant_id}:status:running", {}
+    )
+    assert job_id in redis.zsets[f"jobs:tenant:{tenant_id}:status:cancelled"]
+    assert job_id in redis.zsets[f"jobs:user:{user_id}:status:cancelled"]
+
+
+async def test_a_late_progress_event_cannot_resurrect_a_cancelled_job() -> None:
+    """`cancelled` has to be terminal in the projector too, not merely tracked:
+    Kafka redelivers, and a `job.progress` that was in flight when the saga
+    rolled back would otherwise drag the id back into `running`."""
+    redis = _FakeRedis()
+    projector = ReadModelProjector(redis)  # type: ignore[arg-type]
+    tenant_id, user_id, job_id = str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4())
+
+    cancelled = {
+        "event": "job.cancelled",
+        "tenant_id": tenant_id,
+        "user_id": user_id,
+        "job_id": job_id,
+        "job_type": "csv_upload",
+        "reason": "saga rollback",
+    }
+    await projector.handle_message(topic="job.cancelled", key=user_id, value=cancelled)
+    await projector.handle_message(
+        topic="job.progress",
+        key=user_id,
+        value={
+            "event": "job.progress",
+            "tenant_id": tenant_id,
+            "user_id": user_id,
+            "job_id": job_id,
+            "status": "running",
+        },
+    )
+
+    assert job_id in redis.zsets[f"jobs:tenant:{tenant_id}:status:cancelled"]
+    assert job_id not in redis.zsets.get(
+        f"jobs:tenant:{tenant_id}:status:running", {}
+    )

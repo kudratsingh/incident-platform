@@ -908,8 +908,14 @@ def _job_submitted_payload(job: Job) -> dict[str, Any]:
     """The canonical `job.submitted` outbox payload for a job row.
 
     Shared by every path that re-publishes an existing job (delayed-retry
-    promotion, the stale-PENDING backstop) so a job dispatched by a
-    backstop is byte-identical to one dispatched by the normal path.
+    promotion, the stale-PENDING backstop, the resume sweep) so a job
+    dispatched by a backstop is byte-identical to one dispatched by the
+    normal path.
+
+    The resume sweep built its own copy inline until WO-R2-116 — identical at
+    the time, which is the only state a duplicated literal is ever observed
+    in and the reason the drift shows up later, in whichever path the next
+    field was not added to.
     """
     return {
         "event": "job.submitted",
@@ -1168,20 +1174,15 @@ async def _resume_unblocked_waiting_once(
                 # too, or it still mints a duplicate job.submitted.
                 if not await job_repo.promote_waiting_to_pending(child.id):
                     continue
+                # WO-R2-116: the shared builder, not a fourth hand-assembled
+                # copy of the same seven keys. The shapes were identical when
+                # this was written; the helper is what keeps them identical
+                # after the next field is added to one of them.
                 await outbox_repo.add(
                     tenant_id=child.tenant_id,
                     topic=settings.kafka_topic_job_submitted,
                     key=f"{child.tenant_id}:{child.user_id}",
-                    payload={
-                        "event": "job.submitted",
-                        "tenant_id": str(child.tenant_id),
-                        "job_id": str(child.id),
-                        "user_id": str(child.user_id),
-                        "job_type": child.type,
-                        "payload": dict(child.payload or {}),
-                        "priority": child.priority,
-                        "trace_id": child.trace_id,
-                    },
+                    payload=_job_submitted_payload(child),
                 )
                 logger.info(
                     "resume sweep promoted child",

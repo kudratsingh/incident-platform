@@ -61,7 +61,7 @@ services:
     # when they boot, rather than the stack half-starting behind a one-shot.
     entrypoint: >
       /bin/bash -c "
-        for t in job.submitted job.progress job.completed job.failed job.dlq; do
+        for t in job.submitted job.progress job.completed job.failed job.cancelled job.dlq; do
           rpk topic create $$t --brokers=redpanda:9092 --partitions=6 --replicas=1 || true;
         done
       "

@@ -73,15 +73,18 @@ LAST_EVENT_TTL_SECONDS = 3600
 
 # Statuses after which no further progress event can arrive, so the stream is
 # closed. `cancelled` is here because saga rollbacks cancel jobs and their
-# streams used to hang forever; no producer publishes it as an event status
-# today, but the DB short-circuit in api/streaming.py synthesizes one.
+# streams used to hang forever. It was aspirational until WO-R2-113: no
+# producer published it, and the only thing that ever set it was the DB
+# short-circuit in api/streaming.py, which a client had to reconnect to reach.
+# `SseConsumer` now publishes it from the `job.cancelled` topic, so a stream
+# already open closes on the event like every other terminal status.
 TERMINAL_STATUSES = frozenset({"completed", "failed", "dead_letter", "cancelled"})
 
 
 @dataclass
 class ProgressEvent:
     job_id: str
-    status: str       # running | completed | failed | dead_letter | retrying
+    status: str       # running | completed | failed | dead_letter | retrying | cancelled
     progress: int     # 0-100
     message: str
     retry_count: int = 0

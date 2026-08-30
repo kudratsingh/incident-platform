@@ -115,3 +115,35 @@ async def test_null_job_id_is_recorded() -> None:
     row = session.add.call_args.args[0]
     assert row.job_id is None
     assert row.kafka_offset == 7
+
+
+async def test_cancellation_lands_on_the_timeline() -> None:
+    """WO-R2-113. The event log is shape-agnostic — it stores whatever event
+    name arrives — so the only thing that kept cancellations off
+    `GET /admin/jobs/{id}/timeline` was that no event was ever produced and
+    the consumer was not on the topic."""
+    factory, session = _session_factory()
+    consumer = EventLogConsumer(factory)
+    tenant_id, job_id = uuid.uuid4(), uuid.uuid4()
+
+    await consumer.handle_message(
+        topic="job.cancelled",
+        key="k",
+        value={
+            "event": "job.cancelled",
+            "tenant_id": str(tenant_id),
+            "job_id": str(job_id),
+            "user_id": str(uuid.uuid4()),
+            "job_type": "csv_upload",
+            "reason": "dependency parent failed",
+        },
+        partition=0,
+        offset=17,
+    )
+
+    session.add.assert_called_once()
+    row = session.add.call_args.args[0]
+    assert row.event_name == "job.cancelled"
+    assert row.kafka_topic == "job.cancelled"
+    assert row.tenant_id == tenant_id
+    assert row.payload["reason"] == "dependency parent failed"

@@ -28,9 +28,12 @@ class JobStatus(StrEnum):
 # operator re-entering it deliberately). `FAILED` is deliberately absent: the
 # retry cycle re-enters from it, so a `failed` row is still in flight.
 #
-# `COMPLETED` and `DEAD_LETTER` additionally have a Kafka topic to announce on,
-# which is why `JobRepository.update_status` emits an outbox row for those two
-# and not for `CANCELLED` — there is no `job.cancelled` topic.
+# Every status here has a Kafka topic to announce on — `job.completed`,
+# `job.dlq` and, since WO-R2-113, `job.cancelled` — so
+# `JobRepository.update_status` emits an outbox row for all three in the same
+# transaction as the status write. `test_job_cancelled_topic_wiring.py` pins
+# that equality, so a terminal status added here without a topic fails a test
+# instead of stopping jobs silently the way `CANCELLED` used to.
 TERMINAL_JOB_STATUSES: frozenset[str] = frozenset(
     {JobStatus.COMPLETED, JobStatus.DEAD_LETTER, JobStatus.CANCELLED}
 )

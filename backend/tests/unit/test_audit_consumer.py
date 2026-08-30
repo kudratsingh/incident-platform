@@ -177,3 +177,34 @@ async def test_redelivery_integrity_error_is_swallowed() -> None:
             partition=0,
             offset=7,
         )
+
+
+async def test_audit_consumer_records_cancellation() -> None:
+    """WO-R2-113. Without a mapping entry the consumer logs "no audit mapping
+    for event" once per message and drops it — so subscribing to the topic
+    without teaching the map trades silence for log spam, not for an audit
+    trail."""
+    factory, audit_repo = _factory_with_audit()
+    consumer = AuditConsumer(factory)
+    tenant_id, job_id, user_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+
+    with patch("app.workers.audit_consumer.AuditRepository", return_value=audit_repo):
+        await consumer.handle_message(
+            topic="job.cancelled",
+            key=str(user_id),
+            value={
+                "event": "job.cancelled",
+                "tenant_id": str(tenant_id),
+                "job_id": str(job_id),
+                "user_id": str(user_id),
+                "job_type": "csv_upload",
+                "reason": "dependency parent failed",
+            },
+        )
+
+    audit_repo.log.assert_awaited_once()
+    assert audit_repo.log.await_args.args[0] == "event.job.cancelled"
+    kwargs = audit_repo.log.await_args.kwargs
+    assert kwargs["tenant_id"] == tenant_id
+    assert kwargs["job_id"] == job_id
+    assert kwargs["extra_data"]["reason"] == "dependency parent failed"

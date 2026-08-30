@@ -351,17 +351,18 @@ async def test_update_status_emits_nothing_for_non_terminal_statuses(
 
 
 @pytest.mark.asyncio
-async def test_update_status_cancelled_writes_no_event_because_no_topic_exists(
+async def test_update_status_cancelled_emits_the_cancelled_event(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """CANCELLED is terminal but has no `job.cancelled` topic to announce on,
-    so the repository writes the status alone. Pinned as a deliberate hole
-    rather than an oversight: the saga coordinator cancels steps of a saga it
-    is already settling, so the saga side stays coherent — but the CQRS read
-    model does keep those ids in their previous status set. Adding the topic
-    means a schema-registry entry plus four consumers, tracked in the roadmap.
+    """CANCELLED announces on `job.cancelled` like every other terminal status
+    (WO-R2-113). This test used to assert the opposite — that the repository
+    wrote the status alone — and pinned the hole as deliberate because there
+    was no topic to announce on. There is one now, so the assertion inverts:
+    a cancellation that no consumer hears about is what left CQRS ids in their
+    previous status set and SSE streams open until the client gave up.
     """
     job_id = await _insert_job(session_factory)
+    settings = get_settings()
 
     async with session_factory() as session:
         async with session.begin():
@@ -370,9 +371,57 @@ async def test_update_status_cancelled_writes_no_event_because_no_topic_exists(
             )
 
     assert await _job_status(session_factory, job_id) == JobStatus.CANCELLED
+    rows = await _outbox_rows(session_factory, settings.kafka_topic_job_cancelled)
+    assert len(rows) == 1
+    payload = rows[0].payload
+    assert payload["event"] == "job.cancelled"
+    assert payload["job_id"] == str(job_id)
+    assert payload["reason"] == "saga rollback"
+    # The row is the only producer, so it is also the only thing that has to
+    # satisfy the schema — assert it the way `publish_raw` will.
+    schema_registry.validate(settings.kafka_topic_job_cancelled, payload)
+    assert rows[0].key == f"{DEFAULT_TENANT_ID}:{_USER_ID}"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_terminal_write_stamps_completed_at(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """WO-R2-114. `update_status` stamped `completed_at` for completed/failed/
+    dead_letter and not for cancelled, so a saga-rollback cancellation landed
+    terminal with no record of *when* it stopped — the one column every
+    "how long did this take" question reads."""
+    job_id = await _insert_job(session_factory)
+
     async with session_factory() as session:
-        rows = list((await session.execute(select(OutboxEvent))).scalars().all())
-    assert rows == []
+        async with session.begin():
+            await JobRepository(session).update_status(job_id, JobStatus.CANCELLED)
+
+    async with session_factory() as session:
+        job = (
+            await session.execute(select(Job).where(Job.id == job_id))
+        ).scalar_one()
+    assert job.completed_at is not None
+
+
+@pytest.mark.asyncio
+async def test_cancelled_event_carries_a_reason_even_with_no_error_message(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """`reason` is required by the schema, so a NULL `error_message` must not
+    become `None` on the wire — the same trap `_UNSPECIFIED_ERROR` exists for
+    on the dead-letter side. A schema violation would fail the outbox row and
+    lose the event, which is the failure this whole consolidation prevents."""
+    job_id = await _insert_job(session_factory)
+    settings = get_settings()
+
+    async with session_factory() as session:
+        async with session.begin():
+            await JobRepository(session).update_status(job_id, JobStatus.CANCELLED)
+
+    rows = await _outbox_rows(session_factory, settings.kafka_topic_job_cancelled)
+    assert isinstance(rows[0].payload["reason"], str)
+    schema_registry.validate(settings.kafka_topic_job_cancelled, rows[0].payload)
 
 
 @pytest.mark.asyncio

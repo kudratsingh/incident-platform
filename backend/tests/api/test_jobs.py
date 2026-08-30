@@ -253,11 +253,18 @@ async def test_admin_stats_reads_from_read_model(
     body = resp.json()
     assert "by_status" in body
     # Mocked Redis in tests returns 0 cardinality.
+    #
+    # `cancelled` joined the set with WO-R2-113. It is an additive change to
+    # this response — a new key, no key removed or renamed — but it is a
+    # response-shape change all the same, and it is the point of the work
+    # order rather than a side effect: a cancelled job used to be counted
+    # under whatever status it held before it stopped.
     assert set(body["by_status"].keys()) == {
         "running",
         "completed",
         "failed",
         "dead_letter",
+        "cancelled",
     }
 
 

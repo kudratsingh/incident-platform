@@ -685,3 +685,98 @@ async def test_probe_catches_a_dropped_tenant_isolation_policy(
         await sup.close()
 
     await _probe_as_app(rls_db, "production")
+
+
+async def test_a_cleared_tenant_setting_turns_digest_isolation_off(
+    rls_db: RlsDb,
+) -> None:
+    """WO-R2-127, and why it is a security finding rather than a tidy.
+
+    `app.tenant_id` is set with `set_config(..., true)` — **transaction-local**.
+    The admin digest route reads the window, ends that transaction so the
+    Anthropic round-trip holds no connection, and then INSERTs the result in a
+    new one. The setting does not carry over.
+
+    The intuition is that the unscoped INSERT is then rejected. It is not.
+    Every `tenant_isolation` policy here opens with
+
+        current_setting('app.tenant_id', true) IS NULL OR ... = '' OR ...
+
+    — the ADR 0003 bootstrap hatch that lets authentication read `users` before
+    any tenant is known. An unset setting does not fail closed, it **fails
+    open**: the policy is satisfied unconditionally, the statement runs with no
+    tenant isolation whatsoever, and nothing errors or logs. A write that
+    should have been scoped simply is not, which is the failure this work order
+    removes — RLS is the backstop for a forgotten filter, and here the backstop
+    was silently off for the one statement that had already cost real money.
+    """
+    import asyncpg
+
+    sup = await asyncpg.connect(rls_db.superuser_dsn)
+    try:
+        home = await _create_tenant(sup, "digest-rls-home")
+        foreign = await _create_tenant(sup, "digest-rls-foreign")
+    finally:
+        await sup.close()
+
+    insert = (
+        "INSERT INTO incident_summaries "
+        "(id, tenant_id, window_start, window_end, summary, model_used) "
+        "VALUES ($1, $2, now(), now(), 'digest', 'claude')"
+    )
+
+    app = await asyncpg.connect(rls_db.app_dsn)
+    try:
+        # A connection that has never been scoped — the setting is unset, and
+        # the policy's first branch admits everything.
+        async with app.transaction():
+            assert (
+                await app.fetchval("SELECT current_setting('app.tenant_id', true)")
+            ) is None
+            tag = await app.execute(insert, uuid.uuid4(), foreign)
+            assert tag == "INSERT 0 1", (
+                "an unscoped session must be shown to fail OPEN — if this ever "
+                "starts raising, the bootstrap branch changed and this finding "
+                "needs rewriting, not deleting"
+            )
+            assert await app.fetchval(
+                "SELECT count(*) FROM incident_summaries WHERE tenant_id = $1",
+                foreign,
+            ) == 1, "an unscoped session reads every tenant's digests too"
+
+        # Scope it, the way the read phase does.
+        async with app.transaction():
+            await app.execute(
+                "SELECT set_config('app.tenant_id', $1, true)", str(home)
+            )
+            assert await app.fetchval(
+                "SELECT current_setting('app.tenant_id', true)"
+            ) == str(home)
+
+        # The write phase's transaction: the value is gone. On a pooled
+        # connection it resets to the empty string rather than to unset, which
+        # is its own hazard — `''::uuid` is not a cast Postgres will make, so
+        # the third branch of the policy can raise outright instead of failing
+        # open. Either way it is not the caller's tenant.
+        async with app.transaction():
+            assert await app.fetchval(
+                "SELECT current_setting('app.tenant_id', true)"
+            ) != str(home), "the GUC must not survive the transaction that set it"
+
+        # Re-established on the write session — the whole of the fix. A
+        # cross-tenant row is refused, the caller's own row lands.
+        async with app.transaction():
+            await app.execute(
+                "SELECT set_config('app.tenant_id', $1, true)", str(home)
+            )
+            with pytest.raises(asyncpg.exceptions.InsufficientPrivilegeError):
+                await app.execute(insert, uuid.uuid4(), foreign)
+
+        async with app.transaction():
+            await app.execute(
+                "SELECT set_config('app.tenant_id', $1, true)", str(home)
+            )
+            tag = await app.execute(insert, uuid.uuid4(), home)
+            assert tag == "INSERT 0 1", f"own-tenant INSERT must succeed, got {tag!r}"
+    finally:
+        await app.close()

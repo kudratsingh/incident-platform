@@ -6,6 +6,7 @@ from app.dependencies import (
     get_db,
     get_effective_tenant,
     get_redis,
+    get_session_factory,
     require_platform_admin,
     require_role,
     resolve_admin_tenant,
@@ -35,7 +36,7 @@ from app.workers.read_model import read_global_stats, read_user_stats
 from fastapi import APIRouter, Depends, Query
 from redis.asyncio import Redis
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 # Redis key namespaces for the two paid-call limiters. Separate buckets
 # so exhausting the digest allowance never blocks a natural-language
@@ -339,12 +340,17 @@ async def admin_generate_digest(
     current_user: User = Depends(_require_admin),
     db: AsyncSession = Depends(get_db),
     redis: Redis = Depends(get_redis),
+    session_factory: async_sessionmaker[AsyncSession] = Depends(get_session_factory),
 ) -> dict[str, Any]:
     """Generate a digest for the caller's tenant immediately, without
     waiting for the periodic loop. Useful for incident-response time.
 
     503 if the feature flag is off. The window is the last
-    `llm_digest_window_hours` (or `?hours=N` override, 1..168)."""
+    `llm_digest_window_hours` (or `?hours=N` override, 1..168).
+
+    `db` authenticates and resolves the tenant; the digest itself runs on
+    `session_factory`'s own short transactions so the paid call is not made
+    with an aggregate query's transaction open behind it. See the body."""
     from datetime import UTC, datetime, timedelta
 
     from app.core.exceptions import AppError
@@ -391,23 +397,75 @@ async def admin_generate_digest(
 
     window_end = datetime.now(UTC)
     window_start = window_end - timedelta(hours=hours)
+
+    # Three phases on their own transactions, with the Anthropic round-trip
+    # between them holding none — the shape #161 gave the worker's digest loop
+    # and the residue R2-63 left on this route, which was still calling the
+    # composed `run_digest_for_tenant` on the request session (WO-R2-127).
+    #
+    # Each phase re-issues `set_config('app.tenant_id')` because the setting is
+    # **transaction-local**: `get_current_user` set it on the request's
+    # transaction, and neither of these is that transaction (WO-R2-127).
+    #
+    # Not re-issuing it does not fail loudly, which is the point. Every
+    # `tenant_isolation` policy opens with `current_setting('app.tenant_id',
+    # true) IS NULL OR ... = ''` — the ADR 0003 bootstrap hatch that lets
+    # authentication read `users` before a tenant is known — so an unset value
+    # satisfies the policy unconditionally and the statement runs with **no
+    # tenant isolation at all**. The row still lands; RLS was simply not
+    # standing behind it. (On a pooled connection that has already served a
+    # scoped request the value resets to `''` rather than to unset, and
+    # `''::uuid` can raise instead — same cause, noisier symptom.)
+    # `tests/integration/test_rls_enforcement.py` proves both halves on a live
+    # server. RLS is the backstop for a filter someone forgot; a phase that
+    # does not re-establish context is a phase running without it.
     try:
-        row = await incident_digest.run_digest_for_tenant(
-            db, tenant_row, window_start, window_end
+        async with session_factory() as read_session:
+            async with read_session.begin():
+                await _set_rls_tenant(read_session, effective_tenant)
+                stats = await incident_digest.collect_window_stats(
+                    read_session, tenant_row, window_start, window_end
+                )
+
+        if stats is None:
+            # Empty window — no jobs to summarize. Return a 200-ish shape so
+            # the UI can show "nothing happened" without a special error path,
+            # and skip the paid call entirely.
+            return {
+                "summary": None,
+                "window_start": window_start.isoformat(),
+                "window_end": window_end.isoformat(),
+            }
+        by_status, failed_by_type, errors = stats
+
+        digest_obj, usage, model = await incident_digest.generate_digest(
+            tenant_slug=tenant_row.slug,
+            window_start=window_start,
+            window_end=window_end,
+            by_status_count=by_status,
+            by_type_failed_count=failed_by_type,
+            error_messages=errors,
         )
+
+        async with session_factory() as write_session:
+            async with write_session.begin():
+                await _set_rls_tenant(write_session, effective_tenant)
+                row = await incident_digest.persist_digest(
+                    write_session,
+                    tenant_row,
+                    window_start,
+                    window_end,
+                    by_status,
+                    failed_by_type,
+                    digest_obj,
+                    usage,
+                    model,
+                )
     except incident_digest.DigestDisabledError as exc:
         raise DigestUnavailable(str(exc)) from exc
     except Exception as exc:
         raise DigestUnavailable(f"LLM call failed: {exc}") from exc
 
-    if row is None:
-        # Empty window — no jobs to summarize. Return a 200-ish shape so the
-        # UI can show "nothing happened" without a special error path.
-        return {
-            "summary": None,
-            "window_start": window_start.isoformat(),
-            "window_end": window_end.isoformat(),
-        }
     return _serialize_digest(row)
 
 
