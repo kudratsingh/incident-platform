@@ -51,14 +51,25 @@ What gets cleared/reset:
 
 ## Guardrails
 
-- **Refuses to run in production.** `_assert_not_production()` is the
-  single check, and it is enforced on *both* entry points: `main()`
-  turns it into a stderr message + `exit(1)`, and `reset()` re-raises it
-  as a `RuntimeError` before any engine or Redis client is constructed.
-  Gating only the CLI was the bug (D-08) — `reset()` is exported, takes
-  arbitrary DB/Redis URLs, and is what the eval harness imports. Same
-  belt-and-braces reasoning as ADR 0008: two independent gates on the
-  same invariant.
+- **Refuses to run against a target it was not configured for.**
+  `_assert_not_production()` delegates to
+  `eval_safety.assert_safe_target()`, which checks *two* things: the
+  `ENVIRONMENT=production` label, and — the one that actually matters
+  here — that the `database_url`/`redis_url` about to be destroyed are
+  the ones `settings` names. The label check alone was the bug
+  (WO-R2-18): it inspects the local process while every `DELETE` below
+  runs against whatever DSN the caller passed, so an operator in a
+  `development` shell passed the gate and emptied whatever
+  `DATABASE_URL` pointed at. Pass `--i-know-what-im-doing` (CLI) or
+  `allow_target_mismatch=True` (library) when the mismatch is
+  deliberate.
+- Enforced on *both* entry points: `main()` turns a refusal into a
+  stderr message + `exit(1)`, and `reset()` re-raises it as a
+  `RuntimeError` before any engine or Redis client is constructed.
+  Gating only the CLI was the earlier bug (D-08) — `reset()` is
+  exported, takes arbitrary DB/Redis URLs, and is what the eval harness
+  imports. Same belt-and-braces reasoning as ADR 0008: independent
+  gates on the same invariant.
 - **Audit rows are ground truth and this script never touches them.**
   No statement here reads, writes, updates or deletes `audit_logs`. The
   job and user DELETEs it does perform (`_delete_seeded_dlq_fixtures`,
@@ -101,13 +112,20 @@ from typing import Any
 #     the commander's `make eval-reset` was carrying. Setting both here
 #     makes the shipped image self-sufficient: `docker compose exec app
 #     python /app/scripts/reset_eval_state.py` now works unadorned.
+#   * `_HERE` itself so the sibling `eval_safety` helper resolves whether
+#     this module was imported flat (the unit tests put `scripts/` on
+#     `sys.path`) or as `scripts.reset_eval_state`.
 _HERE = os.path.dirname(os.path.abspath(__file__))
-for _path in (os.path.join(_HERE, "..", "backend"), os.path.join(_HERE, "..")):
+for _path in (
+    os.path.join(_HERE, "..", "backend"),
+    os.path.join(_HERE, ".."),
+    _HERE,
+):
     if _path not in sys.path:
         sys.path.insert(0, _path)
 
+import eval_safety  # type: ignore[import-not-found]  # noqa: E402
 import redis.asyncio as aioredis  # noqa: E402
-from app.config import get_settings  # noqa: E402
 from sqlalchemy import text  # noqa: E402
 from sqlalchemy.ext.asyncio import (  # noqa: E402
     async_sessionmaker,
@@ -231,27 +249,58 @@ async def _clear_dag_pauses(redis: aioredis.Redis) -> int:
 async def _purge_idempotency_records(session_factory: Any) -> int:
     """DELETE every idempotency_records row for the seeded
     incident-commander SA. Scoped to that principal so we don't wipe
-    unrelated agents' state (if any exist)."""
+    unrelated agents' state (if any exist).
+
+    **Every** matching principal, not `scalar_one_or_none()`.
+    `service_accounts.name` is unique *per tenant*, not globally — a
+    second tenant that also seeded an `incident-commander` account made
+    `scalar_one_or_none()` raise `MultipleResultsFound`, and it raised
+    from the tail of `reset()` where every destructive step had already
+    committed: rows deleted, no summary printed, non-zero exit
+    (WO-R2-18). Two tenants each running the eval stack against one
+    database is the normal shape of a shared dev environment, so this
+    was reachable without anything unusual happening.
+
+    Purging all of them is the right reading of the intent as well as
+    the safe one: the docstring's promise is "the seeded commander's
+    cached responses", and each tenant's copy is exactly that. Other
+    principals — `some-other-agent` and friends — are still untouched,
+    which is the property the integration test pins.
+
+    The DELETE is the ORM construct rather than this module's usual
+    `text()`, because the bind is a list of UUIDs and only the mapped
+    column type knows how to render one on both dialects — raw SQL binds
+    the Python `UUID` straight through, which asyncpg accepts and the
+    SQLite unit harness rejects outright. Every other statement here
+    stays raw; this one has a typed parameter and so it is the one that
+    can't be.
+
+    Returns the number of rows deleted, across all matching accounts."""
+    from app.models.idempotency import IdempotencyRecord
     from app.models.service_account import ServiceAccount
-    from sqlalchemy import select
+    from sqlalchemy import delete, select
 
     async with session_factory() as session:
         async with session.begin():
-            sa = (
-                await session.execute(
-                    select(ServiceAccount).where(
-                        ServiceAccount.name == "incident-commander"
+            principal_ids = (
+                (
+                    await session.execute(
+                        select(ServiceAccount.id).where(
+                            ServiceAccount.name == "incident-commander"
+                        )
                     )
                 )
-            ).scalar_one_or_none()
-            if sa is None:
+                .scalars()
+                .all()
+            )
+            if not principal_ids:
                 return 0
+            # The IN list is one entry per tenant holding a commander
+            # account, so it is small and bounded.
             result = await session.execute(
-                text(
-                    "DELETE FROM idempotency_records "
-                    "WHERE principal_id = :pid"
-                ),
-                {"pid": sa.id},
+                delete(IdempotencyRecord).where(
+                    IdempotencyRecord.principal_id.in_(principal_ids)
+                )
             )
             return int(result.rowcount or 0)
 
@@ -461,30 +510,51 @@ async def _sweep_nonfixture_dlq(session_factory: Any) -> int:
             return int(result.rowcount or 0)
 
 
-def _assert_not_production() -> None:
-    """Raise if invoked against a production platform. Backed by ADR
-    0008's environment gate — this is the belt on top of the braces.
+def _assert_not_production(
+    database_url: str = _DB_URL,
+    redis_url: str = _REDIS_URL,
+    *,
+    allow_target_mismatch: bool = False,
+) -> None:
+    """Raise if it is not safe to destroy state at this target.
+
+    Two checks, both in `eval_safety.assert_safe_target()`: the
+    `ENVIRONMENT=production` label (ADR 0008's environment gate) and,
+    since WO-R2-18, the identity of the `database_url`/`redis_url` the
+    caller is about to hand every `DELETE` in this module. The label
+    alone described the operator's shell, not the database being
+    emptied — which is why the arguments default to the module-level
+    DSNs but the real callers pass their own.
 
     The single gate, shared by both entry points: `reset()` lets the
     `RuntimeError` propagate to its (library) caller, `main()` turns it
     into a stderr message and `exit(1)` for the CLI. There is
     deliberately no `allow_production` parameter — overriding
-    `ENVIRONMENT` is the one documented escape hatch, and one lever is
-    enough."""
-    env = get_settings().environment
-    if env == "production":
-        raise RuntimeError(
-            "reset_eval_state.py refuses to run in production "
-            f"(ENVIRONMENT={env!r}). If this is a real production-parity "
-            "eval env, override ENVIRONMENT before invoking."
-        )
+    `ENVIRONMENT` is the one documented escape hatch for *that* check,
+    and one lever is enough. `allow_target_mismatch` is the separate,
+    per-invocation lever for the target check."""
+    eval_safety.assert_safe_target(
+        script="reset_eval_state.py",
+        database_url=database_url,
+        redis_url=redis_url,
+        allow_target_mismatch=allow_target_mismatch,
+    )
 
 
-def _refuse_in_production() -> None:
+def _refuse_in_production(
+    database_url: str = _DB_URL,
+    redis_url: str = _REDIS_URL,
+    *,
+    allow_target_mismatch: bool = False,
+) -> None:
     """CLI wrapper around `_assert_not_production()`: loud message on
     stderr, exit code 1."""
     try:
-        _assert_not_production()
+        _assert_not_production(
+            database_url,
+            redis_url,
+            allow_target_mismatch=allow_target_mismatch,
+        )
     except RuntimeError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         sys.exit(1)
@@ -495,14 +565,24 @@ async def reset(
     database_url: str = _DB_URL,
     redis_url: str = _REDIS_URL,
     purge_idempotency: bool = False,
+    allow_target_mismatch: bool = False,
 ) -> dict[str, Any]:
     """Programmatic entry point. Returns a summary dict suitable for
     JSON encoding by the CLI or the eval harness.
 
-    Raises `RuntimeError` when `ENVIRONMENT=production`, before anything
-    is imported, connected or created — this coroutine accepts arbitrary
-    DB/Redis URLs, so the CLI's gate protected nothing here (D-08)."""
-    _assert_not_production()
+    Raises `RuntimeError` — before anything is imported, connected or
+    created — when `ENVIRONMENT=production`, or when `database_url` /
+    `redis_url` are not the ones `settings` names. This coroutine
+    accepts arbitrary DB/Redis URLs, so the CLI's gate protected nothing
+    here (D-08) and the label-only gate protected nothing either: it
+    read the local process while these arguments chose the victim
+    (WO-R2-18). `allow_target_mismatch=True` is the deliberate
+    override."""
+    _assert_not_production(
+        database_url,
+        redis_url,
+        allow_target_mismatch=allow_target_mismatch,
+    )
 
     # Local import so the seed script's heavy DB imports are only paid
     # by scenarios that actually run this reset.
@@ -513,6 +593,16 @@ async def reset(
     redis = aioredis.from_url(redis_url, decode_responses=True)
 
     try:
+        # First, not last. The purge resolves a service account and can
+        # raise; run last, that raise landed *after* every destructive
+        # step had already committed, so the operator got a traceback
+        # and no summary describing what had just been deleted
+        # (WO-R2-18). Nothing in the reset creates idempotency records,
+        # so the ordering is free — the only thing it changes is which
+        # side of a failure the committed damage sits on.
+        idempotency_purged = 0
+        if purge_idempotency:
+            idempotency_purged = await _purge_idempotency_records(factory)
         chaos_cleared = await _clear_chaos_keys(redis)
         job_cache_cleared = await _clear_job_read_cache(redis)
         timers_cleared = await _clear_scheduled_replays(redis)
@@ -524,6 +614,12 @@ async def reset(
             database_url=database_url,
             redis_url=redis_url,
             reset=True,
+            # The seeder gates its own target too (WO-R2-19). Thread the
+            # override through rather than letting it re-decide: this
+            # reset already passed the gate for these exact URLs, and a
+            # deliberate mismatch that stops halfway through is worse
+            # than one that was refused up front.
+            allow_target_mismatch=allow_target_mismatch,
         )
         # Delete chaos-owner users from any tenant that had
         # `create_bad_data_job` run against it. Runs unconditionally
@@ -538,9 +634,6 @@ async def reset(
         # removed outright rather than left as `cancelled` rows.
         seeded_dlq_deleted = await _delete_seeded_dlq_fixtures(factory)
         dlq_swept = await _sweep_nonfixture_dlq(factory)
-        idempotency_purged = 0
-        if purge_idempotency:
-            idempotency_purged = await _purge_idempotency_records(factory)
     finally:
         await redis.aclose()
         await engine.dispose()
@@ -565,8 +658,21 @@ async def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Reset mutable eval state so live remediation scenarios "
-            "start from baseline. Refuses to run against ENVIRONMENT=production."
+            "start from baseline. Refuses to run against "
+            "ENVIRONMENT=production, or against any DATABASE_URL/REDIS_URL "
+            "other than the configured one."
         )
+    )
+    parser.add_argument(
+        "--i-know-what-im-doing",
+        dest="allow_target_mismatch",
+        action="store_true",
+        help=(
+            "Proceed even though DATABASE_URL/REDIS_URL are not the "
+            "configured ones. This script DESTROYS state at the target; "
+            "the flag exists for deliberate cross-stack resets and for "
+            "nothing else. It does not override the production check."
+        ),
     )
     parser.add_argument(
         "--purge-idempotency",
@@ -579,8 +685,18 @@ async def main() -> None:
     )
     args = parser.parse_args()
 
-    _refuse_in_production()
-    summary = await reset(purge_idempotency=args.purge_idempotency)
+    # Refuse on stderr + exit 1 before anything is connected. `reset()`
+    # re-checks the same invariant for library callers.
+    _refuse_in_production(
+        _DB_URL,
+        _REDIS_URL,
+        allow_target_mismatch=args.allow_target_mismatch,
+    )
+    print(eval_safety.describe_target(_DB_URL, _REDIS_URL), file=sys.stderr)
+    summary = await reset(
+        purge_idempotency=args.purge_idempotency,
+        allow_target_mismatch=args.allow_target_mismatch,
+    )
     print(json.dumps(summary, indent=2, sort_keys=True))
 
 

@@ -10,17 +10,37 @@ Env vars (all optional — match the defaults in locustfile.py):
     LOAD_USER_PASSWORD    default: LoadTest123!
     LOAD_ADMIN_EMAIL      default: loadtest-admin@example.com
     LOAD_ADMIN_PASSWORD   default: LoadTest123!
+
+## Guardrail
+
+This script creates a `role=admin` account whose default password is
+published in this file, in `locustfile.py`, and in the git history of
+both. Until WO-R2-19 it had no gate of any kind: it wrote that account
+into whatever `DATABASE_URL` happened to be set, from any environment,
+with no confirmation and no indication of which host it had just
+written to.
+
+It now refuses unless the target is the configured one and
+`ENVIRONMENT` is not `production` — the same `eval_safety` gate its
+sibling `reset_eval_state.py` uses, and for the same reason: the DSN
+chooses the victim, the ENVIRONMENT label only describes the shell.
+Pass `--i-know-what-im-doing` for a deliberate cross-stack seed. The
+target host is printed before anything is written.
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import os
 import sys
 
-# Allow running from project root without installing the package
+# Allow running from project root without installing the package, and
+# put this script's own dir on the path so `eval_safety` resolves.
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "backend"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import eval_safety  # type: ignore[import-not-found]  # noqa: E402
 from app.core.security import hash_password  # noqa: E402
 from app.models.enums import UserRole  # noqa: E402
 from app.models.tenant import DEFAULT_TENANT_ID  # noqa: E402
@@ -51,7 +71,39 @@ _USERS = [
 ]
 
 
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Create the two load-test accounts locustfile.py expects "
+            "(one of them role=admin, with a repo-published default "
+            "password). Refuses to run against ENVIRONMENT=production or "
+            "against any DATABASE_URL other than the configured one."
+        )
+    )
+    parser.add_argument(
+        "--i-know-what-im-doing",
+        dest="allow_target_mismatch",
+        action="store_true",
+        help=(
+            "Write the load-test accounts even though DATABASE_URL is not "
+            "the configured one. Does not override the production check."
+        ),
+    )
+    return parser.parse_args()
+
+
 async def main() -> None:
+    args = _parse_args()
+    # Before the engine exists, so a refusal connects to nothing.
+    eval_safety.refuse_unsafe_target(
+        script="seed_load_test_users.py",
+        database_url=_DB_URL,
+        allow_target_mismatch=args.allow_target_mismatch,
+    )
+    # An operator about to mint an admin account should be able to see
+    # where it is going without reading their own shell history.
+    print(eval_safety.describe_target(_DB_URL))
+
     engine = create_async_engine(_DB_URL, echo=False)
     factory = async_sessionmaker(engine, expire_on_commit=False)
 

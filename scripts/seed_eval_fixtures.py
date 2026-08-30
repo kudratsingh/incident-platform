@@ -53,7 +53,12 @@ from typing import Any, cast
 
 # Allow running from project root without installing the package.
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "backend"))
+# ...and this script's own directory, so the sibling `eval_safety`
+# helper resolves however this module was imported (flat by the tests,
+# or as `scripts.seed_eval_fixtures` by reset_eval_state).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import eval_safety  # type: ignore[import-not-found]  # noqa: E402
 import redis.asyncio as aioredis  # noqa: E402
 from app.core.security import hash_password  # noqa: E402
 from app.models.alert import Alert  # noqa: E402
@@ -846,9 +851,18 @@ async def seed(
     redis_url: str = _REDIS_URL,
     tenant_slug: str = _TENANT_SLUG,
     reset: bool = False,
+    allow_target_mismatch: bool = False,
 ) -> dict[str, int]:
     """Programmatic entry point — usable from tests and the app
     lifespan's `SEED_EVAL_FIXTURES=true` path. No stdout output.
+
+    Gated on the target, like every other script that writes to a
+    database here (WO-R2-19): refuses when `ENVIRONMENT=production`, and
+    refuses when `database_url`/`redis_url` are not the ones `settings`
+    names, unless `allow_target_mismatch=True`. This seeder writes a
+    user with a known password and overwrites job rows by stable id, so
+    "which database" is exactly as load-bearing a question here as it is
+    for the reset.
 
     `reset=True` re-baselines mutable fixture state that scenarios
     drift over the course of a live eval run (FIX_PLAN #7):
@@ -865,6 +879,13 @@ async def seed(
     Returns a small summary dict
     {'dlq_reset': N, 'timestamps_rebaselined': N} for the caller to
     log / include in a reset-protocol audit trail."""
+    eval_safety.assert_safe_target(
+        script="seed_eval_fixtures.py",
+        database_url=database_url,
+        redis_url=redis_url,
+        allow_target_mismatch=allow_target_mismatch,
+    )
+
     engine = create_async_engine(database_url, echo=False)
     factory = async_sessionmaker(engine, expire_on_commit=False)
     redis = aioredis.from_url(redis_url, decode_responses=True)
@@ -1012,9 +1033,28 @@ async def main() -> None:
             "against a fresh compose stack (no-op) or between scenarios."
         ),
     )
+    parser.add_argument(
+        "--i-know-what-im-doing",
+        dest="allow_target_mismatch",
+        action="store_true",
+        help=(
+            "Proceed even though DATABASE_URL/REDIS_URL are not the "
+            "configured ones. Does not override the production check."
+        ),
+    )
     args = parser.parse_args()
 
-    summary = await seed(reset=args.reset)
+    eval_safety.refuse_unsafe_target(
+        script="seed_eval_fixtures.py",
+        database_url=_DB_URL,
+        redis_url=_REDIS_URL,
+        allow_target_mismatch=args.allow_target_mismatch,
+    )
+    print(eval_safety.describe_target(_DB_URL, _REDIS_URL))
+
+    summary = await seed(
+        reset=args.reset, allow_target_mismatch=args.allow_target_mismatch
+    )
     try:
         pins_path = write_pins_json()
     except OSError as exc:
