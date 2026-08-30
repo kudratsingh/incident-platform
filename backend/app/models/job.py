@@ -14,6 +14,23 @@ if TYPE_CHECKING:
     from app.models.user import User
 
 
+def _default_max_retries(_ctx: Any = None) -> int:
+    """Retry ceiling for a row that does not name one, from `MAX_JOB_RETRIES`.
+
+    A callable rather than a constant so SQLAlchemy resolves it per
+    INSERT: the setting is read at flush time, which is what lets an
+    operator change the ceiling by restarting with a new environment
+    instead of by editing three literals (WO-R2-76).
+
+    The import is deferred to keep `app.models` free of an import-time
+    dependency on `app.config` — models are the one layer nothing else
+    may have to import config *through*.
+    """
+    from app.config import get_settings
+
+    return get_settings().max_job_retries
+
+
 class Job(TimestampMixin, Base):
     __tablename__ = "jobs"
 
@@ -44,7 +61,13 @@ class Job(TimestampMixin, Base):
     result: Mapped[dict[str, Any] | None] = mapped_column(PortableJSON, nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     retry_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    max_retries: Mapped[int] = mapped_column(Integer, default=3, nullable=False)
+    # Resolved per INSERT from `MAX_JOB_RETRIES` rather than frozen at a
+    # literal 3, so the documented knob governs rows written outside
+    # `JobService` too — the chaos hooks, the eval seeds, saga steps
+    # (WO-R2-76). See `_default_max_retries` for why it is a callable.
+    max_retries: Mapped[int] = mapped_column(
+        Integer, default=_default_max_retries, nullable=False
+    )
     # Coarse categorization the agent uses to decide DLQ remediation:
     #   `replay_safe`      — transient / poison; replay after fix
     #   `wait_and_replay`  — external dep down; retry after recovery

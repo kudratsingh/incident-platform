@@ -4,6 +4,15 @@ from pydantic import BaseModel, Field
 
 T = TypeVar("T")
 
+#: Ceiling on any `page_size` query parameter.
+#:
+#: A `page_size` reaches Postgres as the LIMIT, so an unbounded one is a
+#: single-request memory exhaustion — the caller names how many rows the
+#: API materialises. Named here rather than repeated per endpoint so the
+#: listing surfaces cannot drift apart (WO-R2-61); `PaginationParams`
+#: below and the hand-rolled `Query(...)` declarations both read it.
+MAX_PAGE_SIZE = 100
+
 
 class ErrorResponse(BaseModel):
     error_code: str
@@ -34,7 +43,7 @@ class PaginatedResponse(BaseModel, Generic[T]):
 
 class PaginationParams(BaseModel):
     page: int = Field(default=1, ge=1)
-    page_size: int = Field(default=20, ge=1, le=100)
+    page_size: int = Field(default=20, ge=1, le=MAX_PAGE_SIZE)
 
     @property
     def offset(self) -> int:

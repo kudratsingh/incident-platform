@@ -477,9 +477,18 @@ async def test_clear_scheduled_replays_drops_pending_timers() -> None:
     cleared = await reset._clear_scheduled_replays(redis)
 
     assert cleared == 5
+    # Asserted against the worker's constants, not re-hardcoded strings.
+    # The reset script duplicates these literals on purpose, so it has no
+    # import dependency on the worker package — which means this test is
+    # the only thing standing between that duplication and a silent
+    # divergence. Re-typing the literal here made the pair unguarded:
+    # renaming SCHEDULED_KEY would leave the script sweeping a key
+    # nothing writes any more, and the test would still pass (R2-76).
+    from app.workers.dlq_replay_scheduler import INFLIGHT_KEY, SCHEDULED_KEY
+
     assert [c.args[0] for c in redis.delete.await_args_list] == [
-        "jobs:dlq_replay_delayed",
-        "jobs:dlq_replay_inflight",
+        SCHEDULED_KEY,
+        INFLIGHT_KEY,
     ]
 
 

@@ -22,12 +22,28 @@ See ADR 0007 for the scope taxonomy.
 """
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from app.core.scopes import Scope
 from app.mcp.registry import ToolContext, tool
 from app.repositories.audit import AuditRepository
 from pydantic import BaseModel, ConfigDict, Field
+
+# The two principal shapes that write to `audit_logs`, mirroring
+# `app.models.audit.PRINCIPAL_TYPE_USER` / `PRINCIPAL_TYPE_SERVICE_ACCOUNT`.
+#
+# Spelled out rather than derived, because these strings are baked
+# verbatim into this tool's inputSchema — the agent reads the allowed
+# values there and nowhere else, so a change has to be visible in this
+# file's diff. Same arrangement, and same reason, as
+# `seed_dlq_messages._HINT_VALUES`;
+# `test_principal_type_literal_matches_the_model_constants` fails if the
+# pair ever drifts.
+#
+# The *column* stays a lax string on purpose (new principal shapes must
+# not need a migration) — this is a filter on a closed set of values that
+# exist today, not a constraint on what may be stored tomorrow.
+_PRINCIPAL_TYPES = Literal["user", "service_account"]
 
 
 class ListAuditEventsInput(BaseModel):
@@ -44,10 +60,13 @@ class ListAuditEventsInput(BaseModel):
         "`service_account.` covers principal "
         "lifecycle. Ignored when `action` is set.",
     )
-    principal_type: str | None = Field(
+    principal_type: _PRINCIPAL_TYPES | None = Field(
         default=None,
         description="Filter to `user` (human) or `service_account` "
-        "(machine) actors. Omit for both.",
+        "(machine) actors. Omit for both. An unrecognised value is "
+        "rejected at parse time as an invalid-params error rather than "
+        "matching no rows — an empty result reads as 'nothing happened' "
+        "when the truth is 'you asked the wrong question'.",
     )
     limit: int = Field(default=50, ge=1, le=200)
 

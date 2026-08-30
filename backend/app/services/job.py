@@ -7,7 +7,7 @@ from app.core.exceptions import AuthorizationError, JobError, NotFoundError
 from app.core.logging import get_logger, request_id_var, trace_id_var
 from app.core.tracing import inject_context
 from app.models.enums import JobStatus, UserRole
-from app.models.job import Job
+from app.models.job import Job, _default_max_retries
 from app.repositories.audit import AuditRepository
 from app.repositories.job import JobRepository
 from app.repositories.job_dependency import JobDependencyRepository
@@ -44,11 +44,18 @@ class JobService:
         payload: dict[str, Any] | None = None,
         idempotency_key: str | None = None,
         priority: int = 0,
-        max_retries: int = 3,
+        max_retries: int | None = None,
         dependencies: list[uuid.UUID] | None = None,
         saga_id: uuid.UUID | None = None,
         saga_step_index: int | None = None,
     ) -> Job:
+        # `None` means "the platform default", which is `MAX_JOB_RETRIES`
+        # — not a literal 3 restated here (WO-R2-76). Callers that want a
+        # different ceiling for one job (the saga coordinator, per step)
+        # still pass it explicitly and win.
+        if max_retries is None:
+            max_retries = _default_max_retries()
+
         # Idempotency: return the existing job if this key was already used
         # in this tenant. (Different tenants can reuse the same key.)
         if idempotency_key:

@@ -12,6 +12,7 @@ import json
 import uuid
 from typing import Any
 
+import pytest
 import pytest_asyncio
 from app.core.scopes import Scope
 from app.dependencies import get_db, get_redis
@@ -261,7 +262,7 @@ async def test_wrong_scope_forbidden(
     assert body["error"]["code"] == protocol.MCP_FORBIDDEN
 
 
-async def test_bad_principal_type_is_rejected(
+async def test_unknown_field_is_rejected(
     mcp_client: AsyncClient,
     db_session: AsyncSession,
     default_tenant,  # type: ignore[no-untyped-def]
@@ -274,3 +275,61 @@ async def test_bad_principal_type_is_rejected(
     # unknown key trips the extra=forbid guard
     body = await _call(mcp_client, token, {"unknown_field": "x"})
     assert body["error"]["code"] == protocol.JSONRPC_INVALID_PARAMS
+
+
+@pytest.mark.parametrize(
+    "bad", ["admin", "User", "service-account", "", "sErViCe_AcCoUnT"]
+)
+async def test_bad_principal_type_is_rejected(
+    mcp_client: AsyncClient,
+    db_session: AsyncSession,
+    default_tenant,  # type: ignore[no-untyped-def]
+    bad: str,
+) -> None:
+    """The filter is closed over the two principal shapes that exist.
+
+    This test used to pass an *unknown field* and call that a bad
+    principal_type — so it proved `extra=forbid` (already covered above)
+    and nothing about `principal_type`, which was an unconstrained
+    `str | None`. An unrecognised value silently matched no rows, and an
+    empty result set reads to the agent as "nothing happened" rather than
+    "you asked the wrong question" (R2-61)."""
+    token = await _token(
+        db_session, default_tenant.id, [Scope.INCIDENTS_READ.value]
+    )
+    body = await _call(mcp_client, token, {"principal_type": bad})
+    assert body["error"]["code"] == protocol.JSONRPC_INVALID_PARAMS
+
+
+@pytest.mark.parametrize("good", ["user", "service_account"])
+async def test_known_principal_types_are_accepted(
+    mcp_client: AsyncClient,
+    db_session: AsyncSession,
+    default_tenant,  # type: ignore[no-untyped-def]
+    good: str,
+) -> None:
+    token = await _token(
+        db_session, default_tenant.id, [Scope.INCIDENTS_READ.value]
+    )
+    body = await _call(mcp_client, token, {"principal_type": good})
+    assert "error" not in body
+
+
+def test_principal_type_literal_matches_the_model_constants() -> None:
+    """The `Literal` is spelled out because its members are baked into
+    the tool's inputSchema, which the agent reads and the contract
+    snapshot pins — so a change has to be visible in that file's diff.
+    This test is what keeps the spelled-out copy honest, the same
+    arrangement as `test_seed_dlq_hint_literal_matches_the_enum`."""
+    from typing import get_args
+
+    from app.mcp.tools.list_audit_events import _PRINCIPAL_TYPES
+    from app.models.audit import (
+        PRINCIPAL_TYPE_SERVICE_ACCOUNT,
+        PRINCIPAL_TYPE_USER,
+    )
+
+    assert set(get_args(_PRINCIPAL_TYPES)) == {
+        PRINCIPAL_TYPE_USER,
+        PRINCIPAL_TYPE_SERVICE_ACCOUNT,
+    }
