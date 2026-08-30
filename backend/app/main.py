@@ -202,6 +202,44 @@ def create_app() -> FastAPI:
             },
         )
 
+    @app.exception_handler(Exception)
+    async def unhandled_error_handler(request: Request, exc: Exception) -> JSONResponse:
+        """Catch-all so an escaped non-AppError still answers in the documented
+        envelope (`error_code` / `message` / `details` / `request_id`) instead of
+        Starlette's bare `text/plain` "Internal Server Error".
+
+        The error shape a client is most likely to meet during an incident was
+        the one shape it could not parse, and the response carried no
+        correlation ID — so the 500 a user reported could not be tied back to a
+        log line. Starlette re-raises after this handler runs, so uvicorn still
+        logs the traceback and the error still reaches OTel; only the bytes on
+        the wire change.
+
+        `request_id_var` is read off the header rather than the contextvar:
+        `RequestContextMiddleware` is a `BaseHTTPMiddleware`, so its contextvar
+        assignments happen in a child task that this handler does not inherit.
+        """
+        request_id = request.headers.get("X-Request-ID") or request_id_var.get("")
+        logger.exception(
+            "unhandled exception",
+            extra={
+                "path": request.url.path,
+                "method": request.method,
+                "error_type": type(exc).__name__,
+            },
+        )
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error_code": "internal_error",
+                # Deliberately generic: exception text can carry connection
+                # strings, row contents or internal hostnames.
+                "message": "Internal server error.",
+                "details": {},
+                "request_id": request_id or None,
+            },
+        )
+
     # ---------------------------------------------------------------------------
     # Routers
     # ---------------------------------------------------------------------------

@@ -1,5 +1,6 @@
 """Unit tests for the backpressure check."""
 
+import logging
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -53,6 +54,42 @@ async def test_str_value_is_decoded() -> None:
     redis = AsyncMock()
     redis.get.return_value = "42"
     await check_backpressure(redis)
+
+
+async def test_redis_error_fails_open(caplog: pytest.LogCaptureFixture) -> None:
+    """A raising GET is "lag unknown", not "reject the job".
+
+    This was the only unguarded Redis call on `POST /jobs`: an outage 500'd
+    every submission while rate_limit.py, quota.py and cache.py all degraded
+    quietly. Delete the try/except in check_backpressure and this test goes
+    red with ConnectionError.
+    """
+    redis = AsyncMock()
+    redis.get.side_effect = ConnectionError("Connection refused")
+
+    with caplog.at_level(logging.WARNING, logger="app.utils.backpressure"):
+        await check_backpressure(redis)  # must not raise
+
+    assert any(
+        r.message == "backpressure_check_failed" for r in caplog.records
+    ), "the degradation must be visible in the log, not silent"
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        ConnectionError("Connection refused"),
+        TimeoutError("Timed out reading from socket"),
+        RuntimeError("connection pool exhausted"),
+    ],
+)
+async def test_redis_error_fails_open_for_any_error_type(exc: Exception) -> None:
+    """Fail-open is keyed on "the read failed", not on a specific exception
+    class — redis-py raises several unrelated types (and wraps others), so
+    narrowing this to ConnectionError would reopen the hole."""
+    redis = AsyncMock()
+    redis.get.side_effect = exc
+    await check_backpressure(redis)  # must not raise
 
 
 async def test_dispatcher_consumer_lag_returns_none_when_not_started() -> None:
