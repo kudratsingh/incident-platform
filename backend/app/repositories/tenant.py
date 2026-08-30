@@ -21,7 +21,7 @@ class TenantRepository(BaseRepository[Tenant]):
         total = (await self.session.execute(select(func.count()).select_from(Tenant))).scalar_one()
         result = await self.session.execute(
             select(Tenant)
-            .order_by(Tenant.created_at.desc())
+            .order_by(Tenant.created_at.desc(), Tenant.id.desc())
             .offset(offset)
             .limit(limit)
         )

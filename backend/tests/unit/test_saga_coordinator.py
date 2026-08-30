@@ -213,6 +213,103 @@ async def test_cancelled_downstream_is_zero_when_nothing_was_waiting() -> None:
     assert extra["cancelled_downstream"] == 0
 
 
+async def test_dlq_with_no_completed_steps_settles_the_saga_on_the_same_tick()\
+        -> None:
+    """R2-49: the FIRST step of a fresh saga dead-letters.
+
+    Nothing has completed, so zero `.compensate` jobs are minted — and while
+    settlement was reachable only from a `.compensate` job's terminal event,
+    no such event could ever arrive and the saga pinned at COMPENSATING
+    forever. The rollback is vacuously complete (nothing to undo), so the
+    saga must reach a terminal status with its audit row on this tick.
+    """
+    factory = _factory()
+    coord = SagaCoordinator(factory)
+    saga = _saga()
+
+    failed = _job_in_saga(saga.id, JobStatus.DEAD_LETTER)
+
+    saga_repo = AsyncMock()
+    saga_repo.get_by_id.return_value = saga
+    saga_repo.completed_steps.return_value = []
+    saga_repo.waiting_steps.return_value = []
+    # The saga's only job is the step that just died — no `.compensate` rows.
+    saga_repo.jobs.return_value = [failed]
+    job_repo = _comp_job_repo(failed)
+    outbox = AsyncMock()
+    audit = AsyncMock()
+
+    with patch("app.workers.saga_coordinator.JobRepository", return_value=job_repo), \
+         patch("app.workers.saga_coordinator.SagaRepository", return_value=saga_repo), \
+         patch("app.workers.saga_coordinator.OutboxRepository", return_value=outbox), \
+         patch("app.workers.saga_coordinator.AuditRepository", return_value=audit):
+        await coord.handle_message(
+            topic="job.dlq",
+            key="u",
+            value={
+                "event": "job.failed",
+                "job_id": str(failed.id),
+                "dead_lettered": True,
+            },
+        )
+
+    assert saga.status == SagaStatus.COMPENSATED
+    assert saga.completed_at is not None
+    # Nothing to compensate: no rows minted, nothing announced.
+    job_repo.create.assert_not_awaited()
+    outbox.add.assert_not_awaited()
+    # Both audit rows on one tick — the transition and its settlement.
+    assert [c.args[0] for c in audit.log.await_args_list] == [
+        "saga.compensating",
+        "saga.compensated",
+    ]
+    assert audit.log.await_args.kwargs["extra_data"] == {
+        "compensation_steps": 0,
+        "dead_lettered": 0,
+    }
+
+
+async def test_zero_compensation_settlement_still_cancels_downstream_steps()\
+        -> None:
+    """R2-49: settling at zero must not skip the downstream cancellation —
+    the WAITING steps below the failed one still have to be stood down."""
+    factory = _factory()
+    coord = SagaCoordinator(factory)
+    saga = _saga()
+
+    failed = _job_in_saga(saga.id, JobStatus.DEAD_LETTER)
+    waiting = _job_in_saga(saga.id, JobStatus.WAITING)
+
+    saga_repo = AsyncMock()
+    saga_repo.get_by_id.return_value = saga
+    saga_repo.completed_steps.return_value = []
+    saga_repo.waiting_steps.return_value = [waiting]
+    saga_repo.jobs.return_value = [failed, waiting]
+    job_repo = _comp_job_repo(failed)
+    audit = AsyncMock()
+
+    with patch("app.workers.saga_coordinator.JobRepository", return_value=job_repo), \
+         patch("app.workers.saga_coordinator.SagaRepository", return_value=saga_repo), \
+         patch("app.workers.saga_coordinator.OutboxRepository", return_value=AsyncMock()), \
+         patch("app.workers.saga_coordinator.AuditRepository", return_value=audit):
+        await coord.handle_message(
+            topic="job.dlq",
+            key="u",
+            value={
+                "event": "job.failed",
+                "job_id": str(failed.id),
+                "dead_lettered": True,
+            },
+        )
+
+    cancelled_calls = [
+        c for c in job_repo.update_status.await_args_list
+        if c.args[1] == JobStatus.CANCELLED
+    ]
+    assert [c.args[0] for c in cancelled_calls] == [waiting.id]
+    assert saga.status == SagaStatus.COMPENSATED
+
+
 async def test_compensation_creates_real_job_rows_matching_the_outbox() -> None:
     """E1-02: compensation steps must be real `jobs` rows created in the same
     transaction as the outbox row, and the published job_id must be that row's

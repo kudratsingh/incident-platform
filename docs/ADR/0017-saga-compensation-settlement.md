@@ -97,6 +97,72 @@ and the saga never left `COMPENSATING`. A saga that dead-letters a step will now
 `FAILED` with a `saga.compensation_failed` audit row naming how many compensation steps failed.
 Registering a real compensation processor is what turns that into `COMPENSATED`.
 
+## Addendum (2026-08-30, WO-R2-49 / WO-R2-58) — settlement is drainage, and the rollback order is written down
+
+Two follow-ups. Both are consequences of decision 2 above being stated in terms of *events*
+rather than in terms of the *set* the events were draining.
+
+### Settlement is a function of the compensation set, including the empty set
+
+Decision 2 said a saga settles when every `.compensate` job is terminal, but the code only ever
+asked that question from a `.compensate` job's terminal event. A saga whose **first** step
+dead-letters has no already-COMPLETED predecessor, so `_handle_failure` minted zero compensation
+jobs — and zero jobs produce zero events, so nothing ever asked. The saga was set `COMPENSATING`
+and stayed there permanently: a non-terminal status field, no terminal audit row, and a frontend
+polling for a transition that could not happen.
+
+The rollback that never ran was vacuously correct — nothing completed, so there was nothing to
+undo — which is exactly why the right answer is `COMPENSATED` and not a new "nothing to
+compensate" status. An empty set is a **drained** set.
+
+`_handle_compensation_settlement` is accordingly renamed `_settle_if_drained`, its
+`if not comp_jobs: return` guard is gone, and `_handle_failure` calls it in its own transaction
+when it minted nothing. The audit row is the ordinary `saga.compensated` with
+`compensation_steps: 0, dead_lettered: 0` — an honest description of what happened, and the row
+the read side needs to see a terminal saga.
+
+The call is guarded on "minted nothing" rather than made unconditionally because the rows
+`_handle_failure` has just created are `PENDING` by construction: when there *are* compensations
+the set cannot be drained yet, and an unconditional call would be a query that can only answer no.
+
+Downstream `WAITING`/`PENDING` steps are still cancelled first — settling at zero changes what
+happens after the cancellation loop, not whether it runs.
+
+### Compensation order comes from a column, not a timestamp
+
+`completed_steps()` ordered by `Job.created_at` and the coordinator reversed the result. But
+`TimestampMixin.created_at` is `func.now()` = `transaction_timestamp()`, and every step of a saga
+is inserted by one `POST /sagas` request — so all steps share one timestamp, the `ORDER BY` is a
+total tie, and "most recent success rolls back first" was whatever order the planner happened to
+return. The non-goal below about there being no reverse-order *execution* guarantee was about
+dispatch; this was weaker than that, because even the *enqueue* order was arbitrary.
+
+A timestamp that cannot distinguish the rows cannot be repaired into a sequence, so the order is
+now written at creation: `jobs.saga_step_index`, 0-based, stamped by `SagaService.create_saga`
+(Alembic `d1f6a2b940c7`, which backfills existing sagas from `(created_at, id)` — stable, but no
+more meaningful than the tie it froze). `.compensate` rows deliberately carry no index: they are
+ordered by the steps they undo.
+
+Both queries that return saga steps — `completed_steps()` (the rollback order) and `jobs()` (what
+the API returns as a saga's `steps`, and what the detail view renders) — share one ordering
+expression, `_STEP_ORDER`, precisely so they cannot disagree: index first, `NULLS LAST` so
+compensation rows sit below the steps they undo, then `(created_at, id)` for rows with no index.
+
+**Determinism and declaration order are different requirements, and treating them as one is its own
+bug.** The first cut of this change gave `jobs()` a bare `(created_at, id)` sort, reasoning that any
+total order beats a tie. It does not: `id` is a random uuid4, so a tied `created_at` plus an `id`
+tiebreaker yields an order that is *stable and stably wrong* — every read agrees, and every read
+renders step 3 first. That is arguably worse than the accident it replaced, because it looks
+deliberate. It was caught by `test_create_saga_returns_chained_jobs`, which had asserted
+`steps[0].status == "pending"` since the saga endpoint shipped, and caught it *probabilistically*
+(the correct order is one of six), which is its own lesson about tie-dependent tests. Pagination is
+the case where determinism alone is genuinely the whole requirement — hence `(clock, id)` there and
+`_STEP_ORDER` here.
+
+The same root cause made OFFSET/LIMIT pagination over `created_at` non-deterministic — a row could
+appear on two pages or on none — so every paginated repository query now carries an `id`
+tiebreaker. Arbitrary, but total, which is all pagination needs.
+
 ## Non-goals
 
 - **In-flight steps are still not cancelled.** `_handle_failure` only cancels `WAITING`/`PENDING`
@@ -120,7 +186,17 @@ Registering a real compensation processor is what turns that into `COMPENSATED`.
 - one comp step still `PENDING` ⇒ saga stays `COMPENSATING`, no audit row;
 - a redelivered `job.dlq` for the *original* step at `COMPENSATING` creates no rows and emits
   nothing;
-- `cancelled_downstream` equals the real cancellation count (1 with one waiting step, 0 with none).
+- `cancelled_downstream` equals the real cancellation count (1 with one waiting step, 0 with none);
+- a dead-letter with **no completed steps** settles the saga `COMPENSATED` on the same tick, with
+  both audit rows (`saga.compensating` then `saga.compensated`, `compensation_steps: 0`) and no
+  compensation rows minted — and still cancels the downstream `WAITING` steps.
+
+`backend/tests/unit/test_ordering_determinism.py` covers the ordering half: `completed_steps()`
+returns declaration order for steps written back-to-front under one shared `created_at`, `jobs()`
+returns declaration order with `.compensate` rows last for a saga whose ids descend as its step
+indices ascend (the stable-but-wrong case above, pinned deterministically), `SagaService` stamps
+`saga_step_index` 0..N-1 in declaration order, and `list_jobs` paginates an entirely tied set with
+every row appearing exactly once.
 
 There is no saga E2E in the integration tier, so these coordinator unit tests are the only
 automated proof. `backend/tests/unit/test_dispatcher.py::test_run_job_dead_letters_compensation_when_no_processor`
@@ -128,7 +204,7 @@ covers the other half of the loop: the `job.dlq` outbox row that triggers settle
 
 ## Pointers
 
-- `backend/app/workers/saga_coordinator.py` — routing, `_handle_failure`, `_handle_compensation_settlement`
+- `backend/app/workers/saga_coordinator.py` — routing, `_handle_failure`, `_settle_if_drained`
 - `backend/app/workers/dispatcher.py` — `_run_job` job lookup and the unregistered-type DEAD_LETTER branch
 - `backend/app/repositories/saga.py` — `jobs()` / `completed_steps()` / `waiting_steps()`
 - `backend/app/services/saga.py` — saga creation and the stated compensation policy

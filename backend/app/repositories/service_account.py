@@ -35,7 +35,7 @@ class ServiceAccountRepository(BaseRepository[ServiceAccount]):
         result = await self.session.execute(
             select(ServiceAccount)
             .where(ServiceAccount.tenant_id == tenant_id)
-            .order_by(ServiceAccount.created_at.desc())
+            .order_by(ServiceAccount.created_at.desc(), ServiceAccount.id.desc())
             .offset(offset)
             .limit(limit)
         )
@@ -59,6 +59,9 @@ class ServiceAccountTokenRepository(BaseRepository[ServiceAccountToken]):
         result = await self.session.execute(
             select(ServiceAccountToken)
             .where(ServiceAccountToken.service_account_id == service_account_id)
-            .order_by(ServiceAccountToken.created_at.desc())
+            .order_by(
+                ServiceAccountToken.created_at.desc(),
+                ServiceAccountToken.id.desc(),
+            )
         )
         return list(result.scalars().all())

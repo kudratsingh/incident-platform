@@ -47,6 +47,7 @@ class JobService:
         max_retries: int = 3,
         dependencies: list[uuid.UUID] | None = None,
         saga_id: uuid.UUID | None = None,
+        saga_step_index: int | None = None,
     ) -> Job:
         # Idempotency: return the existing job if this key was already used
         # in this tenant. (Different tenants can reuse the same key.)
@@ -132,6 +133,7 @@ class JobService:
                     max_retries=max_retries,
                     trace_id=trace_id_var.get("") or None,
                     saga_id=saga_id,
+                    saga_step_index=saga_step_index,
                 )
         except IntegrityError:
             if idempotency_key is None:

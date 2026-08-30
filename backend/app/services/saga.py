@@ -62,7 +62,12 @@ class SagaService:
         )
 
         prev_id: uuid.UUID | None = None
-        for step in steps:
+        # `saga_step_index` is the saga's declaration order written down.
+        # It cannot be recovered later: every step below is inserted in one
+        # transaction, so they all share a `created_at` and the ordering the
+        # rollback needs would be a total tie (WO-R2-58). This loop is the
+        # only writer.
+        for index, step in enumerate(steps):
             job = await self.job_service.create_job(
                 user_id=user_id,
                 tenant_id=tenant_id,
@@ -71,6 +76,7 @@ class SagaService:
                 priority=step.priority,
                 dependencies=[prev_id] if prev_id else None,
                 saga_id=saga.id,
+                saga_step_index=index,
             )
             prev_id = job.id
 
