@@ -49,6 +49,8 @@ class UserRepository(BaseRepository[User]):
         else:
             total = await self._count()
         result = await self.session.execute(
-            base.order_by(User.created_at.desc()).offset(offset).limit(limit)
+            base.order_by(User.created_at.desc(), User.id.desc())
+            .offset(offset)
+            .limit(limit)
         )
         return list(result.scalars().all()), total

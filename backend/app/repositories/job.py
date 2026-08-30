@@ -145,6 +145,14 @@ class JobRepository(BaseRepository[Job]):
         where = and_(*filters)
         total = await self._count(where)
 
+        # `id` is the tiebreaker, and it is not cosmetic (WO-R2-58).
+        # `created_at` is `transaction_timestamp()`, so every job a request
+        # writes shares one value; OFFSET/LIMIT over a non-unique ORDER BY
+        # lets the server return a row on two pages and another on none.
+        # A uuid tiebreaker is arbitrary but *total*, which is all
+        # pagination needs. Same shape on every paginated query in this
+        # package — and it applies to whichever clock `sort` selected, since
+        # `completed_at` ties for exactly the same reason `created_at` does.
         sort_key = (
             func.coalesce(Job.completed_at, Job.created_at)
             if sort is JobSort.DEAD_LETTERED_AT
@@ -153,7 +161,7 @@ class JobRepository(BaseRepository[Job]):
         stmt = (
             select(Job)
             .where(where)
-            .order_by(sort_key.desc())
+            .order_by(sort_key.desc(), Job.id.desc())
             .offset(offset)
             .limit(limit)
         )

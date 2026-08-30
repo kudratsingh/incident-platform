@@ -100,6 +100,18 @@ class Job(TimestampMixin, Base):
         nullable=True,
         index=True,
     )
+    # Position of this step in its saga's declaration order, 0-based, written
+    # once at creation (WO-R2-58). It exists because `created_at` cannot carry
+    # this: `func.now()` is Postgres `transaction_timestamp()`, so every step
+    # of a saga — all inserted by one request — shares an identical value and
+    # `ORDER BY created_at` over them is a total tie. Compensation rolls back
+    # in reverse of this column, and "undo the most recent success first" is a
+    # correctness property, not a display preference.
+    #
+    # NULL for everything that is not a declared step: ordinary jobs, and the
+    # `.compensate` rows the coordinator mints (they are ordered by the steps
+    # they undo, not by a position of their own).
+    saga_step_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     user: Mapped["User"] = relationship("User", back_populates="jobs", lazy="noload")
     saga: Mapped["Saga | None"] = relationship(

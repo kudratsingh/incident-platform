@@ -122,7 +122,7 @@ class AuditRepository(BaseRepository[AuditLog]):
 
         stmt = (
             select(AuditLog)
-            .order_by(AuditLog.created_at.desc())
+            .order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
             .offset(offset)
             .limit(limit)
         )

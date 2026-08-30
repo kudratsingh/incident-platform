@@ -8,6 +8,27 @@ from app.models.saga import Saga
 from app.repositories.base import BaseRepository
 from sqlalchemy import select
 
+# The order a saga's steps are meant to be read in: the declaration order
+# recorded at creation, then — for rows that carry no index — the stable
+# `(created_at, id)` fallback.
+#
+# One expression, used by every query that returns saga steps, because the
+# two of them disagreeing is precisely the bug this constant exists to
+# prevent. `saga_step_index` must lead: `created_at` is
+# `transaction_timestamp()`, so the steps of one saga are a total tie under
+# it, and appending a uuid tiebreaker to a tie does not produce declaration
+# order — it produces a *stable random* order, which for a rendered step
+# list is worse than the accident it replaced.
+#
+# NULLS LAST is what keeps the `.compensate` rows (index NULL by design)
+# below the steps they undo, and it is also the correct place for a legacy
+# saga's unindexed rows.
+_STEP_ORDER = (
+    Job.saga_step_index.asc().nulls_last(),
+    Job.created_at.asc(),
+    Job.id.asc(),
+)
+
 
 class SagaRepository(BaseRepository[Saga]):
     model = Saga
@@ -37,20 +58,31 @@ class SagaRepository(BaseRepository[Saga]):
         return result.scalar_one_or_none()
 
     async def jobs(self, saga_id: uuid.UUID) -> list[Job]:
-        """All jobs belonging to a saga, in creation order."""
-        stmt = (
-            select(Job)
-            .where(Job.saga_id == saga_id)
-            .order_by(Job.created_at.asc())
-        )
+        """All jobs belonging to a saga, in declaration order.
+
+        This is the list the API returns as a saga's `steps` and the detail
+        view renders, so the order is part of the contract: step 1 first.
+        `_STEP_ORDER` is what makes that true — see the note there for why a
+        bare `(created_at, id)` sort does not.
+        """
+        stmt = select(Job).where(Job.saga_id == saga_id).order_by(*_STEP_ORDER)
         result = await self.session.execute(stmt)
         return list(result.scalars().all())
 
     async def completed_steps(self, saga_id: uuid.UUID) -> list[Job]:
+        """Completed steps of a saga in declaration order.
+
+        The compensation order is this list reversed, so the ordering is
+        load-bearing: it is what makes "undo the most recent success first"
+        true rather than merely likely. `saga_step_index` is the recorded
+        declaration order (WO-R2-58); `(created_at, id)` is the fallback for
+        rows written before that column existed — arbitrary between tied
+        steps, as it always was, but at least stable across reads.
+        """
         stmt = (
             select(Job)
             .where(Job.saga_id == saga_id, Job.status == JobStatus.COMPLETED)
-            .order_by(Job.created_at.asc())
+            .order_by(*_STEP_ORDER)
         )
         result = await self.session.execute(stmt)
         return list(result.scalars().all())
@@ -94,7 +126,9 @@ class SagaRepository(BaseRepository[Saga]):
             count_stmt = count_stmt.where(Saga.id.in_(sub))
 
         result = await self.session.execute(
-            base.order_by(Saga.created_at.desc()).offset(offset).limit(limit)
+            base.order_by(Saga.created_at.desc(), Saga.id.desc())
+            .offset(offset)
+            .limit(limit)
         )
         total_result = await self.session.execute(count_stmt)
         return list(result.scalars().all()), int(total_result.scalar_one())
