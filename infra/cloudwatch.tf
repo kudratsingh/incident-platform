@@ -201,3 +201,59 @@ resource "aws_cloudwatch_metric_alarm" "slo_dispatch_latency_fast_burn" {
   alarm_actions = [aws_sns_topic.alarms.arn]
   ok_actions    = [aws_sns_topic.alarms.arn]
 }
+
+# ── Alarm 8: Outbox relay stalled ────────────────────────────────────────────
+# The relay leader emits OutboxOldestUnpublishedAgeSeconds every ~60s. Age,
+# not depth, is the stall signal: a busy system can hold hundreds of rows for
+# a second each and be perfectly healthy, while a stalled one can hold three
+# rows forever.
+#
+# This alarm exists because nothing else can see this failure. QueueDepth
+# measures the Redis delayed set — it is untouched by the outbox and reads
+# green through a total delivery stall. Every lifecycle event (SSE, audit,
+# read model, sagas, triage) rides the outbox, so a stall is invisible to
+# users right up until nothing in the product updates.
+#
+# 300s is ~300 relay ticks. Anything that old is stuck, not slow.
+
+resource "aws_cloudwatch_metric_alarm" "outbox_relay_stalled" {
+  alarm_name          = "${var.app_name}-outbox-relay-stalled"
+  alarm_description   = "Oldest unpublished outbox row is over 5 minutes old — the relay is not draining. Runbook: rb-outbox-relay-stalled (/admin/runbooks/rb-outbox-relay-stalled). No lifecycle events are reaching Kafka."
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 3
+  metric_name         = "OutboxOldestUnpublishedAgeSeconds"
+  namespace           = "IncidentPlatform"
+  period              = 60
+  statistic           = "Maximum"
+  threshold           = 300
+  treat_missing_data  = "notBreaching"
+
+  alarm_actions = [aws_sns_topic.alarms.arn]
+  ok_actions    = [aws_sns_topic.alarms.arn]
+}
+
+# ── Alarm 9: Outbox rows being dead-lettered ─────────────────────────────────
+# A dead-lettered row is an event that will never be delivered — a job whose
+# completion no consumer will ever see. The relay is healthy (this is the
+# mechanism working as designed), but the events are gone unless someone
+# requeues them, so it must not be silent.
+#
+# treat_missing_data = "notBreaching" because the counter is only emitted
+# when it happens; steady state is no datapoints at all. Threshold 0 over a
+# 5-minute Sum: any dead-letter at all is worth a look.
+
+resource "aws_cloudwatch_metric_alarm" "outbox_dead_lettered" {
+  alarm_name          = "${var.app_name}-outbox-dead-lettered"
+  alarm_description   = "The outbox relay abandoned one or more events. Runbook: rb-outbox-relay-stalled (/admin/runbooks/rb-outbox-relay-stalled), 'dead-lettered rows' section. These events will never reach Kafka unless requeued."
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "OutboxDeadLettered"
+  namespace           = "IncidentPlatform"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 0
+  treat_missing_data  = "notBreaching"
+
+  alarm_actions = [aws_sns_topic.alarms.arn]
+  ok_actions    = [aws_sns_topic.alarms.arn]
+}

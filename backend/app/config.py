@@ -90,6 +90,26 @@ class Settings(BaseSettings):
     # live job looks orphaned here and survives purely on this threshold.
     stale_running_threshold_seconds: int = 900
 
+    # How many failed publish attempts an outbox row gets before the relay
+    # dead-letters it (ADR 0001 Decision item 3 / its 2026 Q3 addendum).
+    # The relay ticks once a second and retries every unpublished row every
+    # tick, so `attempts` is really "seconds of continuous failure" — this
+    # default is ~15 minutes. That is deliberately generous: a broker outage
+    # fails every row in the batch, and quarantining an entire backlog for a
+    # blip would be worse than the head-of-line stall this cap exists to
+    # stop. Deterministic failures do not wait for the cap — a
+    # SchemaValidationError dead-letters on the first attempt — so this is
+    # the backstop for failures we cannot classify, not the primary path.
+    # The unpublished-age alarm fires long before this does.
+    outbox_max_attempts: int = 900
+
+    # Largest job payload we accept at submission, in bytes. The outbox event
+    # wrapping a payload must fit Kafka's default 1 MiB `message.max.bytes`,
+    # and a record the broker refuses is refused identically forever — a
+    # poison row an ordinary user could otherwise create at will. 256 KiB
+    # leaves ample room for the envelope fields around the payload.
+    max_job_payload_bytes: int = 256 * 1024
+
     # Kafka / Redpanda
     kafka_bootstrap_servers: str = "localhost:9092"
     kafka_topic_job_submitted: str = "job.submitted"

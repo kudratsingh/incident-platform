@@ -128,7 +128,7 @@ The discipline:
 3. **Never remove a required field.** Producers writing the field still work; consumers reading it after a producer drops it get a `KeyError` or `None`. Add new fields freely; deprecate but keep writing old ones until all consumers stop reading.
 4. **Required vs optional matters.** A consumer reading an optional field with `value.get("x")` is unaffected by absence; `value["x"]` raises. Be deliberate.
 
-Producer-side validation in `publish_raw` catches schema violations *before* they hit the broker, so a bad payload in a new producer fails loudly in the outbox row (`error_message=`) rather than poisoning a topic.
+Producer-side validation in `publish_raw` catches schema violations *before* they hit the broker, so a bad payload in a new producer fails loudly in the outbox row (`error_message=`) rather than poisoning a topic. The relay dead-letters that row on its first attempt rather than retrying it — a schema violation is deterministic, so the second attempt would fail identically. Non-schema failures (a broker outage, an oversize record) retry until `outbox_max_attempts`. Either way the row leaves the queue instead of blocking it; `SELECT ... WHERE failed_at IS NOT NULL` lists what was abandoned and why, and the `outbox-dead-lettered` alarm fires when it happens.
 
 ---
 

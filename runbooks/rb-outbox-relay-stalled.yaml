@@ -1,0 +1,78 @@
+id: rb-outbox-relay-stalled
+title: Outbox relay stalled or dead-lettering events
+severity: critical
+alarm: incident-platform-outbox-relay-stalled
+
+summary: |
+  The oldest unpublished row in outbox_events is more than five minutes old,
+  or the relay has abandoned rows it could not publish.
+
+  Every job lifecycle event reaches Kafka through this one loop: SSE
+  streaming, the audit writer, the event log, the CQRS read model, the saga
+  coordinator and LLM triage all consume what it publishes. While it is
+  stalled the API and the database look completely healthy — jobs run, rows
+  update — and nothing in the product moves. QueueDepth will read normal
+  throughout; it measures the Redis delayed set, not this queue.
+
+symptoms:
+  - "OutboxOldestUnpublishedAgeSeconds climbing without falling back"
+  - "OutboxUnpublishedDepth flat or rising while jobs are still being submitted"
+  - "SSE clients connected but receiving no events; job status frozen in the UI"
+  - "job_events / audit rows stop appearing while the jobs table keeps changing"
+  - "QueueDepth, ConsumerLag and InFlightJobs all normal — this alarm is the only one firing"
+
+diagnosis_steps:
+  - id: is-anything-leader
+    description: >
+      The relay is leader-gated on a Postgres advisory lock (ADR 0020). If no
+      replica holds it, no replica is relaying. Check for the lock holder.
+    command: "SELECT pid, granted FROM pg_locks WHERE locktype = 'advisory';"
+  - id: queue-shape
+    description: "How deep, how old, and how much of it is stuck at the attempt cap?"
+    command: "SELECT count(*), min(created_at), max(attempts) FROM outbox_events WHERE published_at IS NULL;"
+  - id: dead-letters
+    description: >
+      The dead-letter queue and why each row was abandoned. This is the
+      question the OutboxDeadLettered alarm is asking you to answer.
+    command: "SELECT id, topic, attempts, error_message, failed_at FROM outbox_events WHERE failed_at IS NOT NULL ORDER BY failed_at DESC LIMIT 50;"
+  - id: broker-reachable
+    description: >
+      A dead broker fails every row in the batch, not one. If error_message is
+      the same connection error across many rows, this is an outage, not a
+      poison payload.
+    command: "CloudWatch metric IncidentPlatform/ConsumerLag; check Redpanda/MSK health"
+  - id: relay-logs
+    description: "The relay names every abandoned row and its reason."
+    command: "Filter worker logs for 'outbox row dead-lettered' and 'outbox publish failed'"
+
+mitigation:
+  - "No leader: confirm at least one worker replica is running. The gate is
+    take-it-or-skip, so leadership returns on its own within one tick once a
+    replica is up."
+  - "Broker outage: fix the broker. The relay self-heals — it retries every
+    row every tick and restarts the producer once the broker answers."
+  - "Poison row (error_message is a schema violation or an oversize record):
+    it has already been dead-lettered and is out of the way. Nothing to do
+    operationally; file the bug against the producer of that payload."
+  - "Backlog dead-lettered by mistake — a broker outage that outlasted
+    outbox_max_attempts (default 900 ticks, ~15 min): the rows and payloads
+    are intact. Requeue once the broker is healthy:
+    UPDATE outbox_events SET published_at = NULL, failed_at = NULL,
+    error_message = NULL, attempts = 0
+    WHERE failed_at IS NOT NULL AND failed_at > now() - interval '1 hour';
+    Consumers are idempotent, so a duplicate republish is safe."
+  - "Raise outbox_max_attempts if your broker's realistic worst-case outage
+    exceeds the default window. It is a plain setting; the cap is a backstop,
+    not the primary poison-row path."
+
+escalation:
+  - "If the age metric keeps climbing after the broker is confirmed healthy
+    and a leader is confirmed present, page the platform on-call — the relay
+    itself is wedged and the worker process needs a restart."
+  - "If dead-lettered rows include job.completed or job.dlq events, the read
+    model and saga coordinator are now out of sync with the jobs table for
+    those ids; escalate before requeueing so someone can assess the blast
+    radius."
+
+related_dashboards:
+  - "IncidentPlatform → OutboxOldestUnpublishedAgeSeconds, OutboxUnpublishedDepth, OutboxDeadLettered"
