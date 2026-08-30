@@ -24,7 +24,11 @@ Env vars (all optional):
     SA_NAME          default: incident-commander
     SA_TENANT_SLUG   default: default
     SA_SCOPES        comma-separated (default: telemetry:read,incidents:read)
-    SA_TTL_DAYS      token time-to-live (default: platform default, 90)
+    SA_TTL_DAYS      token time-to-live in days, 1-365 (same bound as the
+                     API's own mint endpoint). Unset for the platform
+                     default (90). 0, a negative, or a non-number exits
+                     non-zero without minting — 0 used to be read as
+                     "unset" and quietly mint the 90-day default.
     SA_REPLACE_SCOPES  set to 1 to REPLACE an existing account's scopes
                      with SA_SCOPES verbatim instead of merging (see
                      `_ensure_service_account`). Off by default.
@@ -42,9 +46,12 @@ import os
 import sys
 from datetime import timedelta
 
-# Allow running from project root without installing the package.
+# Allow running from project root without installing the package, and
+# put this script's own dir on the path so `eval_safety` resolves.
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "backend"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import eval_safety  # type: ignore[import-not-found]  # noqa: E402
 from app.core.scopes import Scope, validate_scopes  # noqa: E402
 from app.models.tenant import Tenant  # noqa: E402
 from app.repositories.audit import AuditRepository  # noqa: E402
@@ -173,6 +180,55 @@ async def _ensure_service_account(
     return sa, True
 
 
+_TTL_MIN_DAYS = 1
+_TTL_MAX_DAYS = 365
+
+
+def _parse_ttl_days(raw: str | None) -> int | None:
+    """`SA_TTL_DAYS` -> an int in [1, 365], or `None` when unset.
+
+    Unset means "platform default" (90 days). Everything else must be a
+    number in the same range the API's own `MintTokenRequest.ttl_days`
+    accepts (`ge=1, le=365`) — a script that mints the identical
+    credential should not accept values the endpoint rejects.
+
+    The value this exists for is `0`. `int(env) if env else None`
+    parsed it to `0`, and `timedelta(days=ttl) if ttl else None` then
+    read that `0` as falsy and minted the **90-day default** — an
+    operator who asked for the shortest possible lifetime got the
+    longest one, silently, with the plaintext token printed as if
+    nothing had happened (WO-R2-19). Negatives were worse in a quieter
+    way: `-5` is truthy, so it minted a token that was already expired.
+
+    Raises `ValueError` with an actionable message; `main()` turns that
+    into stderr + a non-zero exit rather than a traceback."""
+    if raw is None or not raw.strip():
+        return None
+    text = raw.strip()
+    try:
+        days = int(text)
+    except ValueError:
+        raise ValueError(
+            f"SA_TTL_DAYS must be a whole number of days, got {text!r}. "
+            f"Valid range is {_TTL_MIN_DAYS}-{_TTL_MAX_DAYS}; unset it for "
+            "the platform default (90)."
+        ) from None
+    if not (_TTL_MIN_DAYS <= days <= _TTL_MAX_DAYS):
+        detail = (
+            "a token with a zero-length lifetime cannot be used for "
+            "anything, and this used to be read as 'unset' and mint the "
+            "90-day default instead"
+            if days == 0
+            else "out of range"
+        )
+        raise ValueError(
+            f"SA_TTL_DAYS={days} is invalid ({detail}). Valid range is "
+            f"{_TTL_MIN_DAYS}-{_TTL_MAX_DAYS}; unset it for the platform "
+            "default (90). No token was minted."
+        )
+    return days
+
+
 async def _mint(
     session: AsyncSession,
     service_account,  # type: ignore[no-untyped-def]
@@ -183,7 +239,10 @@ async def _mint(
         ServiceAccountTokenRepository(session),
         AuditRepository(session),
     )
-    ttl = timedelta(days=ttl_days) if ttl_days else None
+    # `is not None`, not truthiness: `_parse_ttl_days` already rejects 0,
+    # but truthiness is what turned an explicit 0 into the 90-day default
+    # in the first place, and it should not be the spelling here either.
+    ttl = timedelta(days=ttl_days) if ttl_days is not None else None
     _, plaintext = await service.mint_token(
         service_account=service_account,
         scopes=None,  # inherit full account scope set
@@ -213,8 +272,44 @@ def _print_banner(name: str, scopes: list[str], created: bool, plaintext: str) -
 
 
 async def main() -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Seed the incident-commander service account and mint a "
+            "scoped bearer token. Refuses to run against "
+            "ENVIRONMENT=production or against any DATABASE_URL other "
+            "than the configured one."
+        )
+    )
+    parser.add_argument(
+        "--i-know-what-im-doing",
+        dest="allow_target_mismatch",
+        action="store_true",
+        help=(
+            "Mint against a DATABASE_URL that is not the configured one. "
+            "Does not override the production check."
+        ),
+    )
+    args = parser.parse_args()
+
     scopes = _parse_scopes(_SCOPES_ENV)
-    ttl_days = int(_TTL_DAYS_ENV) if _TTL_DAYS_ENV else None
+    # Validate before the gate's DB work and before anything is minted,
+    # so a bad TTL costs nothing and prints one line.
+    try:
+        ttl_days = _parse_ttl_days(_TTL_DAYS_ENV)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    # This script writes a live credential; gate it on the target the
+    # same way the destructive scripts are gated (WO-R2-19).
+    eval_safety.refuse_unsafe_target(
+        script="seed_incident_commander.py",
+        database_url=_DB_URL,
+        allow_target_mismatch=args.allow_target_mismatch,
+    )
+    print(eval_safety.describe_target(_DB_URL))
 
     engine = create_async_engine(_DB_URL, echo=False)
     factory = async_sessionmaker(engine, expire_on_commit=False)

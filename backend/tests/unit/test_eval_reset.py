@@ -974,3 +974,125 @@ async def test_clear_poisoned_job_cache_sweeps_the_live_read_namespace() -> None
     # The pattern must actually match the key builder's output — a
     # hand-typed pattern that matches nothing is the D-13 failure mode.
     assert fnmatch.fnmatch(poisoned, reset._JOB_CACHE_PATTERN)
+
+
+# ---------------------------------------------------------------------------
+# _purge_idempotency_records — WO-R2-18 finding 2
+# ---------------------------------------------------------------------------
+
+
+async def test_purge_idempotency_survives_two_tenants_holding_the_sa(
+    db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
+) -> None:
+    """`service_accounts.name` is unique *per tenant*, not globally.
+
+    The purge resolved it with `scalar_one_or_none()`, so a second
+    tenant that had also seeded an `incident-commander` account made the
+    whole reset raise `MultipleResultsFound` — and it raised from the
+    tail of `reset()`, where every destructive step had already
+    committed. The operator got a traceback, no summary, and a non-zero
+    exit describing a reset that had in fact already deleted rows. Two
+    tenants sharing one database is the normal shape of a dev stack, so
+    nothing unusual had to happen for this to fire (WO-R2-18).
+
+    Green-after: both commanders' records are purged, and an unrelated
+    principal's are not."""
+    import uuid as _uuid
+
+    from app.models.idempotency import IdempotencyRecord
+    from app.models.service_account import ServiceAccount
+    from app.models.tenant import Tenant
+
+    second_tenant = Tenant(
+        id=_uuid.uuid4(), name="Second Tenant", slug="second-tenant"
+    )
+    db_session.add(second_tenant)
+    await db_session.flush()
+
+    accounts = {
+        "commander_a": ServiceAccount(
+            id=_uuid.uuid4(),
+            tenant_id=default_tenant.id,
+            name="incident-commander",
+            scopes=["telemetry:read"],
+        ),
+        # Same name, different tenant — legal, and what used to break it.
+        "commander_b": ServiceAccount(
+            id=_uuid.uuid4(),
+            tenant_id=second_tenant.id,
+            name="incident-commander",
+            scopes=["telemetry:read"],
+        ),
+        "other": ServiceAccount(
+            id=_uuid.uuid4(),
+            tenant_id=default_tenant.id,
+            name="some-other-agent",
+            scopes=["telemetry:read"],
+        ),
+    }
+    db_session.add_all(list(accounts.values()))
+    await db_session.flush()
+
+    for key, sa in accounts.items():
+        db_session.add(
+            IdempotencyRecord(
+                id=_uuid.uuid4(),
+                tenant_id=sa.tenant_id,
+                principal_id=sa.id,
+                tool_name="replay_dlq_by_ids",
+                idempotency_key=f"{key}-1",
+                arguments_hash="deadbeef",
+                response_json={"ok": True},
+            )
+        )
+    await db_session.flush()
+    other_id = accounts["other"].id
+
+    reset = _reset_module()
+    purged = await reset._purge_idempotency_records(_factory(db_session))
+
+    # Both commanders, neither more nor fewer — and no exception.
+    assert purged == 2
+    remaining = (
+        (await db_session.execute(select(IdempotencyRecord.principal_id)))
+        .scalars()
+        .all()
+    )
+    assert list(remaining) == [other_id]
+
+
+async def test_purge_idempotency_is_a_noop_with_no_commander(
+    db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
+) -> None:
+    """The zero-match path still returns 0 rather than tripping over an
+    empty IN list."""
+    reset = _reset_module()
+    assert await reset._purge_idempotency_records(_factory(db_session)) == 0
+
+
+def test_idempotency_purge_precedes_the_destructive_steps() -> None:
+    """Ordering, asserted on the source rather than by running a reset.
+
+    The purge can still fail for reasons this module does not control (a
+    lock, a dropped connection). What must never recur is a failure
+    there landing *after* the deletes have committed, leaving an
+    operator with a traceback and no record of what was destroyed. So it
+    runs first: nothing in the reset creates idempotency records, which
+    makes the ordering free."""
+    reset = _reset_module()
+    body = inspect.getsource(reset.reset)
+    purge_at = body.index("_purge_idempotency_records(factory)")
+    for destructive in (
+        "_clear_chaos_keys(redis)",
+        # Added by #162 (WO-R2-20). Listed here so the guard keeps pace
+        # with the steps it guards: a new destructive step that lands
+        # after the purge is exactly what this test exists to catch.
+        "_clear_job_read_cache(redis)",
+        "_delete_chaos_owner_users(factory)",
+        "_delete_seeded_dlq_fixtures(factory)",
+        "_sweep_nonfixture_dlq(factory)",
+    ):
+        assert purge_at < body.index(destructive), (
+            f"{destructive} must not commit before the idempotency purge "
+            "has had its chance to fail"
+        )
