@@ -127,13 +127,17 @@ def _expired_stream_token(job_id: uuid.UUID, tenant_id: uuid.UUID) -> str:
     return jwt.encode(payload, settings.secret_key, algorithm=settings.algorithm)
 
 
-async def _empty_subscribe(*args: object) -> AsyncGenerator[ProgressEvent, None]:
+async def _empty_subscribe(
+    *args: object, **kwargs: object
+) -> AsyncGenerator[ProgressEvent, None]:
     """Stand-in for progress.subscribe — yields nothing and ends the stream."""
     return
     yield  # pragma: no cover — unreachable; makes this an async generator
 
 
-async def _never_ending_subscribe(*args: object) -> AsyncGenerator[ProgressEvent, None]:
+async def _never_ending_subscribe(
+    *args: object, **kwargs: object
+) -> AsyncGenerator[ProgressEvent, None]:
     """Stand-in for a live-but-silent channel: yields nothing, never returns.
 
     This is what the endpoint used to do to a late subscriber. The E1-10 tests
@@ -459,6 +463,160 @@ async def test_retained_snapshot_takes_precedence_over_the_row(
 
     # subscribe() (stubbed empty here) was used — no synthetic event was emitted.
     assert _sse_events(resp.text) == []
+
+
+# ---------------------------------------------------------------------------
+# ...and the case where the snapshot and the row DISAGREE (WO-R2-57)
+#
+# The test above only covers a snapshot that agrees with the row — both
+# terminal-completed — so it cannot see the failure the reconciliation exists
+# to prevent: a terminal snapshot retained in front of a row that is not
+# terminal. A DLQ replay produces exactly that (the job reaches dead_letter,
+# the snapshot records it, an operator replays the job, and the replay's
+# `running` events are deliberately refused by the snapshot's ordering guard),
+# and handing that snapshot to a viewer closes the stream on its first event
+# for a job that is running right now.
+#
+# The tie-break is recency, not "the row always wins": the same disagreement
+# is produced by an ordinary race, where a job finishes microseconds after
+# this request read its row, and there the snapshot is the truthful half.
+# ---------------------------------------------------------------------------
+
+
+def _subscribe_recorder(calls: list[dict[str, object]]):  # type: ignore[no-untyped-def]
+    async def _subscribe(
+        job_id: str, **kwargs: object
+    ) -> AsyncGenerator[ProgressEvent, None]:
+        calls.append(kwargs)
+        return
+        yield  # pragma: no cover — unreachable; makes this an async generator
+
+    return _subscribe
+
+
+def _snapshot_returning(event: ProgressEvent):  # type: ignore[no-untyped-def]
+    async def _read(*args: object) -> ProgressEvent:
+        return event
+
+    return _read
+
+
+async def test_stale_terminal_snapshot_does_not_close_a_running_job_stream(
+    client: AsyncClient,
+    db_session,  # type: ignore[no-untyped-def]
+    test_user: User,
+) -> None:
+    """Row says running and was written after the snapshot said dead_letter.
+
+    Before WO-R2-57 the snapshot was passed straight through, so the viewer of
+    a replayed job got one `dead_letter` event and a closed stream.
+    """
+    job = await _finished_job(
+        db_session,
+        test_user,
+        JobStatus.RUNNING,
+        updated_at=datetime.now(UTC),
+    )
+    token = create_stream_token(job.id, job.tenant_id)
+    stale = ProgressEvent(
+        job_id=str(job.id),
+        status="dead_letter",
+        progress=0,
+        message="from a lifecycle this job has left",
+        timestamp=(datetime.now(UTC) - timedelta(minutes=5)).isoformat(),
+    )
+    calls: list[dict[str, object]] = []
+
+    with (
+        mock.patch("app.api.streaming.read_last_event", _snapshot_returning(stale)),
+        mock.patch("app.api.streaming.subscribe", _subscribe_recorder(calls)),
+    ):
+        resp = await asyncio.wait_for(
+            client.get(f"/api/v1/jobs/{job.id}/stream", params={"token": token}),
+            timeout=5,
+        )
+
+    assert resp.status_code == 200
+    # The stale snapshot is not delivered: the stream stays open for the live
+    # events of the run that is actually happening.
+    assert calls == [{"use_snapshot": False}]
+    assert _sse_events(resp.text) == []
+
+
+async def test_snapshot_newer_than_the_row_is_still_believed(
+    client: AsyncClient,
+    db_session,  # type: ignore[no-untyped-def]
+    test_user: User,
+) -> None:
+    """The ordinary race: the job finished just after this request read its row.
+
+    Distrusting every terminal-snapshot-on-a-running-row would turn this into
+    a stream that waits out the broker's idle timeout for events that have
+    already been published.
+    """
+    job = await _finished_job(
+        db_session,
+        test_user,
+        JobStatus.RUNNING,
+        updated_at=datetime.now(UTC) - timedelta(minutes=5),
+    )
+    token = create_stream_token(job.id, job.tenant_id)
+    fresh = ProgressEvent(
+        job_id=str(job.id),
+        status="completed",
+        progress=100,
+        message="finished a moment ago",
+        timestamp=datetime.now(UTC).isoformat(),
+    )
+    calls: list[dict[str, object]] = []
+
+    with (
+        mock.patch("app.api.streaming.read_last_event", _snapshot_returning(fresh)),
+        mock.patch("app.api.streaming.subscribe", _subscribe_recorder(calls)),
+    ):
+        resp = await asyncio.wait_for(
+            client.get(f"/api/v1/jobs/{job.id}/stream", params={"token": token}),
+            timeout=5,
+        )
+
+    assert resp.status_code == 200
+    assert calls == [{"use_snapshot": True}]
+
+
+async def test_non_terminal_snapshot_on_a_running_row_is_untouched(
+    client: AsyncClient,
+    db_session,  # type: ignore[no-untyped-def]
+    test_user: User,
+) -> None:
+    """Only a *terminal* snapshot can close a stream, so only that case is
+    reconciled — a `running` snapshot older than the row is just old news."""
+    job = await _finished_job(
+        db_session,
+        test_user,
+        JobStatus.RUNNING,
+        updated_at=datetime.now(UTC),
+    )
+    token = create_stream_token(job.id, job.tenant_id)
+    older = ProgressEvent(
+        job_id=str(job.id),
+        status="running",
+        progress=40,
+        message="halfway",
+        timestamp=(datetime.now(UTC) - timedelta(minutes=5)).isoformat(),
+    )
+    calls: list[dict[str, object]] = []
+
+    with (
+        mock.patch("app.api.streaming.read_last_event", _snapshot_returning(older)),
+        mock.patch("app.api.streaming.subscribe", _subscribe_recorder(calls)),
+    ):
+        resp = await asyncio.wait_for(
+            client.get(f"/api/v1/jobs/{job.id}/stream", params={"token": token}),
+            timeout=5,
+        )
+
+    assert resp.status_code == 200
+    assert calls == [{"use_snapshot": True}]
 
 
 # ---------------------------------------------------------------------------

@@ -178,7 +178,9 @@ class ProgressBroker:
 
     # -- the stream -------------------------------------------------------
 
-    async def subscribe(self, job_id: str) -> AsyncGenerator[ProgressEvent, None]:
+    async def subscribe(
+        self, job_id: str, *, use_snapshot: bool = True
+    ) -> AsyncGenerator[ProgressEvent, None]:
         """Yield this job's progress events until it ends, times out or closes.
 
         The first event is the retained snapshot (if any), read AFTER the
@@ -188,11 +190,18 @@ class ProgressBroker:
         on a progress bar), while read-then-subscribe leaves a gap in which an
         event published between the two is lost, which is the silent-hang this
         snapshot exists to prevent.
+
+        `use_snapshot=False` streams live events only. The endpoint passes it
+        when it has already compared the snapshot against the `jobs` row and
+        found the snapshot stale — a terminal snapshot in front of a job the
+        row says is running again (WO-R2-57). Yielding it there would close
+        the stream on the first event, which is the disagreement this flag
+        exists to resolve; the broker itself has no row to compare against.
         """
         queue: asyncio.Queue[_QueueItem] = asyncio.Queue(maxsize=QUEUE_MAXSIZE)
         await self._register(job_id, queue)
         try:
-            snapshot = await self._read_snapshot(job_id)
+            snapshot = await self._read_snapshot(job_id) if use_snapshot else None
             if snapshot is not None:
                 yield snapshot
                 if snapshot.status in TERMINAL_STATUSES:
@@ -415,6 +424,8 @@ def acquire_stream_slot() -> StreamSlot:
     return get_broker().acquire()
 
 
-def subscribe(job_id: str) -> AsyncGenerator[ProgressEvent, None]:
+def subscribe(
+    job_id: str, *, use_snapshot: bool = True
+) -> AsyncGenerator[ProgressEvent, None]:
     """Stream a job's progress events off the shared Pub/Sub connection."""
-    return get_broker().subscribe(job_id)
+    return get_broker().subscribe(job_id, use_snapshot=use_snapshot)

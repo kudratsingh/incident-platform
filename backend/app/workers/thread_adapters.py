@@ -10,6 +10,10 @@ calls it via loop.run_in_executor so the event loop can do other work while
 the thread is blocked.  Progress is reported between chunks — we can't publish
 from inside the thread itself (Redis client isn't thread-safe in async mode),
 so we chunk the work and publish from the async wrapper between chunks.
+
+"Between chunks" is where the work is offered to the publisher, not how often
+it reaches Kafka: the publisher is wrapped in `progress.rate_limited`, so the
+event count follows elapsed work rather than the caller's chunk_size.
 """
 
 import asyncio
@@ -17,7 +21,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
-from app.workers.progress import ProgressPublisher
+from app.workers.progress import ProgressPublisher, rate_limited
 
 # Module-level executor — reused across jobs, avoids repeated thread creation.
 # A small pool is intentional: CSV parsing is memory-heavy; too many parallel
@@ -65,6 +69,13 @@ async def process_csv_upload(
     row_count: int = max(0, min(int(payload.get("row_count", 500)), MAX_ROW_COUNT))
     chunk_size: int = max(1, min(int(payload.get("chunk_size", 100)), MAX_CHUNK_SIZE))
     total_chunks = max(1, (row_count + chunk_size - 1) // chunk_size)
+
+    # Chunking is an I/O decision; it must not also decide how many Kafka
+    # messages and immutable job_events rows this job writes. Unwrapped, that
+    # count *was* `total_chunks` — caller-chosen, up to a million for one
+    # upload (WO-R2-57). The floors leave the reporting a function of elapsed
+    # work: first update, last update, and ~one per whole percent between.
+    publish = rate_limited(publish)
 
     await publish(0, f"Parsing {row_count} rows in chunks of {chunk_size}")
 

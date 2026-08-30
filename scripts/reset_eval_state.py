@@ -48,6 +48,14 @@ What gets cleared/reset:
      service account. Off by default; the 24h TTL from [ADR 0010]
      handles the common case, but opt-in purge is useful when a
      scenario needs a guaranteed-fresh cache.
+  7. **CQRS read-model** — rebuilds `jobs:tenant:*` / `jobs:user:*`
+     from the `jobs` table (`read_model.rebuild_read_model`), last, so
+     it projects the rows as this reset finally leaves them. The
+     projection only moves when a Kafka event names a job, so anything
+     a scenario evicted out of it — `saturate_redis` is the tool that
+     does this on purpose — stayed missing from the admin overview for
+     every later scenario (WO-R2-56). This is the only reset step that
+     *recomputes* a surface rather than clearing one.
 
 ## Guardrails
 
@@ -253,6 +261,31 @@ async def _clear_dag_pauses(redis: aioredis.Redis) -> int:
 
     Returns the number of pause flags removed."""
     return await _scan_delete(redis, "dag:paused:*")
+
+
+async def _rebuild_read_model(session_factory: Any, redis: aioredis.Redis) -> int:
+    """Recompute the CQRS read-model keys from the `jobs` table.
+
+    The projection (`jobs:tenant:*` / `jobs:user:*`) is derived state that
+    only moves when a Kafka event names a job, so it has no way to heal
+    itself: whatever a scenario's `saturate_redis` evicted, or a Redis
+    restart dropped, stays missing from the admin overview for every
+    later scenario. Every other reset step above restores a surface the
+    scenarios read; before WO-R2-56 this one was simply left broken.
+
+    Runs last, so it projects the job rows as this reset finally leaves
+    them — after the DLQ fixtures are restored, the non-fixture DLQ is
+    swept to `cancelled`, and the chaos-owner users (and their jobs) are
+    deleted. Rebuilding earlier would faithfully project rows that the
+    steps below it were about to change.
+
+    Returns the number of keys written.
+    """
+    from app.workers.read_model import rebuild_read_model
+
+    async with session_factory() as session:
+        summary = await rebuild_read_model(session, redis)
+    return int(summary["keys"])
 
 
 async def _purge_idempotency_records(session_factory: Any) -> int:
@@ -643,6 +676,8 @@ async def reset(
         # removed outright rather than left as `cancelled` rows.
         seeded_dlq_deleted = await _delete_seeded_dlq_fixtures(factory)
         dlq_swept = await _sweep_nonfixture_dlq(factory)
+        # Last: projects the rows as every step above finally left them.
+        read_model_keys = await _rebuild_read_model(factory, redis)
     finally:
         await redis.aclose()
         await engine.dispose()
@@ -657,6 +692,7 @@ async def reset(
         "timestamps_rebaselined": seed_summary["timestamps_rebaselined"],
         "empty_dlq_baseline": _empty_dlq_baseline(),
         "job_cache_cleared": job_cache_cleared,
+        "read_model_keys_rebuilt": read_model_keys,
         "seeded_dlq_deleted": seeded_dlq_deleted,
         "idempotency_purged": idempotency_purged,
         "timers_cleared": timers_cleared,

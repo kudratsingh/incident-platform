@@ -250,6 +250,37 @@ async def test_saturate_redis_writes_expected_keys(
         teardown()
 
 
+async def test_saturate_redis_refuses_a_footprint_above_the_cap(
+    db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
+) -> None:
+    """Each dimension was bounded and their product was not, so the maxima
+    multiplied out to ~100 GB against the Redis every scenario shares — an OOM
+    rather than the memory pressure the tool is for (WO-R2-56). Both values
+    below are individually legal.
+    """
+    redis_stub = _RedisStub()
+    app, teardown = _mcp_app_with_chaos_enabled(db_session, redis_stub)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app, raise_app_exceptions=False),
+            base_url="http://test",
+        ) as ac:
+            token = await _token(
+                db_session, default_tenant.id, [Scope.CHAOS_INVOKE.value]
+            )
+            body = await _call(
+                ac,
+                token,
+                "saturate_redis",
+                {"num_keys": 100_000, "value_bytes": 1_048_576},
+            )
+        assert body["error"]["code"] == protocol.JSONRPC_INVALID_PARAMS
+        # Refused before writing: a partial 100 GB is still a dead Redis.
+        assert redis_stub._store == {}
+    finally:
+        teardown()
+
+
 # ---------------------------------------------------------------------------
 # inject_latency
 # ---------------------------------------------------------------------------

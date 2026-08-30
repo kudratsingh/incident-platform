@@ -38,6 +38,7 @@ a parked tab from holding a slot forever.
 
 import uuid
 from collections.abc import AsyncGenerator
+from datetime import UTC, datetime
 
 from app.core.exceptions import AuthenticationError, AuthorizationError
 from app.core.redis import get_redis
@@ -111,6 +112,50 @@ def _terminal_event_from_row(job: Job) -> ProgressEvent:
     )
 
 
+def _snapshot_is_stale(
+    snapshot: ProgressEvent | None,
+    *,
+    row_is_terminal: bool,
+    row_updated_at: datetime | None,
+) -> bool:
+    """True when the retained snapshot says 'finished' and the row disagrees.
+
+    A DLQ replay is the way this happens: the job reaches `dead_letter`, the
+    snapshot records it, and then an operator replays the job. The replay's
+    `running` events deliberately do not overwrite a terminal snapshot
+    (`workers/progress.py`), so for the snapshot's remaining TTL it describes
+    a lifecycle the job has already left — and because `subscribe()` ends on
+    the first terminal event, a viewer of a job that is running right now got
+    one `dead_letter` event and a closed stream.
+
+    The tie-break is recency, not a preference for the row: the row is only
+    believed if it was written *after* the snapshot. That matters for the
+    ordinary race where a job finishes microseconds after this request read
+    its row — there the snapshot is the newer of the two, it is honoured, and
+    the client is correctly told the job is done instead of waiting out the
+    broker's idle timeout for events that have already been published.
+
+    Anything unparseable leaves the snapshot in charge, which is the
+    pre-WO-R2-57 behaviour.
+    """
+    if snapshot is None or row_is_terminal or row_updated_at is None:
+        return False
+    if snapshot.status not in TERMINAL_STATUSES:
+        return False
+    try:
+        snapshot_at = datetime.fromisoformat(snapshot.timestamp)
+    except (TypeError, ValueError):
+        return False
+    if snapshot_at.tzinfo is None:
+        snapshot_at = snapshot_at.replace(tzinfo=UTC)
+    row_at = (
+        row_updated_at.replace(tzinfo=UTC)
+        if row_updated_at.tzinfo is None
+        else row_updated_at
+    )
+    return row_at > snapshot_at
+
+
 @router.get("/jobs/{job_id}/stream")
 async def stream_job_progress(
     job_id: uuid.UUID,
@@ -170,14 +215,29 @@ async def stream_job_progress(
     # process refuses cheaply instead of queueing against a finite pool.
     slot = acquire_stream_slot()
 
+    row_updated_at = job.updated_at if job is not None else None
+
     async def _event_stream() -> AsyncGenerator[dict[str, str], None]:
         try:
-            if finished_event is not None and await read_last_event(redis, str(job_id)) is None:
+            snapshot = await read_last_event(redis, str(job_id))
+            if finished_event is not None and snapshot is None:
                 # Job is over and Redis retained nothing to say so — the channel
                 # would stay silent forever. Report the row and close.
                 yield {"data": finished_event.to_json(), "event": finished_event.status}
                 return
-            async for event in subscribe(str(job_id)):
+            # The other disagreement: a terminal snapshot in front of a row
+            # that is not terminal, which is what a DLQ replay leaves behind
+            # (the snapshot's own guard refuses to let the replay's `running`
+            # events overwrite `dead_letter`). Handing that snapshot to the
+            # client closes the stream on its first event, for a job that is
+            # running right now. The row is durable state and it moved after
+            # the snapshot was written, so the row wins and we stream live.
+            stale = _snapshot_is_stale(
+                snapshot,
+                row_is_terminal=finished_event is not None,
+                row_updated_at=row_updated_at,
+            )
+            async for event in subscribe(str(job_id), use_snapshot=not stale):
                 yield {"data": event.to_json(), "event": event.status}
         finally:
             slot.release()
