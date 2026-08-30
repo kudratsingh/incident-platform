@@ -63,9 +63,11 @@ Migration `a7e3d9c41f28` (this change) plus a follow-up role split (phase 2, bel
    the password: it runs exactly once, on a phase-1 deploy that predates the Terraform
    secret — the sync also gives free rotation: change the secret, bounce the service); and
    `app/core/rls_check.assert_rls_posture`, a probe in both lifespans that detects an
-   RLS-inert connection (superuser, or owner without FORCE), logs ERROR always, and refuses
-   to serve only in production — local superuser stacks and the commander's pinned eval
-   stack must keep booting.
+   RLS-inert connection (superuser, RLS switched off, or owner without FORCE), logs ERROR
+   always, and refuses to serve only in production — local superuser stacks and the
+   commander's pinned eval stack must keep booting. *(2026-08-30, WO-R2-26: the middle
+   term and the policy check were added, and the probe widened from one table to all of
+   them — see the addendum below.)*
 
 ## Correcting ADR 0003's "FORCE breaks Alembic" claim
 
@@ -222,12 +224,65 @@ drops the role after revoking its grants. Each phase is individually revertible.
   still nulls `audit_logs.job_id` through the FK (referential actions run with the table
   owner's privileges); CREATE/ALTER TABLE as `incident_app` refused; `alembic_version`
   readable (boot checks); `assert_rls_posture` passes on a live `incident_app` engine and
-  raises on a superuser engine under production settings.
-- `backend/tests/unit/test_rls_check.py` — the probe's raise/log/no-op matrix on SQLite;
+  raises on a superuser engine under production settings, and (WO-R2-26) raises for a
+  single table with `DISABLE ROW LEVEL SECURITY` and for a dropped `tenant_isolation`
+  policy — both against the healthy non-owner role, which is the posture the old probe
+  could not fault.
+- `backend/tests/unit/test_rls_check.py` — the probe's raise/log/no-op matrix, now varying
+  ENABLE and the policy's presence as well as ownership/FORCE, with one bad table among the
+  healthy ones; `backend/tests/unit/test_rls_probe_coverage.py` — the probe and the
+  migration gate ask about the same ORM-derived table set;
   `backend/tests/unit/test_db_bootstrap.py` — no-op discipline and the injection-safe
   `set_config` + `format('%L', ...)` statement shape.
 - Alembic `upgrade head` → `downgrade -1` → `upgrade head` round-trip on Postgres 16 (runs
   inside the integration fixture, covering the role migration's downgrade).
+
+## Addendum — 2026-08-30 (WO-R2-26) — the probe checked FORCE but never ENABLE
+
+*The decision above is unchanged. What follows corrects the guardrail meant to enforce it,
+which was checking one of the three ways this boundary goes down, on one of eleven tables.*
+
+### Two blind spots, one cause
+
+The probe read `relforcerowsecurity` and never `relrowsecurity`, so its inert calculation
+was `su or (is_owner and not forced)`. Both non-superuser terms hang off ownership. For the
+**intended production role** — `incident_app`, deliberately not the owner — `is_owner` is
+always False, so the whole expression short-circuited to `su`, and for a non-superuser
+connection the probe reported "rls posture ok" unconditionally.
+
+That is the opposite of the useful case. The probe would have caught the original
+pre-a7e3d9c41f28 posture (owner, unforced) that motivated it, and then went blind precisely
+once the rollout reached the posture it was supposed to keep watching. A table with
+`ALTER TABLE ... DISABLE ROW LEVEL SECURITY` — RLS off entirely, every row visible to
+everyone — passed. So did a table whose `tenant_isolation` policy had been dropped, because
+nothing looked at `pg_policies` at all.
+
+It also probed only `jobs`, "as the representative", on the reasoning that every tenant
+table received FORCE in the same migration. That is a fact about the migration chain, and a
+runtime probe exists to catch a live database that no longer matches it. Drift is per-table
+by nature.
+
+### What it checks now
+
+Per tenant-scoped table: `relrowsecurity` (ENABLE), `relforcerowsecurity` (FORCE),
+ownership, and an `EXISTS` on `pg_policies` for `tenant_isolation`. Plus the connection's
+superuser bit once, reported on its own because it makes every per-table term moot. A table
+the ORM declares but the database does not answer for is also a failure — silence is not
+evidence of a healthy posture.
+
+The table list is **derived from the ORM**, not written down: every table with a `tenant_id`
+column, minus the single `users` exemption (ADR 0003 bootstrap). `tenant_scoped_tables()`
+in `app/core/rls_check.py` is now the one definition, shared with both RLS test tiers — the
+integration tier had its own hand-maintained copy of the eleven names, which is exactly the
+drift that produced F1-05, where five tables shipped after the original RLS migration with
+no policy. A new tenant-scoped table is probed the moment its model exists.
+
+### Unchanged
+
+Production-only hard failure, ERROR logging everywhere else, and the SQLite no-op. The
+message now names the offending tables and distinguishes a connection problem (use the
+non-owner role) from schema drift (re-apply the migration), because they need different
+fixes.
 
 ## Pointers
 
