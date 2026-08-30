@@ -1,4 +1,3 @@
-import asyncio
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from typing import Any
@@ -14,6 +13,7 @@ from app.core.redis import (
     get_redis_client,
 )
 from app.core.tracing import setup_tracing
+from app.workers import supervisor as worker_supervisor
 from app.workers.progress_broker import reset_broker
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -156,15 +156,23 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     redis = get_redis_client()
     session_factory = _session_factory
-    worker_task = asyncio.create_task(worker_loop(session_factory, redis))
+
+    # Supervised, not fire-and-forget. This one task hosts every consumer and
+    # every background loop — there is no separate worker deployable yet — so
+    # an unwatched `create_task` here means a process that answers HTTP while
+    # dispatching nothing, with `/api/v1/health` still green. The supervisor
+    # restarts it with capped backoff and publishes the liveness the deep
+    # health check below reads (`app/workers/supervisor.py`, ADR 0009).
+    worker_supervisor.start(lambda: worker_loop(session_factory, redis))
 
     yield
 
-    worker_task.cancel()
-    try:
-        await worker_task
-    except asyncio.CancelledError:
-        pass
+    # `stop()` cancels the worker, waits for its in-flight drain, and never
+    # raises. It has to never raise: the previous `await worker_task` re-raised
+    # whatever the worker had stored, which aborted the lifespan right here and
+    # left the Kafka producer and both Redis pools open on every shutdown that
+    # followed a worker crash.
+    await worker_supervisor.stop()
 
     try:
         await stop_producer()
@@ -172,7 +180,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         logger.error("kafka producer failed to stop", extra={"error": str(exc)})
 
     # Last flush before the loop closes, so the final window is not discarded.
-    await metrics.stop_metrics_emitter()
+    # Guarded for the same reason as the worker await: everything below it —
+    # the broker reset and both pool closes — depends on getting past here.
+    try:
+        await metrics.stop_metrics_emitter()
+    except Exception as exc:
+        logger.error("metrics emitter failed to stop", extra={"error": str(exc)})
 
     # Both pools: the shared one every request path uses, and the dedicated
     # SSE pool the progress broker holds its one Pub/Sub connection on.
@@ -292,8 +305,28 @@ def create_app() -> FastAPI:
     async def health() -> JSONResponse:
         """Deep health check used by ECS and load balancers.
 
-        Verifies DB and Redis connectivity. Returns 200 if all healthy,
-        503 if any dependency is down.
+        Verifies DB connectivity, Redis connectivity **and worker liveness**.
+        Returns 200 if all three are healthy, 503 otherwise.
+
+        The worker check changes what a green answer here means. It used to
+        mean "this process can reach its dependencies"; it now means "…and it
+        is processing jobs". That distinction was the whole failure: the
+        worker task runs inside this process (there is no separate worker
+        deployable), so a worker that died at boot left every probe green
+        while the backlog built with nothing draining it — and `ConsumerLag`,
+        the metric both backlog alarms read, is emitted by a loop inside the
+        dead worker and is deliberately not emitted when lag is unknown. A
+        dead worker makes it go *absent*, and both alarms read missing data as
+        `notBreaching`.
+
+        Both probes that consume this endpoint act on it: the ECS container
+        check (`infra/ecs.tf`) and the ALB target group (`infra/alb.tf`), each
+        30s apart with a 3-failure threshold. A worker that recovers does so
+        well inside that window (the restart ladder caps at 30s); one that
+        cannot gets the task recycled, which is the correct outcome.
+
+        The worker probe is in-process and I/O-free, so it adds nothing to the
+        endpoint's latency.
         """
         from app.core.redis import get_redis_client
         from app.dependencies import _engine
@@ -315,10 +348,21 @@ def create_app() -> FastAPI:
         except Exception:
             checks["redis"] = "error"
 
+        worker = worker_supervisor.worker_status()
+        checks["worker"] = "ok" if worker.healthy else "error"
+
         healthy = all(v == "ok" for v in checks.values())
         return JSONResponse(
             status_code=200 if healthy else 503,
-            content={"status": "ok" if healthy else "degraded", **checks},
+            content={
+                "status": "ok" if healthy else "degraded",
+                **checks,
+                # State, restart count and the last error, so the operator who
+                # curls this during an incident learns whether the worker is
+                # dead, flapping or merely slow to heartbeat — without it,
+                # `"worker": "error"` sends them to the logs for the next step.
+                "worker_detail": worker.detail,
+            },
         )
 
     # Every route is mounted by now, so the templated route table is the
