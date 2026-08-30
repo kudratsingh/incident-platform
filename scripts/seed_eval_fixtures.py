@@ -111,6 +111,15 @@ _DB_URL = os.getenv(
 _REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 _TENANT_SLUG = os.getenv("SEED_TENANT_SLUG", "default")
 
+
+class SeedError(RuntimeError):
+    """A seed precondition the caller can act on.
+
+    Deliberately an `Exception` rather than `SystemExit`: this module is
+    imported by the API's boot path, which catches `Exception` to log and
+    degrade. See `_ensure_tenant` (WO-R2-69).
+    """
+
 # Kept in one place so a typo doesn't drift the tool + the seed apart.
 # Mirror of app.mcp.tools.consumer_lag._CONSUMER_LAG_KEY_PREFIX.
 _LAG_KEY_PREFIX = "kafka:consumer_lag:"
@@ -149,12 +158,97 @@ _CONSUMER_LAGS: dict[str, int] = {
 }
 
 
-def _deploy_rows(tenant_id: uuid.UUID | None) -> list[dict[str, object]]:
+# How long a seeded job waited to be dispatched, and the lifecycle columns
+# that follow from it (WO-R2-69).
+#
+# `update_status` stamps `started_at` on the PENDING→RUNNING write and
+# `completed_at` on every terminal write, so a `completed`/`failed`/
+# `dead_letter` row the platform produced *always* has both. Seeded rows had
+# neither, which made them incoherent in two directions at once:
+#
+#   * The dispatch-latency SLO counts a dispatched job with `started_at IS
+#     NULL` as a dispatch miss — that is what NULL means there. Seven fixture
+#     rows therefore sat permanently in the denominator as failures, and every
+#     reset re-anchored them into the rolling 24h window so they never aged
+#     out. On a lab stack with little other traffic that is most of the
+#     denominator, i.e. a seeded fast-burn alert about nothing.
+#   * `list_jobs(sort=DEAD_LETTERED_AT)` orders on
+#     `coalesce(completed_at, created_at)` (WO-R2-53), so for exactly the
+#     fixture set the DLQ scenarios are graded against, the "when did it die"
+#     sort silently degraded to "when was it submitted".
+#
+# 4 seconds is deliberately well inside the objective's 30-second threshold:
+# the fixtures should be ordinary healthy dispatches, so that a scenario that
+# *induces* latency is measuring its own effect and not the seed's.
+_DISPATCH_LATENCY_SECONDS = 4
+
+
+def _lifecycle(
+    now: datetime, created_offset: timedelta, run_seconds: int | None
+) -> tuple[datetime, datetime | None, datetime | None]:
+    """(created_at, started_at, completed_at) for one seeded job.
+
+    One derivation, used by both the seed and the re-baseline, so a reset
+    cannot produce a row shape the seed would never have written. Jobs that
+    were never dispatched (`run_seconds is None` — the WAITING half of the DAG)
+    keep NULL for both, which is what never-dispatched means.
+    """
+    created_at = now - created_offset
+    if run_seconds is None:
+        return created_at, None, None
+    started_at = created_at + timedelta(seconds=_DISPATCH_LATENCY_SECONDS)
+    return created_at, started_at, started_at + timedelta(seconds=run_seconds)
+
+
+def _dag_specs() -> list[dict[str, object]]:
+    """The three-node DAG: parent (completed) → seed (waiting) → child.
+
+    Given explicit offsets so the parent's own lifecycle is orderable. The
+    re-baseline used to pin all three at exactly `now`, which — once the
+    parent had a real `started_at` — would have meant a job that started
+    before it was created, and a negative dispatch latency in every tool that
+    subtracts the two.
+    """
+    return [
+        {
+            "name": "dag-parent-job",
+            "status": JobStatus.COMPLETED.value,
+            "created_offset": timedelta(minutes=6),
+            "run_seconds": 50,
+        },
+        {
+            "name": "dag-seed-job",
+            "status": JobStatus.WAITING.value,
+            "created_offset": timedelta(minutes=5),
+            "run_seconds": None,
+        },
+        {
+            "name": "dag-child-job",
+            "status": JobStatus.WAITING.value,
+            "created_offset": timedelta(minutes=5),
+            "run_seconds": None,
+        },
+    ]
+
+
+def _deploy_rows() -> list[dict[str, object]]:
+    """The seeded deploy history. Always `tenant_id=None` (WO-R2-69).
+
+    A deploy marker is platform-wide by construction: the column is nullable
+    precisely so it can say "this is not a tenant's row", the RLS policy is
+    written around `tenant_id IS NULL`, and every other producer of these rows
+    passes None. The seeder alone stamped them with a concrete tenant, which
+    made the fixture history invisible to the policy's platform-wide branch
+    and visible to exactly one tenant — so `get_deploy_history`, which the
+    correlation scenarios read, agreed with the contract on an empty database
+    and disagreed with it on a seeded one. There is no parameter to get this
+    wrong with any more.
+    """
     now = datetime.now(UTC)
     return [
         {
             "id": stable("deploy-v0.4.0"),
-            "tenant_id": tenant_id,
+            "tenant_id": None,
             "version": "v0.4.0",
             "revision": "a1940af",
             "image_tag": "v0.4.0",
@@ -164,7 +258,7 @@ def _deploy_rows(tenant_id: uuid.UUID | None) -> list[dict[str, object]]:
         },
         {
             "id": stable("deploy-v0.4.1"),
-            "tenant_id": tenant_id,
+            "tenant_id": None,
             "version": "v0.4.1",
             "revision": "b7c3e51",
             "image_tag": "v0.4.1",
@@ -174,7 +268,7 @@ def _deploy_rows(tenant_id: uuid.UUID | None) -> list[dict[str, object]]:
         },
         {
             "id": stable("deploy-v0.4.2-billing-hotfix"),
-            "tenant_id": tenant_id,
+            "tenant_id": None,
             "version": "v0.4.2",
             "revision": "c9f4d02",
             "image_tag": "v0.4.2",
@@ -185,7 +279,7 @@ def _deploy_rows(tenant_id: uuid.UUID | None) -> list[dict[str, object]]:
         },
         {
             "id": stable("deploy-v0.4.3"),
-            "tenant_id": tenant_id,
+            "tenant_id": None,
             "version": "v0.4.3",
             "revision": "d1e5a83",
             "image_tag": "v0.4.3",
@@ -195,7 +289,7 @@ def _deploy_rows(tenant_id: uuid.UUID | None) -> list[dict[str, object]]:
         },
         {
             "id": stable("deploy-v0.4.3-staging"),
-            "tenant_id": tenant_id,
+            "tenant_id": None,
             "version": "v0.4.3",
             "revision": "d1e5a83",
             "image_tag": "v0.4.3",
@@ -205,7 +299,7 @@ def _deploy_rows(tenant_id: uuid.UUID | None) -> list[dict[str, object]]:
         },
         {
             "id": stable("deploy-v0.3.9"),
-            "tenant_id": tenant_id,
+            "tenant_id": None,
             "version": "v0.3.9",
             "revision": "e0f6b14",
             "image_tag": "v0.3.9",
@@ -286,6 +380,7 @@ def _dlq_specs() -> list[dict[str, object]]:
     return [
         {
             "job_id": stable("dlq-job-schema-violation"),
+            "run_seconds": 2,
             "triage_id": stable("dlq-triage-schema-violation"),
             "type": JobType.BULK_API_SYNC.value,
             "remediation_hint": RemediationHint.REPLAY_SAFE.value,
@@ -312,6 +407,7 @@ def _dlq_specs() -> list[dict[str, object]]:
         },
         {
             "job_id": stable("dlq-job-send-email"),
+            "run_seconds": 12,
             "triage_id": stable("dlq-triage-send-email"),
             "type": JobType.BULK_API_SYNC.value,
             "remediation_hint": RemediationHint.WAIT_AND_REPLAY.value,
@@ -336,6 +432,7 @@ def _dlq_specs() -> list[dict[str, object]]:
         },
         {
             "job_id": stable("dlq-job-process-payment"),
+            "run_seconds": 30,
             "triage_id": stable("dlq-triage-process-payment"),
             "type": JobType.BULK_API_SYNC.value,
             "remediation_hint": RemediationHint.WAIT_AND_REPLAY.value,
@@ -359,6 +456,7 @@ def _dlq_specs() -> list[dict[str, object]]:
         },
         {
             "job_id": stable("dlq-job-csv-parse"),
+            "run_seconds": 18,
             "triage_id": stable("dlq-triage-csv-parse"),
             "type": JobType.CSV_UPLOAD.value,
             "remediation_hint": RemediationHint.HUMAN_REQUIRED.value,
@@ -388,6 +486,7 @@ def _failed_trace_specs() -> list[dict[str, object]]:
     return [
         {
             "job_id": stable("failed-job-trace-a"),
+            "run_seconds": 95,
             "trace_id": str(stable("failed-trace-a")),
             "type": JobType.REPORT_GEN.value,
             "error_message": "OOM during PDF generation (200MB report)",
@@ -395,6 +494,7 @@ def _failed_trace_specs() -> list[dict[str, object]]:
         },
         {
             "job_id": stable("failed-job-trace-b"),
+            "run_seconds": 6,
             "trace_id": str(stable("failed-trace-b")),
             "type": JobType.DOC_ANALYSIS.value,
             "error_message": "pdf extraction failed: file is corrupted",
@@ -409,13 +509,27 @@ def _failed_trace_specs() -> list[dict[str, object]]:
 
 
 async def _ensure_tenant(session: AsyncSession, slug: str) -> Tenant:
+    """The tenant every fixture hangs off. Raises `SeedError` when absent.
+
+    A normal exception, not `SystemExit` (WO-R2-69). `SystemExit` derives
+    from `BaseException`, so the API's boot-time seed guard — an
+    `except Exception` around `await seed()` whose entire purpose is to log
+    the failure and let the app start anyway — could not catch it. A missing
+    `SEED_TENANT_SLUG`, which is a configuration typo on a lab stack, instead
+    unwound through the lifespan and killed the process on every boot: a
+    crash-loop whose log line said nothing about tenants, for a fixture set
+    the platform is designed to run without.
+
+    The CLI still exits non-zero with this message — `main()` catches it and
+    reports it — so the operator-facing behaviour is unchanged. What changes
+    is that an embedded caller now gets an exception it is allowed to handle.
+    """
     tenant = (
         await session.execute(select(Tenant).where(Tenant.slug == slug))
     ).scalar_one_or_none()
     if tenant is None:
-        raise SystemExit(
-            f"error: tenant slug {slug!r} not found. Run `alembic upgrade "
-            "head` first."
+        raise SeedError(
+            f"tenant slug {slug!r} not found. Run `alembic upgrade head` first."
         )
     return tenant
 
@@ -553,12 +667,19 @@ async def _rebaseline_timestamps(session: AsyncSession) -> int:
 
     Scope — every seeded fixture field an eval can time-assert on:
 
-      * `jobs` (DLQ + failed-trace specs): `created_at` / `updated_at`
-        from each spec's `created_offset` — the column
+      * `jobs` (DLQ + failed-trace specs): the whole lifecycle —
+        `created_at` / `updated_at` / `started_at` / `completed_at` —
+        derived together by `_lifecycle` from each spec's
+        `created_offset` and `run_seconds`. `created_at` is what
         `search_traces(since_hours=...)` filters on and
-        `list_dlq_messages` returns.
-      * `jobs` (DAG trio): `created_at` / `updated_at` to now — they
-        were server-defaulted to the seed instant at first boot.
+        `list_dlq_messages` returns; `completed_at` is what the
+        `DEAD_LETTERED_AT` sort orders on and what the dispatch-latency
+        SLO measures against `started_at`.
+      * `jobs` (DAG trio): the same four columns from `_dag_specs`. The
+        parent is `completed` and so carries a start and an end; the two
+        `waiting` nodes carry neither, because they have not been
+        dispatched. This loop used to pin all three at `now`, which is
+        what gave the parent a start earlier than its own creation.
       * `alerts`: `fired_at` / `resolved_at` from `_alert_rows` —
         `list_active_alerts` returns `fired_at`.
       * `deploy_markers`: `deployed_at` from `_deploy_rows` —
@@ -574,7 +695,7 @@ async def _rebaseline_timestamps(session: AsyncSession) -> int:
     now = datetime.now(UTC)
     shifted = 0
 
-    for deploy_spec in _deploy_rows(None):
+    for deploy_spec in _deploy_rows():
         marker = (
             await session.execute(
                 select(DeployMarker).where(DeployMarker.id == deploy_spec["id"])
@@ -603,39 +724,70 @@ async def _rebaseline_timestamps(session: AsyncSession) -> int:
             alert.resolved_at = resolved_target
             shifted += 1
 
-    job_targets: dict[uuid.UUID, datetime] = {}
+    # The whole lifecycle, not just created_at (WO-R2-69). Re-anchoring
+    # `created_at` alone left `started_at`/`completed_at` at whatever
+    # wall-clock the previous run stamped, which produced rows that started
+    # before they were created — the DAG parent, pinned at `now` by this
+    # very loop while its start stayed in the past, was guaranteed to — and
+    # a negative dispatch latency in every tool that subtracts the two.
+    # Deriving all three from the spec makes the reset restore a shape the
+    # seed would have written, rather than a shifted half of one.
+    job_targets: dict[uuid.UUID, tuple[datetime, datetime | None, datetime | None]] = {}
     for job_spec in (*_dlq_specs(), *_failed_trace_specs()):
-        offset = cast("timedelta", job_spec["created_offset"])
-        job_targets[cast("uuid.UUID", job_spec["job_id"])] = now - offset
-    for dag_name in ("dag-parent-job", "dag-seed-job", "dag-child-job"):
-        job_targets[stable(dag_name)] = now
+        job_targets[cast("uuid.UUID", job_spec["job_id"])] = _lifecycle(
+            now,
+            cast("timedelta", job_spec["created_offset"]),
+            cast("int", job_spec["run_seconds"]),
+        )
+    for dag_spec in _dag_specs():
+        job_targets[stable(cast("str", dag_spec["name"]))] = _lifecycle(
+            now,
+            cast("timedelta", dag_spec["created_offset"]),
+            cast("int | None", dag_spec["run_seconds"]),
+        )
 
-    for job_id, created_target in job_targets.items():
+    for job_id, (created_target, started_target, completed_target) in (
+        job_targets.items()
+    ):
         job = (
             await session.execute(select(Job).where(Job.id == job_id))
         ).scalar_one_or_none()
         if job is None:
             continue
-        if _drifted(job.created_at, created_target) or _drifted(
-            job.updated_at, created_target
+        updated_target = completed_target or created_target
+        if (
+            _drifted(job.created_at, created_target)
+            or _drifted(job.updated_at, updated_target)
+            or _drifted(job.started_at, started_target)
+            or _drifted(job.completed_at, completed_target)
         ):
             job.created_at = created_target
-            job.updated_at = created_target
+            job.updated_at = updated_target
+            job.started_at = started_target
+            job.completed_at = completed_target
             shifted += 1
 
     return shifted
 
 
-async def _seed_deploys(
-    session: AsyncSession, tenant_id: uuid.UUID | None
-) -> None:
-    for spec in _deploy_rows(tenant_id):
+async def _seed_deploys(session: AsyncSession) -> None:
+    """Insert the deploy history, and repair any row a previous seed
+    tenant-stamped.
+
+    The repair matters because this seeder is check-then-insert: a stack
+    seeded before WO-R2-69 already holds these six ids with a concrete
+    `tenant_id`, and re-seeding would skip straight past them forever. The
+    rows are addressed by stable id, so this can only touch fixtures.
+    """
+    for spec in _deploy_rows():
         existing = (
             await session.execute(
                 select(DeployMarker).where(DeployMarker.id == spec["id"])
             )
         ).scalar_one_or_none()
         if existing is not None:
+            if existing.tenant_id is not None:
+                existing.tenant_id = None
             continue
         session.add(DeployMarker(**spec))
 
@@ -661,7 +813,11 @@ async def _seed_dlq(session: AsyncSession, tenant: Tenant, user: User) -> None:
         ).scalar_one_or_none()
         if existing is not None:
             continue
-        created_at = now - spec["created_offset"]  # type: ignore[operator]
+        created_at, started_at, completed_at = _lifecycle(
+            now,
+            cast("timedelta", spec["created_offset"]),
+            cast("int", spec["run_seconds"]),
+        )
         session.add(
             Job(
                 id=job_id,
@@ -675,7 +831,9 @@ async def _seed_dlq(session: AsyncSession, tenant: Tenant, user: User) -> None:
                 remediation_hint=spec.get("remediation_hint"),
                 trace_id=str(stable(f"dlq-trace-{spec['job_id']}")),
                 created_at=created_at,
-                updated_at=created_at,
+                updated_at=completed_at or created_at,
+                started_at=started_at,
+                completed_at=completed_at,
             )
         )
     await session.flush()
@@ -719,7 +877,11 @@ async def _seed_failed_traces(
         ).scalar_one_or_none()
         if existing is not None:
             continue
-        created_at = now - spec["created_offset"]  # type: ignore[operator]
+        created_at, started_at, completed_at = _lifecycle(
+            now,
+            cast("timedelta", spec["created_offset"]),
+            cast("int", spec["run_seconds"]),
+        )
         session.add(
             Job(
                 id=job_id,
@@ -732,7 +894,9 @@ async def _seed_failed_traces(
                 error_message=spec["error_message"],
                 trace_id=spec["trace_id"],
                 created_at=created_at,
-                updated_at=created_at,
+                updated_at=completed_at or created_at,
+                started_at=started_at,
+                completed_at=completed_at,
             )
         )
         # One audit row sharing the trace_id (via request_id) so
@@ -772,28 +936,34 @@ async def _seed_dag(
     child_id = stable("dag-child-job")
 
     # Jobs
-    to_add = [
-        (parent_id, JobStatus.COMPLETED.value),
-        (seed_id, JobStatus.WAITING.value),
-        (child_id, JobStatus.WAITING.value),
-    ]
-    for job_id, status in to_add:
+    now = datetime.now(UTC)
+    for spec in _dag_specs():
+        job_id = stable(cast("str", spec["name"]))
         existing = (
             await session.execute(select(Job).where(Job.id == job_id))
         ).scalar_one_or_none()
         if existing is not None:
             continue
+        created_at, started_at, completed_at = _lifecycle(
+            now,
+            cast("timedelta", spec["created_offset"]),
+            cast("int | None", spec["run_seconds"]),
+        )
         session.add(
             Job(
                 id=job_id,
                 tenant_id=tenant.id,
                 user_id=user.id,
                 type=JobType.BULK_API_SYNC.value,
-                status=status,
+                status=spec["status"],
                 payload={"eval_fixture": True, "role": job_id.hex[:6]},
                 retry_count=0,
                 error_message=None,
                 trace_id=str(stable(f"dag-trace-{job_id}")),
+                created_at=created_at,
+                updated_at=completed_at or created_at,
+                started_at=started_at,
+                completed_at=completed_at,
             )
         )
     await session.flush()
@@ -831,7 +1001,7 @@ def _print_pins() -> None:
         print(f"    {g:<24} lag ≈ {lag}")
     print()
     print("  # Deploy markers (deploy_markers table):")
-    for spec in _deploy_rows(None):
+    for spec in _deploy_rows():
         note = f"    <- {spec['notes']}" if spec['notes'] else ""
         print(f"    {spec['version']:<10} {spec['environment']:<8}{note}")
     print()
@@ -906,7 +1076,7 @@ async def seed(
             async with session.begin():
                 tenant = await _ensure_tenant(session, tenant_slug)
                 user = await _ensure_seed_user(session, tenant)
-                await _seed_deploys(session, tenant.id)
+                await _seed_deploys(session)
                 await _seed_alerts(session, tenant.id)
                 await _seed_dlq(session, tenant, user)
                 await _seed_failed_traces(session, tenant, user)
@@ -946,7 +1116,7 @@ def collect_pins() -> dict[str, object]:
                 "environment": spec["environment"],
                 "notes": spec["notes"],
             }
-            for spec in _deploy_rows(None)
+            for spec in _deploy_rows()
         ],
         "alerts": [
             {
@@ -1061,9 +1231,17 @@ async def main() -> None:
     )
     print(eval_safety.describe_target(_DB_URL, _REDIS_URL))
 
-    summary = await seed(
-        reset=args.reset, allow_target_mismatch=args.allow_target_mismatch
-    )
+    try:
+        summary = await seed(
+            reset=args.reset, allow_target_mismatch=args.allow_target_mismatch
+        )
+    except SeedError as exc:
+        # The CLI contract is unchanged — message on stderr, exit 1. Only the
+        # exception type changed, so that the API's boot guard can catch it
+        # (WO-R2-69); turning it back into an exit code belongs here, at the
+        # one call site that is actually a command line.
+        print(f"error: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
     try:
         pins_path = write_pins_json()
     except OSError as exc:

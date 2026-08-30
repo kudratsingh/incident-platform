@@ -496,7 +496,7 @@ async def test_rebaseline_timestamps_on_postgres(session_factory: Any) -> None:
 
     now = datetime.now(UTC)
     stale = timedelta(days=2)
-    specs = seed_eval_fixtures._deploy_rows(None)
+    specs = seed_eval_fixtures._deploy_rows()
     async with session_factory() as session:
         async with session.begin():
             for spec in specs:

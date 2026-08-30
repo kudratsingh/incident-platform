@@ -199,3 +199,60 @@ async def test_boot_success_logs_seed_and_pins_separately(
     infos = rec.messages("info")
     assert "seeded eval fixtures" in infos
     assert any("pins" in m for m in infos)
+
+
+# ---------------------------------------------------------------------------
+# A missing tenant slug degrades; it does not kill the process (WO-R2-69)
+# ---------------------------------------------------------------------------
+
+
+def test_missing_tenant_raises_a_catchable_exception() -> None:
+    """`_ensure_tenant` must not raise `SystemExit`.
+
+    `SystemExit` derives from `BaseException`, so the boot guard's
+    `except Exception` — whose whole job is to log and let the app start —
+    could not catch it. A `SEED_TENANT_SLUG` typo therefore unwound through
+    the lifespan and crash-looped the API, for a fixture set the platform is
+    designed to run without.
+    """
+    seed = _seed_module()
+
+    assert issubclass(seed.SeedError, Exception)
+    assert not issubclass(seed.SeedError, SystemExit)
+    # The guard catches what `_ensure_tenant` raises.
+    assert isinstance(seed.SeedError("x"), Exception)
+
+
+async def test_boot_survives_a_missing_tenant_slug(
+    monkeypatch: pytest.MonkeyPatch,
+    db_session,  # type: ignore[no-untyped-def]
+) -> None:
+    """End to end through the real guard, raising from the real function.
+
+    Deliberately calls `_ensure_tenant` rather than raising a stand-in: what
+    made this a crash-loop was the exception *class* that one function chose,
+    so a test that raises its own exception proves nothing. At HEAD this
+    unwinds `SystemExit` straight through `_boot_seed_eval_fixtures` and out
+    of the test.
+    """
+    from app import main as app_main
+
+    seed = _seed_module()
+    rec = _RecordingLogger()
+    monkeypatch.setattr(app_main, "logger", rec)
+
+    async def _seed_missing_tenant(**_kwargs: Any) -> dict[str, int]:
+        await seed._ensure_tenant(db_session, "definitely-not-a-seeded-slug")
+        return {}  # pragma: no cover — the line above always raises
+
+    monkeypatch.setattr(
+        app_main,
+        "_import_eval_seeder",
+        lambda: (_seed_missing_tenant, lambda: "/tmp/pins.json"),
+    )
+
+    # At HEAD this raised SystemExit straight through the lifespan.
+    await app_main._boot_seed_eval_fixtures()
+
+    errors = rec.messages("error")
+    assert any("seed failed" in m for m in errors)

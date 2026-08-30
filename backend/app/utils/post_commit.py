@@ -20,9 +20,12 @@ post-commit work here and the session owner drains it:
         ...
     await run_post_commit(session)
 
-Rollback needs no handling. The `session.begin()` block raises on the way
-out, the drain never runs, and the queue dies with the session — no
-commit, no side effect, which is exactly right.
+Rollback drops the queue, two ways over. The `session.begin()` block raises
+on the way out so the drain never runs, and a rollback listener clears the
+queue outright — because `session.info` survives a rollback, and a session
+reused for a second transaction would otherwise drain hooks belonging to
+the transaction that failed. No commit, no side effect, which is exactly
+right.
 
 Hooks must not raise, and this module holds them to it. By the time one
 runs its transaction is durable and there is nothing left to roll back;
@@ -35,7 +38,9 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from app.core.logging import get_logger
+from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import Session
 
 logger = get_logger(__name__)
 
@@ -43,6 +48,7 @@ PostCommitHook = Callable[[], Awaitable[None]]
 
 # Namespaced because `Session.info` is a shared per-session scratchpad.
 _INFO_KEY = "app.post_commit_hooks"
+_GUARD_KEY = "app.post_commit_rollback_guard"
 
 
 def _queue(session: AsyncSession) -> dict[Any, Any] | None:
@@ -58,18 +64,59 @@ def _queue(session: AsyncSession) -> dict[Any, Any] | None:
     return info if isinstance(info, dict) else None
 
 
-def register_post_commit(session: AsyncSession, hook: PostCommitHook) -> None:
+def register_post_commit(session: AsyncSession, hook: PostCommitHook) -> bool:
     """Queue `hook` to run once `session`'s current transaction commits.
 
     Ordering is registration order. Registering the same effect twice runs
     it twice — the hooks here are idempotent, so that is a cost rather
     than a bug, and de-duplication would need an identity for a closure.
+
+    Returns whether the hook was actually queued. False means this session
+    has no queue (the stand-ins described in `_queue`), and the caller — not
+    this module — decides what that should mean for its effect: cache
+    invalidation is content to skip, while an alert webhook would rather run
+    inline than vanish. Silently returning None for both was fine while
+    staleness was the only cost.
     """
     info = _queue(session)
     if info is None:
-        return
+        return False
+    _install_rollback_guard(session, info)
     hooks: list[PostCommitHook] = info.setdefault(_INFO_KEY, [])
     hooks.append(hook)
+    return True
+
+
+def _install_rollback_guard(session: AsyncSession, info: dict[Any, Any]) -> None:
+    """Drop queued hooks when the session rolls back. Installed once.
+
+    "Rollback needs no handling" held only while every caller discarded the
+    session with the failed transaction. `session.info` outlives a rollback,
+    so a session reused for a second transaction — the worker loops do this —
+    would drain hooks belonging to the transaction that failed. For a cache
+    invalidation that is a harmless extra delete. For an alert webhook it is
+    an announcement of a row that was rolled back, which is the exact failure
+    WO-R2-70 moved delivery here to prevent, reintroduced one layer down.
+    """
+    if info.get(_GUARD_KEY):
+        return
+    sync_session = getattr(session, "sync_session", None)
+    # Same stance as `_queue`: a stand-in gets no machinery. `event.listen`
+    # refuses an unrecognised target outright, and a session that is not a
+    # real one has no rollback to guard against either.
+    if not isinstance(sync_session, Session):
+        return
+
+    def _discard(*_args: Any) -> None:
+        dropped = info.pop(_INFO_KEY, [])
+        if dropped:
+            logger.debug(
+                "post_commit_hooks_discarded_on_rollback",
+                extra={"count": len(dropped)},
+            )
+
+    event.listen(sync_session, "after_soft_rollback", _discard)
+    info[_GUARD_KEY] = True
 
 
 async def run_post_commit(session: AsyncSession) -> None:

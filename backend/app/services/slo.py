@@ -60,6 +60,7 @@ from app.models.job import Job
 from app.models.tenant import DEFAULT_TENANT_ID
 from app.repositories.alert import AlertRepository
 from app.services.alerts import AlertService
+from app.utils.post_commit import run_post_commit
 from sqlalchemy import case, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -395,7 +396,7 @@ async def _raise_fast_burn_alert(
         async with session_factory() as session:
             async with session.begin():
                 service = AlertService(AlertRepository(session))
-                return await service.create_alert(
+                alert = await service.create_alert(
                     tenant_id=DEFAULT_TENANT_ID,
                     severity=SEVERITY_CRITICAL,
                     source=f"slo:{state.definition.id}",
@@ -419,6 +420,17 @@ async def _raise_fast_burn_alert(
                     },
                     dedup_key=dedup_key,
                 )
+            # This loop owns `session.begin()`, so it owns the drain: the
+            # alert's webhook is queued rather than POSTed inside the
+            # transaction (WO-R2-70), and nothing else here would run it.
+            # It sits after the block on purpose — a de-duplication
+            # conflict raises out of the flush above, the block unwinds,
+            # and the queue dies with the session, so a suppressed alert
+            # is not delivered. That is the ordering this function's
+            # dedup_key exists to produce, now enforced structurally
+            # rather than by which statement happens to come first.
+            await run_post_commit(session)
+            return alert
     except IntegrityError:
         # Another replica (or an earlier tick inside this window) already
         # raised it. That is the de-duplication working, not a failure.
