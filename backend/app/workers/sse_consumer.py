@@ -22,9 +22,16 @@ logger = get_logger(__name__)
 # `job.failed` is split based on the `dead_lettered` flag at runtime:
 #   - dead_lettered=True  → "dead_letter" (terminal)
 #   - dead_lettered=False → "retrying"    (transient — will be re-dispatched)
+#
+# `cancelled` is terminal and was already in `progress.TERMINAL_STATUSES`, so
+# the stream-closing half of this has been in place all along, waiting for a
+# producer that did not exist (WO-R2-113). Until then the only thing that ever
+# closed a cancelled job's stream was the DB short-circuit in `api/streaming.py`
+# on reconnect — a client already connected simply waited.
 _EVENT_TO_STATUS: dict[str, str] = {
     "job.progress": "running",
     "job.completed": "completed",
+    "job.cancelled": "cancelled",
 }
 
 
@@ -36,6 +43,7 @@ class SseConsumer(BaseKafkaConsumer):
                 settings.kafka_topic_job_progress,
                 settings.kafka_topic_job_completed,
                 settings.kafka_topic_job_failed,
+                settings.kafka_topic_job_cancelled,
                 settings.kafka_topic_job_dlq,
             ],
             group_id=settings.kafka_consumer_group_sse,

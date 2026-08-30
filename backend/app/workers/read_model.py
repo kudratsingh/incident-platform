@@ -82,13 +82,19 @@ logger = get_logger(__name__)
 
 # Statuses we track in the projection. Strings rather than the enum so the
 # projector doesn't need to import the SQLAlchemy enum module.
-_TRACKED_STATUSES = ("running", "completed", "failed", "dead_letter")
+_TRACKED_STATUSES = ("running", "completed", "failed", "dead_letter", "cancelled")
 
 # Statuses that end a job's lifecycle. Once a job sits in one of these views,
 # only another terminal event may move it (see the handle_message guard).
 # 'failed' is NOT terminal — the retry cycle legitimately moves failed jobs
 # back to running.
-_TERMINAL_STATUSES = ("completed", "dead_letter")
+#
+# 'cancelled' joined both tuples with WO-R2-113. Tracked, because `_move`
+# only ZREMs an id from the statuses it knows about: an untracked `cancelled`
+# would have left the id in its `running` set while adding it to a set nothing
+# reads. Terminal, because Kafka redelivers — a `job.progress` still in flight
+# when the saga rolled back would otherwise drag the id back to `running`.
+_TERMINAL_STATUSES = ("completed", "dead_letter", "cancelled")
 
 # Map Kafka event → new status. job.submitted intentionally doesn't change a
 # status view: the dispatcher creates the row in PENDING, and the next event
@@ -96,6 +102,7 @@ _TERMINAL_STATUSES = ("completed", "dead_letter")
 _EVENT_TO_STATUS: dict[str, str] = {
     "job.progress": "running",
     "job.completed": "completed",
+    "job.cancelled": "cancelled",
 }
 
 # How many job_ids one (scope, status) key retains. The window has to comfortably
@@ -211,6 +218,7 @@ class ReadModelProjector(BaseKafkaConsumer):
                 settings.kafka_topic_job_progress,
                 settings.kafka_topic_job_completed,
                 settings.kafka_topic_job_failed,
+                settings.kafka_topic_job_cancelled,
                 settings.kafka_topic_job_dlq,
             ],
             group_id=settings.kafka_consumer_group_read_model,

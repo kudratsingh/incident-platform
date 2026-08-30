@@ -175,6 +175,7 @@ class Settings(BaseSettings):
     kafka_topic_job_progress: str = "job.progress"
     kafka_topic_job_completed: str = "job.completed"
     kafka_topic_job_failed: str = "job.failed"
+    kafka_topic_job_cancelled: str = "job.cancelled"
     kafka_topic_job_dlq: str = "job.dlq"
     kafka_consumer_group_worker: str = "worker-dispatcher"
     kafka_consumer_group_audit: str = "audit-writer"

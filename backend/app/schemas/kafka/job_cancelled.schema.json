@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "job.cancelled/v1",
+  "title": "JobCancelled",
+  "type": "object",
+  "required": ["event", "tenant_id", "job_id", "user_id", "job_type", "reason"],
+  "properties": {
+    "event": { "const": "job.cancelled" },
+    "tenant_id": { "type": "string", "format": "uuid" },
+    "job_id": { "type": "string", "format": "uuid" },
+    "user_id": { "type": "string", "format": "uuid" },
+    "job_type": { "type": "string", "minLength": 1 },
+    "reason": { "type": "string" },
+    "retry_count": { "type": "integer", "minimum": 0 },
+    "trace_id": { "type": ["string", "null"] }
+  },
+  "additionalProperties": true
+}

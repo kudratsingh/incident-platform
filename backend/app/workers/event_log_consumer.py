@@ -32,6 +32,7 @@ class EventLogConsumer(BaseKafkaConsumer):
                 settings.kafka_topic_job_progress,
                 settings.kafka_topic_job_completed,
                 settings.kafka_topic_job_failed,
+                settings.kafka_topic_job_cancelled,
                 settings.kafka_topic_job_dlq,
             ],
             group_id=settings.kafka_consumer_group_event_log,

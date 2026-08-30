@@ -109,3 +109,39 @@ async def test_sse_skips_malformed_event() -> None:
         )
 
     mock_pub.assert_not_awaited()
+
+
+async def test_sse_cancelled_event_maps_to_cancelled_status() -> None:
+    """WO-R2-113. `cancelled` was already in `progress.TERMINAL_STATUSES`, so
+    the stream-closing half was in place and waiting for a producer — the
+    consumer just had no event that ever produced the status. Without the
+    mapping the event falls through the `_EVENT_TO_STATUS` lookup and is
+    dropped silently, which is indistinguishable from the bug being unfixed.
+    """
+    redis = AsyncMock()
+    consumer = SseConsumer(redis)
+    job_id = uuid.uuid4()
+
+    with patch("app.workers.sse_consumer.publish_progress", new=AsyncMock()) as mock_pub:
+        await consumer.handle_message(
+            topic="job.cancelled",
+            key="u",
+            value={
+                "event": "job.cancelled",
+                "job_id": str(job_id),
+                "reason": "saga rollback",
+            },
+        )
+
+    mock_pub.assert_awaited_once()
+    kwargs = mock_pub.await_args.kwargs
+    assert kwargs["status"] == "cancelled"
+    assert kwargs["job_id"] == str(job_id)
+
+
+async def test_sse_cancelled_status_closes_the_stream() -> None:
+    """The status the consumer publishes has to be one the broker treats as
+    terminal, or the stream stays open and the fix is cosmetic."""
+    from app.workers.progress import TERMINAL_STATUSES
+
+    assert "cancelled" in TERMINAL_STATUSES

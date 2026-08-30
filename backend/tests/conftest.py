@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock
 import pytest
 import pytest_asyncio
 from app.core.security import create_access_token, hash_password
-from app.dependencies import get_db, get_redis
+from app.dependencies import get_db, get_redis, get_session_factory
 from app.main import create_app
 from app.models.base import Base
 from app.models.enums import UserRole
@@ -153,6 +153,48 @@ class AbortingSession:
         return _wrapper()
 
 
+class _SharedSessionFactory:
+    """Stand-in for `get_session_factory` that reuses the test's session.
+
+    A handler that opens its own session — the digest route does, so its
+    Anthropic round-trip holds no transaction (WO-R2-127) — would otherwise
+    reach the real engine and a database no test has set up.
+
+    Each `factory()` hands back the one `db_session` every fixture and
+    assertion already shares, with `begin()` demoted to a SAVEPOINT so a
+    handler's "own transaction" nests inside the outer one the suite rolls
+    back, and `close()` neutralised so the handler cannot close the session
+    the test is still using. What the handler observes is unchanged: it opens
+    a scope, writes, and the write is visible afterwards.
+    """
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    def __call__(self) -> "_SharedSession":
+        return _SharedSession(self._session)
+
+
+class _SharedSession:
+    def __init__(self, inner: AsyncSession) -> None:
+        self._inner = inner
+
+    def __getattr__(self, name: str):  # type: ignore[no-untyped-def]
+        return getattr(self._inner, name)
+
+    async def __aenter__(self) -> "_SharedSession":
+        return self
+
+    async def __aexit__(self, *exc: object) -> bool:
+        return False
+
+    def begin(self):  # type: ignore[no-untyped-def]
+        return self._inner.begin_nested()
+
+    async def close(self) -> None:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # FastAPI test client with DB override
 # ---------------------------------------------------------------------------
@@ -181,6 +223,9 @@ async def client(  # type: ignore[no-untyped-def]
 
     app.dependency_overrides[get_db] = _override_db
     app.dependency_overrides[get_redis] = _override_redis
+    app.dependency_overrides[get_session_factory] = lambda: _SharedSessionFactory(
+        db_session
+    )
 
     async with AsyncClient(
         transport=ASGITransport(app=app, raise_app_exceptions=False),

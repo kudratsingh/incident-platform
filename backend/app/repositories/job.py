@@ -10,18 +10,45 @@ from app.models.job import Job
 from app.models.job_dependency import JobDependency
 from app.repositories.base import BaseRepository
 from app.repositories.outbox import OutboxRepository
-from app.schemas.job_events import completed_event_payload, dlq_event_payload
+from app.schemas.job_events import (
+    cancelled_event_payload,
+    completed_event_payload,
+    dlq_event_payload,
+)
 from sqlalchemy import CursorResult, and_, func, or_, select, update
 
 # The statuses a job never leaves, and the Kafka topic each one announces on.
-# `CANCELLED` is terminal too but is deliberately absent: the platform has no
-# `job.cancelled` topic, so there is no event to emit in the same transaction.
-# Its single writer (`SagaCoordinator._handle_failure`) cancels steps that the
-# saga is already settling, so the saga side stays coherent — but the CQRS read
-# model does leave those ids in their previous status set. Adding the topic is
-# a schema-registry change with four consumers to update; tracked in
-# docs/ROADMAP.md rather than smuggled in here.
-_TERMINAL_EVENT_STATUSES = (JobStatus.DEAD_LETTER, JobStatus.COMPLETED)
+# Every one of them has a topic: `CANCELLED` was the exception until
+# WO-R2-113, and being the exception is exactly what made it dangerous. A
+# cancelled job stopped in Postgres while every consumer of the lifecycle went
+# on believing whatever it had last been told — the CQRS read model held the
+# id in its previous status set forever, the SSE stream stayed open until the
+# browser gave up, and the timeline just ended mid-job.
+#
+# Asserted against `TERMINAL_JOB_STATUSES` in
+# `tests/unit/test_job_cancelled_topic_wiring.py`, so the next terminal status
+# added to the enum fails a test until it has somewhere to announce on rather
+# than inheriting CANCELLED's silence.
+_TERMINAL_EVENT_STATUSES = (
+    JobStatus.DEAD_LETTER,
+    JobStatus.COMPLETED,
+    JobStatus.CANCELLED,
+)
+
+# The terminal statuses that stamp `completed_at` (WO-R2-114). All of them:
+# the column records when the job stopped, and a cancellation stops it. It
+# used to omit CANCELLED, so a saga-rollback or cascade cancellation landed
+# terminal with `completed_at IS NULL` and nothing could answer "when did this
+# stop" for the one class of terminal job an operator is most likely to ask it
+# about. `FAILED` is here because a failed job may still be retried and the
+# stamp is refreshed on the next terminal write — the pre-existing behaviour,
+# unchanged.
+_COMPLETED_AT_STATUSES = (
+    JobStatus.COMPLETED,
+    JobStatus.FAILED,
+    JobStatus.DEAD_LETTER,
+    JobStatus.CANCELLED,
+)
 
 # The statuses that strand a dependency DAG below them. A parent here will
 # never reach COMPLETED under its own power, so every WAITING descendant is
@@ -225,7 +252,7 @@ class JobRepository(BaseRepository[Job]):
         # code paths meet on a real Postgres value.
         if status == "running" and "started_at" not in values:
             values["started_at"] = datetime.now(UTC)
-        if status in ("completed", "failed", "dead_letter") and "completed_at" not in values:
+        if status in _COMPLETED_AT_STATUSES and "completed_at" not in values:
             values["completed_at"] = datetime.now(UTC)
 
         result = cast(
@@ -267,6 +294,9 @@ class JobRepository(BaseRepository[Job]):
         if status == JobStatus.DEAD_LETTER:
             topic = settings.kafka_topic_job_dlq
             payload = dlq_event_payload(job, message=event_message)
+        elif status == JobStatus.CANCELLED:
+            topic = settings.kafka_topic_job_cancelled
+            payload = cancelled_event_payload(job)
         else:
             topic = settings.kafka_topic_job_completed
             payload = completed_event_payload(job)
@@ -471,9 +501,37 @@ class JobRepository(BaseRepository[Job]):
         treats a CANCELLED parent as unmet too — stopping at the first level
         would just relocate the stuck set one generation down.
 
+        Announcing (WO-R2-113 + WO-R2-114): every row this cancels gets its
+        own `job.cancelled` outbox event and its own `completed_at`, written
+        in the caller's transaction alongside the status.
+
+        This method is the reason both work orders needed more than the one
+        branch in `update_status` they were scoped as. #152 made terminal
+        emission non-elective by routing every terminal write through that
+        method — but this is a set-based `UPDATE ... WHERE id IN (...)` that
+        never passes through it, so it is a *second* terminal writer, and the
+        one that produces cancellations in bulk. Adding CANCELLED to
+        `_TERMINAL_EVENT_STATUSES` alone would have announced the saga
+        coordinator's cancellations and left a whole DAG level's worth silent
+        per stranded parent, which is the failure mode inverted, not fixed.
+
+        It stays set-based rather than looping through `update_status` per
+        child for two reasons: the per-row path would re-enter the cascade
+        from every child (CANCELLED is itself a `_CASCADE_SOURCE_STATUSES`
+        member), re-walking the subtree once per node; and the level-by-level
+        UPDATE is what keeps this portable to the SQLite the unit suite runs
+        on. The payload is built by the same `cancelled_event_payload` the
+        single writer uses, so the two producers cannot drift.
+
         Returns the number of rows cancelled, for the caller's logging.
         """
+        settings = get_settings()
+        outbox = OutboxRepository(self.session)
         reason = f"dependency parent {parent_id} ended in {parent_status}"
+        # One timestamp for the whole cascade: it stamps the rows, and it is
+        # also how the re-read below identifies exactly the rows this UPDATE
+        # touched (a concurrent cascade computes its own, to the microsecond).
+        cancelled_at = datetime.now(UTC)
         cancelled = 0
         frontier: list[uuid.UUID] = [parent_id]
         seen: set[uuid.UUID] = {parent_id}
@@ -504,12 +562,35 @@ class JobRepository(BaseRepository[Job]):
                         Job.saga_id.is_(None),
                     )
                     .values(
-                        status=JobStatus.CANCELLED, error_message=reason
+                        status=JobStatus.CANCELLED,
+                        error_message=reason,
+                        completed_at=cancelled_at,
                     )
                 ),
             )
             await self.session.flush()
             cancelled += result.rowcount
+
+            # Re-read what actually changed and announce it. The UPDATE
+            # re-checks `status == WAITING`, so `targets` is what we intended
+            # to cancel and this is what we did — the difference is a child a
+            # concurrent writer moved first, and that writer owns its event.
+            newly_cancelled = (
+                await self.session.execute(
+                    select(Job).where(
+                        Job.id.in_(targets),
+                        Job.completed_at == cancelled_at,
+                    )
+                )
+            ).scalars().all()
+            for child in newly_cancelled:
+                await outbox.add(
+                    tenant_id=child.tenant_id,
+                    topic=settings.kafka_topic_job_cancelled,
+                    key=f"{child.tenant_id}:{child.user_id}",
+                    payload=cancelled_event_payload(child),
+                )
+
             seen.update(targets)
             frontier = targets
 

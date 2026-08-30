@@ -348,10 +348,13 @@ async def test_digest_generate_refuses_past_its_ceiling(
     client._transport.app.dependency_overrides[get_redis] = _override_redis  # type: ignore[attr-defined]
 
     limit = get_settings().admin_digest_rate_limit
-    with patch(
-        "app.services.incident_digest.run_digest_for_tenant",
-        new=AsyncMock(return_value=None),
-    ):
+    # `collect_window_stats` is the route's first call since WO-R2-127 split
+    # it into read / call / write; returning None is an empty window, which
+    # short-circuits before `generate_digest` — so no paid call is made and
+    # the limiter is still what decides the 429. Patching the old composed
+    # `run_digest_for_tenant` here would intercept nothing at all.
+    read = AsyncMock(return_value=None)
+    with patch("app.services.incident_digest.collect_window_stats", new=read):
         for n in range(limit):
             resp = await client.post(
                 "/api/v1/admin/digests/generate", json={}, headers=admin_headers
@@ -361,6 +364,13 @@ async def test_digest_generate_refuses_past_its_ceiling(
         resp = await client.post(
             "/api/v1/admin/digests/generate", json={}, headers=admin_headers
         )
+
+    # The stub has to have been the thing that answered, or this test would
+    # pass just as well with the patch pointing at a function the route no
+    # longer calls: the real read also returns None on an empty window, so
+    # the status codes alone cannot tell the two apart. The refused call is
+    # rejected before the read, hence `limit` and not `limit + 1`.
+    assert read.await_count == limit
 
     assert resp.status_code == 429
     assert resp.json()["error_code"] == "rate_limit_exceeded"
@@ -385,8 +395,13 @@ async def test_paid_endpoints_have_independent_buckets(
 
     client._transport.app.dependency_overrides[get_redis] = _override_redis  # type: ignore[attr-defined]
 
+    # `collect_window_stats` is the route's first call since WO-R2-127 split
+    # it into read / call / write; returning None is an empty window, which
+    # short-circuits before `generate_digest` — so no paid call is made and
+    # the limiter is still what decides the 429. Patching the old composed
+    # `run_digest_for_tenant` here would intercept nothing at all.
     with patch(
-        "app.services.incident_digest.run_digest_for_tenant",
+        "app.services.incident_digest.collect_window_stats",
         new=AsyncMock(return_value=None),
     ):
         for _ in range(get_settings().admin_digest_rate_limit + 1):

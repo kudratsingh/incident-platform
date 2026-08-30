@@ -33,6 +33,7 @@ _EVENT_TO_ACTION: dict[str, str] = {
     "job.submitted": "event.job.submitted",
     "job.completed": "event.job.completed",
     "job.failed": "event.job.failed",
+    "job.cancelled": "event.job.cancelled",
 }
 
 
@@ -44,6 +45,7 @@ class AuditConsumer(BaseKafkaConsumer):
                 settings.kafka_topic_job_submitted,
                 settings.kafka_topic_job_completed,
                 settings.kafka_topic_job_failed,
+                settings.kafka_topic_job_cancelled,
                 settings.kafka_topic_job_dlq,
             ],
             group_id=settings.kafka_consumer_group_audit,

@@ -16,6 +16,7 @@ Topic names come from `Settings.kafka_topic_*` so they're configurable; the tabl
 | `job.progress` | `kafka_producer.publish_job_progress` (direct, from `_run_job`) | `JobProgress` schema | 1 day | 12 / 48 |
 | `job.completed` | Outbox relay (from `_run_job` success path) | `JobCompleted` schema | 7 days | 12 / 48 |
 | `job.failed` | Outbox relay (from `_run_job` failure path, both retry and DLQ) | `JobFailed` schema | 7 days | 12 / 48 |
+| `job.cancelled` | Outbox relay (from `JobRepository.update_status` and the dependency cascade in the same class) | `JobCancelled` schema | 7 days | 12 / 48 |
 | `job.dlq` | Outbox relay (from `_run_job` exhaustion, LLM-forced dead-letter, or an unregistered job type) | `JobFailed` schema with `dead_lettered: true`, plus the triage context fields below | 30 days | 12 / 48 |
 
 Schemas live in `backend/app/schemas/kafka/*.schema.json` and are validated on both producer and consumer paths. See [ADR 0002](ADR/0002-json-schema-vs-protobuf.md) for the why.
@@ -31,6 +32,26 @@ Schemas live in `backend/app/schemas/kafka/*.schema.json` and are validated on b
 | `trace_id` | string or null | The job's `trace_id` column — the raw value, not the `trace_id_var` fallback (which substitutes the job id when the column is NULL). |
 
 The producer's full key set is `app/schemas/job_events.py`'s `DLQ_EVENT_KEYS`; `tests/unit/test_triage_consumer.py` asserts it stays a superset of every key the triage consumer reads, so producer/consumer drift fails a test instead of degrading triage in silence. There is exactly one producer of that payload — `JobRepository.update_status`, which writes it in the same transaction as the `dead_letter` status itself (see the addendum on [ADR 0001](ADR/0001-outbox-vs-cdc.md)). Four sites used to assemble it by hand and two other terminal writers assembled nothing at all.
+
+### `job.cancelled` is not a `job.failed`
+
+A cancellation is not a failure: the job was stood down — by a saga rolling
+back, or by a dependency parent that can no longer complete — and nothing
+about it went wrong. Folding it into `job.failed` with a flag would have made
+that distinction a payload field, and the two consumers that must not confuse
+them are exactly the two that read no payload fields: the read model projects
+it into its own status set, and the dispatch-latency SLO excludes cancellations
+from its denominator by status (`_DISPATCHED_STATUSES`) because those rows
+never left PENDING and would otherwise read as dispatch misses.
+
+It is also the newest topic, and the reason it was late is worth keeping: until
+WO-R2-113 `CANCELLED` was the only terminal status with nothing to announce on,
+so a cancelled job stopped in Postgres while every consumer went on believing
+whatever it had last been told. It has **two producers**, both in
+`JobRepository`: `update_status`, which covers the saga coordinator, and
+`cascade_cancel_blocked_children`, whose set-based `UPDATE` never passes
+through `update_status` and therefore emits its own events — one per cancelled
+descendant, in the same transaction.
 
 ### Why these topics, not one mega-topic
 

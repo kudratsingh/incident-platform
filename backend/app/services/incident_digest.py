@@ -298,12 +298,21 @@ async def run_digest_for_tenant(
     whether to retry.
 
     NOTE: this composes all three steps on the caller's session, so the LLM
-    round-trip happens inside whatever transaction the caller holds. That is
-    acceptable for the admin route (`POST /admin/digests`), where a request is
-    already holding its own connection for its duration and the deadline above
-    bounds it — but it is NOT how the worker should do it. The digest loop
-    calls the three parts separately so it can close the read transaction
-    first; see `run_digest_for_all_active_tenants`.
+    round-trip happens inside whatever transaction the caller holds. Nothing
+    in the application calls it any more, and that is the point: the admin
+    route (`POST /admin/digests/generate`) was its last caller and the reason
+    this note used to say the shape was "acceptable" there. WO-R2-127 moved
+    that route onto the same read / call / write split the worker uses, so
+    the composed form now has no caller to be acceptable for.
+
+    Kept rather than deleted because `tests/unit/test_incident_digest.py`
+    pins the empty-window contract through it and the three parts below are
+    the real surface; it is a deletion candidate, not a supported entry
+    point. Do not reach for it from a request path — holding a transaction
+    across the round-trip pins a pooled connection `idle in transaction` for
+    as long as the model takes, and the caller's tenant RLS context does not
+    survive the transaction boundary either way. Use the three parts; see
+    `run_digest_for_all_active_tenants` or the admin route.
     """
     stats = await collect_window_stats(session, tenant, window_start, window_end)
     if stats is None:

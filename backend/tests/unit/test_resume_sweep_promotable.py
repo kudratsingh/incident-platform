@@ -483,8 +483,14 @@ async def test_failed_parent_does_not_cascade_because_retries_remain(
 async def test_cascade_records_why_the_child_was_cancelled(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """There is no `job.cancelled` topic, so the error message on the row is
-    the only trace an operator has of why a child vanished from the DAG."""
+    """The error message on the row says why a child vanished from the DAG.
+
+    It used to be the *only* trace, because there was no `job.cancelled`
+    topic. There is one now (WO-R2-113) and the cascade emits it — see
+    `test_cascade_announces_every_child_it_cancels` — so this is no longer
+    the operator's last resort, but the row-level reason is still what the
+    admin UI and the timeline read, and it stays asserted here.
+    """
     async with session_factory() as session:
         async with session.begin():
             parent = _job(status=JobStatus.RUNNING, created_at=_EPOCH)
@@ -509,6 +515,141 @@ async def test_cascade_records_why_the_child_was_cancelled(
         ).scalar_one()
     assert str(parent_id) in msg
     assert JobStatus.DEAD_LETTER in msg
+
+
+async def test_cascade_announces_every_child_it_cancels(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The cascade is the *other* CANCELLED writer, and it is not
+    `update_status` (WO-R2-113).
+
+    #152 made terminal emission non-elective by routing every terminal write
+    through `update_status`, and adding CANCELLED to `_TERMINAL_EVENT_STATUSES`
+    covers the saga coordinator, which calls it. It does not cover this: the
+    cascade writes CANCELLED with a set-based `UPDATE ... WHERE id IN (...)`
+    for portability (SQLite has no `UPDATE ... WITH RECURSIVE`), so it never
+    passes through the single writer at all. Left alone, exactly the jobs
+    R2-09 cancels in bulk — a whole DAG level at a time — would stay the
+    silent terminal state the work order set out to remove.
+
+    Every cancelled descendant gets its own event, at every depth, in the
+    same transaction as the status write.
+    """
+    from app.config import get_settings
+
+    async with session_factory() as session:
+        async with session.begin():
+            root = _job(status=JobStatus.RUNNING, created_at=_EPOCH)
+            mid = _job(status=JobStatus.WAITING, created_at=_EPOCH)
+            leaf = _job(status=JobStatus.WAITING, created_at=_EPOCH)
+            session.add_all([root, mid, leaf])
+            session.add_all(
+                [
+                    JobDependency(job_id=mid.id, depends_on_job_id=root.id),
+                    JobDependency(job_id=leaf.id, depends_on_job_id=mid.id),
+                ]
+            )
+    root_id, mid_id, leaf_id = root.id, mid.id, leaf.id
+
+    async with session_factory() as session:
+        async with session.begin():
+            await JobRepository(session).update_status(
+                root_id, JobStatus.DEAD_LETTER
+            )
+
+    topic = get_settings().kafka_topic_job_cancelled
+    async with session_factory() as session:
+        rows = list(
+            (
+                await session.execute(
+                    select(OutboxEvent).where(OutboxEvent.topic == topic)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    announced = {r.payload["job_id"] for r in rows}
+    assert announced == {str(mid_id), str(leaf_id)}
+    assert all(r.payload["event"] == "job.cancelled" for r in rows)
+    assert all(str(root_id) in r.payload["reason"] for r in rows)
+
+
+async def test_cascade_stamps_completed_at_on_every_child(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """WO-R2-114 has the same second writer as WO-R2-113.
+
+    Stamping `completed_at` inside `update_status` leaves the cascade's bulk
+    UPDATE untouched, so a DAG cancellation would produce terminal rows whose
+    stamp depends on which mechanism cancelled them — the inconsistency is
+    worse than the uniform NULL it replaces, because it is invisible.
+    """
+    async with session_factory() as session:
+        async with session.begin():
+            parent = _job(status=JobStatus.RUNNING, created_at=_EPOCH)
+            child = _job(status=JobStatus.WAITING, created_at=_EPOCH)
+            session.add_all([parent, child])
+            session.add(
+                JobDependency(job_id=child.id, depends_on_job_id=parent.id)
+            )
+    parent_id, child_id = parent.id, child.id
+
+    async with session_factory() as session:
+        async with session.begin():
+            await JobRepository(session).update_status(
+                parent_id, JobStatus.DEAD_LETTER
+            )
+
+    async with session_factory() as session:
+        job = (
+            await session.execute(select(Job).where(Job.id == child_id))
+        ).scalar_one()
+    assert job.status == JobStatus.CANCELLED
+    assert job.completed_at is not None
+
+
+async def test_cascade_cancellation_events_roll_back_with_the_status_write(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Same invariant the dead-letter side has (ADR 0001): the events are in
+    the caller's transaction, so an abort leaves neither cancelled rows nor
+    announcements of cancellations that did not happen."""
+    from app.config import get_settings
+
+    async with session_factory() as session:
+        async with session.begin():
+            parent = _job(status=JobStatus.RUNNING, created_at=_EPOCH)
+            child = _job(status=JobStatus.WAITING, created_at=_EPOCH)
+            session.add_all([parent, child])
+            session.add(
+                JobDependency(job_id=child.id, depends_on_job_id=parent.id)
+            )
+    parent_id, child_id = parent.id, child.id
+
+    with pytest.raises(RuntimeError):
+        async with session_factory() as session:
+            async with session.begin():
+                await JobRepository(session).update_status(
+                    parent_id, JobStatus.DEAD_LETTER
+                )
+                raise RuntimeError("caller blew up after the cascade")
+
+    topic = get_settings().kafka_topic_job_cancelled
+    async with session_factory() as session:
+        rows = list(
+            (
+                await session.execute(
+                    select(OutboxEvent).where(OutboxEvent.topic == topic)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        status = (
+            await session.execute(select(Job.status).where(Job.id == child_id))
+        ).scalar_one()
+    assert rows == []
+    assert status == JobStatus.WAITING
 
 
 async def test_cascaded_children_never_reappear_as_sweep_candidates(
@@ -543,3 +684,42 @@ async def test_cascaded_children_never_reappear_as_sweep_candidates(
             ).scalars()
         )
     assert waiting == []
+
+
+async def test_resume_sweep_publishes_the_shared_submitted_payload(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """WO-R2-116. The sweep built the `job.submitted` payload inline while
+    every other re-publish path called `_job_submitted_payload`, so the two
+    shapes could drift — and a job dispatched by this backstop would stop
+    being byte-identical to one dispatched by the normal path, which is the
+    property that helper exists to guarantee.
+
+    Asserted as equality against the helper rather than field-by-field, so a
+    field added to the helper cannot pass here while the sweep omits it.
+    """
+    from app.workers.dispatcher import _job_submitted_payload
+
+    async with session_factory() as session:
+        async with session.begin():
+            parent = _job(status=JobStatus.COMPLETED, created_at=_EPOCH)
+            child = _job(status=JobStatus.WAITING, created_at=_EPOCH)
+            session.add_all([parent, child])
+            session.add(
+                JobDependency(job_id=child.id, depends_on_job_id=parent.id)
+            )
+    child_id = child.id
+
+    await _resume_unblocked_waiting_once(session_factory, _StubRedis())
+
+    async with session_factory() as session:
+        row = (
+            await session.execute(
+                select(OutboxEvent).where(OutboxEvent.topic == "job.submitted")
+            )
+        ).scalar_one()
+        promoted = (
+            await session.execute(select(Job).where(Job.id == child_id))
+        ).scalar_one()
+
+    assert row.payload == _job_submitted_payload(promoted)

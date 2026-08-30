@@ -65,12 +65,36 @@ COMPLETED_EVENT_KEYS: frozenset[str] = frozenset(
     }
 )
 
+# Same contract for the cancelled side (WO-R2-113), read by the read model
+# (which moves the id into its `cancelled` set), the SSE bridge (which closes
+# the stream), the event log and the audit writer.
+CANCELLED_EVENT_KEYS: frozenset[str] = frozenset(
+    {
+        "event",
+        "tenant_id",
+        "job_id",
+        "user_id",
+        "job_type",
+        "reason",
+        "retry_count",
+        "trace_id",
+    }
+)
+
 # Fallback `error` string for a dead-letter whose row carries no
 # `error_message`. The `job.failed` schema requires `error` to be a string, so
 # a NULL column must not become `None` on the wire — a schema violation would
 # mark the outbox row failed and lose the event, which is the exact failure
 # this whole consolidation exists to prevent.
 _UNSPECIFIED_ERROR = "job dead-lettered without a recorded error"
+
+# The same trap on the cancelled side: `reason` is required and typed string,
+# and both writers happen to set `error_message` today (the saga coordinator
+# writes "saga rollback", the dependency cascade writes which parent stranded
+# the DAG). "Happen to" is why the fallback exists — a third writer that
+# forgets would otherwise lose its event to a validation failure rather than
+# publish a vague one.
+_UNSPECIFIED_CANCEL_REASON = "job cancelled without a recorded reason"
 
 # The OTel carrier is injected into the payload at job creation and popped
 # before execution. It must never ride along on a lifecycle event: it is
@@ -132,6 +156,34 @@ def dlq_event_payload(job: Job, message: str | None = None) -> dict[str, Any]:
         # that doesn't exist.
         "trace_id": job.trace_id,
         "dead_lettered": True,
+    }
+
+
+def cancelled_event_payload(job: Job) -> dict[str, Any]:
+    """The `job.cancelled` event for a job row just written CANCELLED.
+
+    CANCELLED was the platform's only terminal status with nothing to announce
+    on (WO-R2-113), which made it the only way for a job to stop without any
+    consumer finding out: the read model kept the id in whichever status set it
+    last saw, the SSE stream stayed open, and the timeline simply ended.
+
+    `reason` rather than `error` because a cancellation is not a failure — the
+    job was stood down, by a saga rolling back or by a dependency parent that
+    can no longer complete — and the distinction is the whole reason this is
+    its own topic instead of a `job.failed` with a flag. Consumers that treat
+    the two alike (the event log, the audit writer) are free to; the read model
+    and the SLO denominator are not, and merging them would have made that
+    impossible to express.
+    """
+    return {
+        "event": "job.cancelled",
+        "tenant_id": str(job.tenant_id),
+        "job_id": str(job.id),
+        "user_id": str(job.user_id),
+        "job_type": job.type,
+        "reason": job.error_message or _UNSPECIFIED_CANCEL_REASON,
+        "retry_count": job.retry_count,
+        "trace_id": job.trace_id,
     }
 
 
