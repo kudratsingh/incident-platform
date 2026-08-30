@@ -16,8 +16,10 @@ For the broader architectural context, see [`docs/ARCHITECTURE.md`](ARCHITECTURE
 | `rate:tenant:{tenant_id}:{window_start}` | string (counter) | `quota.py` `_check_tenant_rate` | `quota.py` `_check_tenant_rate` | 120s | Yes — fails open |
 | `job:progress:{job_id}` | Pub/Sub channel (no persisted key) | `progress.py` `publish` | `progress_broker.py` — one shared subscription per process, fanned out to every viewer of that job | N/A (Pub/Sub is fire-and-forget) | No — listeners must be connected |
 | `job:progress:last:{job_id}` | string (last `ProgressEvent` as JSON) | `progress.py` `publish` (fed by `sse_consumer`) | `progress_broker.py` `subscribe` via `progress.py` `read_last_event`, for the SSE endpoint | 1h (`LAST_EVENT_TTL_SECONDS`) | Yes — degrades to the pre-snapshot stream; the `jobs` row is the fallback |
-| `jobs:tenant:{tenant_id}:status:{status}` | set of job_ids | `read_model.py` `_move` | `admin.py` `system_stats` via `read_global_stats` | None | No — read model goes stale |
-| `jobs:user:{user_id}:status:{status}` | set of job_ids | `read_model.py` `_move` | `admin.py` `user_stats` via `read_user_stats` | None | No — read model goes stale |
+| `jobs:tenant:{tenant_id}:status:{status}` | sorted set of job_ids, scored by projection time, capped at `READ_MODEL_WINDOW` | `read_model.py` `_move` | `admin.py` `system_stats` via `read_global_stats` | 7d (`READ_MODEL_TTL_SECONDS`), refreshed on write | Recoverable — `rebuild_read_model` restores it from `jobs` |
+| `jobs:tenant:{tenant_id}:status:{status}:evicted` | string (counter) | `read_model.py` `_project` trim | `read_model.py` `_member_count` | same as its key | Recoverable — same rebuild |
+| `jobs:user:{user_id}:status:{status}` | sorted set of job_ids, scored by projection time, capped at `READ_MODEL_WINDOW` | `read_model.py` `_move` | `admin.py` `user_stats` via `read_user_stats` | 7d (`READ_MODEL_TTL_SECONDS`), refreshed on write | Recoverable — `rebuild_read_model` restores it from `jobs` |
+| `jobs:user:{user_id}:status:{status}:evicted` | string (counter) | `read_model.py` `_project` trim | `read_model.py` `_member_count` | same as its key | Recoverable — same rebuild |
 | `cache:job:{tenant_id}:{job_id}` | JSON object (`JobResponse`) | `cache.py` `JobCache.set` — **live path, not chaos-writable** | `cache.py` `JobCache.get` | 10s | Yes — cache miss = DB read; a non-object payload also reads as a miss |
 | `kafka:consumer_lag:worker-dispatcher` | string (int) | `dispatcher.py` `_metrics_loop` | `backpressure.py` `check_backpressure` | 90s | Yes — falls back to "no backpressure" |
 | `priority_queue` (sorted set) | sorted set of job_ids by priority score | `queue.py` `push` | `queue.py` `pop` | None | Critical — see below |
@@ -93,27 +95,34 @@ Pub/Sub itself is fire-and-forget and at-most-once, so `publish()` also SETs the
 
 That snapshot is what stops a late subscriber from hanging. A client that connects after the job already finished (or reconnects across a Redis blip) receives the terminal snapshot immediately and the stream closes, instead of waiting forever on a channel that will never speak again. Terminal for this purpose is `completed | failed | dead_letter | cancelled` — `cancelled` included because saga rollbacks cancel jobs.
 
+**The snapshot write is ordered (WO-R2-57).** It used to be unconditional, so the last *write* won rather than the latest *event* — and these events come off Kafka, where a rebalance or a failed handler redelivers a `job.progress` the job has already moved past. That redelivery overwrote a terminal snapshot with `running`, and nothing corrected it, because a finished job produces no further events: for the snapshot's remaining hour every late subscriber was told the job was still running and sat on a dead channel. `publish()` now refuses to replace a terminal snapshot with a non-terminal one, and refuses an event whose Kafka offset within its own topic is one the snapshot has already seen (offsets from different topics are incomparable, which is what the terminal rule covers). Terminal→terminal still applies, so a DLQ replay's eventual `job.completed` lands.
+
+The inverse — a terminal snapshot in front of a job a replay put back in flight — is reconciled at the endpoint, which holds the `jobs` row: if the row is non-terminal and was updated *after* the snapshot was written, the row wins and the stream skips the snapshot (`subscribe(..., use_snapshot=False)`). The tie-break is recency rather than a blanket preference, so the ordinary race — the job finishing microseconds after the row was read — still ends the stream promptly instead of waiting out the idle timeout.
+
+Publish rate is bounded too: `progress.rate_limited` wraps the publisher a processor is handed, so the number of Kafka messages and immutable `job_events` rows a job writes follows elapsed work (at most one per whole percent, and no more than one per half second) rather than the caller's chunk count.
+
 Eviction is safe by design: with no snapshot the behaviour degrades to exactly the old pure-Pub/Sub stream, and the SSE endpoint covers the terminal case from durable state instead — it loads the `jobs` row (tenant-scoped) up front and, if the job is already in a terminal status **and** no snapshot is retained, emits one synthetic `ProgressEvent` built from the row and closes. Redis is never a correctness dependency here; durable state lives in `jobs` + `job_events`. A subscriber that disconnects mid-job still misses the intervening events — only the latest one is retained — which is fine for a progress bar.
 
-### CQRS read-model sets (`jobs:tenant:*`, `jobs:user:*`)
+### CQRS read-model (`jobs:tenant:*`, `jobs:user:*`)
 
-Per-tenant sets keyed by `(tenant_id, status)`; per-user sets keyed by `(user_id, status)`. The `read-model` Kafka consumer (`ReadModelProjector` in `app/workers/read_model.py`) handles every lifecycle event by:
+Per-tenant keys keyed by `(tenant_id, status)`; per-user keys keyed by `(user_id, status)`. The `read-model` Kafka consumer (`ReadModelProjector` in `app/workers/read_model.py`) handles every lifecycle event by:
 
-1. `SREM job_id` from every *other* status set
-2. `SADD job_id` to the *new* status set
+1. `ZREM job_id` from every *other* status key
+2. `ZADD job_id` (scored by projection time) to the *new* status key
 
-Both operations are idempotent: SADD on an existing member is a no-op, SREM on a missing one is a no-op. This is what makes the read-model correct under at-least-once Kafka redelivery.
+Both operations are idempotent: re-adding an existing member updates its score and nothing else, and `ZREM` on a missing one is a no-op. This is what makes the read-model correct under at-least-once Kafka redelivery.
 
-`GET /admin/stats` and `GET /admin/users/{user_id}/stats` read these sets via `SCARD` — O(1) per status. There's no SQL aggregate on the `jobs` table on the admin read path.
+`GET /admin/stats` and `GET /admin/users/{user_id}/stats` read these keys via `ZCARD` plus the `:evicted` counter — O(1) per status. There's no SQL aggregate on the `jobs` table on the admin read path.
 
-The keys have **no TTL**: they represent the source of truth for the admin overview. If Redis flushes them (eviction, restart), the read-model goes silent until either:
+**Bounded, with a reaper (WO-R2-56).** These were unbounded SETs with no TTL: every terminal job_id stayed a member forever, and production runs `noeviction`, which cannot reclaim a key that has no TTL. Now:
 
-- A future PR adds a "rebuild from event_log" backfill — currently the rebuild path is manual.
-- Or each job naturally transitions through a lifecycle event, repopulating its set membership.
+- The key is a ZSET trimmed to the `READ_MODEL_WINDOW` (10,000) most recent ids after every write, oldest first. Ordering is the whole reason it is a ZSET rather than a SET — `SPOP` evicts a random member, which can drop a just-projected terminal id and re-open the reordering hole the projector's terminal guard exists to close.
+- What the trim removes is added to a sibling `:evicted` counter, so a status count is `ZCARD + evicted` and stays whole. The counter is monotonic, so a *trimmed* id that later changes status leaves its old status over-counted by one — bounded by the number of ids ever trimmed, and corrected by a rebuild.
+- Every key carries a 7-day TTL refreshed on each write. That is the reaper (a tenant or user that stops submitting stops holding memory) and it is also what makes the key evictable at all under a `volatile-*` policy.
 
-This is the most operationally fragile thing about the current Redis usage. Documented as a roadmap item in [`docs/ROADMAP.md`](ROADMAP.md).
+**Rebuilding is a real path now**, not a roadmap item: `read_model.rebuild_read_model(session, redis, tenant_id=None)` recomputes every key from the `jobs` table — exact counts from a `GROUP BY`, membership from a windowed query — and `scripts/reset_eval_state.py` runs it at the end of every eval reset. That matters because the projection cannot heal itself: an id only moves when an event names it, and no further event is coming for a finished job, so anything an eviction or a restart or a `saturate_redis` run drops stays dropped. Use it after any Redis incident, and after deploying WO-R2-56 (the projector migrates a pre-existing SET key by dropping it, which is safe but lossy until the rebuild runs).
 
-The tenant scoping landed in Phase 12 PR D — before that, the sets were keyed only by status (`jobs:status:running`) and one tenant's overview counted sibling tenants' jobs. See the PR description on #38.
+The tenant scoping landed in Phase 12 PR D — before that, the keys were keyed only by status (`jobs:status:running`) and one tenant's overview counted sibling tenants' jobs. See the PR description on #38.
 
 ### Job cache (`cache:job:{tenant_id}:{job_id}`)
 
@@ -194,9 +203,11 @@ The writer half is ordered to match. `_scheduled_replay.schedule_one_audited` �
 
 ## Eviction policy
 
-Production: `maxmemory-policy noeviction`. We never want Redis to silently drop a key — the failure modes are bad enough already (read-model goes silent, delayed retries disappear). Better to OOM and alert.
+Production: `maxmemory-policy noeviction`. We never want Redis to silently drop a key — the failure modes are bad enough already (the read-model under-reports, delayed retries disappear). Better to OOM and alert.
 
 Rationale: every key in this catalog either has a TTL (so it expires naturally) or is durable state we don't want lost. There's no LRU-cacheable category big enough to justify enabling eviction.
+
+`noeviction` makes an unbounded key without a TTL a slow OOM rather than a large key, which is why the read-model keys are now both capped and TTL'd (WO-R2-56) — under this policy nothing else was ever going to reclaim them. `saturate_redis` is the tool that makes the pressure happen on purpose; its own keys expire, but keys it pushes out do not come back by themselves, and for the read-model the way back is `rebuild_read_model`.
 
 When `maxmemory` fills up, writes start failing with OOM. The CloudWatch alarm `redis-memory-low` fires at 80% utilization (see `infra/cloudwatch.tf`, runbook `runbooks/rb-redis-memory-low.yaml`).
 
@@ -208,7 +219,7 @@ Production: AOF every second + daily RDB snapshot. The trade-off is durability v
 
 Local dev: in-memory, no AOF, no snapshot. Restarts lose state. This is fine because:
 - The dispatcher would rebuild the priority queue from `jobs WHERE status=pending` on startup (TODO: this isn't actually wired — currently a restart leaves PENDING jobs orphaned).
-- The read-model would rebuild as new events flow.
+- The read-model would **not** rebuild by itself — an id only moves when an event names it, and a finished job has no more events coming. Run `read_model.rebuild_read_model` (the eval reset already does).
 - The delayed queue would lose pending retries (those jobs are stuck in `failed` status with `retry_count < max_retries` until manually replayed).
 
 The orphaned-PENDING-on-restart issue is the second roadmap item in [`docs/ROADMAP.md`](ROADMAP.md).
@@ -223,21 +234,29 @@ The orphaned-PENDING-on-restart issue is the second roadmap item in [`docs/ROADM
 docker compose exec redis redis-cli
 > KEYS 'jobs:tenant:*'                    # don't do this in prod
 > SCAN 0 MATCH 'jobs:tenant:*' COUNT 100  # do this in prod
-> SMEMBERS jobs:tenant:<tid>:status:completed
+> ZRANGE jobs:tenant:<tid>:status:completed 0 -1        # newest last
+> ZCARD jobs:tenant:<tid>:status:completed             # + the :evicted counter
+> GET jobs:tenant:<tid>:status:completed:evicted       # = the true count
 > ZRANGEBYSCORE delayed_queue 0 +inf WITHSCORES
 > GET kafka:consumer_lag:worker-dispatcher
 ```
 
 ### Rebuild the read-model
 
-Manual today; future PR (Phase 8 platform work) makes it an admin endpoint. The pattern:
+From the `jobs` table, which is the source of truth — not from `event_log`, which would replay the same at-least-once ordering problems the projector guards against:
 
 ```python
-# DELETE all jobs:tenant:* and jobs:user:* keys
-# Replay from event_log:
-#   for each job_event in order:
-#     apply the same logic as ReadModelProjector.handle_message
+from app.workers.read_model import rebuild_read_model
+
+# Whole projection:
+await rebuild_read_model(session, redis)
+# One tenant, leaving every other tenant's keys untouched:
+await rebuild_read_model(session, redis, tenant_id=tenant_id)
 ```
+
+Run it after a Redis restart or eviction event, after any `saturate_redis` run that tripped eviction, and once after deploying WO-R2-56 (which changes these keys from SETs to ZSETs; the projector drops a stale-typed key rather than raising, so counts are low until the rebuild lands). It deletes the keys in scope and rewrites them, so counts are exact and membership is windowed exactly as the live projector would keep it.
+
+It is not atomic against a running projector: an event landing mid-rebuild can be overwritten by it, self-correcting on that job's next event. `scripts/reset_eval_state.py` runs it as the last step of every eval reset.
 
 ### Clear the cache
 

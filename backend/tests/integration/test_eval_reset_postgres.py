@@ -524,3 +524,91 @@ async def test_rebaseline_timestamps_on_postgres(session_factory: Any) -> None:
     async with session_factory() as session:
         async with session.begin():
             assert await seed_eval_fixtures._rebaseline_timestamps(session) == 0
+
+
+# ---------------------------------------------------------------------------
+# _rebuild_read_model — the CQRS projection, on the dialect that ships (WO-R2-56)
+#
+# The rebuild reads its membership through a window function partitioned by
+# (scope, status). The unit tier proves it on SQLite; this proves the same SQL
+# on Postgres, which is the dialect the eval reset actually runs against and
+# the one where `jobs.tenant_id` is a real UUID column rather than a string.
+# ---------------------------------------------------------------------------
+
+
+class _RedisForRebuild:
+    """Enough Redis for read_model's write path; nothing here talks to a server."""
+
+    def __init__(self) -> None:
+        self.zsets: dict[str, dict[str, float]] = {}
+        self.strings: dict[str, str] = {}
+        self.ttls: dict[str, int] = {}
+
+    async def zadd(self, key: str, mapping: dict[str, float]) -> int:
+        self.zsets.setdefault(key, {}).update(mapping)
+        return len(mapping)
+
+    async def expire(self, key: str, seconds: int) -> bool:
+        self.ttls[key] = seconds
+        return True
+
+    async def set(self, key: str, value: Any, ex: int | None = None) -> None:
+        self.strings[key] = str(value)
+
+    async def get(self, key: str) -> str | None:
+        return self.strings.get(key)
+
+    async def zcard(self, key: str) -> int:
+        return len(self.zsets.get(key, {}))
+
+    async def delete(self, *keys: str) -> int:
+        gone = 0
+        for key in keys:
+            gone += int(self.zsets.pop(key, None) is not None)
+            gone += int(self.strings.pop(key, None) is not None)
+        return gone
+
+    async def scan(
+        self, cursor: int = 0, match: str = "*", count: int = 10
+    ) -> tuple[int, list[str]]:
+        import fnmatch
+
+        return 0, [
+            k for k in (*self.zsets, *self.strings) if fnmatch.fnmatch(k, match)
+        ]
+
+
+async def test_rebuild_read_model_projects_postgres_rows(
+    session_factory: Any,
+) -> None:
+    from app.models.enums import JobStatus
+    from app.workers.read_model import rebuild_read_model
+
+    async with session_factory() as session:
+        async with session.begin():
+            tenant_id, user_id = await _make_tenant_and_user(session, "readmodel")
+            completed = [
+                _job(tenant_id, user_id, status=JobStatus.COMPLETED.value)
+                for _ in range(3)
+            ]
+            dead = _job(tenant_id, user_id, status=JobStatus.DEAD_LETTER.value)
+            # Not a projected status — must not appear anywhere.
+            pending = _job(tenant_id, user_id, status=JobStatus.PENDING.value)
+            session.add_all([*completed, dead, pending])
+
+    redis = _RedisForRebuild()
+    async with session_factory() as session:
+        summary = await rebuild_read_model(session, redis, tenant_id=tenant_id)  # type: ignore[arg-type]
+
+    completed_key = f"jobs:tenant:{tenant_id}:status:completed"
+    assert set(redis.zsets[completed_key]) == {str(job.id) for job in completed}
+    assert set(redis.zsets[f"jobs:tenant:{tenant_id}:status:dead_letter"]) == {
+        str(dead.id)
+    }
+    assert f"jobs:tenant:{tenant_id}:status:pending" not in redis.zsets
+    assert set(redis.zsets[f"jobs:user:{user_id}:status:completed"]) == {
+        str(job.id) for job in completed
+    }
+    # 4 projected rows × (tenant key + user key).
+    assert summary["members"] == 8
+    assert redis.ttls[completed_key] > 0

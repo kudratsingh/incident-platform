@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from app.core.circuit_breaker import CircuitState
-from app.workers import cpu_processors
+from app.workers import cpu_processors, thread_adapters
 from app.workers.async_tasks import (
     MAX_ENDPOINT_COUNT,
     _bulk_api_breaker,
@@ -79,6 +79,30 @@ async def test_csv_upload_returns_row_count() -> None:
 async def test_csv_upload_progress_reaches_100() -> None:
     log, publish = _collect_publishes()
     await process_csv_upload({"row_count": 100, "chunk_size": 100}, publish)
+    assert log[-1][0] == 100
+
+
+async def test_csv_upload_event_count_is_bounded_not_the_chunk_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every progress publish is a Kafka message and an immutable job_events
+    row. Unwrapped, a job wrote one of each per chunk — and chunk_size is the
+    caller's, so a 1,000,000-row upload with chunk_size=1 wrote a million
+    (WO-R2-57). The parse is stubbed out because the point under test is the
+    publish rate, not the (simulated) blocking read.
+    """
+    monkeypatch.setattr(
+        thread_adapters,
+        "_parse_chunk_blocking",
+        lambda start, end: {"chunk_start": start, "chunk_end": end, "checksum": 0},
+    )
+    log, publish = _collect_publishes()
+
+    await process_csv_upload({"row_count": 20_000, "chunk_size": 1}, publish)
+
+    # 20,000 chunks, at most one event per whole percent plus the first.
+    assert len(log) <= 102
+    assert log[0][0] == 0
     assert log[-1][0] == 100
 
 

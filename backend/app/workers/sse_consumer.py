@@ -47,7 +47,7 @@ class SseConsumer(BaseKafkaConsumer):
         topic: str,
         key: str | None,
         value: dict[str, Any],
-        **_kafka_meta: Any,
+        **kafka_meta: Any,
     ) -> None:
         if not isinstance(value, dict):
             logger.warning("skipping non-dict SSE event", extra={"topic": topic})
@@ -83,6 +83,13 @@ class SseConsumer(BaseKafkaConsumer):
         )
         retry_count = int(value.get("retry_count", 0))
 
+        # Provenance for the snapshot's ordering guard (WO-R2-57). Every event
+        # for a job carries the same Kafka key (`{tenant}:{user}`) and so
+        # shares a partition, which makes the offset within one topic the
+        # producer's own order — and makes a redelivered offset recognisable
+        # as the replay it is. Offsets from *different* topics are
+        # incomparable, hence the topic travelling with the offset.
+        offset = kafka_meta.get("offset")
         await publish_progress(
             self.redis,
             job_id=str(job_id),
@@ -90,4 +97,6 @@ class SseConsumer(BaseKafkaConsumer):
             progress=percent,
             message=message,
             retry_count=retry_count,
+            source=topic,
+            sequence=int(offset) if offset is not None else None,
         )

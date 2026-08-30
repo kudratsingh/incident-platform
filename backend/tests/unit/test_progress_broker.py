@@ -347,6 +347,25 @@ async def test_non_terminal_snapshot_is_followed_by_live_events() -> None:
     assert [e.status for e in events] == ["running", "completed"]
 
 
+async def test_use_snapshot_false_streams_live_events_only() -> None:
+    """The endpoint's escape hatch for a snapshot it has compared against the
+    `jobs` row and found stale (WO-R2-57). Yielding a terminal snapshot for a
+    job the row says is running again ends the stream on its first event; the
+    broker has no row to make that call, so the caller makes it.
+    """
+    redis = _FakeRedis(
+        last_event=_event_json("dead_letter", 0, "a lifecycle this job has left"),
+        messages=[_message(JOB_ID, _event_json("completed", 100, "replay done"))],
+    )
+    broker = _broker(redis)
+
+    events = await asyncio.wait_for(
+        _drain(broker.subscribe(JOB_ID, use_snapshot=False)), timeout=2
+    )
+
+    assert [e.status for e in events] == ["completed"]
+
+
 async def test_no_snapshot_falls_through_to_the_live_channel() -> None:
     redis = _FakeRedis(messages=[_message(JOB_ID, _event_json("failed", 0, "boom"))])
     broker = _broker(redis)
