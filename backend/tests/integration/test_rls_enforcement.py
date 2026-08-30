@@ -5,9 +5,10 @@ chain (including both RLS migrations), then proves:
 
   1. With `app.tenant_id` set to tenant A, queries see only A's rows.
   2. With it set to B, only B's rows are visible.
-  3. With it unset, *all* rows are visible — this is the bootstrap escape
-     hatch the policy was deliberately written with (workers and
-     migrations don't carry a tenant context).
+  3. With it unset, *nothing* is visible and nothing can be written — the
+     bootstrap escape hatch is gone (WO-R2-129 / ADR 0026). Cross-tenant
+     work declares itself with `app.tenant_scope = 'platform'` instead of
+     being admitted for having set nothing.
   4. Posture: every tenant table has RLS both ENABLEd and FORCEd. FORCE
      is what makes the policies bind the table *owner* — production
      connects as the RDS master, which owns every table and is otherwise
@@ -42,10 +43,11 @@ itself and given its password by `python -m app.core.db_bootstrap`
 (exactly what scripts/entrypoint.sh and the compose migrate one-shot
 run) — not a hand-rolled test role.
 
-The third assertion is intentional: it documents the trade-off the
-migration was written under. If a future change tightens the policy
-(removes the IS NULL escape), this test will fail loudly and force the
-author to migrate workers + relays to set the variable per transaction.
+The third assertion used to read the other way — "unset sees all rows" —
+and warned that tightening the policy would force the author to migrate
+workers + relays. That is exactly what WO-R2-129 did: the loops now run
+on `tenant_scope.platform_session_factory`, which declares the scope once
+per transaction, and `alembic/env.py` declares it for migration runs.
 
 Skipped automatically when Docker / testcontainers isn't available so the
 rest of the suite still runs.
@@ -82,6 +84,14 @@ pytestmark = pytest.mark.skipif(
 # table joins this list, the unit coverage gate and the runtime probe at
 # once, the moment its model exists.
 ALL_TENANT_RLS_TABLES = sorted(tenant_scoped_tables())
+
+# The strict `tenant_isolation` predicate as shipped by e2a9c4f70b31 (ADR
+# 0026). Kept here so a test that has to drop and rebuild a policy restores
+# the real one rather than an approximation of it.
+_STRICT_MATCH = (
+    "current_setting('app.tenant_scope', true) = 'platform'"
+    " OR tenant_id = nullif(current_setting('app.tenant_id', true), '')::uuid"
+)
 
 
 @pytest.fixture(scope="module")
@@ -237,10 +247,22 @@ async def test_rls_isolates_tenants(rls_db: RlsDb) -> None:
             assert len(rows) == 1
             assert rows[0]["tenant_id"] == tenant_b
 
-        # Unset — bootstrap escape hatch lets workers/migrations see all rows.
+        # Unset — refused, not admitted (WO-R2-129). This assertion is the
+        # inverse of the one that stood here: the bootstrap escape hatch used
+        # to make an unscoped read return every tenant's rows.
         async with app.transaction():
             rows = await app.fetch("SELECT tenant_id FROM jobs")
-            assert len(rows) == 2
+            assert rows == [], "an unscoped read must see nothing"
+
+        # Cross-tenant work declares itself instead of being admitted for
+        # having forgotten — this is what the worker loops, the migration
+        # runner and the seed/reset scripts now do (ADR 0026).
+        async with app.transaction():
+            await app.execute(
+                "SELECT set_config('app.tenant_scope', 'platform', true)"
+            )
+            rows = await app.fetch("SELECT tenant_id FROM jobs")
+            assert len(rows) == 2, "declared platform scope must span tenants"
     finally:
         await app.close()
 
@@ -678,37 +700,48 @@ async def test_probe_catches_a_dropped_tenant_isolation_policy(
         with pytest.raises(RuntimeError, match="row-level security"):
             await _probe_as_app(rls_db, "production")
     finally:
+        # Restore the policy the migration actually creates, WITH CHECK and
+        # all. The previous restore here rebuilt a USING-only policy with a
+        # bare `::uuid` cast — so every test ordered after this one ran
+        # against a `sagas` whose writes were unconstrained and whose reads
+        # raised on an empty-string GUC, rather than against the shipped
+        # policy. Nothing looked until
+        # `test_unscoped_writes_are_refused_on_every_tenant_table` did.
         await sup.execute(
-            "CREATE POLICY tenant_isolation ON sagas "
-            "USING (tenant_id = current_setting('app.tenant_id', true)::uuid)"
+            "CREATE POLICY tenant_isolation ON sagas"
+            "  USING (" + _STRICT_MATCH + ")"
+            "  WITH CHECK (" + _STRICT_MATCH + ")"
         )
         await sup.close()
 
     await _probe_as_app(rls_db, "production")
 
 
-async def test_a_cleared_tenant_setting_turns_digest_isolation_off(
+async def test_a_cleared_tenant_setting_is_refused_not_admitted(
     rls_db: RlsDb,
 ) -> None:
-    """WO-R2-127, and why it is a security finding rather than a tidy.
+    """WO-R2-129 — the inversion of the WO-R2-127 finding.
 
     `app.tenant_id` is set with `set_config(..., true)` — **transaction-local**.
     The admin digest route reads the window, ends that transaction so the
     Anthropic round-trip holds no connection, and then INSERTs the result in a
     new one. The setting does not carry over.
 
-    The intuition is that the unscoped INSERT is then rejected. It is not.
-    Every `tenant_isolation` policy here opens with
+    This test used to assert that the unscoped INSERT *succeeded* — because
+    every `tenant_isolation` policy opened with
 
         current_setting('app.tenant_id', true) IS NULL OR ... = '' OR ...
 
-    — the ADR 0003 bootstrap hatch that lets authentication read `users` before
-    any tenant is known. An unset setting does not fail closed, it **fails
-    open**: the policy is satisfied unconditionally, the statement runs with no
-    tenant isolation whatsoever, and nothing errors or logs. A write that
-    should have been scoped simply is not, which is the failure this work order
-    removes — RLS is the backstop for a forgotten filter, and here the backstop
-    was silently off for the one statement that had already cost real money.
+    the ADR 0003 bootstrap hatch, which made an unset setting fail **open**:
+    the policy was satisfied unconditionally, the statement ran with no tenant
+    isolation whatsoever, and nothing errored or logged. Its own assertion
+    message said that if this ever started raising, the branch had changed and
+    the finding needed rewriting rather than deleting. It has, and this is the
+    rewrite.
+
+    The bootstrap branch is gone (ADR 0026). An unscoped statement is now
+    refused on both halves: the write trips WITH CHECK, and the read returns
+    nothing rather than every tenant's rows.
     """
     import asyncpg
 
@@ -727,22 +760,35 @@ async def test_a_cleared_tenant_setting_turns_digest_isolation_off(
 
     app = await asyncpg.connect(rls_db.app_dsn)
     try:
-        # A connection that has never been scoped — the setting is unset, and
-        # the policy's first branch admits everything.
+        # A connection that has never been scoped. The write is refused and
+        # the read is empty — the exact pair that used to succeed.
         async with app.transaction():
             assert (
                 await app.fetchval("SELECT current_setting('app.tenant_id', true)")
             ) is None
-            tag = await app.execute(insert, uuid.uuid4(), foreign)
-            assert tag == "INSERT 0 1", (
-                "an unscoped session must be shown to fail OPEN — if this ever "
-                "starts raising, the bootstrap branch changed and this finding "
-                "needs rewriting, not deleting"
-            )
+            with pytest.raises(asyncpg.exceptions.InsufficientPrivilegeError):
+                await app.execute(insert, uuid.uuid4(), foreign)
+
+        async with app.transaction():
             assert await app.fetchval(
-                "SELECT count(*) FROM incident_summaries WHERE tenant_id = $1",
-                foreign,
-            ) == 1, "an unscoped session reads every tenant's digests too"
+                "SELECT count(*) FROM incident_summaries"
+            ) == 0, "an unscoped session must read no tenant's digests"
+
+        # The pooled-connection variant of the same hazard: the GUC resets to
+        # the empty string rather than to unset. That used to reach
+        # `''::uuid` and raise invalid_text_representation — a different
+        # error for the same mistake. `nullif(..., '')` folds it into the
+        # same clean refusal. Note the refusal aborts its transaction, so
+        # the follow-up count gets a fresh one.
+        async with app.transaction():
+            await app.execute("SELECT set_config('app.tenant_id', '', true)")
+            with pytest.raises(asyncpg.exceptions.InsufficientPrivilegeError):
+                await app.execute(insert, uuid.uuid4(), foreign)
+
+        async with app.transaction():
+            assert await app.fetchval(
+                "SELECT count(*) FROM incident_summaries"
+            ) == 0
 
         # Scope it, the way the read phase does.
         async with app.transaction():
@@ -753,18 +799,14 @@ async def test_a_cleared_tenant_setting_turns_digest_isolation_off(
                 "SELECT current_setting('app.tenant_id', true)"
             ) == str(home)
 
-        # The write phase's transaction: the value is gone. On a pooled
-        # connection it resets to the empty string rather than to unset, which
-        # is its own hazard — `''::uuid` is not a cast Postgres will make, so
-        # the third branch of the policy can raise outright instead of failing
-        # open. Either way it is not the caller's tenant.
+        # The write phase's transaction: the value is gone.
         async with app.transaction():
             assert await app.fetchval(
                 "SELECT current_setting('app.tenant_id', true)"
             ) != str(home), "the GUC must not survive the transaction that set it"
 
-        # Re-established on the write session — the whole of the fix. A
-        # cross-tenant row is refused, the caller's own row lands.
+        # Re-established on the write session — a cross-tenant row is still
+        # refused, the caller's own row lands.
         async with app.transaction():
             await app.execute(
                 "SELECT set_config('app.tenant_id', $1, true)", str(home)
@@ -780,3 +822,283 @@ async def test_a_cleared_tenant_setting_turns_digest_isolation_off(
             assert tag == "INSERT 0 1", f"own-tenant INSERT must succeed, got {tag!r}"
     finally:
         await app.close()
+
+
+async def test_unscoped_writes_are_refused_on_every_tenant_table(
+    rls_db: RlsDb,
+) -> None:
+    """The finding was never specific to digests (WO-R2-129).
+
+    The bootstrap branch was in the policy text of all eleven tables, so
+    the fail-open default was wave-wide. Rather than trust that the
+    migration looped correctly, ask the server what predicate each policy
+    actually ended up with: no `tenant_isolation` policy may still admit
+    a session on the grounds that it set nothing.
+    """
+    import asyncpg
+
+    sup = await asyncpg.connect(rls_db.superuser_dsn)
+    try:
+        rows = await sup.fetch(
+            "SELECT tablename, qual, with_check FROM pg_policies "
+            "WHERE policyname = 'tenant_isolation' ORDER BY tablename"
+        )
+    finally:
+        await sup.close()
+
+    assert {r["tablename"] for r in rows} == set(ALL_TENANT_RLS_TABLES), (
+        "every tenant-scoped table must carry a tenant_isolation policy"
+    )
+
+    for row in rows:
+        for clause in (row["qual"], row["with_check"]):
+            assert clause is not None, f"{row['tablename']}: missing clause"
+            normalised = " ".join(clause.split())
+            assert "IS NULL" not in normalised.replace(
+                "tenant_id IS NULL", ""
+            ), (
+                f"{row['tablename']}: the bootstrap branch is back — {normalised}"
+            )
+            assert "= ''::text" not in normalised, (
+                f"{row['tablename']}: empty-string escape is back — {normalised}"
+            )
+
+
+async def test_platform_scope_is_what_lets_the_worker_loops_work(
+    rls_db: RlsDb,
+) -> None:
+    """The declared-scope half of the design.
+
+    Without it the loops would be broken rather than secured: the outbox
+    relay, dispatcher and reapers are mixed-tenant by construction. The
+    declaration is transaction-local, so it cannot leak onto the next
+    request that checks the same pooled connection out.
+    """
+    import asyncpg
+
+    sup = await asyncpg.connect(rls_db.superuser_dsn)
+    try:
+        tenant = await _create_tenant(sup, "platform-scope-probe")
+    finally:
+        await sup.close()
+
+    app = await asyncpg.connect(rls_db.app_dsn)
+    try:
+        summary_id = uuid.uuid4()
+        async with app.transaction():
+            await app.execute(
+                "SELECT set_config('app.tenant_scope', 'platform', true)"
+            )
+            tag = await app.execute(
+                "INSERT INTO incident_summaries (id, tenant_id, window_start, "
+                "window_end, summary, model_used) "
+                "VALUES ($1, $2, now(), now(), 'digest', 'claude')",
+                summary_id,
+                tenant,
+            )
+            assert tag == "INSERT 0 1"
+
+        # New transaction, nothing declared: the scope is gone with it.
+        async with app.transaction():
+            assert await app.fetchval(
+                "SELECT current_setting('app.tenant_scope', true)"
+            ) != "platform", "platform scope must not outlive its transaction"
+            assert await app.fetchval(
+                "SELECT count(*) FROM incident_summaries WHERE id = $1", summary_id
+            ) == 0
+    finally:
+        await app.close()
+
+
+async def test_service_accounts_preauth_read_survives_but_writes_do_not(
+    rls_db: RlsDb,
+) -> None:
+    """The one genuine non-`users` bootstrap consumer (ADR 0026).
+
+    `get_current_principal` -> `verify_token` reads `service_accounts`
+    two statements before `_apply_tenant_context` can issue `set_config`
+    — it is fetching the row that says which tenant this is. So the
+    unscoped SELECT has to keep working, or no machine principal could
+    ever authenticate and the whole MCP surface would go dark.
+
+    It is restored for `FOR SELECT` only: an unscoped session can still
+    resolve a token, and still cannot write.
+    """
+    import asyncpg
+
+    sup = await asyncpg.connect(rls_db.superuser_dsn)
+    try:
+        tenant = await _create_tenant(sup, "sa-bootstrap")
+        sa_id = uuid.uuid4()
+        await sup.execute(
+            "INSERT INTO service_accounts (id, tenant_id, name, scopes, "
+            "is_active) VALUES ($1, $2, 'probe', '[]'::jsonb, true)",
+            sa_id,
+            tenant,
+        )
+    finally:
+        await sup.close()
+
+    app = await asyncpg.connect(rls_db.app_dsn)
+    try:
+        # The pre-auth lookup: unscoped, and it must find the row.
+        async with app.transaction():
+            assert (
+                await app.fetchval("SELECT current_setting('app.tenant_id', true)")
+            ) is None
+            found = await app.fetchval(
+                "SELECT tenant_id FROM service_accounts WHERE id = $1", sa_id
+            )
+            assert found == tenant, "the pre-auth service-account read must work"
+
+        # ...but the bootstrap policy is SELECT-only.
+        async with app.transaction():
+            with pytest.raises(asyncpg.exceptions.InsufficientPrivilegeError):
+                await app.execute(
+                    "INSERT INTO service_accounts (id, tenant_id, name, "
+                    "scopes, is_active) "
+                    "VALUES ($1, $2, 'forged', '[]'::jsonb, true)",
+                    uuid.uuid4(),
+                    tenant,
+                )
+
+        # And it buys nothing once a tenant IS named: a scoped session sees
+        # only its own rows, so the bootstrap read cannot be used as a
+        # cross-tenant window from inside an authenticated request.
+        other = uuid.uuid4()
+        async with app.transaction():
+            await app.execute(
+                "SELECT set_config('app.tenant_id', $1, true)", str(other)
+            )
+            assert await app.fetchval(
+                "SELECT count(*) FROM service_accounts WHERE id = $1", sa_id
+            ) == 0
+    finally:
+        await app.close()
+
+
+async def test_unscoped_deploy_marker_write_is_limited_to_platform_rows(
+    rls_db: RlsDb,
+) -> None:
+    """`deploy_markers` keeps `OR tenant_id IS NULL` — deliberate, ADR 0015.
+
+    Deploys are platform-wide, `tenant_id` is nullable by design, and
+    hiding NULL rows from tenant-scoped sessions would silently degrade
+    `get_deploy_history` to its env-var fallback. What WO-R2-129 changes
+    is the reach of an unscoped session: it may still write a NULL-tenant
+    marker, but it can no longer forge one belonging to a named tenant.
+    """
+    import asyncpg
+
+    sup = await asyncpg.connect(rls_db.superuser_dsn)
+    try:
+        tenant = await _create_tenant(sup, "deploy-marker-scope")
+    finally:
+        await sup.close()
+
+    app = await asyncpg.connect(rls_db.app_dsn)
+    try:
+        async with app.transaction():
+            tag = await app.execute(
+                "INSERT INTO deploy_markers (id, tenant_id, version, "
+                "environment, deployed_at) "
+                "VALUES ($1, NULL, 'v1', 'test', now())",
+                uuid.uuid4(),
+            )
+            assert tag == "INSERT 0 1", "platform-wide markers stay writable"
+
+        async with app.transaction():
+            with pytest.raises(asyncpg.exceptions.InsufficientPrivilegeError):
+                await app.execute(
+                    "INSERT INTO deploy_markers (id, tenant_id, version, "
+                    "environment, deployed_at) "
+                    "VALUES ($1, $2, 'v1', 'test', now())",
+                    uuid.uuid4(),
+                    tenant,
+                )
+    finally:
+        await app.close()
+
+
+async def test_the_real_platform_session_factory_declares_the_scope(
+    rls_db: RlsDb,
+) -> None:
+    """Exercise `platform_session_factory` itself, not a hand-written GUC.
+
+    Everything else in this file speaks raw asyncpg, and the unit/API
+    suite runs on SQLite where the `after_begin` hook is a deliberate
+    no-op — so neither tier would notice if the factory stopped emitting
+    `set_config` on Postgres. That is the one component the worker loops
+    actually depend on: if it silently stopped working, the outbox relay
+    would fetch zero rows and all Kafka delivery would stop.
+
+    So: build both factories over a real engine and show the difference
+    is the factory, not the caller.
+    """
+    import asyncpg
+    from app.core.tenant_scope import platform_session_factory
+    from sqlalchemy import text as sa_text
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    sup = await asyncpg.connect(rls_db.superuser_dsn)
+    try:
+        tenant = await _create_tenant(sup, "factory-probe")
+        user_id = uuid.uuid4()
+        await sup.execute(
+            "INSERT INTO users (id, tenant_id, email, hashed_password, role, "
+            "is_active) VALUES ($1, $2, 'factory@probe.test', 'x', 'user', true)",
+            user_id,
+            tenant,
+        )
+        await sup.execute(
+            "INSERT INTO jobs (id, tenant_id, user_id, type, status, priority, "
+            "retry_count, max_retries, payload) "
+            "VALUES ($1, $2, $3, 'csv_upload', 'pending', 5, 0, 3, '{}'::jsonb)",
+            uuid.uuid4(),
+            tenant,
+            user_id,
+        )
+    finally:
+        await sup.close()
+
+    engine = create_async_engine(rls_db.app_async_url)
+    try:
+        # The factory the worker loops are handed.
+        platform = platform_session_factory(engine)
+        async with platform() as session:
+            async with session.begin():
+                assert (
+                    await session.execute(
+                        sa_text("SELECT current_setting('app.tenant_scope', true)")
+                    )
+                ).scalar() == "platform", "the after_begin hook did not fire"
+                # Scoped to this test's own tenant: the module fixture is
+                # shared, so earlier tests have left their own jobs behind.
+                count = (
+                    await session.execute(
+                        sa_text(
+                            "SELECT count(*) FROM jobs WHERE tenant_id = :t"
+                        ),
+                        {"t": tenant},
+                    )
+                ).scalar()
+                assert count == 1, "declared platform scope must see the row"
+
+        # The stock factory the request path uses — same engine, same pool,
+        # no declaration, nothing visible.
+        plain = async_sessionmaker(engine, expire_on_commit=False)
+        async with plain() as session:
+            async with session.begin():
+                assert (
+                    await session.execute(
+                        sa_text("SELECT current_setting('app.tenant_scope', true)")
+                    )
+                ).scalar() != "platform", "platform scope leaked across factories"
+                # No tenant named and no scope declared: the whole table is
+                # invisible, not just this tenant's slice.
+                count = (
+                    await session.execute(sa_text("SELECT count(*) FROM jobs"))
+                ).scalar()
+                assert count == 0, "an undeclared session must see nothing"
+    finally:
+        await engine.dispose()

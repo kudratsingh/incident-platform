@@ -53,6 +53,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import eval_safety  # type: ignore[import-not-found]  # noqa: E402
 from app.core.scopes import Scope, validate_scopes  # noqa: E402
+from app.core.tenant_scope import platform_session_factory  # noqa: E402
 from app.models.tenant import Tenant  # noqa: E402
 from app.repositories.audit import AuditRepository  # noqa: E402
 from app.repositories.service_account import (  # noqa: E402
@@ -63,7 +64,6 @@ from app.repositories.tenant import TenantRepository  # noqa: E402
 from app.services.service_account import ServiceAccountService  # noqa: E402
 from sqlalchemy.ext.asyncio import (  # noqa: E402
     AsyncSession,
-    async_sessionmaker,
     create_async_engine,
 )
 
@@ -312,7 +312,12 @@ async def main() -> None:
     print(eval_safety.describe_target(_DB_URL))
 
     engine = create_async_engine(_DB_URL, echo=False)
-    factory = async_sessionmaker(engine, expire_on_commit=False)
+    # Platform (cross-tenant) scope: this script touches many tenants'
+    # rows and sets no `app.tenant_id`. Since WO-R2-129 that is refused
+    # rather than silently admitted, and it runs as `incident_app`
+    # (docker-compose `app` service) — a non-owner role with no
+    # BYPASSRLS — so the declaration is what keeps it working. ADR 0026.
+    factory = platform_session_factory(engine)
 
     async with factory() as session:
         async with session.begin():

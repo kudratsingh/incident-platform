@@ -106,7 +106,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # Import here to avoid circular imports at module load time
     from app.core.migration_check import assert_migrations_current
     from app.core.rls_check import assert_rls_posture
-    from app.dependencies import get_session_factory
+    from app.core.tenant_scope import platform_session_factory
+    from app.dependencies import get_engine, get_session_factory
     from app.workers.dispatcher import worker_loop
     from app.workers.kafka_producer import start_producer, stop_producer
 
@@ -160,7 +161,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     await metrics.start_metrics_emitter()
 
     redis = get_redis_client()
-    session_factory = _session_factory
+    # Platform (cross-tenant) scope, declared once for every consumer and
+    # background loop below (ADR 0026). The loops are mixed-tenant by
+    # design — the outbox relay publishes for all tenants, the dispatcher
+    # polls pending jobs across them — and since WO-R2-129 the
+    # `tenant_isolation` policies refuse a statement that names no tenant
+    # instead of admitting it. Attaching the declaration to the factory
+    # they are handed covers all ~30 `async with session_factory()` sites
+    # without each one remembering; `_session_factory` above stays
+    # strictly scoped and is what the boot probes keep using.
+    session_factory = platform_session_factory(get_engine())
 
     # Supervised, not fire-and-forget. This one task hosts every consumer and
     # every background loop — there is no separate worker deployable yet — so

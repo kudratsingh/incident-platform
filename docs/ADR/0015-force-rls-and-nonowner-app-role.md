@@ -2,6 +2,14 @@
 
 **Status:** Accepted · **Date:** 2026-08-09 · **Owner:** Platform
 
+> **Superseded in part by [ADR 0026](0026-strict-tenant-isolation-and-declared-platform-scope.md)
+> (2026-08-30):** this ADR says the unset-tenant escape hatch is "load-bearing … do not
+> tighten it". It has been tightened. The consumer list below is accurate and was the
+> starting point for the work — what was wrong is the conclusion drawn from it: those paths
+> needed a way to *declare* cross-tenant intent, not a policy that admits anyone who declares
+> nothing. Only the pre-auth `service_accounts` lookup genuinely could not declare, and it
+> keeps a narrow SELECT-only policy of its own.
+>
 > **Amends [ADR 0003](0003-rls-as-defense-in-depth.md).** ADR 0003's design — permissive
 > `tenant_isolation` policies with a deliberate unset-tenant escape hatch — stands unchanged.
 > What this ADR adds: the policies now *bind the table owner* (`FORCE ROW LEVEL SECURITY`),
@@ -100,6 +108,8 @@ for the production connection at the next deploy that runs migrations — no rol
 connection-string change needed.
 
 The unset-tenant escape hatch remains **load-bearing** under FORCE — do not tighten it:
+*(ADR 0026 tightened it. Each consumer below now declares platform scope explicitly, except
+the last, which gets a SELECT-only bootstrap policy.)*
 
 - migrations (the entrypoint runs `alembic upgrade head` as the owner, no tenant context);
 - worker loops (dispatcher, outbox relay, reaper, digest) — mixed-tenant by design (ADR 0003);

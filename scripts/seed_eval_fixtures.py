@@ -61,6 +61,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import eval_safety  # type: ignore[import-not-found]  # noqa: E402
 import redis.asyncio as aioredis  # noqa: E402
 from app.core.security import hash_password  # noqa: E402
+from app.core.tenant_scope import platform_session_factory  # noqa: E402
 from app.models.alert import Alert  # noqa: E402
 from app.models.audit import (  # noqa: E402
     PRINCIPAL_TYPE_USER,
@@ -81,7 +82,6 @@ from app.models.user import User  # noqa: E402
 from sqlalchemy import select  # noqa: E402
 from sqlalchemy.ext.asyncio import (  # noqa: E402
     AsyncSession,
-    async_sessionmaker,
     create_async_engine,
 )
 
@@ -1066,7 +1066,12 @@ async def seed(
     )
 
     engine = create_async_engine(database_url, echo=False)
-    factory = async_sessionmaker(engine, expire_on_commit=False)
+    # Platform (cross-tenant) scope: this script touches many tenants'
+    # rows and sets no `app.tenant_id`. Since WO-R2-129 that is refused
+    # rather than silently admitted, and it runs as `incident_app`
+    # (docker-compose `app` service) — a non-owner role with no
+    # BYPASSRLS — so the declaration is what keeps it working. ADR 0026.
+    factory = platform_session_factory(engine)
     redis = aioredis.from_url(redis_url, decode_responses=True)
     dlq_reset = 0
     timestamps_rebaselined = 0
