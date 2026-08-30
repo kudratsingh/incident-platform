@@ -2,10 +2,23 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any, cast
 
+from app.config import get_settings
 from app.models.enums import JobStatus
 from app.models.job import Job
 from app.repositories.base import BaseRepository
+from app.repositories.outbox import OutboxRepository
+from app.schemas.job_events import completed_event_payload, dlq_event_payload
 from sqlalchemy import CursorResult, and_, func, select, update
+
+# The statuses a job never leaves, and the Kafka topic each one announces on.
+# `CANCELLED` is terminal too but is deliberately absent: the platform has no
+# `job.cancelled` topic, so there is no event to emit in the same transaction.
+# Its single writer (`SagaCoordinator._handle_failure`) cancels steps that the
+# saga is already settling, so the saga side stays coherent — but the CQRS read
+# model does leave those ids in their previous status set. Adding the topic is
+# a schema-registry change with four consumers to update; tracked in
+# docs/ROADMAP.md rather than smuggled in here.
+_TERMINAL_EVENT_STATUSES = (JobStatus.DEAD_LETTER, JobStatus.COMPLETED)
 
 
 class JobRepository(BaseRepository[Job]):
@@ -84,7 +97,27 @@ class JobRepository(BaseRepository[Job]):
         job_id: uuid.UUID,
         status: str,
         extra: dict[str, Any] | None = None,
+        event_message: str | None = None,
     ) -> Job | None:
+        """Write a job status, emitting its lifecycle event when terminal.
+
+        A terminal status and its outbox event are one write. The row and the
+        `outbox_events` insert land in the caller's transaction, so a job
+        cannot be `dead_letter`/`completed` in Postgres while no consumer ever
+        hears about it — no saga stranded in RUNNING, no id pinned in the read
+        model's failed set, no gap in the event log.
+
+        This used to be each caller's job, and four of the nine call sites got
+        it wrong or partly wrong (`_force_dead_letter` emitted nothing,
+        `resolve_incident` emitted nothing). Emission is no longer elective:
+        every path that writes a terminal status goes through here, which is
+        the point. See the addendum on ADR 0001.
+
+        `event_message` colours the human-readable `message` field of a
+        dead-letter event and is ignored by events that have no such field.
+        It is deliberately the *only* thing a caller can vary — the rest of the
+        payload is derived from the row, so the sites cannot drift apart again.
+        """
         values: dict[str, Any] = {"status": status}
         if extra:
             values.update(extra)
@@ -102,7 +135,42 @@ class JobRepository(BaseRepository[Job]):
             update(Job).where(Job.id == job_id).values(**values)
         )
         await self.session.flush()
-        return await self.get_by_id(job_id)
+        job = await self.get_by_id(job_id)
+        if job is not None and status in _TERMINAL_EVENT_STATUSES:
+            await self._emit_terminal_event(job, status, event_message)
+        return job
+
+    async def _emit_terminal_event(
+        self, job: Job, status: str, event_message: str | None
+    ) -> None:
+        """Insert the outbox row announcing a terminal status.
+
+        Same session, therefore the same transaction as the status write —
+        that is the whole invariant (ADR 0001). Built from the freshly-read
+        row, so the event always describes the state that was actually
+        committed rather than what the caller believed it was writing.
+
+        Emitting on every terminal write (rather than only on a real
+        transition) is deliberate: detecting "was it already terminal?" needs
+        a pre-read this method does not do, and a duplicate event is cheap —
+        every consumer downstream is idempotent under at-least-once delivery
+        already, which is what the outbox promises. A *missing* event is the
+        expensive one.
+        """
+        settings = get_settings()
+        if status == JobStatus.DEAD_LETTER:
+            topic = settings.kafka_topic_job_dlq
+            payload = dlq_event_payload(job, message=event_message)
+        else:
+            topic = settings.kafka_topic_job_completed
+            payload = completed_event_payload(job)
+
+        await OutboxRepository(self.session).add(
+            tenant_id=job.tenant_id,
+            topic=topic,
+            key=f"{job.tenant_id}:{job.user_id}",
+            payload=payload,
+        )
 
     async def claim_for_running(self, job_id: uuid.UUID) -> bool:
         """Atomically claim a PENDING job for execution (E1-04).

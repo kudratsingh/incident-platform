@@ -4,14 +4,16 @@ import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from app.services.triage import TriageAnalysis, TriageDisabledError
 
-# The producer contract, imported rather than re-typed: this is the exact key
-# set both `job.dlq` outbox payloads in `dispatcher._run_job` write. Importing
+# `PRODUCER_DLQ_KEYS` is the producer contract, imported rather than re-typed:
+# it is the exact key set `dlq_event_payload` writes, and since the
+# terminal-event consolidation there is exactly one producer of it
+# (`JobRepository.update_status`) instead of four hand-rolled dicts. Importing
 # it (instead of hand-rolling a fixture, which is how E1-14 hid) means a
 # producer that drops a key fails the tests below instead of silently zeroing
 # every triage's context.
-from app.workers.dispatcher import DLQ_EVENT_KEYS as PRODUCER_DLQ_KEYS
+from app.schemas.job_events import DLQ_EVENT_KEYS as PRODUCER_DLQ_KEYS
+from app.services.triage import TriageAnalysis, TriageDisabledError
 from app.workers.triage_consumer import LlmTriageConsumer
 
 # Every key `LlmTriageConsumer.handle_message` reads off the event value.

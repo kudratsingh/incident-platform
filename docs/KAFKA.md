@@ -27,10 +27,10 @@ Schemas live in `backend/app/schemas/kafka/*.schema.json` and are validated on b
 | Field | Type | Meaning |
 |---|---|---|
 | `max_retries` | integer ≥ 0 | The job's retry budget. Absent it, `LlmTriageConsumer` fell back to `0` and asked the model to explain "retry 3 of 0". |
-| `payload` | object or null | The job payload as executed, with the `__traceparent` OTel carrier already popped. Bounded: if it serializes to more than `dispatcher.DLQ_PAYLOAD_MAX_BYTES` (4 KB) it is replaced by `{"_truncated": true, "_original_bytes": n}`, and it is `null` if the payload wasn't serializable. The bound exists because this event fans out to four consumer groups and is appended verbatim to `job_events`. |
+| `payload` | object or null | The job payload as executed, with the `__traceparent` OTel carrier already popped. Bounded: if it serializes to more than `job_events.DLQ_PAYLOAD_MAX_BYTES` (4 KB) it is replaced by `{"_truncated": true, "_original_bytes": n}`, and it is `null` if the payload wasn't serializable. The bound exists because this event fans out to four consumer groups and is appended verbatim to `job_events`. |
 | `trace_id` | string or null | The job's `trace_id` column — the raw value, not the `trace_id_var` fallback (which substitutes the job id when the column is NULL). |
 
-The producer's full key set is `dispatcher.DLQ_EVENT_KEYS`; `tests/unit/test_triage_consumer.py` asserts it stays a superset of every key the triage consumer reads, so producer/consumer drift fails a test instead of degrading triage in silence.
+The producer's full key set is `app/schemas/job_events.py`'s `DLQ_EVENT_KEYS`; `tests/unit/test_triage_consumer.py` asserts it stays a superset of every key the triage consumer reads, so producer/consumer drift fails a test instead of degrading triage in silence. There is exactly one producer of that payload — `JobRepository.update_status`, which writes it in the same transaction as the `dead_letter` status itself (see the addendum on [ADR 0001](ADR/0001-outbox-vs-cdc.md)). Four sites used to assemble it by hand and two other terminal writers assembled nothing at all.
 
 ### Why these topics, not one mega-topic
 
