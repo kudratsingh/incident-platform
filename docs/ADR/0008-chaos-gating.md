@@ -115,7 +115,7 @@ Each call requires a fresh MFA-style token.
 
 ### Reversibility
 
-Removing the framework entirely is deletion of `backend/app/mcp/chaos_tools/`, deletion of the `chaos:invoke` scope, deletion of the `CHAOS_ENABLED` variable. No downstream code depends on chaos being available. Fully reversible in one PR.
+Removing the framework entirely is deletion of `backend/app/mcp/tools/chaos/`, deletion of the `chaos:invoke` scope, deletion of the `CHAOS_ENABLED` variable. No downstream code depends on chaos being available. Fully reversible in one PR.
 
 ## Verification
 
@@ -170,6 +170,34 @@ chaos-enabled stack. The three invoke-time gates are unchanged.
 
 - `backend/app/config.py` — the boot-time assertion (to be added in Wave 1 PR #4)
 - `infra/variables.tf` — the Terraform validation
-- `backend/app/mcp/chaos_tools/` — the tool implementations (to be created in Wave 1 PR #4)
+- `backend/app/mcp/tools/chaos/` — the tool implementations (shipped; nine tools as of the 2026-08 addendum below)
 - `backend/app/core/scopes.py` — `assert_api_grantable`, the grant-path gate (v0.5.0)
 - Related ADRs: [0006 — MCP server standalone process](0006-mcp-server-standalone-process.md), [0007 — Machine-principal scope model](0007-machine-principal-scope-model.md), [0009 — Consumer lifecycle and supervision](0009-consumer-lifecycle-and-supervision.md)
+
+---
+
+## Addendum (2026-08) — Gate 2's seed-principal claim, and the tool directory
+
+*The triple gate above is unchanged and remains accepted. This section corrects two statements of fact in it: one about the seed principal, one about where the code lives.*
+
+### Gate 2: the seed principal does hold `chaos:invoke`
+
+Gate 2 says, of `chaos:invoke`:
+
+> No human role grants this; only a service account with the scope explicitly minted onto its token. **The seed `incident-commander` principal does not have it.**
+
+The first sentence is still true and is the part this ADR decides. The bolded sentence has been false since **v0.4.9**, when the live seed grant widened to four scopes — `telemetry:read`, `incidents:read`, `actions:execute`, `chaos:invoke` — because the live remediation scenarios began self-seeding their own faults. Neither the v0.4.5 nor the v0.5.0 amendment corrected it. [ADR 0007's v0.4.9 update](0007-machine-principal-scope-model.md) records the same widening; this ADR was the copy that still read as current state.
+
+**Decision: the documentation moves, the seeder does not.** Recorded explicitly because this is a security-gating statement rather than a typo, and the alternative — narrowing the seed grant to match the ADR — was considered and rejected:
+
+- The grant is deliberate and load-bearing. Live remediation evals break the platform and repair it with no operator in the loop; removing `chaos:invoke` from the seed principal disables that entire class of scenario.
+- Narrowing the default would not revoke anything in any case. `scripts/seed_incident_commander.py` **unions** requested scopes into the set an existing account already holds and never narrows (that is D-01, and `backend/tests/unit/test_seed_incident_commander.py` pins it). A live four-scope account re-seeded with a two-scope default keeps all four. Only the explicit `SA_REPLACE_SCOPES=1` escape hatch narrows.
+- The property that actually protects production is not carried by this sentence. Production safety rests on gate 1 — `CHAOS_ENABLED=false`, which Terraform refuses to set true in the production workspace and which `app/config.py` refuses to boot against — plus the v0.5.0 grant-path gate that keeps `chaos:invoke` out of the human API. A seed principal holding the scope on a chaos-disabled stack can still invoke nothing: the tools are not registered, so they are not merely refused but invisible ([ADR 0012](0012-the-lab-is-invisible-to-the-agent.md), [ADR 0016](0016-defer-principal-scoped-tools-list.md)).
+
+Read Gate 2 as: *`chaos:invoke` is never granted by a human role and never grantable through the human API on a production stack; which service accounts hold it is a per-environment fact, and the authority is `SELECT name, scopes FROM service_accounts`, not this document.*
+
+### The chaos tools are at `backend/app/mcp/tools/chaos/`
+
+The Reversibility section and the Pointers list both named **backend/app/mcp/chaos_tools/** (unbackticked here on purpose — the guard below treats a backticked path as a live citation), a directory that has never existed. The path strings have been corrected in place — they are references to code, not decisions, and a reader following either one landed nowhere. `backend/tests/unit/test_docs_adr_paths.py` now fails on any ADR citing a path that does not exist.
+
+While correcting them: the set is **nine** tools, not the five that `docker-compose.yml` claimed — `kill_consumer`, `poison_message`, `saturate_redis`, `inject_latency`, `bad_deploy`, `create_bad_data_job`, `create_stale_cache`, `create_stuck_dag`, `seed_dlq_messages`. The compose comment is pinned to the registry by `backend/tests/unit/test_docs_chaos_surface_drift.py`. The Pointers entry for `backend/app/config.py` still reads "to be added in Wave 1 PR #4"; the assertion shipped, and the parenthetical is left as a dated note rather than rewritten.

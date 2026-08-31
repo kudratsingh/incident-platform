@@ -93,3 +93,21 @@ Both are now implemented. A `SchemaValidationError` from `publish_raw` dead-lett
 One consequence specific to this ADR's subject: a schema violation is the *cleanest* dead-letter case, because it is deterministic. The same payload fails the same way on every future tick, so unlike a broker error there is nothing to gain by retrying and no ambiguity about whether the failure belongs to the row or the infrastructure. That is why it exits on attempt one rather than waiting out the cap — a distinction only producer-side validation makes possible, and a concrete argument for validating before the send that the original Consequences list was reaching for.
 
 Verification: `test_relay_dead_letters_a_schema_invalid_row_immediately` in `backend/tests/unit/test_outbox.py`, and the hundred schema-invalid rows in `backend/tests/integration/test_outbox_dead_letter.py::test_a_healthy_row_behind_a_full_window_of_poison_still_publishes`.
+
+---
+
+## Addendum (2026-08) — the "two Kafka brokers" the rejection rests on do not exist
+
+*The decision above is unchanged and remains accepted. This section corrects the supporting figure in one bullet, which describes infrastructure that was never provisioned.*
+
+Under **Alternatives considered → Protocol Buffers**, the "Schema Registry as a service" bullet reads:
+
+> We're a single ECS Fargate region with **two Kafka brokers**. Adding Schema Registry doubles the broker-adjacent infra footprint.
+
+There are no Kafka brokers. There have never been two of anything: production Kafka is not provisioned at all — that absence is itself a recorded decision, [ADR 0018](0018-production-kafka-posture.md) — and local development runs a **single Redpanda node** (`docker-compose.yml`, one `redpanda` service, topics created with `--replicas=1`). The second sentence inherits the error: "doubles the broker-adjacent infra footprint" is not a quantity that can be computed against zero provisioned brokers.
+
+Why this survived the sweep that produced ADR 0018: the CI guard added there greps `CLAUDE.md`, `README.md` and `docs/` for the *phantom Terraform module's filename*. This ADR never names that file — it asserts a broker count in prose, which no filename grep can see. A claim can be false in a way that is invisible to the check written for the last false claim.
+
+**The conclusion is unaffected, and if anything is stronger.** The bullet was reaching for "a Schema Registry is another stateful service to operate, secure and back up, and we are not at a scale that earns it." With zero provisioned brokers that argument does not weaken — it sharpens, because Confluent Schema Registry would become the *first* piece of managed streaming infrastructure this project provisions, ahead of the brokers it is supposed to serve. The registry would be the tail wagging a dog that has not been adopted yet.
+
+Read the bullet as: *we run a single Redpanda node locally and no production broker; a Schema Registry would be net-new managed infrastructure standing in front of a cluster that does not exist.* The JSON Schema decision, and the in-process `validate()` that implements it, are what this ADR actually decides and they are untouched.
