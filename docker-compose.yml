@@ -224,10 +224,15 @@ services:
       KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
       # Chaos framework — must match the `app` service's setting.
       # The @chaos_tool decorators evaluate this at MCP process import
-      # time, so with CHAOS_ENABLED=true the 5 chaos tools register
+      # time, so with CHAOS_ENABLED=true the 9 chaos tools register
       # (kill_consumer, poison_message, saturate_redis, inject_latency,
-      # bad_deploy); with false they're absent from tools/list. See
-      # ADR 0008 for the triple gate.
+      # bad_deploy, create_bad_data_job, create_stale_cache,
+      # create_stuck_dag, seed_dlq_messages); with false they're absent
+      # from tools/list. See ADR 0008 for the triple gate.
+      # The count and the list are pinned by
+      # backend/tests/unit/test_docs_chaos_surface_drift.py — this
+      # comment read "5" for four releases after the set grew, which
+      # understated the blast radius of flipping the flag.
       CHAOS_ENABLED: "true"
     depends_on:
       postgres:
