@@ -168,3 +168,42 @@ model, which is not affected.
 The scope model itself (fixed enum, non-hierarchical, tokens carry subsets) is
 untouched; what changed is *who* may operate the grant machinery and *which*
 scopes the human API will grant.
+
+---
+
+## Addendum (2026-08) — the `revoked_at` column, and the tests this ADR names
+
+*The scope model and the two-principal split above are unchanged and remain accepted. This section corrects three statements of fact that describe code which does not exist in the shape stated.*
+
+### `service_accounts` has no `revoked_at`; `service_account_tokens` does
+
+The Decision says:
+
+> Every row has `id`, `tenant_id`, `name`, `is_active`, `created_by_user_id`, `revoked_at`.
+
+`ServiceAccount` carries `id`, `tenant_id`, `name`, `scopes`, `is_active`, `created_by_user_id`, plus `created_at`/`updated_at` from `TimestampMixin`. There is no `revoked_at` on the account and there never was — migration `f2b48c9a0117` puts that column on `service_account_tokens`. The list also omits `scopes`, which is the column the whole scope model rests on.
+
+This matters beyond bookkeeping because the two columns mean different things and the ADR's own consequences lean on the distinction. Revocation is **per token** (`ServiceAccountToken.revoked_at`), so an account can outlive any number of revoked tokens; disabling the **account** is `is_active=false`. "Kill switch is a scope revocation" under Consequences → Positive describes clearing scopes on the token, which is consistent with the real schema — the Decision's column list was the part that drifted.
+
+Read the Decision list as: `id`, `tenant_id`, `name`, `scopes`, `is_active`, `created_by_user_id`, `created_at`, `updated_at`. The authority is `backend/app/models/service_account.py`.
+
+### The named test files do not exist
+
+Under Consequences → Negative:
+
+> Tested via `test_scope_enforcement.py` (wrong-scope → 403; revoked → 401; per-SA rate limit trips before per-tenant).
+
+and under Verification:
+
+> Integration test: full MCP round-trip through the standalone MCP process using a real seeded `incident-commander` token against a read-only endpoint.
+
+No `test_scope_enforcement.py` has ever existed. The two auth paths *are* covered, under different names:
+
+- **wrong-scope → 403** — `backend/tests/api/test_service_accounts.py::test_scope_probe_rejects_token_missing_scope`, plus per-tool coverage in `backend/tests/api/test_mcp_standalone.py::test_tools_call_wrong_scope_forbidden` and the `*_wrong_scope_forbidden` tests across the MCP suites.
+- **revoked → 401** — `backend/tests/api/test_service_accounts.py::test_scope_probe_rejects_revoked_token` and `backend/tests/unit/test_service_account_service.py::test_verify_rejects_revoked_token`.
+- **the human JWT path** — `backend/tests/api/test_auth.py`.
+- **full MCP round-trip** — `backend/tests/api/test_mcp_standalone.py` exercises the standalone process end to end (unauthenticated handshake, `tools/list` 401, `tools/call` 403 and happy path with the audit row); `backend/tests/integration/test_mcp_envelope_postgres.py` does the same against a real Postgres for the transaction envelope.
+
+**The per-SA rate limit is not merely untested — it does not exist.** There is no per-service-account rate limiter in the codebase; rate limiting is per tenant (`backend/app/utils/quota.py`, `backend/tests/unit/test_quota.py`). The parenthetical asserted an ordering property between two limiters when only one of them was ever built. It is struck, not relocated: if a per-SA limit is wanted it is new work, not a missing test.
+
+`backend/tests/unit/test_docs_adr_paths.py` now fails on any ADR citing a file path that does not exist, which would have caught the integration-test pointer had it been written as a path rather than as prose.

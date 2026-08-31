@@ -15,7 +15,9 @@ Built as an intentional showcase of senior-level distributed-systems patterns: t
 - **LLM features** (Claude via Anthropic SDK): DLQ triage, retry-policy advisor, natural-language admin queries, periodic incident summaries — all off-by-default and fail-open.
 - **AWS deployment** via Terraform: VPC + ECS Fargate + RDS + ElastiCache + S3 + ALB + CloudWatch alarms with linked runbooks. No Kafka broker is provisioned and the deploy job is opt-in — see [ADR 0018](docs/ADR/0018-production-kafka-posture.md).
 
-Current test suite: **726 passing tests** (447 unit + 254 API contract + 25 Testcontainers integration). `mypy --strict` clean; 70% coverage gate on the unit + API job. All three tiers run on every PR.
+Current test suite: three tiers — unit, API contract, and Testcontainers integration — all running on every PR. `mypy --strict` clean; 70% coverage gate on the unit + API job.
+
+There is deliberately no headline test count here. The number was refreshed three times (`240+` → `243` → `726`) and was stale again within a release each time, most recently by roughly 2x. `make test` reports the count for your checkout; `.github/workflows/ci.yml` is the authority on what runs.
 
 ---
 
@@ -103,7 +105,7 @@ All LLM features use `messages.parse()` with Pydantic schemas, `claude-opus-4-7`
 - `tenants` table, `tenant_id` on every domain table, JWT carries `tenant_id` claim.
 - Per-tenant rate limits + monthly job quotas configurable per tenant.
 - Composite `{tenant_id}:{user_id}` Kafka partition key preserves per-tenant AND per-user ordering ([ADR 0004](docs/ADR/0004-tenant-id-in-kafka-partition-key.md)).
-- **Postgres row-level security** on all 6 tenant-scoped tables as defense-in-depth against forgotten `WHERE tenant_id = ?` clauses ([ADR 0003](docs/ADR/0003-rls-as-defense-in-depth.md)).
+- **Postgres row-level security**, with `FORCE ROW LEVEL SECURITY` so the table owner is not exempt, as defense-in-depth against forgotten `WHERE tenant_id = ?` clauses ([ADR 0003](docs/ADR/0003-rls-as-defense-in-depth.md), [ADR 0015](docs/ADR/0015-force-rls-and-nonowner-app-role.md)). Migration `a7e3d9c41f28` enumerates the covered tables and is the authority on the set — it is listed there rather than counted here so the two cannot disagree.
 - `is_platform_admin` role for cross-tenant operators; `?tenant_id=` query-param override on admin endpoints.
 - Self-service tenant creation at `/auth/register`.
 - Admin Tenants tab with drill-down page, inline rate/quota editors, create-tenant modal.
@@ -121,7 +123,7 @@ All LLM features use `messages.parse()` with Pydantic schemas, `claude-opus-4-7`
 - [`docs/KAFKA.md`](docs/KAFKA.md) — topic catalog, schema-evolution rules, 8-consumer-group ops
 - [`docs/REDIS.md`](docs/REDIS.md) — key catalog with TTLs; what degrades when Redis dies
 - [`docs/ROADMAP.md`](docs/ROADMAP.md) — ~80 categorized extension ideas
-- [`docs/ADR/`](docs/ADR/) — five architecture decision records covering outbox vs. CDC, JSON Schema vs. Protobuf, RLS as defense-in-depth, composite partition keys, LLM fail-open policy
+- [`docs/ADR/`](docs/ADR/) — architecture decision records: outbox vs. CDC, JSON Schema vs. Protobuf, RLS as defense-in-depth, composite partition keys, LLM fail-open policy, machine-principal scopes, chaos gating, production Kafka posture, and more
 - [`runbooks/`](runbooks/) — machine-readable on-call playbooks for every CloudWatch alarm + SLO
 
 ---
@@ -316,10 +318,10 @@ Load tests live in `backend/tests/load/` (Locust).
 │   │   ├── workers/                Kafka consumers, worker loop, processors (async / thread / process)
 │   │   ├── utils/                  rate_limit, quota, cache, backpressure, circuit_breaker
 │   │   └── main.py                 app factory + lifespan
-│   ├── alembic/versions/           11 migrations (through incident_summaries)
+│   ├── alembic/versions/           Alembic revisions (`alembic history` for the current chain)
 │   └── tests/
-│       ├── unit/                   161 tests
-│       ├── api/                    82 tests
+│       ├── unit/                   no I/O, mocked deps
+│       ├── api/                    full FastAPI app, dependency overrides
 │       ├── integration/            Testcontainers (Postgres for RLS, Redpanda for Kafka; opt-in)
 │       └── load/                   Locust
 ├── frontend/

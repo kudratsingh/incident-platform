@@ -29,11 +29,16 @@ if TYPE_CHECKING:
 
 
 DEFAULT_TENANT_SLUG = "default"
-# Matches the UUID seeded by the f8a1c4e23507 migration. Models use this as
-# the column-level default for tenant_id so every existing insert site keeps
-# working without code change — they implicitly write to the default tenant.
-# PR B (Phase 12 enforcement) replaces these defaults with explicit
-# propagation from the authenticated request.
+# Matches the UUID seeded by the f8a1c4e23507 migration.
+#
+# No model declares this as a column-level default: `tenant_id` is a
+# required column everywhere and is propagated explicitly from the
+# authenticated request. Column defaults were the pre-Phase-12 shape and
+# were removed when enforcement landed, precisely so that an insert site
+# which forgets a tenant fails loudly instead of silently writing to the
+# default tenant. The one deliberate explicit use left is the platform-owned
+# SLO fast-burn alert in `app/services/slo.py`, which has no request
+# context to inherit a tenant from.
 #
 # Hex pattern is deliberately mixed letters/digits: SQLite has loose typing
 # and stores a UUID whose 16 bytes happen to interpret as a small integer

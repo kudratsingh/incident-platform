@@ -68,6 +68,24 @@ const INITIAL_PAGES: Record<Tab, number> = {
   audit: 1,
 }
 
+/**
+ * Human-readable actor for an audit row.
+ *
+ * Rows written by a machine principal carry `principal_type='service_account'`
+ * and a null `user_id`. The detail modal used to render only `user_id`, so
+ * every action the agent took showed no actor at all — precisely the rows an
+ * operator opens the modal to review. The list view already badges these as
+ * "agent"; this makes the detail view agree with it.
+ */
+export function auditActorLabel(
+  log: Pick<AuditLog, 'principal_type' | 'principal_id' | 'user_id'>,
+): string {
+  if (log.principal_type === 'service_account') {
+    return `service account · ${log.principal_id ?? '(id unavailable)'}`
+  }
+  return `user · ${log.user_id ?? log.principal_id ?? '(id unavailable)'}`
+}
+
 function AuditLogModal({ log, onClose }: { log: AuditLog; onClose: () => void }) {
   return (
     <div
@@ -93,6 +111,8 @@ function AuditLogModal({ log, onClose }: { log: AuditLog; onClose: () => void })
             <Row label="Resource" value={`${log.resource_type} / ${log.resource_id ?? '—'}`} mono />
           )}
           {log.job_id && <Row label="Job ID" value={log.job_id} mono />}
+          <Row label="Actor" value={auditActorLabel(log)} mono />
+          {log.principal_id && <Row label="Principal ID" value={log.principal_id} mono />}
           {log.user_id && <Row label="User ID" value={log.user_id} mono />}
           {log.request_id && <Row label="Request ID" value={log.request_id} mono />}
           {log.ip_address && <Row label="IP Address" value={log.ip_address} mono />}
