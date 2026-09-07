@@ -19,6 +19,7 @@ import uuid
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
+import pytest
 from app.config import Settings
 from app.core.scopes import Scope
 from app.dependencies import get_db, get_redis
@@ -495,6 +496,19 @@ async def test_poison_message_also_writes_replay_safe_dlq_entry(
         assert row.status == "dead_letter"
         assert row.remediation_hint == RemediationHint.REPLAY_SAFE.value
         assert row.tenant_id == default_tenant.id
+        # WO-R2-146: the row is stamped replay_safe, so its text has to
+        # describe something a replay would actually fix. It used to
+        # name the schema violation this hook sends to Kafka, which is
+        # permanent — the hint and the text said opposite things.
+        from app.lab.dlq_failure_stories import coherence_violations
+
+        assert row.error_message is not None
+        assert not coherence_violations(
+            RemediationHint.REPLAY_SAFE.value, row.error_message
+        ), row.error_message
+        # Still traceable to this hook and this topic.
+        assert "job.submitted" in row.error_message
+        assert "poison_message" in row.error_message
     finally:
         teardown()
 
@@ -1122,3 +1136,62 @@ def test_seed_dlq_hint_literal_matches_the_enum() -> None:
     assert set(typing.get_args(_HINT_VALUES)) == {
         h.value for h in RemediationHint
     }
+
+
+@pytest.mark.parametrize(
+    "hint",
+    ["replay_safe", "wait_and_replay", "human_required"],
+)
+async def test_seeded_dlq_row_text_agrees_with_its_hint(
+    db_session: AsyncSession,
+    default_tenant,  # type: ignore[no-untyped-def]
+    test_user,  # type: ignore[no-untyped-def]
+    hint: str,
+) -> None:
+    """WO-R2-146, end to end for the declared-fixture hook.
+
+    A scenario that declares only a hint gets the canned text for it,
+    and the agent reads both fields off the same row. This hook's table
+    used to pair `replay_safe` with a SchemaValidationError, which is a
+    permanent data fault — an agent following the error refuses the
+    replay the hint asks for, and the scenario grades it wrong.
+
+    Read back through the wire rather than off the table, so a hook that
+    stopped consulting the table fails here.
+    """
+    from app.lab.dlq_failure_stories import coherence_violations
+    from app.models.job import Job
+    from sqlalchemy import select as _select
+
+    redis_stub = _RedisStub()
+    app, teardown = _mcp_app_with_chaos_enabled(db_session, redis_stub)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app, raise_app_exceptions=False),
+            base_url="http://test",
+        ) as ac:
+            token = await _token(
+                db_session, default_tenant.id, [Scope.CHAOS_INVOKE.value]
+            )
+            payload = _content(
+                await _call(
+                    ac,
+                    token,
+                    "seed_dlq_messages",
+                    {"remediation_hint": hint, "count": 1},
+                )
+            )
+        row = (
+            await db_session.execute(
+                _select(Job).where(
+                    Job.id == uuid.UUID(payload["job_ids"][0])
+                )
+            )
+        ).scalar_one()
+        assert row.remediation_hint == hint
+        assert row.error_message is not None
+        assert not coherence_violations(hint, row.error_message), (
+            row.error_message
+        )
+    finally:
+        teardown()

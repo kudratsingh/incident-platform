@@ -29,6 +29,7 @@ from typing import Literal
 
 from app.core.exceptions import AppError
 from app.core.logging import get_logger
+from app.lab.dlq_failure_stories import default_error_for
 from app.mcp.chaos import BlastRadius, chaos_tool
 from app.mcp.registry import ToolContext
 from app.models.enums import JobStatus, JobType, RemediationHint
@@ -44,24 +45,16 @@ logger = get_logger(__name__)
 # differs — see module docstring.
 SEEDED_FIXTURE_MARKER = "seeded_fixture"
 
-# Canned error strings per hint, so a scenario that only declares
-# `remediation_hint` still gets a string the agent's triage can read as
-# realistic. Lifted from the retired `_dlq_specs()` pool, which is what
-# these defaults replace.
-_DEFAULT_ERRORS: dict[str, str] = {
-    RemediationHint.REPLAY_SAFE.value: (
-        "SchemaValidationError: payload missing required field "
-        "'user_id' (received keys: ['tenant_id', 'action', 'ts'])"
-    ),
-    RemediationHint.WAIT_AND_REPLAY.value: (
-        "send_email downstream call failed: "
-        "ConnectionRefusedError('smtp.mailer.internal:587')"
-    ),
-    RemediationHint.HUMAN_REQUIRED.value: (
-        "ValueError: invalid literal for int() with base 10: "
-        "'not-a-number' at row 15,382"
-    ),
-}
+# Canned error strings per hint used to be a dict right here, and it
+# paired `replay_safe` with a SchemaValidationError. A missing required
+# field is permanent, so an agent that read the row correctly refused to
+# replay it — and the scenario graded that refusal as a failure
+# (WO-R2-146, live run efdc3b2a9864). The hint was the only truth in the
+# lab and nothing on the wire said so.
+#
+# The strings now come from `app.lab.dlq_failure_stories`, one table
+# shared with the sibling hooks and with `scripts/seed_eval_fixtures.py`,
+# whose pairings are checked by `tests/unit/test_dlq_text_coherence.py`.
 
 
 class SeedDlqHintError(AppError):
@@ -144,7 +137,7 @@ async def seed_dlq_messages(
     hint = _validated_hint(inp.remediation_hint)
     tenant_id = ctx.principal.tenant_id
     user = await _fixture_owner(ctx, tenant_id)
-    error_message = inp.error_message or _DEFAULT_ERRORS[hint]
+    error_message = inp.error_message or default_error_for(hint)
 
     jobs: list[Job] = []
     for _ in range(inp.count):

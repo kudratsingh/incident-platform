@@ -134,6 +134,7 @@ type = "forbidden"
 source_modules = [
     "app.api",
     "app.core",
+    "app.lab",
     "app.models",
     "app.repositories",
     "app.schemas",

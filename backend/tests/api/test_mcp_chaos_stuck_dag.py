@@ -31,12 +31,14 @@ import uuid
 from typing import Any
 from unittest.mock import patch
 
+import pytest
 from app.config import Settings, get_settings
 from app.core.scopes import Scope
 from app.dependencies import get_db, get_redis
+from app.lab.dlq_failure_stories import coherence_violations
 from app.mcp import protocol
 from app.mcp.registry import _restore_for_tests, _snapshot_for_tests
-from app.models.enums import JobStatus
+from app.models.enums import JobStatus, RemediationHint
 from app.models.job import Job
 from app.models.outbox import OutboxEvent
 from app.models.tenant import Tenant
@@ -703,5 +705,66 @@ async def test_repeat_with_fewer_waiting_steps_is_not_intact(
             )
             assert same["created"] is False
             assert same["waiting_job_ids"] == first["waiting_job_ids"]
+    finally:
+        teardown()
+
+
+@pytest.mark.parametrize(
+    "hint",
+    [
+        RemediationHint.REPLAY_SAFE.value,
+        RemediationHint.WAIT_AND_REPLAY.value,
+        RemediationHint.HUMAN_REQUIRED.value,
+    ],
+)
+async def test_stuck_root_text_agrees_with_the_declared_hint(
+    db_session: AsyncSession,
+    default_tenant,  # type: ignore[no-untyped-def]
+    test_user,  # type: ignore[no-untyped-def]
+    hint: str,
+) -> None:
+    """WO-R2-146, end to end.
+
+    The root is the row the agent reads before deciding whether a replay
+    is safe, and the scenario declares its hint. Live run efdc3b2a9864
+    declared `replay_safe` and got a root whose text said
+    SchemaValidationError — a permanent data fault — so the agent
+    escalated, correctly, on a scenario graded for a replay.
+
+    Asserted through the wire rather than against the table so that a
+    hook which stopped consulting the table fails here.
+    """
+    redis_stub = _RedisStub()
+    app, teardown = _mcp_app_with_chaos_enabled(db_session, redis_stub)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app, raise_app_exceptions=False),
+            base_url="http://test",
+        ) as ac:
+            chaos = await _token(
+                db_session, default_tenant.id, [Scope.CHAOS_INVOKE.value]
+            )
+            made = _content(
+                await _call(
+                    ac,
+                    chaos,
+                    "create_stuck_dag",
+                    {
+                        "chain_name": f"coherent-{hint.replace('_', '-')}",
+                        "remediation_hint": hint,
+                    },
+                )
+            )
+        root = await _job(db_session, made["root_job_id"])
+        assert root.remediation_hint == hint
+        assert root.error_message is not None
+        assert not coherence_violations(hint, root.error_message), (
+            root.error_message
+        )
+        # The descendants carry neither, so nothing can contradict.
+        for step_id in made["waiting_job_ids"]:
+            step = await _job(db_session, step_id)
+            assert step.remediation_hint is None
+            assert step.error_message is None
     finally:
         teardown()

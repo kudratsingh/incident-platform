@@ -62,6 +62,13 @@ import eval_safety  # type: ignore[import-not-found]  # noqa: E402
 import redis.asyncio as aioredis  # noqa: E402
 from app.core.security import hash_password  # noqa: E402
 from app.core.tenant_scope import platform_session_factory  # noqa: E402
+from app.lab.dlq_failure_stories import (  # noqa: E402
+    CSV_BAD_ROW,
+    PARTNER_RATE_LIMITED,
+    SMTP_UNREACHABLE,
+    UPSTREAM_TIMEOUT,
+    DlqFailureStory,
+)
 from app.models.alert import Alert  # noqa: E402
 from app.models.audit import (  # noqa: E402
     PRINCIPAL_TYPE_USER,
@@ -366,17 +373,56 @@ def _alert_rows(tenant_id: uuid.UUID) -> list[dict[str, object]]:
     ]
 
 
+def _triage_from(story: DlqFailureStory) -> dict[str, object]:
+    """The `job_triages` row that goes with a story.
+
+    `list_dlq_messages` returns the triage block inline with the entry,
+    so it is as agent-visible as the error text and is held to the same
+    coherence rule (WO-R2-146). It lives in the table beside the error
+    string precisely so the two can never be updated apart."""
+    assert story.triage is not None, f"{story.key} has no triage row"
+    return {
+        "root_cause_category": story.triage.root_cause_category,
+        "summary": story.triage.summary,
+        "suggested_fix": story.triage.suggested_fix,
+        "is_retryable": story.triage.is_retryable,
+        "confidence": story.triage.confidence,
+    }
+
+
 def _dlq_specs() -> list[dict[str, object]]:
     """Each spec becomes one Job + one JobTriage row. Each maps to one
     of the three `remediation_hint` categories the agent branches on:
 
-      * schema-violation  → replay_safe        (fix consumer, replay)
-      * SMTP / stripe     → wait_and_replay    (dep down, retry later)
+      * upstream timeout  → replay_safe        (blip, replay as-is)
+      * SMTP / rate limit → wait_and_replay    (dep refusing, retry later)
       * csv bad-data      → human_required     (persistent bug, escalate)
 
     Job types use the platform's real enum values but error strings
     name the intended service (send_email, process_payment) so the
-    agent's LLM reads a realistic string."""
+    agent's LLM reads a realistic string.
+
+    Every error string and triage row comes from
+    `app.lab.dlq_failure_stories`, and `story_key` names which one. Ids,
+    job types, retry counts and order are unchanged — this pack is
+    pinned by scenario YAML and by canned commander fixtures, so only
+    the texts move.
+
+    Two of the four texts changed with WO-R2-146:
+
+      * `dlq-job-schema-violation` was `replay_safe` carrying a
+        SchemaValidationError. A missing required field is permanent, so
+        the row told the agent not to do the one thing its hint asked
+        for. Its id keeps the old name — the *fixture* is still "the
+        replay-safe one" — while its story is now an upstream timeout.
+      * `dlq-job-process-payment` was `wait_and_replay` carrying a bare
+        30s timeout, which reads as "retry now" rather than "retry
+        later". It is now the rate-limited case, where the text says why
+        waiting is the point.
+
+    The other two were already coherent and are untouched, which is why
+    they are pinned by `story()` rather than by `story_for(hint)`.
+    """
     return [
         {
             "job_id": stable("dlq-job-schema-violation"),
@@ -384,26 +430,11 @@ def _dlq_specs() -> list[dict[str, object]]:
             "triage_id": stable("dlq-triage-schema-violation"),
             "type": JobType.BULK_API_SYNC.value,
             "remediation_hint": RemediationHint.REPLAY_SAFE.value,
-            "error_message": (
-                "SchemaValidationError: payload missing required field "
-                "'user_id' (received keys: ['tenant_id', 'action', 'ts'])"
-            ),
+            "story_key": UPSTREAM_TIMEOUT.key,
+            "error_message": UPSTREAM_TIMEOUT.error_message,
             "retry_count": 3,
             "created_offset": timedelta(minutes=8),
-            "triage": {
-                "root_cause_category": "schema_violation",
-                "summary": (
-                    "Producer sent a payload missing user_id — schema "
-                    "rejected it three times."
-                ),
-                "suggested_fix": (
-                    "Fix the producer to include user_id, then replay the "
-                    "DLQ entry. Backwards-compatible producer fix + replay "
-                    "is the standard remediation."
-                ),
-                "is_retryable": True,
-                "confidence": 0.91,
-            },
+            "triage": _triage_from(UPSTREAM_TIMEOUT),
         },
         {
             "job_id": stable("dlq-job-send-email"),
@@ -411,24 +442,11 @@ def _dlq_specs() -> list[dict[str, object]]:
             "triage_id": stable("dlq-triage-send-email"),
             "type": JobType.BULK_API_SYNC.value,
             "remediation_hint": RemediationHint.WAIT_AND_REPLAY.value,
-            "error_message": (
-                "send_email downstream call failed: "
-                "ConnectionRefusedError('smtp.mailer.internal:587')"
-            ),
+            "story_key": SMTP_UNREACHABLE.key,
+            "error_message": SMTP_UNREACHABLE.error_message,
             "retry_count": 3,
             "created_offset": timedelta(minutes=40),
-            "triage": {
-                "root_cause_category": "downstream_unavailable",
-                "summary": "SMTP relay unreachable — connection refused at TCP layer.",
-                "suggested_fix": (
-                    "Check smtp.mailer.internal ECS task health; recent "
-                    "billing hotfix (v0.4.2) may have changed VPC egress "
-                    "rules — cross-reference `get_deploy_history`. Replay "
-                    "once the dependency recovers."
-                ),
-                "is_retryable": True,
-                "confidence": 0.82,
-            },
+            "triage": _triage_from(SMTP_UNREACHABLE),
         },
         {
             "job_id": stable("dlq-job-process-payment"),
@@ -436,23 +454,11 @@ def _dlq_specs() -> list[dict[str, object]]:
             "triage_id": stable("dlq-triage-process-payment"),
             "type": JobType.BULK_API_SYNC.value,
             "remediation_hint": RemediationHint.WAIT_AND_REPLAY.value,
-            "error_message": (
-                "process_payment call timed out after 30s: "
-                "TimeoutError('stripe.api')"
-            ),
+            "story_key": PARTNER_RATE_LIMITED.key,
+            "error_message": PARTNER_RATE_LIMITED.error_message,
             "retry_count": 3,
             "created_offset": timedelta(minutes=25),
-            "triage": {
-                "root_cause_category": "third_party_timeout",
-                "summary": "Stripe API exceeded 30s deadline three consecutive attempts.",
-                "suggested_fix": (
-                    "Verify Stripe status page; if green, raise the per-call "
-                    "timeout via the retry policy for payment-type jobs and "
-                    "replay the DLQ batch."
-                ),
-                "is_retryable": True,
-                "confidence": 0.71,
-            },
+            "triage": _triage_from(PARTNER_RATE_LIMITED),
         },
         {
             "job_id": stable("dlq-job-csv-parse"),
@@ -460,24 +466,11 @@ def _dlq_specs() -> list[dict[str, object]]:
             "triage_id": stable("dlq-triage-csv-parse"),
             "type": JobType.CSV_UPLOAD.value,
             "remediation_hint": RemediationHint.HUMAN_REQUIRED.value,
-            "error_message": (
-                "ValueError: invalid literal for int() with base 10: "
-                "'not-a-number' at row 15,382"
-            ),
+            "story_key": CSV_BAD_ROW.key,
+            "error_message": CSV_BAD_ROW.error_message,
             "retry_count": 3,
             "created_offset": timedelta(minutes=12),
-            "triage": {
-                "root_cause_category": "bad_input",
-                "summary": "Non-numeric value in a supposedly-integer CSV column.",
-                "suggested_fix": (
-                    "Not retryable — data quality issue. Notify the uploader; "
-                    "add a validation step in the CSV importer that fails "
-                    "the whole upload with a clear error rather than half-"
-                    "processing."
-                ),
-                "is_retryable": False,
-                "confidence": 0.94,
-            },
+            "triage": _triage_from(CSV_BAD_ROW),
         },
     ]
 
@@ -595,7 +588,20 @@ async def _reset_dlq_state(session: AsyncSession) -> int:
     touches the stable() IDs from `_dlq_specs()`; leaves any non-fixture
     jobs alone.
 
-    Returns the number of rows reset (0 = fixtures already baseline)."""
+    Four columns are restored, `error_message` among them — said out
+    loud because WO-R2-146 changed what these texts say, and a row that
+    kept a stale text across runs would put the *old* contradiction back
+    in front of the agent on a stack seeded before the change. A replay
+    overwrites the text with the live processor's own error, so this is
+    not a theoretical path. `tests/unit/test_eval_reset.py` pins it.
+
+    The fixture's `job_triages` row is restored alongside it — see
+    `_reset_triage_state` for why a stale triage block is the same defect
+    one field lower.
+
+    Returns the number of fixtures reset (0 = already baseline). A
+    fixture counts once whether its job row, its triage row, or both had
+    drifted."""
     now = datetime.now(UTC)
     reset_count = 0
     for spec in _dlq_specs():
@@ -611,7 +617,10 @@ async def _reset_dlq_state(session: AsyncSession) -> int:
             or existing.remediation_hint != spec.get("remediation_hint")
             or existing.error_message != spec["error_message"]
         )
+        triage_reset = await _reset_triage_state(session, spec)
         if not needs_reset:
+            if triage_reset:
+                reset_count += 1
             continue
         existing.status = JobStatus.DEAD_LETTER.value
         existing.retry_count = cast("int", spec["retry_count"])
@@ -622,6 +631,44 @@ async def _reset_dlq_state(session: AsyncSession) -> int:
         existing.updated_at = now
         reset_count += 1
     return reset_count
+
+
+async def _reset_triage_state(
+    session: AsyncSession, spec: dict[str, object]
+) -> bool:
+    """Re-baseline one fixture's `job_triages` row. True if it changed.
+
+    `_seed_dlq` inserts a triage row only when none exists, so on a stack
+    that was seeded before a text change the job row gets re-baselined by
+    the caller while its triage block keeps the old wording forever. That
+    matters because `list_dlq_messages` returns the triage inline: a row
+    whose error text now reads as a transient timeout, above a triage
+    that still says "schema rejected it three times", puts WO-R2-146's
+    contradiction straight back in front of the agent one field lower.
+
+    Restores content only. `id`, `job_id` and `model_used` identify the
+    row and are what it is looked up by."""
+    triage_id = spec["triage_id"]
+    existing = (
+        await session.execute(
+            select(JobTriage).where(JobTriage.id == triage_id)
+        )
+    ).scalar_one_or_none()
+    if existing is None:
+        return False  # never seeded; `_seed_dlq` inserts it
+    want = cast("dict[str, Any]", spec["triage"])
+    fields = (
+        "root_cause_category",
+        "summary",
+        "suggested_fix",
+        "is_retryable",
+        "confidence",
+    )
+    if all(getattr(existing, f) == want[f] for f in fields):
+        return False
+    for field in fields:
+        setattr(existing, field, want[field])
+    return True
 
 
 # How much wall-clock drift a fixture timestamp may accumulate before a

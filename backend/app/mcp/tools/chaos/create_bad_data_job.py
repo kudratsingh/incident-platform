@@ -8,8 +8,10 @@ live platform; this hook drops a synthetic DLQ row that the
 `replay_dlq_by_category` guardrail will refuse.
 
 Doesn't touch Kafka — writes directly to `jobs` with
-`status=dead_letter`, `remediation_hint=human_required`, and a
-realistic error string. Chaos-only surface: gated behind
+`status=dead_letter`, `remediation_hint=human_required`, and an error
+string from `app.lab.dlq_failure_stories` that names a permanent data
+fault, so the row's text and its hint say the same thing (WO-R2-146).
+Chaos-only surface: gated behind
 `CHAOS_ENABLED=true` + `chaos:invoke` scope + `environment_wide`
 blast radius label.
 """
@@ -18,6 +20,7 @@ blast radius label.
 import uuid
 
 from app.core.logging import get_logger
+from app.lab.dlq_failure_stories import CSV_BAD_ROW
 from app.mcp.chaos import BlastRadius, chaos_tool
 from app.mcp.registry import ToolContext
 from app.models.enums import JobStatus, JobType, RemediationHint, UserRole
@@ -39,13 +42,13 @@ class CreateBadDataJobInput(BaseModel):
         ),
     )
     error_message: str = Field(
-        default=(
-            "ValueError: invalid literal for int() with base 10: "
-            "'not-a-number' at row 15,382"
-        ),
+        default=CSV_BAD_ROW.error_message,
         max_length=2048,
-        description="Realistic error string. Default matches the same "
-        "shape as the seed fixture's persistent-bug entry.",
+        description="Realistic error string. Default is the "
+        "persistent-bug text this platform's `human_required` rows "
+        "carry — a permanent data fault, which is what makes the "
+        "hint honest. Overriding it with a transient-sounding error "
+        "contradicts the hint and invites a replay that cannot work.",
     )
 
 
