@@ -36,13 +36,19 @@ What gets cleared/reset:
      chaos-owner-user cleanup below can't reach. Also de-noises the
      planner on non-DLQ scenarios, which read the same surface.
   5. **Chaos-fired alerts** — every `alerts` row whose source matches
-     `chaos:%` and is still active gets `resolved_at` stamped, returning
-     the active-alert surface to the seeded baseline. `bad_deploy` is
-     the only producer today; without this the alert it fires is never
-     resolved by anything, so each invocation permanently adds one more
-     active `critical` alert to every later alert-count/noise scenario.
-     Resolved, never deleted — the alert id appears in the invoking
-     scenario's output and trajectories.
+     `chaos:%` and is still active gets `resolved_at` stamped. Without
+     this the alert `bad_deploy` fires is never resolved by anything, so
+     each invocation permanently adds one more active `critical` alert
+     to every later alert-count/noise scenario. Resolved, never deleted
+     — the alert id appears in the invoking scenario's output and
+     trajectories.
+
+     This clears the *chaos* alerts, not the alert surface. Since
+     WO-R2-29 the scheduled SLO evaluator is a second producer, writing
+     `source = 'slo:<objective-id>'`, which `chaos:%` does not match —
+     so an organic fast-burn alert survives every reset and accumulates
+     exactly the way `bad_deploy`'s used to. Restoring the *seeded
+     baseline* is therefore still an open gap: **WO-R2-131**.
   6. **Idempotency records** — with `--purge-idempotency`, `DELETE`s
      every `idempotency_records` row for the seeded incident-commander
      service account. Off by default; the 24h TTL from [ADR 0010]
@@ -388,6 +394,19 @@ async def _resolve_chaos_alerts(session_factory: Any) -> int:
     touches resolution. So every invocation left one more permanently
     active critical alert behind, contaminating the alert-count and
     noise scenarios of every campaign that followed.
+
+    Scope, stated exactly: this resolves chaos alerts. It does **not**
+    return the active-alert surface to the seeded baseline, and has not
+    since WO-R2-29 gave the platform a second alert producer. The
+    scheduled SLO evaluator writes `source = f"slo:{definition.id}"`
+    (`app/services/slo.py`), which `chaos:%` does not match, so an
+    organic fast-burn alert is invisible to this sweep and survives
+    every reset — the same permanent-distractor failure this function
+    was written to end, reintroduced through a source string it does not
+    cover. Widening the predicate (or resolving everything and letting
+    the fixture reseed put the seeded alerts back) is **WO-R2-131**.
+    Until that lands, a live campaign must check the alert surface by
+    hand between scenarios.
 
     Resolve rather than DELETE: the alert id is quoted in the invoking
     scenario's output and trajectories, so deleting would mutate history

@@ -100,7 +100,16 @@ class ListAuditEventsOutput(BaseModel):
         "FRESHNESS: live read from Postgres. Rows written directly by "
         "an action appear immediately; rows produced by the Kafka "
         "audit consumer land within a second or two of the event, so "
-        "allow a moment before concluding an event is missing."
+        "allow a moment before concluding an event is missing.\n"
+        "PAGINATION: newest first, ordered by `created_at` (the time "
+        "the audit row was written, not the time the action was "
+        "requested — for consumer-written rows those differ by the "
+        "delivery lag above), tiebroken by `id`. There is NO offset: "
+        "you always get the newest `limit` rows matching the filters "
+        "and cannot page past them. `total` is the full count of "
+        "matching rows and may exceed the number returned — when it "
+        "does, older matches exist that this call did not show you, "
+        "and the only way to reach them is a narrower filter."
     ),
     input_model=ListAuditEventsInput,
     output_model=ListAuditEventsOutput,
