@@ -106,7 +106,16 @@ class ReplayDlqByIdsOutput(BaseModel):
         "DLQ is the expected state, not a failure. Verify with the "
         "`scheduled` outcomes in this response and the "
         "`job.replay_scheduled` audit events, not with DLQ shrink. "
-        "Re-check DLQ size only after `execute_at`."
+        "Re-check DLQ size only after `execute_at`.\n"
+        "DAG ROOTS: a dead-lettered job that is a node in a dependency "
+        "chain is replayed the same way, and this is the platform's "
+        "un-stick path for a stalled chain. `dead_letter` is terminal "
+        "and the resolver promotes a child only when every parent is "
+        "`completed`, so replaying the root completes it and the held "
+        "descendants promote. Verify with `get_dag_state(root_job_id)`. "
+        "This is refused while any ancestor is paused (`pause_dag`) — "
+        "the per-id result comes back `ok: false` — so do not pause a "
+        "chain you intend to replay."
     ),
     input_model=ReplayDlqByIdsInput,
     output_model=ReplayDlqByIdsOutput,

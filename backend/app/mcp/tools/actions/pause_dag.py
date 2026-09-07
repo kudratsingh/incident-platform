@@ -78,7 +78,13 @@ class PauseDagOutput(BaseModel):
         "occur while the flag is set. Already-RUNNING jobs are not "
         "cancelled — pause stops promotion, it does not stop work in "
         "flight. Self-cleans on TTL (default 10 minutes), after which "
-        "held children promote automatically. Idempotent."
+        "held children promote automatically. Idempotent.\n"
+        "STABILIZER, NOT A FIX: pausing changes nothing about the node "
+        "that stopped the chain. When the TTL expires the held children "
+        "promote back into the same stalled state. It also blocks the "
+        "fix while it holds — the platform refuses to replay any job "
+        "inside a paused DAG. Use it to stop promotion while a human "
+        "decides, never as a remediation."
     ),
     input_model=PauseDagInput,
     output_model=PauseDagOutput,
