@@ -47,6 +47,10 @@ This file (`CLAUDE.md`) is the high-signal index. Treat it as the entry point �
   - [0009 — Consumer lifecycle and supervision](docs/ADR/0009-consumer-lifecycle-and-supervision.md)
 - [`docs/ROADMAP.md`](docs/ROADMAP.md) — open extension ideas, sized + categorized
 - [`runbooks/`](runbooks/) — machine-readable on-call playbooks for every CloudWatch alarm + SLO
+- **Workspace hub first:** this repo lives inside the `audit-ws` workspace, whose auto-loaded
+  `CLAUDE.md` makes `../context/START-HERE.md` → `STATE.md` → `LESSONS.md` → `PROTOCOL.md` the
+  mandatory reading order for every session, before this repo's own index below. Cross-repo state,
+  the paid-run protocol, and the consolidated lessons ledger live there (created 2026-09-07).
 - [`context/INDEX.md`](context/INDEX.md) — **session history; read it at the start of a session.**
   One line per session plus the findings that cost real time once: that the digest to pin is the
   index and not the linux/amd64 child, that `tools/list` needs no rows so an empty database was
