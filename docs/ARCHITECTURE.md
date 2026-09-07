@@ -582,6 +582,20 @@ The body remains `json.dumps(payload, sort_keys=True, separators=(",", ":"))`. S
 
 ---
 
+## The lab writes rows the agent can believe
+
+The chaos hooks and `scripts/seed_eval_fixtures.py` manufacture the world an eval scenario is graded against. Every field they stamp is a claim the agent will reason from, and two of them are read together off a single `list_dlq_messages` entry: `remediation_hint`, the category its remediation logic branches on, and `error_message`, the free text a planner actually reads. Where those disagree, the fixture is unwinnable — an agent that reads the error and an agent that reads the hint reach opposite conclusions, and only one of them matches the scenario's expectation.
+
+That is not hypothetical. Live run `efdc3b2a9864` (2026-09-07) seeded a stuck chain whose dead-lettered root was `replay_safe` and whose text said `SchemaValidationError: payload missing required field 'user_id'`. The agent escalated instead of replaying, naming the contradiction. It was right; the fixture was wrong. In the lab no processor validates payloads, so the error text was decoration and the hint was the truth — a distinction the agent had no way to make from the wire (WO-R2-146).
+
+`backend/app/lab/dlq_failure_stories.py` is now the single table every lab writer draws from, with `coherence_violations()` stating the rule in code and `tests/unit/test_dlq_text_coherence.py` walking each writer's pairs through it. The per-hint table and its consequences are in [DATA_MODEL](DATA_MODEL.md#the-labs-error-texts-agree-with-their-hints).
+
+**Why it is a package of its own.** Its callers straddle the ADR 0006 import contract: the chaos hooks live in `app.mcp.tools.chaos`, and "nothing outside `app.mcp` imports `app.mcp`" is enforced by import-linter — so `scripts/seed_eval_fixtures.py`, which the API also runs at boot, cannot reach into the MCP surface for a shared constant. Anything both may import has to sit below both, and `app.models` (persistence) and `app.utils` (runtime behaviour) are neither. `app.lab` is inert data, and it is listed in the contract's `source_modules` so it can never grow an import of `app.mcp` without CI saying so.
+
+**The general rule.** [ADR 0012](ADR/0012-the-lab-is-invisible-to-the-agent.md) says the lab must not name itself on the agent's surface. This is the same principle one layer in: the lab must not *contradict* itself there either. A fixture whose fields disagree tells the agent something false about the world, and grades it on believing the wrong half.
+
+---
+
 ## Tracing
 
 OpenTelemetry auto-instrumentation enabled on FastAPI, SQLAlchemy, and Redis. Traces export to OTLP (X-Ray in prod, Jaeger locally).

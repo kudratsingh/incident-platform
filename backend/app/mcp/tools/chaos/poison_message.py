@@ -11,11 +11,16 @@ Two effects (both observable via `list_dlq_messages` +
    using an inline short-lived aiokafka producer.
 
 2. **DLQ side.** Writes a synthetic `jobs` row with
-   `status=dead_letter`, `remediation_hint=replay_safe`, and a
-   realistic error string. That's how the agent's remediation loop
-   sees the poisoning — the platform's real consumers don't route
-   schema errors to DLQ (they log-and-drop), so without this
-   synthetic row the agent would see no downstream effect.
+   `status=dead_letter`, `remediation_hint=replay_safe`, and an error
+   string drawn from `app.lab.dlq_failure_stories`. That's how the
+   agent's remediation loop sees the poisoning — the platform's real
+   consumers don't route schema errors to DLQ (they log-and-drop), so
+   without this synthetic row the agent would see no downstream effect.
+
+   The row's text describes a *transient* fault, not the schema
+   violation sent to Kafka, because the row is stamped `replay_safe` and
+   the two have to agree — see `_dlq_error_for_topic` for why the old
+   wording made the fixture unwinnable.
 
 Requires `chaos:invoke`. Registered only when `CHAOS_ENABLED=true`.
 """
@@ -25,6 +30,7 @@ import json
 from app.config import get_settings
 from app.core.exceptions import AppError
 from app.core.logging import get_logger
+from app.lab.dlq_failure_stories import default_error_for
 from app.mcp.chaos import BlastRadius, chaos_tool
 from app.mcp.registry import ToolContext
 from app.models.enums import JobStatus, JobType, RemediationHint
@@ -61,6 +67,30 @@ class PoisonMessageSendFailedError(AppError):
 
 
 logger = get_logger(__name__)
+
+
+def _dlq_error_for_topic(topic: str) -> str:
+    """The error text on the synthetic DLQ row this hook writes.
+
+    Module level, and separate from the handler, so the coherence table
+    test can check the (hint, text) pair this hook produces without a
+    broker (`tests/unit/test_dlq_text_coherence.py`).
+
+    The row is stamped `replay_safe`, so the text is the canonical
+    transient one. It used to read `SchemaValidationError: payload
+    missing required field on topic '<t>'`, which described the *Kafka*
+    half of this hook honestly and contradicted the DLQ half's hint: a
+    missing required field never becomes replayable, so an agent reading
+    the row refused the replay the row was there to invite (WO-R2-146).
+
+    The Kafka poisoning stays observable where it actually happens — the
+    consumer's own logs, and `get_consumer_lag` — and the row keeps
+    naming its topic and this hook so a human sweeping the DLQ can still
+    trace it. What the row no longer does is describe a permanent data
+    fault while claiming to be safe to replay.
+    """
+    base = default_error_for(RemediationHint.REPLAY_SAFE.value)
+    return f"{base} (chaos poison_message on topic '{topic}')"
 
 
 class PoisonMessageInput(BaseModel):
@@ -185,10 +215,7 @@ async def poison_message(
 
         user = await _ensure_chaos_owner(ctx, tenant_id)
 
-    error_msg = (
-        f"SchemaValidationError: payload missing required field on "
-        f"topic '{inp.topic}' (chaos poison_message)"
-    )
+    error_msg = _dlq_error_for_topic(inp.topic)
     job = Job(
         tenant_id=tenant_id,
         user_id=user.id,

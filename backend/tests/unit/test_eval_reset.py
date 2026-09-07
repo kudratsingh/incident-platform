@@ -1363,3 +1363,169 @@ async def test_seeded_deploy_markers_are_platform_wide(
     markers = (await db_session.execute(select(DeployMarker))).scalars().all()
     assert len(markers) == len(seed._deploy_rows())
     assert [m.tenant_id for m in markers] == [None] * len(markers)
+
+
+# ---------------------------------------------------------------------------
+# The seeded pack's TEXTS are re-baselined too (WO-R2-146)
+# ---------------------------------------------------------------------------
+
+
+async def test_reset_restores_a_row_carrying_the_old_contradictory_text(
+    db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
+) -> None:
+    """A stack seeded before WO-R2-146 holds `replay_safe` rows whose
+    error text names a permanent schema fault. That is the pair the live
+    run graded an honest escalation on, so it must not survive a reset —
+    otherwise the fix ships and the world the agent meets is unchanged.
+
+    Also the general case: a replay overwrites `error_message` with the
+    live processor's own error, so a mutated text is the normal state of
+    a fixture after a scenario runs, not an edge case.
+    """
+    from app.lab.dlq_failure_stories import coherence_violations
+
+    seed = _seed_module()
+    spec = seed._dlq_specs()[0]
+    assert spec["remediation_hint"] == "replay_safe"
+    now = datetime.now(UTC)
+
+    db_session.add(
+        Job(
+            id=spec["job_id"],
+            tenant_id=default_tenant.id,
+            user_id=test_user.id,
+            type=spec["type"],
+            status=JobStatus.DEAD_LETTER.value,
+            payload={"eval_fixture": True},
+            retry_count=spec["retry_count"],
+            # Verbatim from live run efdc3b2a9864.
+            error_message=(
+                "SchemaValidationError: payload missing required field "
+                "'user_id' (received keys: ['tenant_id', 'action', 'ts'])"
+            ),
+            remediation_hint=spec["remediation_hint"],
+            trace_id=str(seed.stable(f"dlq-trace-{spec['job_id']}")),
+            created_at=now - timedelta(minutes=8),
+            updated_at=now - timedelta(minutes=8),
+        )
+    )
+    await db_session.flush()
+
+    assert await seed._reset_dlq_state(db_session) >= 1
+
+    restored = (
+        await db_session.execute(select(Job).where(Job.id == spec["job_id"]))
+    ).scalar_one()
+    assert restored.error_message == spec["error_message"]
+    assert not coherence_violations(
+        restored.remediation_hint, restored.error_message or ""
+    )
+
+
+async def test_reset_restores_a_drifted_triage_row(
+    db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
+) -> None:
+    """`list_dlq_messages` returns the triage block inline with the
+    entry, so a stale triage is the same contradiction one field lower.
+    `_seed_dlq` inserts a triage row only when none exists, so nothing
+    but this restore ever updates one on a stack that already has it."""
+    from app.models.triage import JobTriage
+
+    seed = _seed_module()
+    spec = seed._dlq_specs()[0]
+    want = spec["triage"]
+    now = datetime.now(UTC)
+
+    db_session.add(
+        Job(
+            id=spec["job_id"],
+            tenant_id=default_tenant.id,
+            user_id=test_user.id,
+            type=spec["type"],
+            status=JobStatus.DEAD_LETTER.value,
+            payload={"eval_fixture": True},
+            retry_count=spec["retry_count"],
+            error_message=spec["error_message"],
+            remediation_hint=spec["remediation_hint"],
+            trace_id=str(seed.stable(f"dlq-trace-{spec['job_id']}")),
+            created_at=now - timedelta(minutes=8),
+            updated_at=now - timedelta(minutes=8),
+        )
+    )
+    db_session.add(
+        JobTriage(
+            id=spec["triage_id"],
+            tenant_id=default_tenant.id,
+            job_id=spec["job_id"],
+            # The pre-WO-R2-146 story for this row: it told the agent to
+            # fix the producer before replaying a row marked replay_safe.
+            root_cause_category="schema_violation",
+            summary=(
+                "Producer sent a payload missing user_id — schema "
+                "rejected it three times."
+            ),
+            suggested_fix=(
+                "Fix the producer to include user_id, then replay the "
+                "DLQ entry."
+            ),
+            is_retryable=True,
+            confidence=0.91,
+            model_used="seed-fixture",
+            usage={"input_tokens": 0, "output_tokens": 0},
+        )
+    )
+    await db_session.flush()
+
+    # The job row is already at baseline, so the only thing to fix is
+    # the triage — and the reset must still report the fixture as reset.
+    assert await seed._reset_dlq_state(db_session) >= 1
+
+    restored = (
+        await db_session.execute(
+            select(JobTriage).where(JobTriage.id == spec["triage_id"])
+        )
+    ).scalar_one()
+    for field, expected in want.items():
+        assert getattr(restored, field) == expected, field
+
+
+async def test_reset_leaves_a_matching_triage_row_alone(
+    db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
+) -> None:
+    """Back-to-back resets stay no-ops — the idempotency `reset_eval_state`
+    documents, now that a second field can trigger a write."""
+    from app.models.triage import JobTriage
+
+    seed = _seed_module()
+    spec = seed._dlq_specs()[0]
+    now = datetime.now(UTC)
+
+    db_session.add(
+        Job(
+            id=spec["job_id"],
+            tenant_id=default_tenant.id,
+            user_id=test_user.id,
+            type=spec["type"],
+            status=JobStatus.DEAD_LETTER.value,
+            payload={"eval_fixture": True},
+            retry_count=spec["retry_count"],
+            error_message=spec["error_message"],
+            remediation_hint=spec["remediation_hint"],
+            trace_id=str(seed.stable(f"dlq-trace-{spec['job_id']}")),
+            created_at=now - timedelta(minutes=8),
+            updated_at=now - timedelta(minutes=8),
+        )
+    )
+    db_session.add(
+        JobTriage(
+            id=spec["triage_id"],
+            tenant_id=default_tenant.id,
+            job_id=spec["job_id"],
+            model_used="seed-fixture",
+            usage={"input_tokens": 0, "output_tokens": 0},
+            **spec["triage"],
+        )
+    )
+    await db_session.flush()
+
+    assert await seed._reset_dlq_state(db_session) == 0

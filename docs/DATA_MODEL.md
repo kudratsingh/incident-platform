@@ -88,7 +88,7 @@ Adding a new role to a Postgres ENUM requires `ALTER TYPE`, which can't run insi
 | `idempotency_key` | String(255) NULLABLE | Optional. UNIQUE constraint is **composite** with `tenant_id` (`UNIQUE (tenant_id, idempotency_key)`), set in Alembic `a9c2d1e83104`. Pre-Phase-12 this was a global UNIQUE, which prevented two tenants from using the same key. |
 | `payload` | JSONB NULLABLE | The job's input. Schema enforced by the processor (each `JobType` has its own Pydantic shape). Includes `__traceparent` for OTel context propagation. |
 | `result` | JSONB NULLABLE | Set on success. |
-| `error_message` | Text NULLABLE | Set on failure. Truncated/sanitized at the worker; not the full traceback. |
+| `error_message` | Text NULLABLE | Set on failure. Truncated/sanitized at the worker; not the full traceback. On a row the **lab** wrote it is not free text: see [The lab's error texts agree with their hints](#the-labs-error-texts-agree-with-their-hints) below. |
 | `retry_count` | Integer (default 0) | Incremented on each failure. Reset to 0 on admin Replay (previous value recorded in audit log). |
 | `max_retries` | Integer (default `MAX_JOB_RETRIES`, itself 3) | Per-job cap, stamped at INSERT from the setting rather than from a literal, so the knob reaches every writer — REST creation, chaos hooks, eval seeds, saga steps (WO-R2-76). A caller may still name a different ceiling for one job; the saga coordinator does. Changing the setting does **not** re-stamp existing rows: the dispatcher reads the ceiling off the row, so jobs created before the change keep the budget they were admitted with. |
 | `dead_lettered_by` | String(32) NULLABLE | Which mechanism forced the dead-letter, when it was not the default one — `llm_retry_policy` is the only value today. NULL = retries simply ran out (or no processor was registered, or the dispatcher's safety net fired), so the admin DLQ tab can badge the LLM rows without inferring it from `retry_count < max_retries`, which mislabelled every compensation job. Reset to NULL on admin Replay. Added in Alembic `c9a3e5d70b12`; not backfilled, so pre-migration rows read NULL. |
@@ -111,6 +111,30 @@ Adding a new role to a Postgres ENUM requires `ALTER TYPE`, which can't run insi
 ### Why error_message is Text, not String
 
 Stack traces are typically 1-10KB. `VARCHAR(N)` with a small N would truncate; with a large N it's just Text with extra constraints. Text is what we want.
+
+### The lab's error texts agree with their hints
+
+For a job that failed on its own, `error_message` and `remediation_hint` come from different places and either can be missing. For a row the **lab** wrote — a chaos hook or the eval seed script — both are chosen by the same author at the same moment, and the agent reads them together off one `list_dlq_messages` entry. So a lab row where they disagree is not a cosmetic problem: it is a fixture that grades correct reasoning as wrong.
+
+That happened. Live run `efdc3b2a9864` (2026-09-07) seeded a dead-lettered DAG root `remediation_hint=replay_safe` with `error_message` = `SchemaValidationError: payload missing required field 'user_id'`. The agent read both, judged that a payload missing a required field fails identically on every attempt, and escalated rather than replaying — the right call against that text, and a failure against the scenario's expectation. In the lab nothing validates payloads, so the hint was the truth and the text was decoration; nothing on the wire said which to believe (WO-R2-146).
+
+Every lab writer now draws its text from one table, `backend/app/lab/dlq_failure_stories.py`:
+
+| `remediation_hint` | The kind of failure its text must describe | Canonical text |
+|---|---|---|
+| `replay_safe` | Transient, left nothing behind — replaying now is the whole fix | upstream timeout, request never acknowledged |
+| `wait_and_replay` | A dependency refusing work — replaying now burns another attempt | 429 with `retry-after`; also a refused SMTP connection |
+| `human_required` | Bad data or a schema violation in the stored payload — every replay fails identically | missing required field; a non-numeric value in an integer column |
+| `NULL` | Nothing has classified this failure, and the text must not classify it either | worker exited without recording an outcome |
+
+The table carries the matching `job_triages` row alongside each text, because `list_dlq_messages` returns the triage block inline — a `replay_safe` row whose triage says "fix the producer, then replay" contradicts its hint just as loudly one field lower.
+
+`coherence_violations()` in that module is the rule as code, and `tests/unit/test_dlq_text_coherence.py` walks every writer's pairs through it — `seed_dlq_messages`, `create_stuck_dag`, `poison_message`, `create_bad_data_job` and the four seeded rows. The API tier asserts the same thing on rows read back over the wire, so a hook that stops consulting the table fails rather than quietly drifting.
+
+Two consequences worth knowing before editing a lab text:
+
+- **`poison_message`'s DLQ row no longer describes the schema violation it sends to Kafka.** That row is a stand-in — real consumers log-and-drop schema errors instead of dead-lettering them — and it is stamped `replay_safe`, so its text has to be transient. The Kafka half stays observable in the consumer's logs and in `get_consumer_lag`; the row still names its topic and the hook.
+- **`scripts/reset_eval_state.py` re-baselines these texts, not just the statuses.** A replay overwrites `error_message` with the live processor's own error, so a mutated text is the normal state of a fixture after a scenario runs. `_reset_dlq_state` restores `status`, `retry_count`, `remediation_hint`, `error_message` and the fixture's `job_triages` row.
 
 ### Why payload + result are JSONB rather than a typed schema
 

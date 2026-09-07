@@ -46,9 +46,21 @@ Compensating actions (ADR 0008 amendment — named on both sides):
     and the resolver promotes each descendant in turn. Round-trip test:
     `test_create_stuck_dag_round_trip_with_replay_dlq_by_ids` in
     `tests/api/test_mcp_chaos_stuck_dag.py`.
-  * `pause_dag(root_job_id)` is the stabilization the scenario grades:
-    `get_dag_state` reads `paused=true` while descendants hold in
-    `waiting`; the pause self-cleans on TTL.
+  * `pause_dag(root_job_id)` stabilizes without fixing: `get_dag_state`
+    reads `paused=true` while descendants hold in `waiting`, and the
+    pause self-cleans on TTL — so the chain is stuck again the moment it
+    lapses, and while it holds the platform refuses the replay above.
+    The scenario grades the replay, not the pause (commander ADR 0026 —
+    a stabilizer is not a resolution). This bullet used to call the
+    pause "the stabilization the scenario grades", which stopped being
+    true when that scenario was redesigned around the replay.
+
+The root's `error_message` is derived from the `remediation_hint` the
+call declares, through `app.lab.dlq_failure_stories`. The two have to
+agree: the agent reads the root's row before deciding whether a replay
+is safe, and a `replay_safe` root whose text named a permanent schema
+violation is what made it escalate on a scenario graded for a replay
+(WO-R2-146).
   * Every row is tagged `payload.seeded_fixture = true`, so the reset
     sweep (`scripts/reset_eval_state.py::_delete_seeded_dlq_fixtures`)
     DELETEs the whole chain — edges CASCADE with the jobs (ADR 0012
@@ -84,15 +96,17 @@ from collections.abc import Sequence
 
 from app.core.exceptions import AppError
 from app.core.logging import get_logger
+from app.lab.dlq_failure_stories import default_error_for
 from app.mcp.chaos import BlastRadius, chaos_tool
 from app.mcp.registry import ToolContext
 
-# Deliberately reuses seed_dlq_messages' marker, owner fallback, hint
-# validation, and canned error strings so the two declared-fixture
-# hooks stay in lockstep — same disposal rule, same chaos-owner
-# cleanup, same hint vocabulary (see that module's docstring).
+# Deliberately reuses seed_dlq_messages' marker, owner fallback, and hint
+# validation so the two declared-fixture hooks stay in lockstep — same
+# disposal rule, same chaos-owner cleanup, same hint vocabulary (see that
+# module's docstring). The canned error strings are shared too, but they
+# now come from `app.lab.dlq_failure_stories` rather than from a dict in
+# that module.
 from app.mcp.tools.chaos.seed_dlq_messages import (
-    _DEFAULT_ERRORS,
     SEEDED_FIXTURE_MARKER,
     _fixture_owner,
     _validated_hint,
@@ -265,7 +279,12 @@ async def create_stuck_dag(
         )
 
     user = await _fixture_owner(ctx, tenant_id)
-    error_message = inp.error_message or _DEFAULT_ERRORS[hint]
+    # Derived from the hint this call declares, never fixed: the root the
+    # agent reads has to describe a failure the declared hint's action
+    # would actually fix. A chain seeded `replay_safe` whose root said
+    # SchemaValidationError is what made the agent escalate, correctly,
+    # on a scenario graded for a replay (WO-R2-146).
+    error_message = inp.error_message or default_error_for(hint)
 
     for job_id, status in expected.items():
         ctx.db.add(
