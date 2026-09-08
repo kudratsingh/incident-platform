@@ -402,6 +402,7 @@ async def test_mark_dlq_permanent_sets_hint(
     assert payload["remediation_hint"] == RemediationHint.HUMAN_REQUIRED.value
     assert payload["already_marked"] is False
     assert payload["previous_hint"] == RemediationHint.REPLAY_SAFE.value
+    assert payload["fenced_at"] is not None
 
     # And an audit row was written
     rows = (
@@ -414,12 +415,125 @@ async def test_mark_dlq_permanent_sets_hint(
     assert row.extra_data is not None
     assert "same bug" in row.extra_data["reason"]
 
+    # The fence is on the row, not only in the audit trail (WO-R2-158).
+    db_session.expire_all()
+    job = (
+        await db_session.execute(select(Job).where(Job.id == replay_safe_id))
+    ).scalar_one()
+    assert job.fenced_at is not None
+    assert job.fenced_by is not None
+    # `"{principal_type}:{principal_id}"` — the type is spelled out because
+    # the id alone cannot say which table it belongs to (ADR 0007).
+    assert job.fenced_by.startswith("service_account:")
+    assert uuid.UUID(job.fenced_by.split(":", 1)[1])
 
-async def test_mark_dlq_permanent_idempotent(
+
+async def test_mark_dlq_permanent_on_an_unclassified_row_fences_and_audits(
     mcp_client, db_session, default_tenant, test_user  # type: ignore[no-untyped-def]
 ) -> None:
+    """The shape the `dlq_human_required_escalates` drill runs on: a row
+    nobody has classified, fenced by the agent.
+
+    The hint goes from NULL to `human_required`, `fenced_at`/`fenced_by`
+    record that an operator did it rather than triage, and the reason
+    lands on an audit row.
+    """
+    job = Job(
+        tenant_id=default_tenant.id,
+        user_id=test_user.id,
+        type=JobType.CSV_UPLOAD.value,
+        status=JobStatus.DEAD_LETTER.value,
+        retry_count=3,
+        error_message=(
+            "ValueError: invalid literal for int() with base 10: 'N/A' "
+            "at row 8,214"
+        ),
+        remediation_hint=None,
+    )
+    db_session.add(job)
+    await db_session.flush()
+    # Read the id out before the expire below — touching an expired ORM
+    # attribute inside a SQL expression is sync IO in an async session.
+    job_id = job.id
+
+    token = await _token(
+        db_session, default_tenant.id, [Scope.ACTIONS_EXECUTE.value]
+    )
+    payload = _content(
+        await _call(
+            mcp_client,
+            token,
+            "mark_dlq_permanent",
+            {
+                "job_id": str(job_id),
+                "reason": "A non-numeric value in an integer column is "
+                "baked into the stored payload; every replay fails here.",
+                "idempotency_key": "mark-unclassified-0001",
+            },
+        )
+    )
+    assert payload["previous_hint"] is None
+    assert payload["already_marked"] is False
+    assert payload["remediation_hint"] == RemediationHint.HUMAN_REQUIRED.value
+    assert payload["fenced_at"] is not None
+
+    db_session.expire_all()
+    fenced = (
+        await db_session.execute(select(Job).where(Job.id == job_id))
+    ).scalar_one()
+    assert fenced.remediation_hint == RemediationHint.HUMAN_REQUIRED.value
+    assert fenced.fenced_at is not None
+    assert fenced.fenced_by is not None
+    # The status is untouched — the fence is a classification, not a
+    # transition. The row stays in the DLQ for the human review path.
+    assert fenced.status == JobStatus.DEAD_LETTER.value
+
+    rows = (
+        await db_session.execute(
+            select(AuditLog).where(
+                AuditLog.action == "job.marked_permanent",
+                AuditLog.resource_id == str(job_id),
+            )
+        )
+    ).scalars().all()
+    assert len(rows) == 1
+    assert rows[0].extra_data is not None
+    assert rows[0].extra_data["previous_hint"] is None
+    assert rows[0].extra_data["already_marked"] is False
+
+
+async def test_mark_dlq_permanent_re_fence_still_writes_and_audits(
+    mcp_client, db_session, default_tenant, test_user  # type: ignore[no-untyped-def]
+) -> None:
+    """WO-R2-158, the finding that blocked the drill.
+
+    RED before: on a row already `human_required` this tool took an
+    `already_marked` early return and wrote nothing at all — not the row,
+    not even an audit row. An agent that fenced the row and an agent that
+    skipped the step left identical worlds, so an eval grading the fence
+    graded a no-op (confirmed live 2026-09-08).
+
+    Re-fencing is still an operator action: a deliberate decision about
+    this row, taken now, with a reason worth keeping. So it stamps
+    `fenced_at`/`fenced_by` and writes the audit row. `already_marked`
+    stays in the response — it now says only "you were not the first",
+    which is what a caller that cares actually wants to know.
+    """
     ids = await _seed_categorized_dlq(db_session, default_tenant, test_user)
     already_marked_id = ids[RemediationHint.HUMAN_REQUIRED.value]
+
+    # Pre-condition: the seeded row carries the hint and no fence stamp,
+    # which is exactly what a triage-classified row looks like.
+    seeded = (
+        await db_session.execute(
+            select(Job).where(Job.id == already_marked_id)
+        )
+    ).scalar_one()
+    assert seeded.remediation_hint == RemediationHint.HUMAN_REQUIRED.value
+    assert seeded.fenced_at is None, (
+        "a hint with no fence stamp is the state this test exists to "
+        "distinguish from an operator's fence"
+    )
 
     token = await _token(
         db_session, default_tenant.id, [Scope.ACTIONS_EXECUTE.value]
@@ -431,12 +545,149 @@ async def test_mark_dlq_permanent_idempotent(
             "mark_dlq_permanent",
             {
                 "job_id": str(already_marked_id),
-                "reason": "no-op, already marked",
+                "reason": "Re-fencing after review — still not replayable.",
                 "idempotency_key": "mark-idem-0001",
             },
         )
     )
     assert payload["already_marked"] is True
+    assert payload["previous_hint"] == RemediationHint.HUMAN_REQUIRED.value
+    assert payload["remediation_hint"] == RemediationHint.HUMAN_REQUIRED.value
+    assert payload["fenced_at"] is not None
+
+    db_session.expire_all()
+    fenced = (
+        await db_session.execute(
+            select(Job).where(Job.id == already_marked_id)
+        )
+    ).scalar_one()
+    assert fenced.fenced_at is not None, (
+        "the fence must be observable on the row even when the hint did "
+        "not move — otherwise the action is indistinguishable from doing "
+        "nothing"
+    )
+    assert fenced.fenced_by is not None
+
+    rows = (
+        await db_session.execute(
+            select(AuditLog).where(
+                AuditLog.action == "job.marked_permanent",
+                AuditLog.resource_id == str(already_marked_id),
+            )
+        )
+    ).scalars().all()
+    assert len(rows) == 1, (
+        "an idempotent re-fence used to write no audit row at all"
+    )
+    assert rows[0].extra_data is not None
+    assert "Re-fencing" in rows[0].extra_data["reason"]
+    # The row keeps only the latest fence; the audit trail is where the
+    # sequence lives, so it has to say which kind each entry was.
+    assert rows[0].extra_data["already_marked"] is True
+    assert rows[0].extra_data["previous_hint"] == (
+        RemediationHint.HUMAN_REQUIRED.value
+    )
+
+
+async def test_a_re_fence_moves_fenced_at_forward(
+    mcp_client, db_session, default_tenant, test_user  # type: ignore[no-untyped-def]
+) -> None:
+    """`fenced_at` is the verification surface, so it has to answer "did
+    MY call land" rather than "has anyone ever fenced this".
+
+    Two marks under different idempotency keys, so both execute (the same
+    key would return the stored response without re-running — ADR 0010).
+    """
+    ids = await _seed_categorized_dlq(db_session, default_tenant, test_user)
+    job_id = ids[RemediationHint.REPLAY_SAFE.value]
+    token = await _token(
+        db_session, default_tenant.id, [Scope.ACTIONS_EXECUTE.value]
+    )
+
+    stamps = []
+    for n in (1, 2):
+        payload = _content(
+            await _call(
+                mcp_client,
+                token,
+                "mark_dlq_permanent",
+                {
+                    "job_id": str(job_id),
+                    "reason": f"Fence attempt {n} — data is still bad.",
+                    "idempotency_key": f"mark-refence-{n:04d}",
+                },
+            )
+        )
+        stamps.append(payload["fenced_at"])
+
+    assert stamps[1] >= stamps[0]
+    db_session.expire_all()
+    job = (
+        await db_session.execute(select(Job).where(Job.id == job_id))
+    ).scalar_one()
+    assert job.fenced_at is not None
+    # Both executions are on the record even though only one stamp
+    # survives on the row.
+    rows = (
+        await db_session.execute(
+            select(AuditLog).where(
+                AuditLog.action == "job.marked_permanent",
+                AuditLog.resource_id == str(job_id),
+            )
+        )
+    ).scalars().all()
+    assert len(rows) == 2
+    assert [r.extra_data["already_marked"] for r in rows if r.extra_data] == [
+        False,
+        True,
+    ]
+
+
+async def test_list_dlq_shows_the_fence_stamps(
+    mcp_client, db_session, default_tenant, test_user  # type: ignore[no-untyped-def]
+) -> None:
+    """The fence has to be readable through the surface the agent uses.
+
+    `remediation_hint` cannot carry this: `human_required` is the same
+    value from triage and from an operator, so a row classified by triage
+    and a row somebody fenced were identical over the wire.
+    """
+    ids = await _seed_categorized_dlq(db_session, default_tenant, test_user)
+    fenced_id = ids[RemediationHint.REPLAY_SAFE.value]
+    triaged_id = ids[RemediationHint.HUMAN_REQUIRED.value]
+
+    action_token = await _token(
+        db_session, default_tenant.id, [Scope.ACTIONS_EXECUTE.value]
+    )
+    await _call(
+        mcp_client,
+        action_token,
+        "mark_dlq_permanent",
+        {
+            "job_id": str(fenced_id),
+            "reason": "Fenced by the operator, not by triage.",
+            "idempotency_key": "mark-listed-0001",
+        },
+    )
+
+    read_token = await _token(
+        db_session, default_tenant.id, [Scope.INCIDENTS_READ.value]
+    )
+    listing = _content(
+        await _call(mcp_client, read_token, "list_dlq_messages", {})
+    )
+    by_id = {item["id"]: item for item in listing["items"]}
+
+    fenced = by_id[str(fenced_id)]
+    assert fenced["remediation_hint"] == RemediationHint.HUMAN_REQUIRED.value
+    assert fenced["fenced_at"] is not None
+    assert fenced["fenced_by"].startswith("service_account:")
+
+    # Same hint, no fence — the distinction the two fields exist to make.
+    triaged = by_id[str(triaged_id)]
+    assert triaged["remediation_hint"] == RemediationHint.HUMAN_REQUIRED.value
+    assert triaged["fenced_at"] is None
+    assert triaged["fenced_by"] is None
 
 
 async def test_mark_dlq_permanent_refuses_non_dlq(

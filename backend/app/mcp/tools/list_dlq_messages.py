@@ -76,6 +76,26 @@ class DlqEntry(BaseModel):
         "field the list is sorted by. Null only for rows that predate the "
         "column being stamped.",
     )
+    fenced_at: datetime | None = Field(
+        default=None,
+        description="When this row was last fenced by `mark_dlq_permanent` "
+        "— the platform's clock, UTC, and a different clock from "
+        "`dead_lettered_at` (when the job died) and `created_at` (when it "
+        "was submitted). Null means nobody has fenced it, so a "
+        "`human_required` hint with a null `fenced_at` was written by "
+        "triage rather than by an operator. This is the field to verify a "
+        "fence on: the hint alone cannot say who set it, and it is "
+        "re-stamped on every mark, so a re-fence of an already-fenced row "
+        "moves it.",
+    )
+    fenced_by: str | None = Field(
+        default=None,
+        description="Which principal raised the fence, as "
+        "`{principal_type}:{principal_id}` — e.g. "
+        "`service_account:0f9a…`. The type is spelled out because the id "
+        "alone cannot say whether it names a user or a service account. "
+        "Null whenever `fenced_at` is null.",
+    )
     updated_at: datetime | None = None
     trace_id: str | None = None
     triage: DlqTriageSummary | None = None
@@ -108,7 +128,15 @@ class ListDlqMessagesOutput(BaseModel):
         "these yet, NOT that they resist classification. A null hint is "
         "UNKNOWN, not replay-safe: do not feed those to a categorised "
         "replay. Read the error, then replay by explicit id, or fence it "
-        "with `mark_dlq_permanent`. A dead-lettered DAG root appears in "
+        "with `mark_dlq_permanent`.\n"
+        "WHO CLASSIFIED IT: `fenced_at` and `fenced_by` say whether an "
+        "operator fenced this row, which `remediation_hint` cannot — "
+        "`human_required` is the same value from triage and from a fence. "
+        "`fenced_at` is therefore the surface to verify a fence on, and it "
+        "is re-stamped on every `mark_dlq_permanent` call, so a re-fence "
+        "of an already-fenced row moves it. Both are null on a row nobody "
+        "has fenced, and a replay clears them with the hint.\n"
+        "A dead-lettered DAG root appears in "
         "this listing like any other row, and this listing is the ONLY "
         "read that exposes a job's `remediation_hint` — `get_dag_state` "
         "does not carry it. There is no job-id filter, so locating one "
@@ -165,6 +193,8 @@ async def list_dlq_messages(
                 remediation_hint=job.remediation_hint,
                 created_at=job.created_at,
                 dead_lettered_at=job.completed_at,
+                fenced_at=job.fenced_at,
+                fenced_by=job.fenced_by,
                 updated_at=job.updated_at,
                 trace_id=job.trace_id,
                 triage=triage_summary,

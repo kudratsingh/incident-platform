@@ -34,8 +34,36 @@ So the rule this module exists to hold:
   * `human_required`   — bad data or a schema violation baked into the
                          stored payload. Every replay fails identically.
   * `None`             — nothing has classified this failure. The text
-                         must not imply a class either, because a null
-                         hint means unknown and *not* replay-safe.
+                         must not invite a replay, because a null hint
+                         means unknown and *not* replay-safe.
+
+That last bullet used to read "the text must not imply a class either".
+That was too broad in one direction, and the over-reach was load-bearing
+rather than cosmetic: it made the pair an escalation drill actually needs
+— an *unclassified* row whose error text a human can read and act on —
+representable nowhere in this table. The rule for a null hint is
+asymmetric, because the harm is:
+
+  * A null-hint row whose text reads transient ("timed out, nothing was
+    committed") or backoff ("429, retry-after 120s") is incoherent. Every
+    tool description says a null hint is UNKNOWN and explicitly not
+    replay-safe, so a text that says "replaying is the fix" is telling
+    the agent to do the thing the missing classification does not
+    authorise.
+  * A null-hint row whose text names a permanent data fault is coherent.
+    A hint is a *classification*; an error text is the *symptom* the
+    failing code recorded. "Nobody has classified this" and "the symptom
+    is a bad row in the payload" do not disagree — the text is precisely
+    the evidence a triage pass (or an operator) would read to reach
+    `human_required`, and it points away from a replay, which is where a
+    null hint already sits. Refusing that pair would be refusing the
+    normal state of an organically dead-lettered job on a stack with LLM
+    triage switched off, which is this platform's default.
+
+So `coherence_violations` screens a null hint for backoff and transient
+markers and admits permanent ones. What a null hint may never carry is a
+`job_triages` row — that block *is* a classification — and
+`triage_violations` still refuses it.
 
 `coherence_violations()` is that rule as code, and every writer's pairs
 are walked through it by `tests/unit/test_dlq_text_coherence.py`. The
@@ -242,6 +270,26 @@ UNCLASSIFIED_WORKER_EXIT = DlqFailureStory(
     triage=None,
 )
 
+UNCLASSIFIED_CSV_BAD_ROW = DlqFailureStory(
+    key="unclassified_csv_bad_row",
+    hint=None,
+    error_message=(
+        "ValueError: invalid literal for int() with base 10: 'N/A' in "
+        "column 'quantity' at row 8,214 of 12,000 — csv_upload aborted "
+        "on attempt 3/3"
+    ),
+    # Same reason as the story above, and the reason this variant exists:
+    # a triage block would classify the row, and the whole point of it is
+    # that nothing has. The text is a symptom a reader can act on; the
+    # hint column is still empty, so deciding what to do with the row is
+    # work the reader has to do. `create_bad_data_job` pins this story by
+    # key for the escalation drill (`dlq_human_required_escalates`), where
+    # the agent has to read the error, fence the row itself, and escalate
+    # — none of which is measurable against a row that arrived already
+    # stamped `human_required`.
+    triage=None,
+)
+
 
 # Element 0 of each tuple is the canonical default for that hint.
 DLQ_FAILURE_STORIES: Mapping[str | None, tuple[DlqFailureStory, ...]] = (
@@ -256,7 +304,13 @@ DLQ_FAILURE_STORIES: Mapping[str | None, tuple[DlqFailureStory, ...]] = (
                 SCHEMA_MISSING_FIELD,
                 CSV_BAD_ROW,
             ),
-            None: (UNCLASSIFIED_WORKER_EXIT,),
+            # Element 0 stays the story that says nothing at all about
+            # its class: that is what a writer given only "uncategorised"
+            # should stamp, and `default_error_for(None)` must keep
+            # returning it. The bad-data variant is reached by key, by the
+            # one hook that wants an unclassified row a reader can
+            # actually act on.
+            None: (UNCLASSIFIED_WORKER_EXIT, UNCLASSIFIED_CSV_BAD_ROW),
         }
     )
 )
@@ -419,12 +473,19 @@ def coherence_violations(hint: str | None, error_message: str) -> list[str]:
                 "replay the hint forbids"
             )
     elif hint is None:
-        found = permanent + backoff + transient
-        if found:
+        # Asymmetric on purpose — see the module docstring. A null hint is
+        # UNKNOWN and explicitly not replay-safe, so the contradiction is
+        # a text that says a replay (now, or after a wait) is the remedy.
+        # A text naming a permanent data fault agrees with the null hint
+        # about the only thing the null hint asserts: don't replay this.
+        routable = transient + backoff
+        if routable:
             reasons.append(
-                "uncategorised row's text implies a class "
-                f"({', '.join(found)}) while the hint says nothing has "
-                "classified it"
+                "uncategorised row's text reads as a fault a replay would "
+                f"clear ({', '.join(routable)}) while the hint says "
+                "nothing has classified it — a null hint is UNKNOWN and "
+                "explicitly not replay-safe, so a text that invites a "
+                "replay contradicts it"
             )
     else:
         reasons.append(f"unknown remediation_hint {hint!r}")

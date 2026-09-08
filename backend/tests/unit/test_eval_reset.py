@@ -604,6 +604,72 @@ async def test_delete_seeded_dlq_fixtures_removes_declared_rows(
     )
 
 
+async def test_delete_seeded_dlq_fixtures_removes_a_bad_data_job_row(
+    db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
+) -> None:
+    """The disposal half of WO-R2-158, against the payload the hook really
+    writes rather than a hand-built approximation of it.
+
+    `create_bad_data_job` used to write a randomly-idded row marked only
+    `chaos_fixture`, so this sweep never saw it and `_sweep_nonfixture_dlq`
+    merely *cancelled* it — one dead row accumulating per run, and per run
+    a row the next scenario's planner could still read. Now that the row's
+    id is pinned by a scenario in advance it is declared scaffolding, so it
+    carries the top-level marker and is DELETEd.
+
+    The payload has three keys, which is the reason the predicate has to be
+    JSONB *containment* and not equality: a strict `payload = '{...}'`
+    match would silently stop deleting these.
+    """
+    reset = _reset_module()
+    from app.mcp.tools.chaos.create_bad_data_job import fixture_id
+    from app.mcp.tools.chaos.seed_dlq_messages import SEEDED_FIXTURE_MARKER
+
+    job_id = fixture_id(default_tenant.id, "unfenced-csv")
+    declared = Job(
+        id=job_id,
+        tenant_id=default_tenant.id,
+        user_id=test_user.id,
+        type=JobType.CSV_UPLOAD.value,
+        status=JobStatus.DEAD_LETTER.value,
+        payload={
+            SEEDED_FIXTURE_MARKER: True,
+            "chaos_fixture": "bad_data_job",
+            "fixture_name": "unfenced-csv",
+        },
+        retry_count=3,
+        remediation_hint=None,
+    )
+    # `poison_message`'s shape: provenance only, no declaration. It stays —
+    # this sweep is not the one that disposes of it.
+    undeclared = Job(
+        tenant_id=default_tenant.id,
+        user_id=test_user.id,
+        type=JobType.BULK_API_SYNC.value,
+        status=JobStatus.DEAD_LETTER.value,
+        payload={"chaos_fixture": "poison_message", "topic": "job.submitted"},
+        retry_count=3,
+    )
+    db_session.add_all([declared, undeclared])
+    await db_session.flush()
+    undeclared_id = undeclared.id
+
+    deleted = await reset._delete_seeded_dlq_fixtures(_factory(db_session))
+
+    assert deleted == 1
+    remaining = set(
+        (
+            await db_session.execute(
+                select(Job.id).where(Job.id.in_([job_id, undeclared_id]))
+            )
+        ).scalars()
+    )
+    assert remaining == {undeclared_id}, (
+        "the declared bad-data fixture must be deleted and the "
+        "provenance-only chaos row left for the cancel sweep"
+    )
+
+
 # ---------------------------------------------------------------------------
 # _resolve_chaos_alerts — D-03, the compensator ADR 0008's amendment requires
 # ---------------------------------------------------------------------------
@@ -840,7 +906,12 @@ async def test_reset_deletes_leave_audit_rows_byte_identical(
         user_id=chaos_user.id,
         type=JobType.CSV_UPLOAD.value,
         status=JobStatus.DEAD_LETTER.value,
-        payload={"chaos_fixture": "bad_data_job"},
+        # `poison_message`'s shape: a chaos row marked with its
+        # provenance only. `create_bad_data_job` is no longer the
+        # example here — since WO-R2-158 its rows carry the
+        # `seeded_fixture` marker and are DELETEd by the sibling
+        # sweep, so using it would make this row match both.
+        payload={"chaos_fixture": "poison_message"},
         retry_count=3,
     )
     seeded_job = Job(
@@ -917,7 +988,12 @@ async def test_delete_chaos_owner_users_removes_users_and_their_jobs(
         user_id=chaos_user.id,
         type=JobType.CSV_UPLOAD.value,
         status=JobStatus.DEAD_LETTER.value,
-        payload={"chaos_fixture": "bad_data_job"},
+        # `poison_message`'s shape: a chaos row marked with its
+        # provenance only. `create_bad_data_job` is no longer the
+        # example here — since WO-R2-158 its rows carry the
+        # `seeded_fixture` marker and are DELETEd by the sibling
+        # sweep, so using it would make this row match both.
+        payload={"chaos_fixture": "poison_message"},
         retry_count=3,
     )
     db_session.add(chaos_job)

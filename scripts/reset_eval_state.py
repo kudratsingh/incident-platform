@@ -29,10 +29,16 @@ What gets cleared/reset:
      both bleed into the next scenario: a timer fires mid-run and
      shrinks the DLQ unprompted, a stale pause holds the next DAG in
      WAITING (enforced since ADR 0011).
-  4. **Non-fixture DLQ rows** — any `dead_letter` job outside the
-     `_dlq_specs()` stable-ID set is moved to `cancelled`, so the DLQ
-     a scenario sees is exactly the fixture set it was graded against.
-     Catches chaos jobs attached to a real user, which the
+  4. **Declared fixtures and non-fixture DLQ rows** — two disposal
+     classes, deliberately different (ADR 0012 rule 2). A row a scenario
+     *declared* for itself carries the top-level `seeded_fixture` payload
+     marker — `seed_dlq_messages`, `create_stuck_dag`, and since v0.6.2
+     `create_bad_data_job`, whose id a scenario now pins in advance — and
+     is hard-DELETEd, because a `cancelled` copy per run is litter rather
+     than history. Everything else still in `dead_letter` outside the
+     `_dlq_specs()` stable-ID set is moved to `cancelled`, so the DLQ a
+     scenario sees is exactly the fixture set it was graded against; that
+     arm catches chaos jobs attached to a real user, which the
      chaos-owner-user cleanup below can't reach. Also de-noises the
      planner on non-DLQ scenarios, which read the same surface.
   5. **Chaos-fired alerts** — every `alerts` row whose source matches
@@ -439,7 +445,9 @@ async def _resolve_chaos_alerts(session_factory: Any) -> int:
 
 
 async def _delete_seeded_dlq_fixtures(session_factory: Any) -> int:
-    """DELETE rows created by the `seed_dlq_messages` chaos hook.
+    """DELETE rows created by a *declared-fixture* chaos hook —
+    `seed_dlq_messages`, `create_stuck_dag`, and (since v0.6.2)
+    `create_bad_data_job`.
 
     Deleted rather than cancelled (the disposal `_sweep_nonfixture_dlq`
     applies to everything else) because these are scaffolding a
@@ -447,10 +455,22 @@ async def _delete_seeded_dlq_fixtures(session_factory: Any) -> int:
     Cancelling them would leave thousands of dead rows behind across
     eval runs. See ADR 0012 rule 2.
 
-    **The marker contract.** `seed_dlq_messages` writes exactly
-    `payload = {SEEDED_FIXTURE_MARKER: True}` — a *top-level* key holding
-    boolean `true` (`app/mcp/tools/chaos/seed_dlq_messages.py`). The
-    predicate matches that structure and nothing else. It used to be
+    `create_bad_data_job` moved into this sweep with WO-R2-158, when it
+    gained a deterministic id derived from the calling tenant and a
+    `fixture_name` a scenario pins in advance. Before that its rows were
+    randomly idded and merely *cancelled*, on the grounds that one attached
+    to a real user reads as that user's history — the case
+    `_sweep_nonfixture_dlq` below still describes. A row a scenario names
+    before it exists is not that; it is scaffolding, and the reset now
+    disposes of it as such.
+
+    **The marker contract.** Every one of those hooks writes a *top-level*
+    `SEEDED_FIXTURE_MARKER` key holding boolean `true`
+    (`app/mcp/tools/chaos/seed_dlq_messages.py` owns the constant; the
+    others import it). Two of them carry additional payload keys beside it,
+    so the predicate has to be *containment* rather than equality — which
+    it already is. It matches that structure and nothing else. It used to
+    be
     `CAST(payload AS text) LIKE '%"seeded_fixture"%'`, which is a
     substring test against the serialized payload: it also matched the
     marker as a *value* (`{"tag": "seeded_fixture"}`), at any nesting
@@ -508,10 +528,18 @@ async def _sweep_nonfixture_dlq(session_factory: Any) -> int:
 
     `_delete_chaos_owner_users` above only reaches chaos jobs owned by
     a lazy-created `chaos-owner+*` user. When the target tenant already
-    had a real user, `create_bad_data_job` attaches the job to *that*
-    user instead — so the row survives every reset and accumulates.
-    That is how a `bad_data_job` row from 2026-07-31, owned by
+    had a real user, a chaos hook attaches the job to *that* user
+    instead — so the row survives every reset and accumulates. That is
+    how a `bad_data_job` row from 2026-07-31, owned by
     `agent-demo@example.com`, was still sitting in the DLQ days later.
+
+    `create_bad_data_job` is no longer the example: since WO-R2-158 its
+    rows are declared fixtures and `_delete_seeded_dlq_fixtures` DELETEs
+    them outright, whoever owns them. `poison_message` is the hook this
+    arm still catches — its row is randomly idded, marked only
+    `chaos_fixture`, and is genuinely a stand-in for something that
+    happened to a real user's job. The failure mode is unchanged; only
+    which hook demonstrates it.
 
     The cost isn't just a dirty DLQ tab. Stale entries widen the
     surface the agent's planner reads, which pulled it into extra

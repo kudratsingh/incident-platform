@@ -350,6 +350,14 @@ class JobService:
                 # dead-letters again arrives uncategorised, and triage (or a
                 # human) classifies the new episode on its own evidence.
                 "remediation_hint": None,
+                # And the fence stamps that recorded who set that category
+                # and when (WO-R2-158). Same episode scope as the hint they
+                # describe: a `fenced_at` surviving a replay would sit next
+                # to a NULL `remediation_hint`, saying "an operator fenced
+                # this row" about a classification that no longer exists —
+                # the exact incoherence those columns were added to remove.
+                "fenced_at": None,
+                "fenced_by": None,
             },
         )
         audit_user_id: uuid.UUID | None

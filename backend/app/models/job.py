@@ -90,6 +90,32 @@ class Job(TimestampMixin, Base):
     # unbadged rather than being attributed to a policy that never ran.
     # A different axis from remediation_hint, which says what to do NEXT.
     dead_lettered_by: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # When an operator last fenced this row with `mark_dlq_permanent`, and who
+    # (WO-R2-158). `remediation_hint` alone cannot answer either question: the
+    # value `human_required` is identical whether triage classified the row or
+    # a person fenced it, so a fence was unobservable on the row and an
+    # idempotent re-fence used to write nothing at all — not the row, not even
+    # an audit row. These two columns are what makes a fence a visible action.
+    # `fenced_at` is re-stamped on EVERY mark, including a mark on a row that
+    # was already `human_required`, because re-fencing is still an operator
+    # act. It is the platform's own clock at the moment of the call (aware
+    # UTC), and a different clock from `completed_at`/`dead_lettered_at` (when
+    # the job died) and `created_at` (when it was submitted) — the three can
+    # be days apart. Both are episode-scoped exactly as `remediation_hint` and
+    # `dead_lettered_by` are, so `JobService.replay_job` clears all four: a
+    # fence timestamp surviving next to a NULL hint would be the same
+    # incoherence these columns exist to remove (R2-23).
+    fenced_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # The principal that raised the fence, as `"{principal_type}:{principal_id}"`
+    # — e.g. `service_account:0f9a…`. Self-describing rather than a bare UUID
+    # because the same id space is `users.id` or `service_accounts.id`
+    # depending on the type, and a column that cannot say which is the shape
+    # ADR 0007 rejected for `audit_logs`. No FK, same as `audit_logs.principal_id`:
+    # the fence record must survive the principal being deleted. NULL means
+    # nobody has fenced this row.
+    fenced_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # Higher number = higher priority in the queue
     priority: Mapped[int] = mapped_column(Integer, default=0, nullable=False, index=True)
     # Correlation ID from the originating HTTP request, for end-to-end tracing

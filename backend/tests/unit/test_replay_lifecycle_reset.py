@@ -27,6 +27,7 @@ The three:
 import json
 import uuid
 from collections.abc import AsyncGenerator
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
@@ -154,6 +155,7 @@ async def _insert_dead_letter(
     factory: async_sessionmaker[AsyncSession],
     *,
     remediation_hint: str | None = None,
+    fenced: bool = False,
 ) -> uuid.UUID:
     job_id = uuid.uuid4()
     async with factory() as session:
@@ -170,6 +172,10 @@ async def _insert_dead_letter(
                 max_retries=3,
                 remediation_hint=remediation_hint,
                 error_message="boom",
+                fenced_at=datetime.now(UTC) if fenced else None,
+                fenced_by=(
+                    f"service_account:{uuid.uuid4()}" if fenced else None
+                ),
             )
         )
         await session.commit()
@@ -244,6 +250,42 @@ async def test_replay_clears_the_remediation_hint(
     )
     # The paired half of the same invariant, already shipped (F2-16).
     assert job.dead_lettered_by is None
+
+
+@pytest.mark.asyncio
+async def test_replay_clears_the_fence_stamps(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """`fenced_at` / `fenced_by` are episode-scoped like the hint they
+    describe (WO-R2-158).
+
+    They exist so a `human_required` row can say an operator fenced it
+    rather than triage classifying it. A stamp that survived a replay would
+    say exactly that about a classification the replay just cleared — an
+    operator's fence attached to a NULL hint — which is the incoherence the
+    two columns were added to remove.
+
+    RED before: the hint cleared and the stamps did not.
+    """
+    job_id = await _insert_dead_letter(
+        session_factory,
+        remediation_hint=RemediationHint.HUMAN_REQUIRED.value,
+        fenced=True,
+    )
+    before = await _reload(session_factory, job_id)
+    assert before.fenced_at is not None
+    assert before.fenced_by is not None
+
+    await _replay(session_factory, job_id, _InMemoryRedis())
+
+    job = await _reload(session_factory, job_id)
+    assert job.status == JobStatus.PENDING
+    assert job.remediation_hint is None
+    assert job.fenced_at is None, (
+        "a fence stamp outliving its episode would claim an operator "
+        "classified a row that now carries no classification"
+    )
+    assert job.fenced_by is None
 
 
 @pytest.mark.asyncio
