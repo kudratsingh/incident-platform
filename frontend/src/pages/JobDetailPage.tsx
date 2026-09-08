@@ -272,7 +272,7 @@ export default function JobDetailPage() {
                 ['Status', <StatusBadge key="s" status={activeStatus} />],
                 ['Type', JOB_TYPE_LABELS[job.type] ?? job.type],
                 ['Priority', job.priority],
-                ['Retries', `${job.retry_count} / ${job.max_retries}`],
+                ['Attempts', `${job.retry_count} / ${job.max_attempts}`],
                 ['Created', formatDate(job.created_at)],
                 ['Duration', formatDuration(job.started_at, job.completed_at)],
               ].map(([label, value]) => (

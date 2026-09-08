@@ -1,5 +1,6 @@
 """Unit tests for the JSON Schema registry."""
 
+import json
 import uuid
 from pathlib import Path
 
@@ -131,11 +132,46 @@ def _dlq_base() -> dict[str, object]:
 
 
 def test_dlq_with_triage_context_validates() -> None:
-    """E1-14: `job.dlq` now carries max_retries / payload / trace_id."""
+    """E1-14: `job.dlq` now carries max_attempts / payload / trace_id."""
     validate_schema(
         "job.dlq",
-        {**_dlq_base(), "max_retries": 3, "payload": {"file": "x.csv"}, "trace_id": "t-1"},
+        {**_dlq_base(), "max_attempts": 3, "payload": {"file": "x.csv"}, "trace_id": "t-1"},
     )
+
+
+def test_dlq_carrying_both_attempt_field_names_validates() -> None:
+    """WO-R2-172: for one release the producer writes the ceiling twice —
+    `max_attempts` (the name) and `max_retries` (the name this topic
+    shipped with). Both are declared, both are typed, and an event
+    carrying both must validate, because that is the only shape the
+    producer emits today."""
+    validate_schema(
+        "job.dlq",
+        {**_dlq_base(), "max_attempts": 3, "max_retries": 3, "trace_id": None},
+    )
+
+
+def test_dlq_still_validates_with_only_the_deprecated_name() -> None:
+    """A `job.dlq` event produced before the rename — still in a topic with
+    30 days of retention — must not start failing validation on its way to
+    a consumer."""
+    validate_schema("job.dlq", {**_dlq_base(), "max_retries": 3})
+
+
+def test_deprecated_attempt_field_is_marked_deprecated_in_the_schema() -> None:
+    """The JSON Schema is where a consumer team reads the contract, so the
+    deprecation has to be in the schema and not only in a doc.
+    `max_attempts` carries no such marker."""
+    schema_dir = (
+        Path(schema_registry.__file__).resolve().parent.parent / "schemas" / "kafka"
+    )
+    schema = json.loads(
+        (schema_dir / topic_schema_files()["job.dlq"]).read_text(encoding="utf-8")
+    )
+    props = schema["properties"]
+    assert props["max_retries"]["deprecated"] is True
+    assert "max_attempts" in props["max_retries"]["description"]
+    assert "deprecated" not in props["max_attempts"]
 
 
 def test_dlq_with_truncated_payload_marker_validates() -> None:
@@ -143,7 +179,7 @@ def test_dlq_with_truncated_payload_marker_validates() -> None:
         "job.dlq",
         {
             **_dlq_base(),
-            "max_retries": 3,
+            "max_attempts": 3,
             "payload": {"_truncated": True, "_original_bytes": 9001},
             "trace_id": None,
         },
@@ -160,6 +196,8 @@ def test_failed_without_triage_context_still_validates() -> None:
 def test_dlq_rejects_malformed_triage_context() -> None:
     """The new fields are typed, so producer-side validation catches drift
     before a malformed event reaches triage."""
+    with pytest.raises(SchemaValidationError):
+        validate_schema("job.dlq", {**_dlq_base(), "max_attempts": -1})
     with pytest.raises(SchemaValidationError):
         validate_schema("job.dlq", {**_dlq_base(), "max_retries": -1})
     with pytest.raises(SchemaValidationError):

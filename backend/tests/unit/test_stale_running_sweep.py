@@ -104,7 +104,7 @@ async def _seed_running_job(
                     status=JobStatus.RUNNING,
                     payload={"rows": 10, "__traceparent": {"traceparent": "x"}},
                     retry_count=retry_count,
-                    max_retries=3,
+                    max_attempts=3,
                     trace_id="trace-abc",
                     started_at=datetime.now(UTC) - timedelta(seconds=age_seconds),
                 )

@@ -178,7 +178,7 @@ def _job(tenant_id: uuid.UUID, user_id: uuid.UUID, **overrides: Any) -> Any:
         "status": JobStatus.DEAD_LETTER.value,
         "payload": {},
         "retry_count": 3,
-        "max_retries": 3,
+        "max_attempts": 3,
         "priority": 5,
     }
     fields.update(overrides)

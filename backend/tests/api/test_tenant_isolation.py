@@ -93,7 +93,7 @@ async def test_user_cannot_get_job_from_other_tenant(
         type=JobType.CSV_UPLOAD,
         status=JobStatus.COMPLETED,
         retry_count=0,
-        max_retries=3,
+        max_attempts=3,
         priority=0,
     )
     db_session.add(job)
@@ -119,7 +119,7 @@ async def test_admin_cannot_get_job_from_other_tenant(
         type=JobType.CSV_UPLOAD,
         status=JobStatus.DEAD_LETTER,
         retry_count=3,
-        max_retries=3,
+        max_attempts=3,
         priority=0,
         error_message="boom",
     )
@@ -147,7 +147,7 @@ async def test_list_jobs_only_returns_same_tenant_rows(
         type=JobType.CSV_UPLOAD,
         status=JobStatus.COMPLETED,
         retry_count=0,
-        max_retries=3,
+        max_attempts=3,
         priority=0,
     )
     job_b = Job(
@@ -156,7 +156,7 @@ async def test_list_jobs_only_returns_same_tenant_rows(
         type=JobType.REPORT_GEN,
         status=JobStatus.COMPLETED,
         retry_count=0,
-        max_retries=3,
+        max_attempts=3,
         priority=0,
     )
     db_session.add(job_a)
@@ -189,7 +189,7 @@ async def test_replay_rejects_cross_tenant_job(
         type=JobType.CSV_UPLOAD,
         status=JobStatus.DEAD_LETTER,
         retry_count=3,
-        max_retries=3,
+        max_attempts=3,
         priority=0,
         error_message="boom",
     )
@@ -221,7 +221,7 @@ async def test_dlq_stats_scoped_to_tenant(
                 type=JobType.CSV_UPLOAD,
                 status=JobStatus.DEAD_LETTER,
                 retry_count=3,
-                max_retries=3,
+                max_attempts=3,
                 priority=0,
                 error_message="a",
             )
@@ -234,7 +234,7 @@ async def test_dlq_stats_scoped_to_tenant(
                 type=JobType.REPORT_GEN,
                 status=JobStatus.DEAD_LETTER,
                 retry_count=3,
-                max_retries=3,
+                max_attempts=3,
                 priority=0,
                 error_message="b",
             )
@@ -288,7 +288,7 @@ async def test_cache_hit_does_not_leak_cross_tenant_job(
         type=JobType.CSV_UPLOAD,
         status=JobStatus.FAILED,
         retry_count=1,
-        max_retries=3,
+        max_attempts=3,
         priority=0,
         error_message="tenant B secret failure detail",
     )
@@ -385,7 +385,7 @@ async def tenant_a_saga(db_session, test_user: User):  # type: ignore[no-untyped
             type=JobType.CSV_UPLOAD,
             status=JobStatus.DEAD_LETTER,
             retry_count=3,
-            max_retries=3,
+            max_attempts=3,
             priority=0,
             saga_id=saga.id,
             payload={"customer": "tenant A confidential"},

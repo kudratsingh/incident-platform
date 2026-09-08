@@ -64,7 +64,13 @@ export interface Job {
   result: Record<string, unknown> | null
   error_message: string | null
   retry_count: number
-  max_retries: number
+  // Total runs this job may have — the original plus its retries. 3 means
+  // three runs and two retries (WO-R2-172).
+  max_attempts: number
+  /** @deprecated Alias of `max_attempts` carrying the identical value. The
+   *  API sends both for one release and then drops this one — optional so
+   *  nothing here can come to depend on it. Read `max_attempts`. */
+  max_retries?: number
   // Which mechanism forced this job into the DLQ, when it was not the
   // default one. `llm_retry_policy` is the only value today; null means
   // retries simply ran out (or the job never dead-lettered at all).

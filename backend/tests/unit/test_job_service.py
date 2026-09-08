@@ -20,7 +20,7 @@ def _make_job(**kwargs: object) -> Job:
         "status": JobStatus.PENDING,
         "idempotency_key": None,
         "retry_count": 0,
-        "max_retries": 3,
+        "max_attempts": 3,
         "priority": 0,
         "trace_id": None,
         "payload": None,
@@ -247,7 +247,7 @@ async def test_replay_resets_retry_count_and_error() -> None:
     dead_job = _make_job(
         status=JobStatus.DEAD_LETTER,
         retry_count=3,
-        max_retries=3,
+        max_attempts=3,
         error_message="last attempt boom",
         tenant_id=tenant_id,
     )

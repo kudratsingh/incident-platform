@@ -53,7 +53,7 @@ async def _make_job(
         priority=0,
         payload={},
         retry_count=0,
-        max_retries=3,
+        max_attempts=3,
     )
     db_session.add(job)
     await db_session.flush()

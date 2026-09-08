@@ -59,7 +59,7 @@ async def job(db_session, test_user: User) -> Job:  # type: ignore[no-untyped-de
         type=JobType.CSV_UPLOAD,
         status=JobStatus.RUNNING,
         retry_count=0,
-        max_retries=3,
+        max_attempts=3,
         priority=0,
     )
     db_session.add(job)
@@ -292,7 +292,7 @@ async def test_stream_route_rejects_token_for_other_job(
         type=JobType.REPORT_GEN,
         status=JobStatus.RUNNING,
         retry_count=0,
-        max_retries=3,
+        max_attempts=3,
         priority=0,
     )
     db_session.add(other_job)
@@ -345,7 +345,7 @@ async def _finished_job(  # type: ignore[no-untyped-def]
         user_id=test_user.id,
         type=JobType.CSV_UPLOAD,
         status=status,
-        max_retries=3,
+        max_attempts=3,
         priority=0,
         **fields,
     )

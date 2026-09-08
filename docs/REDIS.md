@@ -222,7 +222,7 @@ Production: AOF every second + daily RDB snapshot. The trade-off is durability v
 Local dev: in-memory, no AOF, no snapshot. Restarts lose state. This is fine because:
 - The dispatcher would rebuild the priority queue from `jobs WHERE status=pending` on startup (TODO: this isn't actually wired — currently a restart leaves PENDING jobs orphaned).
 - The read-model would **not** rebuild by itself — an id only moves when an event names it, and a finished job has no more events coming. Run `read_model.rebuild_read_model` (the eval reset already does).
-- The delayed queue would lose pending retries (those jobs are stuck in `failed` status with `retry_count < max_retries` until manually replayed).
+- The delayed queue would lose pending retries. A job waiting on a retry sits in `pending` status with `retry_count < max_attempts` and no timer to re-publish it — the `_requeue_stale_pending_once` backstop is what picks it up, and until it runs the job is stalled rather than lost. (This bullet used to say `failed`: the retry path writes `pending`, and has since the delayed queue landed.)
 
 The orphaned-PENDING-on-restart issue is the second roadmap item in [`docs/ROADMAP.md`](ROADMAP.md).
 

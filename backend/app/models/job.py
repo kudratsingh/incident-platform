@@ -14,8 +14,8 @@ if TYPE_CHECKING:
     from app.models.user import User
 
 
-def _default_max_retries(_ctx: Any = None) -> int:
-    """Retry ceiling for a row that does not name one, from `MAX_JOB_RETRIES`.
+def _default_max_attempts(_ctx: Any = None) -> int:
+    """Run ceiling for a row that does not name one, from `MAX_JOB_ATTEMPTS`.
 
     A callable rather than a constant so SQLAlchemy resolves it per
     INSERT: the setting is read at flush time, which is what lets an
@@ -28,7 +28,7 @@ def _default_max_retries(_ctx: Any = None) -> int:
     """
     from app.config import get_settings
 
-    return get_settings().max_job_retries
+    return get_settings().max_job_attempts
 
 
 class Job(TimestampMixin, Base):
@@ -61,12 +61,18 @@ class Job(TimestampMixin, Base):
     result: Mapped[dict[str, Any] | None] = mapped_column(PortableJSON, nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     retry_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    # Resolved per INSERT from `MAX_JOB_RETRIES` rather than frozen at a
+    # How many times this job may RUN in total — the original run plus its
+    # retries. The dispatcher retries while `retry_count < max_attempts`, so
+    # 3 means three runs and two retries. It was called `max_retries` until
+    # WO-R2-172, which read as one run more than the platform has ever given;
+    # the arithmetic is unchanged, only the name.
+    #
+    # Resolved per INSERT from `MAX_JOB_ATTEMPTS` rather than frozen at a
     # literal 3, so the documented knob governs rows written outside
     # `JobService` too — the chaos hooks, the eval seeds, saga steps
-    # (WO-R2-76). See `_default_max_retries` for why it is a callable.
-    max_retries: Mapped[int] = mapped_column(
-        Integer, default=_default_max_retries, nullable=False
+    # (WO-R2-76). See `_default_max_attempts` for why it is a callable.
+    max_attempts: Mapped[int] = mapped_column(
+        Integer, default=_default_max_attempts, nullable=False
     )
     # Coarse categorization the agent uses to decide DLQ remediation:
     #   `replay_safe`      — transient / poison; replay after fix

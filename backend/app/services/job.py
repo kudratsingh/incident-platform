@@ -7,7 +7,7 @@ from app.core.exceptions import AuthorizationError, JobError, NotFoundError
 from app.core.logging import get_logger, request_id_var, trace_id_var
 from app.core.tracing import inject_context
 from app.models.enums import JobStatus, UserRole
-from app.models.job import Job, _default_max_retries
+from app.models.job import Job, _default_max_attempts
 from app.repositories.audit import AuditRepository
 from app.repositories.job import JobRepository
 from app.repositories.job_dependency import JobDependencyRepository
@@ -44,17 +44,17 @@ class JobService:
         payload: dict[str, Any] | None = None,
         idempotency_key: str | None = None,
         priority: int = 0,
-        max_retries: int | None = None,
+        max_attempts: int | None = None,
         dependencies: list[uuid.UUID] | None = None,
         saga_id: uuid.UUID | None = None,
         saga_step_index: int | None = None,
     ) -> Job:
-        # `None` means "the platform default", which is `MAX_JOB_RETRIES`
+        # `None` means "the platform default", which is `MAX_JOB_ATTEMPTS`
         # — not a literal 3 restated here (WO-R2-76). Callers that want a
         # different ceiling for one job (the saga coordinator, per step)
         # still pass it explicitly and win.
-        if max_retries is None:
-            max_retries = _default_max_retries()
+        if max_attempts is None:
+            max_attempts = _default_max_attempts()
 
         # Idempotency: return the existing job if this key was already used
         # in this tenant. (Different tenants can reuse the same key.)
@@ -137,7 +137,7 @@ class JobService:
                     idempotency_key=idempotency_key,
                     payload=enriched_payload,
                     priority=priority,
-                    max_retries=max_retries,
+                    max_attempts=max_attempts,
                     trace_id=trace_id_var.get("") or None,
                     saga_id=saga_id,
                     saga_step_index=saga_step_index,
@@ -326,7 +326,7 @@ class JobService:
         previous_status = job.status
 
         # Reset retry_count so a DLQ replay actually gets fresh retries.
-        # Without this, a job at retry_count==max_retries would dead-letter
+        # Without this, a job at retry_count==max_attempts would dead-letter
         # again on the first failure of its replayed run.
         updated = await self.job_repo.update_status(
             job_id,

@@ -194,7 +194,7 @@ async def triage_failure(
     payload: dict[str, Any] | None,
     error_message: str,
     retry_count: int,
-    max_retries: int,
+    max_attempts: int,
     trace_id: str | None,
 ) -> tuple[TriageAnalysis, dict[str, Any], str]:
     """Call Claude and return (analysis, usage_dict, model_id).
@@ -217,7 +217,7 @@ async def triage_failure(
     user_payload = {
         "job_type": job_type,
         "retry_count": retry_count,
-        "max_retries": max_retries,
+        "max_attempts": max_attempts,
         "trace_id": trace_id,
         "error_message": error_message,
         "payload": payload or {},

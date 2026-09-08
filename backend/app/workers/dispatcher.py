@@ -276,7 +276,7 @@ async def _run_job(
             user_id = job.user_id
             tenant_id = job.tenant_id
             retry_count = job.retry_count
-            max_retries = job.max_retries
+            max_attempts = job.max_attempts
             prior_error = job.error_message  # filled when this is a retry
             # E1-04: the status check above is only a cheap pre-filter (and
             # a distinct log line) — under at-least-once delivery a second
@@ -506,7 +506,7 @@ async def _run_job(
                 extra={
                     "error": str(exc),
                     "retry_count": new_retry_count,
-                    "max_retries": max_retries,
+                    "max_attempts": max_attempts,
                 },
             )
 
@@ -516,7 +516,7 @@ async def _run_job(
             llm_reasoning: str | None = None
             delay = deterministic_delay
             if (
-                new_retry_count < max_retries
+                new_retry_count < max_attempts
                 and retry_policy.is_enabled()
                 and new_retry_count >= settings.llm_retry_policy_min_retry_count
             ):
@@ -528,7 +528,7 @@ async def _run_job(
                         job_type=job_type,
                         error_message=str(exc),
                         retry_count=new_retry_count,
-                        max_retries=max_retries,
+                        max_attempts=max_attempts,
                         prior_error=prior_error,
                     )
                     llm_reasoning = decision.reasoning
@@ -551,7 +551,10 @@ async def _run_job(
                         extra={"error": str(policy_exc)},
                     )
 
-            if new_retry_count < max_retries and not llm_dead_lettered:
+            # `<`, not `<=`, and deliberately unchanged (WO-R2-172): the
+            # ceiling counts RUNS, so a job on its `max_attempts`-th failure
+            # has no run left to give and dead-letters here.
+            if new_retry_count < max_attempts and not llm_dead_lettered:
                 async with session_factory() as session:
                     async with session.begin():
                         await JobRepository(session).update_status(
@@ -571,7 +574,7 @@ async def _run_job(
                                 "error": str(exc),
                                 "message": (
                                     f"Retrying in {delay:.0f}s "
-                                    f"(attempt {new_retry_count}/{max_retries})"
+                                    f"(attempt {new_retry_count} of {max_attempts})"
                                 ),
                                 "retry_count": new_retry_count,
                                 "dead_lettered": False,
@@ -1454,7 +1457,7 @@ async def _sweep_stale_running_once(
                     Job.user_id,
                     Job.type,
                     Job.retry_count,
-                    Job.max_retries,
+                    Job.max_attempts,
                     Job.payload,
                     Job.trace_id,
                     Job.started_at,

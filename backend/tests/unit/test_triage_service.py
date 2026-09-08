@@ -18,7 +18,7 @@ async def test_disabled_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
                 payload={"file": "x.csv"},
                 error_message="boom",
                 retry_count=3,
-                max_retries=3,
+                max_attempts=3,
                 trace_id="t",
             )
     finally:
@@ -58,7 +58,7 @@ async def test_calls_anthropic_with_cached_system_prompt(
                 payload={"endpoint": "https://api.example.com/x"},
                 error_message="HTTP 500",
                 retry_count=3,
-                max_retries=3,
+                max_attempts=3,
                 trace_id="trace-xyz",
             )
 
@@ -106,7 +106,7 @@ async def test_raises_when_parse_returns_no_output(
                     payload={},
                     error_message="anything",
                     retry_count=3,
-                    max_retries=3,
+                    max_attempts=3,
                     trace_id=str(uuid.uuid4()),
                 )
     finally:

@@ -25,7 +25,7 @@ def _make_job(**kwargs: object) -> MagicMock:
         "status": JobStatus.PENDING,
         "payload": {},
         "retry_count": 0,
-        "max_retries": 3,
+        "max_attempts": 3,
         "trace_id": None,
     }
     defaults.update(kwargs)
@@ -123,7 +123,7 @@ async def test_run_job_duplicate_delivery_loses_claim_and_executes_nothing() -> 
 
 
 async def test_run_job_retries_on_failure() -> None:
-    job = _make_job(type=JobType.BULK_API_SYNC, retry_count=0, max_retries=3)
+    job = _make_job(type=JobType.BULK_API_SYNC, retry_count=0, max_attempts=3)
     factory, job_repo, audit_repo = _make_session_factory(job)
     redis = AsyncMock()
 
@@ -155,7 +155,7 @@ async def test_retry_branch_survives_a_redis_outage_instead_of_dead_lettering() 
     the job must be left PENDING with its retry counted, for the
     stale-PENDING backstop to re-publish.
     """
-    job = _make_job(type=JobType.BULK_API_SYNC, retry_count=0, max_retries=3)
+    job = _make_job(type=JobType.BULK_API_SYNC, retry_count=0, max_attempts=3)
     factory, job_repo, audit_repo = _make_session_factory(job)
     redis = AsyncMock()
     consumer = dispatcher.JobDispatcherConsumer(factory, redis)
@@ -190,7 +190,7 @@ async def test_run_job_dead_letters_after_exhaustion() -> None:
     job = _make_job(
         type=JobType.BULK_API_SYNC,
         retry_count=2,
-        max_retries=3,
+        max_attempts=3,
         payload={"file": "x.csv", "__traceparent": {"traceparent": _TRACEPARENT}},
         trace_id="trace-exhausted",
     )
@@ -235,7 +235,7 @@ async def test_run_job_llm_policy_forces_dead_letter_before_exhaustion() -> None
     honor it even though there are deterministic retries remaining."""
     from app.services.retry_policy import RetryDecision
 
-    job = _make_job(type=JobType.BULK_API_SYNC, retry_count=1, max_retries=5)
+    job = _make_job(type=JobType.BULK_API_SYNC, retry_count=1, max_attempts=5)
     factory, job_repo, audit_repo = _make_session_factory(job)
     redis = AsyncMock()
 
@@ -283,7 +283,7 @@ async def test_run_job_llm_dead_letter_stamps_dead_lettered_by() -> None:
     cannot afford a per-row audit join."""
     from app.services.retry_policy import RetryDecision
 
-    job = _make_job(type=JobType.BULK_API_SYNC, retry_count=1, max_retries=5)
+    job = _make_job(type=JobType.BULK_API_SYNC, retry_count=1, max_attempts=5)
     factory, job_repo, audit_repo = _make_session_factory(job)
     redis = AsyncMock()
 
@@ -314,7 +314,7 @@ async def test_run_job_llm_dead_letter_stamps_dead_lettered_by() -> None:
 async def test_run_job_deterministic_exhaustion_does_not_stamp_dead_lettered_by() -> None:
     """Retries exhausting on their own is the DEFAULT mechanism — it leaves
     dead_lettered_by unset so the row renders unbadged."""
-    job = _make_job(type=JobType.BULK_API_SYNC, retry_count=2, max_retries=3)
+    job = _make_job(type=JobType.BULK_API_SYNC, retry_count=2, max_attempts=3)
     factory, job_repo, audit_repo = _make_session_factory(job)
     redis = AsyncMock()
 
@@ -337,12 +337,12 @@ async def test_run_job_compensation_dead_letter_is_not_attributed_to_the_llm() -
 
     A saga compensation job with no registered processor dead-letters
     immediately at retry_count=0 — by design, and with LLM features off.
-    Under the old `retry_count < max_retries` arithmetic that row was badged
+    Under the old `retry_count < max_attempts` arithmetic that row was badged
     'LLM'. The persisted field must stay None here, and retry_count must
-    still be below max_retries so the assertion genuinely covers the shape
+    still be below max_attempts so the assertion genuinely covers the shape
     the arithmetic got wrong.
     """
-    job = _make_job(type="csv_upload.compensate", retry_count=0, max_retries=3)
+    job = _make_job(type="csv_upload.compensate", retry_count=0, max_attempts=3)
     factory, job_repo, audit_repo = _make_session_factory(job)
     redis = AsyncMock()
 
@@ -356,7 +356,7 @@ async def test_run_job_compensation_dead_letter_is_not_attributed_to_the_llm() -
         await dispatcher._run_job(str(job.id), factory, redis)
 
     extra = _dead_letter_extra(job_repo)
-    assert extra["retry_count"] == 0 < job.max_retries
+    assert extra["retry_count"] == 0 < job.max_attempts
     assert extra.get("dead_lettered_by") is None
 
 
@@ -364,7 +364,7 @@ async def test_run_job_llm_policy_failure_falls_back_to_deterministic() -> None:
     """If the LLM call raises (timeout, network, schema mismatch), the
     deterministic exponential-backoff retry still happens — the worker
     can never block on the API being unhealthy."""
-    job = _make_job(type=JobType.BULK_API_SYNC, retry_count=1, max_retries=5)
+    job = _make_job(type=JobType.BULK_API_SYNC, retry_count=1, max_attempts=5)
     factory, job_repo, audit_repo = _make_session_factory(job)
     redis = AsyncMock()
 
@@ -416,7 +416,7 @@ async def test_run_job_dead_letters_compensation_when_no_processor() -> None:
     job = _make_job(
         type="csv_upload.compensate",
         retry_count=0,
-        max_retries=3,
+        max_attempts=3,
         payload={"parent_job_id": "abc"},
         trace_id="trace-compensate",
     )

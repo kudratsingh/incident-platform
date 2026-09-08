@@ -145,7 +145,7 @@ export default function DashboardPage() {
                 <th className="text-left px-4 py-3 font-medium">Status</th>
                 <th className="text-left px-4 py-3 font-medium hidden md:table-cell">Trace ID</th>
                 <th className="text-left px-4 py-3 font-medium hidden lg:table-cell">Created</th>
-                <th className="text-left px-4 py-3 font-medium">Retries</th>
+                <th className="text-left px-4 py-3 font-medium">Attempts</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-gray-800/60">
@@ -181,7 +181,7 @@ export default function DashboardPage() {
                   </td>
                   <td className="px-4 py-3 text-gray-500 text-xs font-mono">
                     <Link to={`/jobs/${job.id}`}>
-                      {job.retry_count}/{job.max_retries}
+                      {job.retry_count}/{job.max_attempts}
                     </Link>
                   </td>
                 </tr>

@@ -1,7 +1,10 @@
+import logging
 from functools import lru_cache
 
 from pydantic import RedisDsn, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+logger = logging.getLogger(__name__)
 
 _INSECURE_DEFAULT_KEY = "change-me-in-production-please-use-a-long-random-string"
 
@@ -99,7 +102,24 @@ class Settings(BaseSettings):
     storage_bucket: str = "incident-platform"
 
     # Workers
-    max_job_retries: int = 3
+    #
+    # How many times a job may RUN in total — the original run plus its
+    # retries. The dispatcher retries while `retry_count < max_attempts`,
+    # so the default 3 buys three runs and two retries, and the job
+    # dead-letters when the third run fails.
+    #
+    # Named for what the arithmetic counts (WO-R2-172). It shipped as
+    # `MAX_JOB_RETRIES`, which read as "three retries" — one run more than
+    # the platform has ever given. The value and the comparison are
+    # unchanged; only the name is.
+    max_job_attempts: int = 3
+    # Deprecated alias for `max_job_attempts`, accepted for one release so a
+    # deployment already setting `MAX_JOB_RETRIES` keeps its ceiling instead
+    # of silently reverting to the default. Nothing in the app reads this
+    # field — `_resolve_deprecated_max_job_retries` folds it into
+    # `max_job_attempts` at construction and warns. `None` means "not set",
+    # which is what distinguishes an operator's explicit 3 from the default.
+    max_job_retries: int | None = None
     job_retry_backoff_base: float = 2.0
     # How long a job may sit in RUNNING before the crash-recovery sweep
     # (`_stale_running_sweep_loop`) treats it as a worker-crash orphan and
@@ -224,9 +244,10 @@ class Settings(BaseSettings):
     # Hard wall-clock limit on the LLM call, per ADR 0005 ("times out —
     # configurable per feature; defaults to 10s"). This bounds the whole call,
     # SDK-internal retries included: the Anthropic client's own `timeout` is
-    # per attempt and is retried `max_retries` times, so a 10s client timeout
-    # is really up to 30s of wall clock. Only an outer deadline is the
-    # deadline the ADR promises.
+    # per attempt and is retried the SDK's own `max_retries` times — that is
+    # the Anthropic client's parameter, unrelated to this platform's job
+    # attempt ceiling — so a 10s client timeout is really up to 30s of wall
+    # clock. Only an outer deadline is the deadline the ADR promises.
     llm_triage_timeout_seconds: float = 10.0
 
     # LLM-guided retry policy. When enabled, after the first deterministic
@@ -326,6 +347,51 @@ class Settings(BaseSettings):
     # Logging
     log_level: str = "INFO"
     log_file: str | None = None  # e.g. "logs/app.log" — if set, JSON logs are also written here
+
+    @model_validator(mode="after")
+    def _resolve_deprecated_max_job_retries(self) -> "Settings":
+        """Fold `MAX_JOB_RETRIES` into `max_job_attempts` for one release.
+
+        The knob was renamed because the number it holds is a cap on runs,
+        not on retries (WO-R2-172). Three outcomes, and the middle one is
+        the reason this is a validator rather than an alias:
+
+          * only the new name set → nothing to do.
+          * only the old name set → use it, and warn once. Dropping it
+            silently would revert a deployment's tuned ceiling to 3 on the
+            release that renamed it, which is the one failure a rename must
+            not cause.
+          * both set to different values → refuse to boot. There is no
+            defensible winner: picking either one runs a job a different
+            number of times than half the configuration asked for, and the
+            operator finds out from a dead-letter, not from a message.
+
+        Both set to the SAME value is allowed — it is a deployment mid-way
+        through the migration, and it is unambiguous. It still warns.
+        """
+        if self.max_job_retries is None:
+            return self
+        attempts_was_set = "max_job_attempts" in self.model_fields_set
+        if attempts_was_set and self.max_job_attempts != self.max_job_retries:
+            raise ValueError(
+                "MAX_JOB_ATTEMPTS and MAX_JOB_RETRIES are both set and "
+                f"disagree ({self.max_job_attempts} vs {self.max_job_retries}). "
+                "MAX_JOB_RETRIES is the deprecated name for the same knob — "
+                "it caps total runs (original + retries), not retries. Set "
+                "MAX_JOB_ATTEMPTS only and remove MAX_JOB_RETRIES."
+            )
+        if not attempts_was_set:
+            self.max_job_attempts = self.max_job_retries
+        logger.warning(
+            "MAX_JOB_RETRIES is deprecated and will be removed after the "
+            "next release — use MAX_JOB_ATTEMPTS. It caps total runs "
+            "(the original plus its retries), so %d means %d runs and "
+            "%d retries; the name was the only thing wrong with it.",
+            self.max_job_attempts,
+            self.max_job_attempts,
+            max(self.max_job_attempts - 1, 0),
+        )
+        return self
 
     @model_validator(mode="after")
     def _refuse_insecure_production_secrets(self) -> "Settings":

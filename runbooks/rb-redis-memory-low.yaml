@@ -21,7 +21,8 @@ summary: |
       moves when an event names it, and a finished job has no more events
       coming. `rebuild_read_model` is the way back.
     - Delayed-retry pushes fail, so retries are silently lost — those jobs sit
-      in `failed` with `retry_count < max_retries` until replayed by hand.
+      in `pending` with `retry_count < max_attempts` until the stale-PENDING
+      backstop re-publishes them.
 
 symptoms:
   - "FreeableMemory falling steadily toward zero"

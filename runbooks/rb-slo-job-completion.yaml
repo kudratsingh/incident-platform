@@ -30,7 +30,7 @@ mitigation:
   - "If a single root cause: deploy the fix, then bulk-replay the affected DLQ jobs from the admin UI."
   - "If a flaky external dependency: confirm the circuit breaker is shedding
     load, then bulk-replay the affected DLQ jobs once it recovers. There is no
-    per-type retry knob to turn — `max_retries` is a per-row column on `jobs`
+    per-type retry knob to turn — `max_attempts` is a per-row column on `jobs`
     (default 3), fixed when the row is created and read per job by the
     dispatcher, so it cannot be raised for a job type at runtime. Rows already
     dead-lettered do not re-read it either; replay is the path."

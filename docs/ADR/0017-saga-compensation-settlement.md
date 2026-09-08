@@ -28,7 +28,7 @@ ran and never finished.
 ### 1. Compensation steps are real `jobs` rows
 
 `_handle_failure` creates a `Job` (`saga_id` set, `type = f"{step.type}.compensate"`,
-`status=PENDING`, `priority`/`max_retries`/`trace_id` copied from the step it compensates) via
+`status=PENDING`, `priority`/`max_attempts`/`trace_id` copied from the step it compensates) via
 `JobRepository.create`, and the outbox row publishes **that row's id**.
 
 `BaseRepository.create` adds and flushes inside the ambient `handle_message` transaction, which
@@ -170,7 +170,7 @@ tiebreaker. Arbitrary, but total, which is all pagination needs.
   completion/dead-letter is ignored (it is not `.compensate`-typed, so it hits the no-op branch).
   Fixing this needs cancellation semantics for in-flight work — a separate decision.
 - **No compensation retry/ordering policy.** Compensation jobs inherit the failed step's
-  `max_retries` and are dispatched by the normal queue; the reverse-order *enqueue* is not a
+  `max_attempts` and are dispatched by the normal queue; the reverse-order *enqueue* is not a
   reverse-order *execution* guarantee.
 - **No automatic remediation of a `FAILED` saga.** `FAILED` means "needs a human"; replaying the
   dead-lettered compensation job through the existing DLQ replay path is the manual route.

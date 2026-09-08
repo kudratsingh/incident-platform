@@ -31,9 +31,15 @@ DLQ_PAYLOAD_MAX_BYTES = 4096
 # (plus the saga coordinator and the event log);
 # `tests/unit/test_triage_consumer.py` asserts this stays a superset of what
 # triage reads, because a key triage reads and the producer never writes
-# degrades silently (max_retries → 0, payload/trace_id → None) instead of
+# degrades silently (max_attempts → 0, payload/trace_id → None) instead of
 # failing. `dlq_event_payload` below is now the only thing that has to keep
 # step with it.
+#
+# `max_attempts` and `max_retries` are the SAME value under two names for one
+# release (WO-R2-172). The field caps total runs, so `max_retries` was never
+# what it said; `max_attempts` is the name to read, and the old key stays on
+# the wire until every consumer of this topic has moved. A reader takes
+# `max_attempts` and falls back to `max_retries`.
 DLQ_EVENT_KEYS: frozenset[str] = frozenset(
     {
         "event",
@@ -44,6 +50,8 @@ DLQ_EVENT_KEYS: frozenset[str] = frozenset(
         "error",
         "message",
         "retry_count",
+        "max_attempts",
+        # Deprecated alias of `max_attempts`; removed after one release.
         "max_retries",
         "payload",
         "trace_id",
@@ -141,8 +149,13 @@ def dlq_event_payload(job: Job, message: str | None = None) -> dict[str, Any]:
         "error": error,
         "message": message if message is not None else error,
         "retry_count": job.retry_count,
-        # Triage context (E1-14).
-        "max_retries": job.max_retries,
+        # Triage context (E1-14). Emitted twice on purpose: `max_attempts` is
+        # the name, `max_retries` is the same integer under the name this
+        # topic shipped with, kept for one release so a consumer that has not
+        # been updated still gets the ceiling instead of silently falling back
+        # to 0 (WO-R2-172).
+        "max_attempts": job.max_attempts,
+        "max_retries": job.max_attempts,
         "payload": payload_for_event(
             {
                 k: v

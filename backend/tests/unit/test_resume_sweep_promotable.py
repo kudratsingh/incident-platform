@@ -112,7 +112,7 @@ def _job(
         type=JobType.CSV_UPLOAD,
         status=status,
         payload={"rows": 1},
-        max_retries=3,
+        max_attempts=3,
         saga_id=saga_id,
         created_at=created_at,
         updated_at=created_at,
