@@ -458,11 +458,13 @@ async def test_delete_chaos_owner_users_nulls_audit_fks_but_keeps_resource_id(
                 tenant_id,
                 chaos_user.id,
                 status=JobStatus.DEAD_LETTER.value,
-                # `poison_message`'s shape: a chaos row marked with its
-                # provenance only. `create_bad_data_job` is no longer the
-                # example here — since WO-R2-158 its rows carry the
-                # `seeded_fixture` marker and are DELETEd by the sibling
-                # sweep, so using it would make this row match both.
+                # An undeclared chaos row: provenance only, no
+                # `seeded_fixture` marker, so the sibling DELETE sweep
+                # leaves it and this one cancels it. Shaped like a
+                # pre-v0.6.3 `poison_message` row — no current hook writes
+                # one, because `create_bad_data_job` (WO-R2-158) and then
+                # `poison_message` (WO-R2-166) both gained the marker, and
+                # a row carrying it would match both sweeps.
                 payload={"chaos_fixture": "poison_message"},
             )
             session.add(chaos_job)

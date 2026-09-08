@@ -61,8 +61,14 @@ class RemediationHint(StrEnum):
         wrote nothing at all: it persisted a `job_triages` row and
         never touched this column (R2-24).
       - the eval seed script (see scripts/seed_eval_fixtures.py)
-      - chaos hooks that produce DLQ entries (poison_message,
-        create_bad_data_job)
+      - chaos hooks that produce DLQ entries (seed_dlq_messages,
+        create_stuck_dag, create_bad_data_job, poison_message,
+        create_mislabeled_dlq_job) — every one of them stamping a value
+        that agrees with the row's error text, checked by
+        `tests/unit/test_dlq_text_coherence.py`. The single exception is
+        `create_mislabeled_dlq_job`, whose whole purpose is a row whose
+        hint its text contradicts; see
+        `app.lab.dlq_failure_stories`
       - the `mark_dlq_permanent` Tier-1 tool (agent-driven)
 
     Scoped to one dead-letter episode: cleared on replay (R2-23), so a
@@ -71,6 +77,10 @@ class RemediationHint(StrEnum):
     replay-safe.
     """
 
-    REPLAY_SAFE = "replay_safe"          # transient / poison — replay OK
+    # "poison" used to be listed here as a replay_safe cause. It never
+    # was one: a message that fails schema validation fails identically on
+    # every attempt (WO-R2-166). `poison_message`'s dead-letter row is
+    # unclassified or `human_required` now, never this value.
+    REPLAY_SAFE = "replay_safe"          # transient fault — replay OK
     WAIT_AND_REPLAY = "wait_and_replay"  # external dep down — retry later
     HUMAN_REQUIRED = "human_required"    # persistent bug — do NOT replay

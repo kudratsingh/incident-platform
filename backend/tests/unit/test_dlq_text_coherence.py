@@ -27,6 +27,7 @@ Two layers here, and both are needed:
 rows those hooks really write come back coherent over the wire.
 """
 
+import json
 import sys
 from pathlib import Path
 
@@ -39,6 +40,7 @@ from app.lab.dlq_failure_stories import (
     UnknownDlqHintError,
     coherence_violations,
     default_error_for,
+    sanctioned_incoherent_story,
     story,
     story_for,
     triage_violations,
@@ -49,9 +51,13 @@ from app.mcp.tools.chaos.create_bad_data_job import (
     _default_error_for,
 )
 from app.mcp.tools.chaos.create_stuck_dag import CreateStuckDagInput
-from app.mcp.tools.chaos.poison_message import _dlq_error_for_topic
+from app.mcp.tools.chaos.poison_message import (
+    PoisonMessageInput,
+    _dlq_error_for_topic,
+)
 from app.mcp.tools.chaos.seed_dlq_messages import SeedDlqMessagesInput
 from app.models.enums import RemediationHint
+from pydantic import ValidationError
 
 # The seed script is not an importable package member — it lives under
 # `scripts/` and is loaded by path everywhere else in this suite too.
@@ -190,6 +196,39 @@ def test_the_unclassified_bad_data_pair_is_an_entry_in_the_table() -> None:
     assert pinned in DLQ_FAILURE_STORIES[None]
 
 
+def test_the_unclassified_schema_pair_is_an_entry_in_the_table() -> None:
+    """`poison_message`'s default story (WO-R2-166). Same shape as the
+    bad-data variant above and there for the same reason: the text a hook
+    stamps is declared in the table, not composed at the call site.
+
+    A schema violation under a null hint is coherent for exactly the
+    reason the bad-data one is — the text is a symptom, the hint is a
+    classification, and "nobody classified this" does not contradict "the
+    payload is missing a required field". What it emphatically does not
+    say is that a replay would help.
+    """
+    pinned = story("unclassified_schema_missing_field")
+    assert pinned.hint is None
+    assert "SchemaValidationError" in pinned.error_message
+    assert "missing required field" in pinned.error_message
+    assert not coherence_violations(pinned.hint, pinned.error_message)
+    assert pinned.triage is None
+    assert not triage_violations(pinned.hint, pinned.triage)
+    assert pinned in DLQ_FAILURE_STORIES[None]
+
+
+def test_the_two_schema_stories_are_distinguishable() -> None:
+    """`SCHEMA_MISSING_FIELD` is verbatim from live run efdc3b2a9864 and is
+    pinned as "the exact pair that shipped". The unclassified variant names
+    a different field so a reader sweeping a queue can tell a poisoned row
+    from a seeded one, and so a test asserting on the shipped string cannot
+    match this one by accident."""
+    shipped = story("schema_missing_field")
+    variant = story("unclassified_schema_missing_field")
+    assert shipped.error_message != variant.error_message
+    assert LIVE_DEFECT_ERROR not in variant.error_message
+
+
 def test_the_unclassified_default_still_says_nothing_about_its_class() -> None:
     """Adding the bad-data variant must not move what a writer given only
     "uncategorised" stamps. Element 0 of the null tuple stays the
@@ -289,13 +328,21 @@ def _every_writer_pair() -> list[tuple[str | None, str]]:
         hint = _declared_hint(inp.remediation_hint)
         pairs.append((hint, _default_error_for(hint)))
 
-    # `poison_message`: composes its own string around the topic.
-    pairs.append(
-        (
-            RemediationHint.REPLAY_SAFE.value,
-            _dlq_error_for_topic("job.submitted"),
+    # `poison_message`: two declarable hints since WO-R2-166, each
+    # resolving its own schema-violation text, which the hook then wraps
+    # with the topic. Neither is `replay_safe` — that is the whole change,
+    # and the walk reads it off the hook so a regression that restored the
+    # old hint shows up here as an incoherent pair rather than as a passing
+    # test about a table the hook no longer consults.
+    for declared_topic_hint in ("human_required", "unclassified"):
+        poison_inp = PoisonMessageInput(
+            topic="job.submitted",
+            remediation_hint=declared_topic_hint,  # type: ignore[arg-type]
         )
-    )
+        poison_hint = _declared_hint(poison_inp.remediation_hint)
+        pairs.append(
+            (poison_hint, _dlq_error_for_topic("job.submitted", poison_hint))
+        )
 
     # The eval seed pack.
     for spec in seed._dlq_specs():
@@ -322,8 +369,14 @@ def test_the_walk_covers_every_writer() -> None:
     would silently shrink the check to nothing."""
     pairs = _every_writer_pair()
     # seed_dlq_messages/create_stuck_dag's three hints + create_bad_data_job's
-    # two declarable hints + poison_message + the seeded pack.
-    assert len(pairs) == 3 + 2 + 1 + len(seed._dlq_specs())
+    # two declarable hints + poison_message's two + the seeded pack.
+    #
+    # `create_mislabeled_dlq_job` is deliberately NOT in this walk: its whole
+    # output is the one sanctioned incoherent pair, so adding it here would
+    # turn a passing suite red for the fixture working as designed. It is
+    # covered instead by the section below, which asserts the screen still
+    # flags it.
+    assert len(pairs) == 3 + 2 + 2 + len(seed._dlq_specs())
     # Both of `create_bad_data_job`'s hints are actually in the walk — the
     # unclassified one is the pair WO-R2-158 added, so a regression that
     # dropped the argument would show up as a shrinking count above and as
@@ -340,12 +393,137 @@ def test_create_stuck_dag_default_hint_is_still_covered() -> None:
     )
 
 
-def test_poison_message_row_still_names_its_topic() -> None:
-    """The text stopped describing the schema violation it sends to
-    Kafka. It must not also stop being traceable to this hook."""
-    text = _dlq_error_for_topic("job.submitted")
+@pytest.mark.parametrize(
+    "hint", [None, RemediationHint.HUMAN_REQUIRED.value]
+)
+def test_poison_message_row_still_names_its_topic(hint: str | None) -> None:
+    """Whatever else moved, the row stays traceable to this hook and to
+    the topic it poisoned — that is how a human sweeping the DLQ joins the
+    row back to the Kafka half of the same invocation."""
+    text = _dlq_error_for_topic("job.submitted", hint)
     assert "job.submitted" in text
     assert "poison_message" in text
+
+
+@pytest.mark.parametrize(
+    "hint", [None, RemediationHint.HUMAN_REQUIRED.value]
+)
+def test_poison_message_row_describes_the_fault_it_injects(
+    hint: str | None,
+) -> None:
+    """WO-R2-166. The hook publishes a schema-invalid payload, so its
+    dead-letter row says so under both hints it accepts.
+
+    RED before the fix in two different ways, both wrong: the original
+    text was the schema violation under a `replay_safe` hint (incoherent,
+    and the live defect of WO-R2-146); the WO-R2-146 repair swapped the
+    text for `UpstreamTimeout …`, which was coherent and still false —
+    it described a transient fault this hook never injects.
+    """
+    text = _dlq_error_for_topic("job.submitted", hint)
+    assert "SchemaValidationError" in text
+    assert "missing required field" in text
+    assert not coherence_violations(hint, text), text
+
+
+def test_poison_message_cannot_be_asked_for_a_replay_safe_row() -> None:
+    """The narrow structural statement of the fix: `replay_safe` is not in
+    the hook's input vocabulary at all, so no argument produces it.
+
+    Asserted on the input model rather than on a handler run because this
+    is a schema property — an agent reading `inputSchema` sees the same
+    two words, and a widening of the `Literal` fails here before any test
+    that needs a broker.
+    """
+    with pytest.raises(ValidationError):
+        PoisonMessageInput(
+            topic="job.submitted",
+            remediation_hint=RemediationHint.REPLAY_SAFE.value,  # type: ignore[arg-type]
+        )
+    # On the accepted *values*, not on the rendered blob: the description
+    # names `replay_safe` on purpose, to tell an agent reading the schema
+    # that the row it might have expected is not on offer here.
+    schema = PoisonMessageInput.model_json_schema()
+    field = schema["properties"]["remediation_hint"]
+    accepted = {
+        value
+        for branch in field["anyOf"]
+        for value in branch.get("enum", branch.get("const", []) or [])
+    }
+    assert accepted == {"human_required", "unclassified"}, json.dumps(field)
+
+
+def test_poison_message_defaults_to_unclassified() -> None:
+    """A freshly poisoned message has been classified by nobody, because
+    LLM triage is off by default here. Omitting the field must therefore
+    give a NULL hint, not the old `replay_safe` and not `human_required`
+    (which would say a triage pass already ran)."""
+    assert PoisonMessageInput(topic="job.submitted").remediation_hint == (
+        "unclassified"
+    )
+    assert _declared_hint(
+        PoisonMessageInput(topic="job.submitted").remediation_hint
+    ) is None
+
+
+# ---------------------------------------------------------------------------
+# 3b. The one sanctioned incoherent pair (WO-R2-166)
+# ---------------------------------------------------------------------------
+
+
+def test_the_sanctioned_pair_is_still_reported_as_incoherent() -> None:
+    """The fixture for "the classifier lied" is a row whose hint its own
+    text contradicts. The screen must keep saying so.
+
+    This is the test that stops the exception becoming a loophole: a
+    change that taught `coherence_violations` to accept `replay_safe`
+    beside a permanent-fault text would be WO-R2-146 reintroduced, and it
+    would pass every other test in this file.
+    """
+    lie = sanctioned_incoherent_story()
+    assert lie.hint == RemediationHint.REPLAY_SAFE.value
+    reasons = coherence_violations(lie.hint, lie.error_message)
+    assert reasons, (
+        "the screen accepts the deliberately mislabelled fixture — the "
+        "sanctioned exception has become a hole in the rule"
+    )
+    assert any("permanent" in r for r in reasons)
+
+
+def test_the_sanctioned_pair_is_unreachable_through_the_table() -> None:
+    """It is declared, not tabulated. Nothing that resolves a text *from a
+    hint* can reach it, so a writer cannot stamp it by accident — only the
+    one named accessor returns it."""
+    lie = sanctioned_incoherent_story()
+    assert lie not in ALL_STORIES
+    assert lie.key not in STORIES_BY_KEY
+    for stories in DLQ_FAILURE_STORIES.values():
+        assert lie not in stories
+    # And the by-key door is shut too.
+    with pytest.raises(UnknownDlqHintError):
+        story(lie.key)
+    # The canonical replay_safe text is still the transient one.
+    assert default_error_for(RemediationHint.REPLAY_SAFE.value) != (
+        lie.error_message
+    )
+
+
+def test_the_sanctioned_pair_is_not_the_string_that_shipped() -> None:
+    """`test_no_writer_still_stamps_the_pair_that_shipped` promises that
+    the exact live-defect text is never paired with `replay_safe` again.
+    That promise stays absolute only if this fixture uses a different
+    permanent text — so it uses the CSV bad-row one."""
+    lie = sanctioned_incoherent_story()
+    assert "SchemaValidationError" not in lie.error_message
+    assert lie.error_message == story("csv_bad_row").error_message
+
+
+def test_the_sanctioned_pair_carries_no_triage_block() -> None:
+    """One lie per fixture. `is_retryable=True` beside a bad-data text
+    would be a second, different contradiction and would muddy what the
+    scenario measures."""
+    lie = sanctioned_incoherent_story()
+    assert lie.triage is None
 
 
 # ---------------------------------------------------------------------------

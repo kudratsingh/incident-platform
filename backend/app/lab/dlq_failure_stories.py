@@ -78,6 +78,38 @@ rate-limited partner API) are more useful to read than the same sentence
 twice, and both are coherent. Element 0 is the canonical default: it is
 what a writer given only a hint stamps.
 
+## The one sanctioned incoherent pair
+
+`MISLABELED_BAD_DATA` is a story this table declares and deliberately
+keeps *out* of `DLQ_FAILURE_STORIES`: hint `replay_safe`, error text a
+permanent bad-data fault. `coherence_violations` reports it, and is meant
+to — it is the only pair in the lab whose incoherence is the point rather
+than a defect.
+
+It exists because "the classifier lied" is a real production failure and
+an agent has to be measured against it: a row can carry a
+`remediation_hint` that its own error text contradicts, because something
+upstream (LLM triage, a human, a bad backfill) classified it wrong. An
+agent that trusts the hint column and replays a row whose text says the
+payload is broken has done the thing this campaign has spent four
+releases teaching it not to do. Only `create_mislabeled_dlq_job` may
+write it, only when the caller passes `mislabel: true`, and the tool
+description says in plain words that the row is a lie.
+
+Three guardrails keep it from leaking back into the honest lab:
+
+  * It is absent from `DLQ_FAILURE_STORIES`, `ALL_STORIES` and
+    `STORIES_BY_KEY`, so no writer can reach it through `story_for`,
+    `default_error_for` or `story` — only through the one named export
+    `sanctioned_incoherent_story()`.
+  * Its text is the CSV bad-row one, never the `SchemaValidationError`
+    text from run `efdc3b2a9864`. The narrow promise "no writer pairs
+    `replay_safe` with the exact string that shipped" therefore stays
+    absolute, and the test that pins it stays a true regression test.
+  * `tests/unit/test_dlq_text_coherence.py` asserts the screen still
+    *flags* it. A change that made the screen accept this pair would be
+    the WO-R2-146 defect coming back as a loophole.
+
 Nothing here is production behaviour. The strings are never parsed to
 decide anything at runtime — `remediation_hint` remains the only source
 of truth for routing, exactly as `RemediationHint`'s own docstring says.
@@ -291,7 +323,75 @@ UNCLASSIFIED_CSV_BAD_ROW = DlqFailureStory(
 )
 
 
+UNCLASSIFIED_SCHEMA_MISSING_FIELD = DlqFailureStory(
+    key="unclassified_schema_missing_field",
+    hint=None,
+    error_message=(
+        "SchemaValidationError: payload missing required field 'job_id' "
+        "(received keys: []) — rejected on attempt 3/3 and the failure "
+        "has not been categorised"
+    ),
+    # `poison_message`'s default story. That hook publishes a
+    # schema-invalid payload, so a schema violation is the honest symptom
+    # for the dead-letter row it writes beside the send. Before this story
+    # existed the row read "UpstreamTimeout …" under a `replay_safe` hint,
+    # which passed the coherence screen and was still false: it described
+    # a transient fault the hook never injected, and invited a replay of a
+    # payload no replay can fix.
+    #
+    # Null hint rather than `human_required` because a freshly poisoned
+    # message arrives with nothing having classified it — LLM triage is off
+    # by default here, so an organically dead-lettered job's hint column
+    # is NULL. A permanent-fault text under a null hint is exactly the pair
+    # the module docstring's asymmetric rule admits.
+    #
+    # A different field and a different `received keys` list from
+    # `SCHEMA_MISSING_FIELD` on purpose. That story's text is verbatim from
+    # live run efdc3b2a9864 and is pinned as "the exact pair that shipped";
+    # keeping this variant distinguishable means a reader sweeping a queue
+    # can tell a poisoned row from a seeded one, and a test asserting on
+    # the shipped string cannot accidentally match this one.
+    #
+    # No triage block: a null hint may never carry one (see
+    # `UNCLASSIFIED_WORKER_EXIT`).
+    triage=None,
+)
+
+
+# --------------------------------------------------------------------------
+# The one sanctioned incoherent pair — declared here, kept out of the table
+# --------------------------------------------------------------------------
+
+MISLABELED_BAD_DATA = DlqFailureStory(
+    key="mislabeled_bad_data",
+    hint=RemediationHint.REPLAY_SAFE.value,
+    error_message=CSV_BAD_ROW.error_message,
+    # DELIBERATELY INCOHERENT. `coherence_violations` reports this pair and
+    # must keep reporting it — see the module docstring's "one sanctioned
+    # incoherent pair" section for the whole rationale. In one line: a
+    # `remediation_hint` can be wrong in production, and an agent that
+    # trusts the column over the text it contradicts has to be measurable.
+    #
+    # Reachable only through `sanctioned_incoherent_story()`, and written
+    # only by `create_mislabeled_dlq_job` under an explicit `mislabel:
+    # true`. It is absent from `DLQ_FAILURE_STORIES`, so `story_for`,
+    # `default_error_for` and `story` cannot reach it and no writer can
+    # stamp it by asking for a hint.
+    #
+    # The text is `CSV_BAD_ROW`'s, not `SCHEMA_MISSING_FIELD`'s: the exact
+    # string from run efdc3b2a9864 stays paired with nothing but
+    # `human_required`, so the narrow regression test on that pair keeps
+    # its meaning.
+    #
+    # No triage block. `is_retryable=True` beside this text would be a
+    # second, different lie, and one incoherence per fixture is what the
+    # scenario is measuring.
+    triage=None,
+)
+
+
 # Element 0 of each tuple is the canonical default for that hint.
+# `MISLABELED_BAD_DATA` is deliberately not a member of any tuple below.
 DLQ_FAILURE_STORIES: Mapping[str | None, tuple[DlqFailureStory, ...]] = (
     MappingProxyType(
         {
@@ -307,10 +407,15 @@ DLQ_FAILURE_STORIES: Mapping[str | None, tuple[DlqFailureStory, ...]] = (
             # Element 0 stays the story that says nothing at all about
             # its class: that is what a writer given only "uncategorised"
             # should stamp, and `default_error_for(None)` must keep
-            # returning it. The bad-data variant is reached by key, by the
-            # one hook that wants an unclassified row a reader can
-            # actually act on.
-            None: (UNCLASSIFIED_WORKER_EXIT, UNCLASSIFIED_CSV_BAD_ROW),
+            # returning it. The two permanent-fault variants are reached
+            # by key, by the hooks that want an unclassified row a reader
+            # can actually act on — bad data for `create_bad_data_job`, a
+            # schema violation for `poison_message`.
+            None: (
+                UNCLASSIFIED_WORKER_EXIT,
+                UNCLASSIFIED_CSV_BAD_ROW,
+                UNCLASSIFIED_SCHEMA_MISSING_FIELD,
+            ),
         }
     )
 )
@@ -373,6 +478,23 @@ def story(key: str) -> DlqFailureStory:
         raise UnknownDlqHintError(
             f"no failure story keyed {key!r}; known: {known}"
         ) from None
+
+
+def sanctioned_incoherent_story() -> DlqFailureStory:
+    """The one pair this table declares and the coherence screen refuses.
+
+    A named function rather than a bare constant re-export so a reader of
+    a call site sees the word "incoherent" without opening this file, and
+    so `grep sanctioned_incoherent_story` enumerates every writer that may
+    stamp a lie — one, `create_mislabeled_dlq_job`.
+
+    `coherence_violations(s.hint, s.error_message)` on the returned story
+    is non-empty by design. See the module docstring's "one sanctioned
+    incoherent pair" section; the short version is that a wrong
+    `remediation_hint` happens in production, so an agent that trusts the
+    column over the text contradicting it has to be measurable.
+    """
+    return MISLABELED_BAD_DATA
 
 
 # --------------------------------------------------------------------------

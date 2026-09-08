@@ -32,15 +32,19 @@ What gets cleared/reset:
   4. **Declared fixtures and non-fixture DLQ rows** — two disposal
      classes, deliberately different (ADR 0012 rule 2). A row a scenario
      *declared* for itself carries the top-level `seeded_fixture` payload
-     marker — `seed_dlq_messages`, `create_stuck_dag`, and since v0.6.2
-     `create_bad_data_job`, whose id a scenario now pins in advance — and
-     is hard-DELETEd, because a `cancelled` copy per run is litter rather
-     than history. Everything else still in `dead_letter` outside the
+     marker — `seed_dlq_messages`, `create_stuck_dag`,
+     `create_bad_data_job` since v0.6.2, and `poison_message` plus
+     `create_mislabeled_dlq_job` since v0.6.3, every one of them with an id
+     a scenario pins in advance — and is hard-DELETEd, because a
+     `cancelled` copy per run is litter rather than history. Everything
+     else still in `dead_letter` outside the
      `_dlq_specs()` stable-ID set is moved to `cancelled`, so the DLQ a
      scenario sees is exactly the fixture set it was graded against; that
-     arm catches chaos jobs attached to a real user, which the
-     chaos-owner-user cleanup below can't reach. Also de-noises the
-     planner on non-DLQ scenarios, which read the same surface.
+     arm now catches organically dead-lettered jobs and pre-marker legacy
+     rows rather than any current chaos hook, including ones attached to a
+     real user, which the chaos-owner-user cleanup below can't reach. Also
+     de-noises the planner on non-DLQ scenarios, which read the same
+     surface.
   5. **Chaos-fired alerts** — every `alerts` row whose source matches
      `chaos:%` and is still active gets `resolved_at` stamped. Without
      this the alert `bad_deploy` fires is never resolved by anything, so
@@ -446,8 +450,9 @@ async def _resolve_chaos_alerts(session_factory: Any) -> int:
 
 async def _delete_seeded_dlq_fixtures(session_factory: Any) -> int:
     """DELETE rows created by a *declared-fixture* chaos hook —
-    `seed_dlq_messages`, `create_stuck_dag`, and (since v0.6.2)
-    `create_bad_data_job`.
+    `seed_dlq_messages`, `create_stuck_dag`, `create_bad_data_job` (since
+    v0.6.2), and since v0.6.3 `poison_message` and
+    `create_mislabeled_dlq_job`.
 
     Deleted rather than cancelled (the disposal `_sweep_nonfixture_dlq`
     applies to everything else) because these are scaffolding a
@@ -455,14 +460,20 @@ async def _delete_seeded_dlq_fixtures(session_factory: Any) -> int:
     Cancelling them would leave thousands of dead rows behind across
     eval runs. See ADR 0012 rule 2.
 
-    `create_bad_data_job` moved into this sweep with WO-R2-158, when it
-    gained a deterministic id derived from the calling tenant and a
-    `fixture_name` a scenario pins in advance. Before that its rows were
-    randomly idded and merely *cancelled*, on the grounds that one attached
-    to a real user reads as that user's history — the case
-    `_sweep_nonfixture_dlq` below still describes. A row a scenario names
-    before it exists is not that; it is scaffolding, and the reset now
-    disposes of it as such.
+    `create_bad_data_job` moved into this sweep with WO-R2-158, and
+    `poison_message` with WO-R2-166, each when it gained a deterministic id
+    derived from the calling tenant and a `fixture_name` a scenario pins in
+    advance. Before that their rows were randomly idded and merely
+    *cancelled*, on the grounds that one attached to a real user reads as
+    that user's history. A row a scenario names before it exists is not
+    that; it is scaffolding, and the reset now disposes of it as such.
+
+    `create_mislabeled_dlq_job` (v0.6.3) was born into this sweep, and is
+    the one row where the disposal class carries weight beyond tidiness: it
+    is deliberately self-contradictory (hint `replay_safe`, permanent
+    bad-data text), so a `cancelled` copy accumulating one per run would
+    leave the DLQ full of rows that teach the wrong lesson to anything
+    reading it later.
 
     **The marker contract.** Every one of those hooks writes a *top-level*
     `SEEDED_FIXTURE_MARKER` key holding boolean `true`
@@ -533,13 +544,23 @@ async def _sweep_nonfixture_dlq(session_factory: Any) -> int:
     how a `bad_data_job` row from 2026-07-31, owned by
     `agent-demo@example.com`, was still sitting in the DLQ days later.
 
-    `create_bad_data_job` is no longer the example: since WO-R2-158 its
-    rows are declared fixtures and `_delete_seeded_dlq_fixtures` DELETEs
-    them outright, whoever owns them. `poison_message` is the hook this
-    arm still catches — its row is randomly idded, marked only
-    `chaos_fixture`, and is genuinely a stand-in for something that
-    happened to a real user's job. The failure mode is unchanged; only
-    which hook demonstrates it.
+    No chaos hook demonstrates that any more. `create_bad_data_job` stopped
+    being the example with WO-R2-158 and `poison_message` — which was the
+    example after it — with WO-R2-166: every hook that writes a DLQ row now
+    declares it by `fixture_name` under a deterministic id, so
+    `_delete_seeded_dlq_fixtures` DELETEs all of them outright, whoever owns
+    them.
+
+    What this arm still catches is everything the lab did not declare: a job
+    that really dead-lettered on this stack (a processor failure, a stale-
+    RUNNING recovery, an unregistered `*.compensate` type), a row left by an
+    older release's chaos hook before the marker convention existed, and
+    anything a human wrote by hand. Those are real history for a real user,
+    which is why they are still `cancelled` rather than deleted — and the
+    failure mode above is unchanged for them: a chaos-era row from
+    2026-07-31 owned by `agent-demo@example.com` outlived every reset
+    because `_delete_chaos_owner_users` could not reach a job attached to a
+    real user.
 
     The cost isn't just a dirty DLQ tab. Stale entries widen the
     surface the agent's planner reads, which pulled it into extra

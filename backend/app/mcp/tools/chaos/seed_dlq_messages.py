@@ -51,9 +51,13 @@ logger = get_logger(__name__)
 # *declared* fixture — this one, `create_stuck_dag`, `create_bad_data_job`
 # — and imported from here by all of them so there is one spelling.
 # `chaos_fixture` is a different key with a different job: provenance ("which
-# hook wrote this row"), not disposal. `poison_message` carries only
-# `chaos_fixture`, so its row is cancelled rather than deleted; see the
-# module docstring for why declaration is the line.
+# hook wrote this row"), not disposal. Every hook that writes a DLQ row with a
+# scenario-pinnable id carries both — `seed_dlq_messages`, `create_stuck_dag`,
+# `create_bad_data_job`, and since v0.6.3 `poison_message` and
+# `create_mislabeled_dlq_job`. `poison_message` used to be the counter-example
+# here (provenance only, so cancelled rather than deleted); it gained a
+# declared `fixture_name` with WO-R2-166 and moved into the DELETE sweep with
+# it. See the module docstring for why declaration is the line.
 SEEDED_FIXTURE_MARKER = "seeded_fixture"
 
 # Canned error strings per hint used to be a dict right here, and it

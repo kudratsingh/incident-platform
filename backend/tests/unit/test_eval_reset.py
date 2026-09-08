@@ -640,8 +640,16 @@ async def test_delete_seeded_dlq_fixtures_removes_a_bad_data_job_row(
         retry_count=3,
         remediation_hint=None,
     )
-    # `poison_message`'s shape: provenance only, no declaration. It stays —
-    # this sweep is not the one that disposes of it.
+    # An undeclared row: provenance only, no marker. It stays — this sweep
+    # is not the one that disposes of it.
+    #
+    # Shaped like a pre-v0.6.3 `poison_message` row, which is what such a
+    # row looks like in the wild: no current chaos hook writes one any more
+    # (WO-R2-166 gave `poison_message` a declared `fixture_name` and moved
+    # it into this sweep), so what `_sweep_nonfixture_dlq` still catches is
+    # rows from older releases and jobs that really dead-lettered on the
+    # stack. Kept as a legacy shape rather than deleted from the test,
+    # because the predicate has to keep leaving it alone.
     undeclared = Job(
         tenant_id=default_tenant.id,
         user_id=test_user.id,
@@ -667,6 +675,81 @@ async def test_delete_seeded_dlq_fixtures_removes_a_bad_data_job_row(
     assert remaining == {undeclared_id}, (
         "the declared bad-data fixture must be deleted and the "
         "provenance-only chaos row left for the cancel sweep"
+    )
+
+
+async def test_delete_seeded_dlq_fixtures_removes_the_v063_declared_rows(
+    db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
+) -> None:
+    """The disposal half of WO-R2-166, for both hooks that joined this sweep.
+
+    `poison_message` moved in when it gained a declared `fixture_name` under
+    a deterministic id; `create_mislabeled_dlq_job` was born into it. Each
+    payload is built through the hook's own `fixture_id` and the shared
+    marker constant rather than transcribed, so a hook that changes its
+    payload shape shows up here rather than quietly stopping being reachable
+    by the reset.
+
+    On the mislabelled row the disposal class carries weight beyond
+    tidiness: the row is deliberately self-contradictory (hint
+    `replay_safe`, permanent bad-data text), so a `cancelled` copy
+    accumulating one per run would leave the DLQ full of rows that teach
+    the wrong lesson to anything reading it later.
+    """
+    reset = _reset_module()
+    from app.mcp.tools.chaos.create_mislabeled_dlq_job import (
+        fixture_id as mislabel_fixture_id,
+    )
+    from app.mcp.tools.chaos.poison_message import (
+        fixture_id as poison_fixture_id,
+    )
+    from app.mcp.tools.chaos.seed_dlq_messages import SEEDED_FIXTURE_MARKER
+    from app.models.enums import RemediationHint
+
+    poison_id = poison_fixture_id(default_tenant.id, "poison-message")
+    poisoned = Job(
+        id=poison_id,
+        tenant_id=default_tenant.id,
+        user_id=test_user.id,
+        type=JobType.BULK_API_SYNC.value,
+        status=JobStatus.DEAD_LETTER.value,
+        payload={
+            SEEDED_FIXTURE_MARKER: True,
+            "chaos_fixture": "poison_message",
+            "fixture_name": "poison-message",
+            "topic": "job.submitted",
+        },
+        retry_count=3,
+        remediation_hint=None,
+    )
+    mislabel_id = mislabel_fixture_id(default_tenant.id, "mislabeled-dlq-job")
+    mislabelled = Job(
+        id=mislabel_id,
+        tenant_id=default_tenant.id,
+        user_id=test_user.id,
+        status=JobStatus.DEAD_LETTER.value,
+        type=JobType.CSV_UPLOAD.value,
+        payload={
+            SEEDED_FIXTURE_MARKER: True,
+            "chaos_fixture": "mislabeled_dlq_job",
+            "fixture_name": "mislabeled-dlq-job",
+        },
+        retry_count=3,
+        remediation_hint=RemediationHint.REPLAY_SAFE.value,
+    )
+    db_session.add_all([poisoned, mislabelled])
+    await db_session.flush()
+
+    deleted = await reset._delete_seeded_dlq_fixtures(_factory(db_session))
+
+    assert deleted == 2
+    remaining = (
+        await db_session.execute(
+            select(Job.id).where(Job.id.in_([poison_id, mislabel_id]))
+        )
+    ).scalars().all()
+    assert remaining == [], (
+        "both v0.6.3 declared fixtures must be DELETEd, not cancelled"
     )
 
 
@@ -906,11 +989,12 @@ async def test_reset_deletes_leave_audit_rows_byte_identical(
         user_id=chaos_user.id,
         type=JobType.CSV_UPLOAD.value,
         status=JobStatus.DEAD_LETTER.value,
-        # `poison_message`'s shape: a chaos row marked with its
-        # provenance only. `create_bad_data_job` is no longer the
-        # example here — since WO-R2-158 its rows carry the
-        # `seeded_fixture` marker and are DELETEd by the sibling
-        # sweep, so using it would make this row match both.
+        # An undeclared chaos row: provenance only, no `seeded_fixture`
+        # marker, so the sibling DELETE sweep leaves it and this one
+        # cancels it. Shaped like a pre-v0.6.3 `poison_message` row — no
+        # current hook writes one, because `create_bad_data_job`
+        # (WO-R2-158) and then `poison_message` (WO-R2-166) both gained
+        # the marker, and a row carrying it would match both sweeps.
         payload={"chaos_fixture": "poison_message"},
         retry_count=3,
     )
@@ -988,11 +1072,12 @@ async def test_delete_chaos_owner_users_removes_users_and_their_jobs(
         user_id=chaos_user.id,
         type=JobType.CSV_UPLOAD.value,
         status=JobStatus.DEAD_LETTER.value,
-        # `poison_message`'s shape: a chaos row marked with its
-        # provenance only. `create_bad_data_job` is no longer the
-        # example here — since WO-R2-158 its rows carry the
-        # `seeded_fixture` marker and are DELETEd by the sibling
-        # sweep, so using it would make this row match both.
+        # An undeclared chaos row: provenance only, no `seeded_fixture`
+        # marker, so the sibling DELETE sweep leaves it and this one
+        # cancels it. Shaped like a pre-v0.6.3 `poison_message` row — no
+        # current hook writes one, because `create_bad_data_job`
+        # (WO-R2-158) and then `poison_message` (WO-R2-166) both gained
+        # the marker, and a row carrying it would match both sweeps.
         payload={"chaos_fixture": "poison_message"},
         retry_count=3,
     )
