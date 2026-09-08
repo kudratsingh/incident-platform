@@ -187,7 +187,7 @@ async def _insert_dlq_job(
                 priority=0,
                 payload={"file": "x.csv"},
                 retry_count=3,
-                max_retries=3,
+                max_attempts=3,
                 remediation_hint=remediation_hint,
                 error_message="timeout calling upstream",
             )
@@ -207,7 +207,7 @@ def _dlq_event(job_id: uuid.UUID) -> dict[str, Any]:
         "error": "timeout calling upstream",
         "message": "Job exhausted after 3 attempts",
         "retry_count": 3,
-        "max_retries": 3,
+        "max_attempts": 3,
         "payload": {"file": "x.csv"},
         "trace_id": "trace-abc",
     }

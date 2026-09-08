@@ -80,6 +80,7 @@ def _dlq_value(**overrides: object) -> dict[str, object]:
         "error": "timeout calling upstream",
         "message": "Job exhausted after 3 attempts: timeout calling upstream",
         "retry_count": 3,
+        "max_attempts": 3,
         "max_retries": 3,
         "payload": {"file": "x.csv"},
         "trace_id": "trace-abc",
@@ -151,7 +152,7 @@ async def test_triage_is_abandoned_at_its_deadline(
                     payload={"file": "x.csv"},
                     error_message="boom",
                     retry_count=3,
-                    max_retries=3,
+                    max_attempts=3,
                     trace_id=None,
                 )
             )

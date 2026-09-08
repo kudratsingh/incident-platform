@@ -79,7 +79,7 @@ function job(overrides: Partial<Job> = {}): Job {
     result: null,
     error_message: 'boom',
     retry_count: 3,
-    max_retries: 3,
+    max_attempts: 3,
     dead_lettered_by: null,
     priority: 0,
     trace_id: null,

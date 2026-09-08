@@ -23,11 +23,12 @@ Schemas live in `backend/app/schemas/kafka/*.schema.json` and are validated on b
 
 ### `job.dlq` triage context
 
-`job.dlq` events carry three fields on top of the `JobFailed` core. They are **optional in the schema** because the same `JobFailed` schema backs the retry-path `job.failed` topic, which carries none of them — making them required would fail producer-side validation in `publish_raw` and silently drop every retry event.
+`job.dlq` events carry four fields on top of the `JobFailed` core (three values — the run budget is spelled twice while the old name is being retired). They are **optional in the schema** because the same `JobFailed` schema backs the retry-path `job.failed` topic, which carries none of them — making them required would fail producer-side validation in `publish_raw` and silently drop every retry event.
 
 | Field | Type | Meaning |
 |---|---|---|
-| `max_retries` | integer ≥ 0 | The job's retry budget. Absent it, `LlmTriageConsumer` fell back to `0` and asked the model to explain "retry 3 of 0". |
+| `max_attempts` | integer ≥ 0 | The job's total run budget — the original run plus its retries, so 3 means three runs and two retries. Absent it, `LlmTriageConsumer` fell back to `0` and asked the model to explain "retry 3 of 0". |
+| `max_retries` | integer ≥ 0 | **Deprecated** (WO-R2-172). The identical value under the name this topic shipped with; the field never held a retry count. The producer writes both for one release and then drops this one. A consumer reads `max_attempts` and falls back to this. |
 | `payload` | object or null | The job payload as executed, with the `__traceparent` OTel carrier already popped. Bounded: if it serializes to more than `job_events.DLQ_PAYLOAD_MAX_BYTES` (4 KB) it is replaced by `{"_truncated": true, "_original_bytes": n}`, and it is `null` if the payload wasn't serializable. The bound exists because this event fans out to four consumer groups and is appended verbatim to `job_events`. |
 | `trace_id` | string or null | The job's `trace_id` column — the raw value, not the `trace_id_var` fallback (which substitutes the job id when the column is NULL). |
 

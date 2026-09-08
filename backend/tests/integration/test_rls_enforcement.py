@@ -219,11 +219,11 @@ async def test_rls_isolates_tenants(rls_db: RlsDb) -> None:
             "VALUES ($1, $2, $3, 'x', 'user', true), ($4, $5, $6, 'x', 'user', true)",
             user_a, tenant_a, "a@a.test", user_b, tenant_b, "b@b.test",
         )
-        # retry_count / max_retries are NOT NULL without server defaults
+        # retry_count / max_attempts are NOT NULL without server defaults
         # (the defaults are ORM-side), so the raw INSERT must supply them.
         await sup.execute(
             "INSERT INTO jobs (id, tenant_id, user_id, type, status, priority, "
-            "                  retry_count, max_retries, payload) "
+            "                  retry_count, max_attempts, payload) "
             "VALUES ($1, $2, $3, 'csv_upload', 'pending', 5, 0, 3, '{}'::jsonb), "
             "       ($4, $5, $6, 'csv_upload', 'pending', 5, 0, 3, '{}'::jsonb)",
             uuid.uuid4(), tenant_a, user_a,
@@ -587,7 +587,7 @@ async def test_job_delete_still_nulls_audit_fk_via_ri_bypass(rls_db: RlsDb) -> N
         job_id = uuid.uuid4()
         await sup.execute(
             "INSERT INTO jobs (id, tenant_id, user_id, type, status, priority, "
-            "                  retry_count, max_retries, payload) "
+            "                  retry_count, max_attempts, payload) "
             "VALUES ($1, $2, $3, 'csv_upload', 'pending', 5, 0, 3, '{}'::jsonb)",
             job_id, tenant, user_id,
         )
@@ -1052,7 +1052,7 @@ async def test_the_real_platform_session_factory_declares_the_scope(
         )
         await sup.execute(
             "INSERT INTO jobs (id, tenant_id, user_id, type, status, priority, "
-            "retry_count, max_retries, payload) "
+            "retry_count, max_attempts, payload) "
             "VALUES ($1, $2, $3, 'csv_upload', 'pending', 5, 0, 3, '{}'::jsonb)",
             uuid.uuid4(),
             tenant,

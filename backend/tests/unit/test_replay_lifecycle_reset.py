@@ -169,7 +169,7 @@ async def _insert_dead_letter(
                 priority=0,
                 payload={"file": "x.csv"},
                 retry_count=3,
-                max_retries=3,
+                max_attempts=3,
                 remediation_hint=remediation_hint,
                 error_message="boom",
                 fenced_at=datetime.now(UTC) if fenced else None,

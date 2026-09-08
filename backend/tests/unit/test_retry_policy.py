@@ -17,7 +17,7 @@ async def test_disabled_by_default() -> None:
                 job_type="csv_upload",
                 error_message="boom",
                 retry_count=2,
-                max_retries=5,
+                max_attempts=5,
             )
     finally:
         get_settings.cache_clear()
@@ -56,7 +56,7 @@ async def test_calls_anthropic_with_cached_system_prompt(
                 job_type="bulk_api_sync",
                 error_message="HTTP 500",
                 retry_count=2,
-                max_retries=5,
+                max_attempts=5,
                 prior_error="HTTP 502",
             )
     finally:
@@ -100,7 +100,7 @@ async def test_timeout_propagates(monkeypatch: pytest.MonkeyPatch) -> None:
                     job_type="csv_upload",
                     error_message="boom",
                     retry_count=1,
-                    max_retries=5,
+                    max_attempts=5,
                 )
     finally:
         get_settings.cache_clear()
@@ -135,7 +135,7 @@ async def test_dead_letter_now_decision_round_trips(
                 job_type="bulk_api_sync",
                 error_message="401 Unauthorized",
                 retry_count=2,
-                max_retries=5,
+                max_attempts=5,
             )
     finally:
         get_settings.cache_clear()

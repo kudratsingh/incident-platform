@@ -124,7 +124,7 @@ async def _insert_job(
                 priority=0,
                 payload=payload if payload is not None else {"file": "x.csv"},
                 retry_count=retry_count,
-                max_retries=3,
+                max_attempts=3,
                 trace_id=trace_id,
                 saga_id=saga_id,
             )
@@ -192,7 +192,11 @@ async def test_force_dead_letter_writes_status_and_dlq_event_together(
     assert payload["error"] == "Dispatcher escape: boom past guards"
     # E1-14 triage context, owed by every DLQ producer.
     assert payload["retry_count"] == 2
-    assert payload["max_retries"] == 3
+    assert payload["max_attempts"] == 3
+    # The deprecated alias rides along for one release, carrying the
+    # identical value — a consumer on either name gets the same ceiling
+    # (WO-R2-172).
+    assert payload["max_retries"] == payload["max_attempts"]
     assert payload["trace_id"] == "trace-terminal"
     # The OTel carrier is tracing plumbing and must not ride along onto
     # `job_events`, which stores the event verbatim.

@@ -13,7 +13,17 @@
     "error": { "type": "string" },
     "message": { "type": "string" },
     "retry_count": { "type": "integer", "minimum": 0 },
-    "max_retries": { "type": "integer", "minimum": 0 },
+    "max_attempts": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "How many times the job may RUN in total — the original run plus its retries. 3 means three runs and two retries; the job dead-letters when the third run fails."
+    },
+    "max_retries": {
+      "type": "integer",
+      "minimum": 0,
+      "deprecated": true,
+      "description": "DEPRECATED — use max_attempts, which carries the identical value. This field never held a retry count: it has always capped total runs. Kept on the wire for one release so consumers can migrate; removed after that."
+    },
     "payload": { "type": ["object", "null"] },
     "trace_id": { "type": ["string", "null"] },
     "dead_lettered": { "type": "boolean" }

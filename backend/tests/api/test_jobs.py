@@ -187,7 +187,7 @@ async def test_admin_dlq_stats_counts_by_type(
                 type=jt,
                 status=JobStatus.DEAD_LETTER,
                 retry_count=3,
-                max_retries=3,
+                max_attempts=3,
                 priority=0,
                 error_message="boom",
             )
@@ -312,7 +312,7 @@ async def test_admin_slos_reflects_dead_letter_failures(
                 type=JobType.CSV_UPLOAD,
                 status=JobStatus.COMPLETED,
                 retry_count=0,
-                max_retries=3,
+                max_attempts=3,
                 priority=0,
             )
         )
@@ -324,7 +324,7 @@ async def test_admin_slos_reflects_dead_letter_failures(
                 type=JobType.CSV_UPLOAD,
                 status=JobStatus.DEAD_LETTER,
                 retry_count=3,
-                max_retries=3,
+                max_attempts=3,
                 priority=0,
                 error_message="boom",
             )
@@ -361,7 +361,7 @@ async def test_admin_triage_returns_404_when_missing(
         type=JobType.CSV_UPLOAD,
         status=JobStatus.DEAD_LETTER,
         retry_count=3,
-        max_retries=3,
+        max_attempts=3,
         priority=0,
         error_message="boom",
     )
@@ -397,7 +397,7 @@ async def test_admin_triage_returns_row_when_present(
         type=JobType.CSV_UPLOAD,
         status=JobStatus.DEAD_LETTER,
         retry_count=3,
-        max_retries=3,
+        max_attempts=3,
         priority=0,
         error_message="boom",
     )
@@ -463,7 +463,7 @@ async def test_admin_replay_resets_retry_count(
         type=JobType.CSV_UPLOAD,
         status=JobStatus.DEAD_LETTER,
         retry_count=3,
-        max_retries=3,
+        max_attempts=3,
         priority=0,
         error_message="last attempt boom",
     )
@@ -498,6 +498,40 @@ async def test_get_job_exposes_dead_lettered_by(
     assert body["dead_lettered_by"] is None
 
 
+async def test_job_response_carries_both_attempt_field_names(
+    client: AsyncClient, auth_headers: dict[str, str]
+) -> None:
+    """WO-R2-172: the ceiling is `max_attempts` now, and `max_retries` rides
+    along for one release carrying the identical value.
+
+    Additive on purpose. The name was wrong — the field caps total runs, not
+    retries — but a client reading `max_retries` is not wrong to have read the
+    contract it was given, so it keeps working until the field is dropped.
+    """
+    create_resp = await client.post(
+        "/api/v1/jobs", json={"type": "doc_analysis"}, headers=auth_headers
+    )
+    body = create_resp.json()
+    assert body["max_attempts"] == 3
+    assert body["max_retries"] == body["max_attempts"]
+
+    detail = await client.get(f"/api/v1/jobs/{body['id']}", headers=auth_headers)
+    detail_body = detail.json()
+    assert detail_body["max_attempts"] == detail_body["max_retries"] == 3
+
+
+async def test_openapi_marks_the_old_attempt_field_deprecated(
+    client: AsyncClient,
+) -> None:
+    """A client team reads the deprecation off the schema, not off a changelog
+    it never sees. `max_attempts` carries no such marker."""
+    spec = (await client.get("/api/v1/openapi.json")).json()
+    props = spec["components"]["schemas"]["JobResponse"]["properties"]
+    assert props["max_retries"]["deprecated"] is True
+    assert "max_attempts" in props["max_retries"]["description"]
+    assert not props["max_attempts"].get("deprecated")
+
+
 async def test_admin_replay_clears_dead_lettered_by(
     client: AsyncClient,
     db_session,  # type: ignore[no-untyped-def]
@@ -515,7 +549,7 @@ async def test_admin_replay_clears_dead_lettered_by(
         type=JobType.CSV_UPLOAD,
         status=JobStatus.DEAD_LETTER,
         retry_count=1,
-        max_retries=3,
+        max_attempts=3,
         priority=0,
         error_message="401 Unauthorized",
         dead_lettered_by="llm_retry_policy",

@@ -196,7 +196,7 @@ class SagaCoordinator(BaseKafkaConsumer):
                 status=JobStatus.PENDING,
                 payload=comp_payload,
                 priority=done.priority,
-                max_retries=done.max_retries,
+                max_attempts=done.max_attempts,
                 trace_id=done.trace_id,
                 saga_id=saga_id,
             )

@@ -132,7 +132,7 @@ async def _seed_job(
                     type=JobType.CSV_UPLOAD,
                     status=status,
                     payload={"rows": 10},
-                    max_retries=3,
+                    max_attempts=3,
                     trace_id="trace-sweep",
                     created_at=now - timedelta(seconds=age_seconds),
                     updated_at=now - timedelta(seconds=age_seconds),

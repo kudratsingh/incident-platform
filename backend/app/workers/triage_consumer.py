@@ -44,6 +44,24 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 logger = get_logger(__name__)
 
 
+def _attempt_ceiling(value: dict[str, Any]) -> int:
+    """The job's total run budget off a `job.dlq` event.
+
+    `max_attempts` since WO-R2-172; `max_retries` is the same integer under
+    the name this topic shipped with and is still produced for one release.
+    Preferring the new name and falling back keeps an event that was already
+    in the topic when the rollout happened out of the `0` that used to make
+    triage ask the model to explain "retry 3 of 0".
+    """
+    raw = value.get("max_attempts")
+    if raw is None:
+        raw = value.get("max_retries", 0)
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _is_transient(status_code: int) -> bool:
     """Is this status worth redelivering the message for?
 
@@ -108,7 +126,7 @@ class LlmTriageConsumer(BaseKafkaConsumer):
                 payload=value.get("payload"),
                 error_message=str(value.get("error", "")),
                 retry_count=int(value.get("retry_count", 0)),
-                max_retries=int(value.get("max_retries", 0)),
+                max_attempts=_attempt_ceiling(value),
                 trace_id=value.get("trace_id"),
             )
         except triage_service.TriageDisabledError:

@@ -112,7 +112,7 @@ These are sized at "phase" level in the milestone plan. Not repeated here, but r
 | Anomaly detection on metrics | M | Z-score over rolling window per tenant. Pages on outliers — "tenant Acme's failure rate is 5σ above their 7-day baseline." Layer on top of the existing CloudWatch metrics. |
 | Predictive autoscaling | L | Forecast next-hour queue depth from historical patterns; pre-warm ECS tasks. Demonstrates a simple time-series model in production. |
 | LLM-driven workflow generation | L | "Fetch all CSVs from S3 and email summaries" → LLM emits a saga spec. Validated against the workflow template schema before saving. |
-| Cost optimizer | M | LLM looks at a tenant's retry patterns and suggests a cheaper backoff strategy or different max_retries. Surfaces as a recommendation on the admin UI. |
+| Cost optimizer | M | LLM looks at a tenant's retry patterns and suggests a cheaper backoff strategy or a different max_attempts. Surfaces as a recommendation on the admin UI. |
 | RAG over runbooks for on-call chat | M | Pinecone or pgvector + the existing runbooks. "How do I clear a stuck saga?" → grounded answer. |
 | LLM-driven test generation | S | When adding a new processor, LLM scaffolds the pytest file from the processor signature + a description. Developer-facing rather than production. |
 | Fine-tune Claude on the company's failure patterns | XL | Way beyond reasonable. Only worth doing once you have thousands of triaged jobs and the in-house team to run fine-tuning. |

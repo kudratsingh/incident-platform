@@ -96,7 +96,7 @@ async def _seed_pending_job(
     *,
     job_type: str = JobType.CSV_UPLOAD,
     retry_count: int = 0,
-    max_retries: int = 3,
+    max_attempts: int = 3,
 ) -> uuid.UUID:
     job_id = uuid.uuid4()
     async with factory() as session:
@@ -110,7 +110,7 @@ async def _seed_pending_job(
                     status=JobStatus.PENDING,
                     payload={"row_count": 10, "chunk_size": 1},
                     retry_count=retry_count,
-                    max_retries=max_retries,
+                    max_attempts=max_attempts,
                     trace_id="trace-abc",
                 )
             )
@@ -435,7 +435,7 @@ async def _seed_running_job(
                     status=JobStatus.RUNNING,
                     payload={"row_count": 10},
                     retry_count=0,
-                    max_retries=3,
+                    max_attempts=3,
                     trace_id="trace-abc",
                     started_at=datetime.now(UTC) - timedelta(seconds=age_seconds),
                 )

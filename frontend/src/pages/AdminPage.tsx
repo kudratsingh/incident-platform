@@ -1059,7 +1059,7 @@ export default function AdminPage() {
                       </td>
                       <td className="px-4 py-3 hidden md:table-cell align-top">
                         <span className="text-xs font-mono text-gray-400">
-                          {job.retry_count}/{job.max_retries}
+                          {job.retry_count}/{job.max_attempts}
                         </span>
                         {job.dead_lettered_by === 'llm_retry_policy' && (
                           <span

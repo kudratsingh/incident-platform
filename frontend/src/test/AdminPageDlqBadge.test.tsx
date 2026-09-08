@@ -1,7 +1,7 @@
 /**
  * Tests for the admin DLQ tab's purple `LLM` badge (F2-16).
  *
- * The badge used to render on `retry_count < job.max_retries`, reading
+ * The badge used to render on `retry_count < job.max_attempts`, reading
  * "retries were cut short, so the LLM retry policy must have done it". Two
  * populations break that inference and were badged with LLM features off:
  * saga compensation jobs, which dead-letter immediately at retry_count=0
@@ -45,7 +45,7 @@ function makeDlqJob(overrides: Partial<Job>): Job {
     result: null,
     error_message: 'boom',
     retry_count: 3,
-    max_retries: 3,
+    max_attempts: 3,
     dead_lettered_by: null,
     priority: 0,
     trace_id: null,
@@ -99,11 +99,11 @@ describe('admin DLQ tab LLM badge', () => {
   })
 
   it('does not badge a compensation job that dead-lettered at retry_count=0', async () => {
-    // retry_count(0) < max_retries(3) — the exact shape the old arithmetic
+    // retry_count(0) < max_attempts(3) — the exact shape the old arithmetic
     // mislabelled. No processor was registered for the `.compensate` type,
     // which has nothing to do with the LLM retry policy.
     await renderDlqTab([
-      makeDlqJob({ retry_count: 0, max_retries: 3, dead_lettered_by: null }),
+      makeDlqJob({ retry_count: 0, max_attempts: 3, dead_lettered_by: null }),
     ])
 
     await waitFor(() => expect(screen.getByText('0/3')).toBeDefined())
@@ -112,7 +112,7 @@ describe('admin DLQ tab LLM badge', () => {
 
   it('does not badge a job whose retries simply ran out', async () => {
     await renderDlqTab([
-      makeDlqJob({ retry_count: 3, max_retries: 3, dead_lettered_by: null }),
+      makeDlqJob({ retry_count: 3, max_attempts: 3, dead_lettered_by: null }),
     ])
 
     await waitFor(() => expect(screen.getByText('3/3')).toBeDefined())

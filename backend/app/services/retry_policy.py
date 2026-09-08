@@ -106,7 +106,7 @@ async def decide_retry(
     job_type: str,
     error_message: str,
     retry_count: int,
-    max_retries: int,
+    max_attempts: int,
     prior_error: str | None = None,
 ) -> tuple[RetryDecision, dict[str, Any], str]:
     """Call Claude and return (decision, usage_dict, model_id).
@@ -128,7 +128,7 @@ async def decide_retry(
         "current_error": error_message,
         "prior_error": prior_error,
         "retry_count": retry_count,
-        "max_retries": max_retries,
+        "max_attempts": max_attempts,
     }
 
     async def _call() -> Any:

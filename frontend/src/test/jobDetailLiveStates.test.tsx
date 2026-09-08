@@ -65,7 +65,7 @@ function job(status: Job['status']): Job {
     result: null,
     error_message: null,
     retry_count: 0,
-    max_retries: 3,
+    max_attempts: 3,
     dead_lettered_by: null,
     priority: 0,
     trace_id: null,

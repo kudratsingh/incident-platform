@@ -6,7 +6,14 @@ from typing import Any
 from app.config import get_settings
 from app.models.enums import JobStatus, JobType
 from app.schemas.common import PaginationParams
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    computed_field,
+    model_validator,
+)
 
 # ---------------------------------------------------------------------------
 # Per-type payload bounds
@@ -186,7 +193,9 @@ class JobResponse(BaseModel):
     result: dict[str, Any] | None
     error_message: str | None
     retry_count: int
-    max_retries: int
+    # Total runs this job may have — the original plus its retries. 3 means
+    # three runs and two retries (WO-R2-172).
+    max_attempts: int
     # Attribution for a DLQ row (F2-16). REST-only on purpose: the MCP tool
     # output models are contract-frozen, and the admin UI is the only
     # consumer that needs it.
@@ -197,6 +206,31 @@ class JobResponse(BaseModel):
     created_at: datetime
     started_at: datetime | None
     completed_at: datetime | None
+
+    @computed_field(  # type: ignore[prop-decorator]
+        description=(
+            "DEPRECATED — use max_attempts, which carries the identical "
+            "value. This field never held a retry count: it has always "
+            "capped total runs. Kept for one release so clients can "
+            "migrate; removed after that."
+        ),
+        # The marker goes in the schema, not in `deprecated=`, which would
+        # raise a Python DeprecationWarning on every serialization. The
+        # deprecated caller is an HTTP client reading OpenAPI, and warning
+        # this process about the client's field choice is noise it cannot
+        # act on.
+        json_schema_extra={"deprecated": True},
+    )
+    @property
+    def max_retries(self) -> int:
+        """The old name for `max_attempts`, still on the wire (WO-R2-172).
+
+        Computed rather than stored so there is exactly one number: a
+        second real field could be given a different value by a careless
+        constructor, and the whole point of the rename is that these two
+        names were never two things.
+        """
+        return self.max_attempts
 
 
 class StreamTokenResponse(BaseModel):

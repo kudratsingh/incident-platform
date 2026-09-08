@@ -26,6 +26,9 @@ CONSUMER_READ_KEYS = frozenset(
         "job_type",
         "error",
         "retry_count",
+        # Both names: `max_attempts` is what it reads, `max_retries` is the
+        # fallback it still honours for one release (WO-R2-172).
+        "max_attempts",
         "max_retries",
         "payload",
         "trace_id",
@@ -56,6 +59,8 @@ def _dlq_value(**overrides: object) -> dict[str, object]:
         "error": "timeout calling upstream",
         "message": "Job exhausted after 3 attempts: timeout calling upstream",
         "retry_count": 3,
+        "max_attempts": 3,
+        # The deprecated alias the producer still writes — same integer.
         "max_retries": 3,
         "payload": {"file": "x.csv"},
         "trace_id": "trace-abc",
@@ -74,7 +79,7 @@ def test_dlq_fixture_mirrors_the_producer() -> None:
 def test_producer_covers_every_key_the_consumer_reads() -> None:
     """Drift detector: `dispatcher`'s DLQ payloads must remain a superset of
     what `LlmTriageConsumer.handle_message` reads. A key the consumer reads
-    but the producer never writes silently degrades triage (max_retries
+    but the producer never writes silently degrades triage (max_attempts
     defaults to 0, payload/trace_id to None) instead of failing loudly."""
     missing = CONSUMER_READ_KEYS - set(PRODUCER_DLQ_KEYS)
     assert not missing, f"triage reads keys the dispatcher never writes: {sorted(missing)}"
@@ -160,6 +165,54 @@ async def test_persists_analysis_on_success() -> None:
     assert kwargs["is_retryable"] is True
     assert kwargs["model_used"] == "claude-opus-4-7"
     assert kwargs["usage"]["cache_read_input_tokens"] == 1500
+
+
+async def test_reads_the_ceiling_from_either_name() -> None:
+    """WO-R2-172 renamed the field. Both names are on the wire for one
+    release, and `job.dlq` has 30 days of retention — so an event written
+    before the rollout arrives carrying only the old name and must still
+    give triage the real ceiling rather than the 0 that made it ask the
+    model to explain "retry 3 of 0" (E1-14, the bug this consumer already
+    had once).
+    """
+    factory = _factory()
+    consumer = LlmTriageConsumer(factory)
+    analysis = TriageAnalysis(
+        root_cause_category="external_api_failure",
+        summary="Upstream timed out",
+        suggested_fix="Check the upstream.",
+        is_retryable=True,
+        confidence=0.5,
+    )
+
+    async def _ceiling_for(value: dict[str, object]) -> int:
+        call = AsyncMock(return_value=(analysis, {}, "claude-opus-4-7"))
+        with patch(
+            "app.workers.triage_consumer.triage_service.is_enabled", return_value=True
+        ), \
+             patch("app.workers.triage_consumer.triage_service.triage_failure", new=call), \
+             patch("app.workers.triage_consumer.TriageRepository", return_value=AsyncMock()):
+            await consumer.handle_message(topic="job.dlq", key="u", value=value)
+        return int(call.await_args.kwargs["max_attempts"])
+
+    both = _dlq_value(max_attempts=4, max_retries=4)
+    assert await _ceiling_for(both) == 4
+
+    old_only = _dlq_value(max_attempts=4, max_retries=4)
+    del old_only["max_attempts"]
+    old_only["max_retries"] = 7
+    assert await _ceiling_for(old_only) == 7, (
+        "an event produced before the rename must still carry a real ceiling"
+    )
+
+    new_only = _dlq_value(max_attempts=9, max_retries=9)
+    del new_only["max_retries"]
+    assert await _ceiling_for(new_only) == 9
+
+    neither = _dlq_value()
+    del neither["max_attempts"]
+    del neither["max_retries"]
+    assert await _ceiling_for(neither) == 0
 
 
 async def test_triage_disabled_error_is_swallowed() -> None:
