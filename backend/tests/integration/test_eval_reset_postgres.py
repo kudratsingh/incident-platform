@@ -366,6 +366,12 @@ async def test_delete_seeded_dlq_fixtures_matches_only_the_structured_marker(
     than `(payload ->> 'seeded_fixture')::boolean`: that cast raises
     `invalid input syntax for type boolean` on a hostile value, which
     aborts the transaction and takes the whole reset down with it.
+
+    The second declared row is why it also cannot be *equality*. Two hooks
+    write extra keys beside the marker — `create_stuck_dag` carries
+    `chain`, and since WO-R2-158 `create_bad_data_job` carries
+    `chaos_fixture` and `fixture_name` — so a `payload = '{...}'` rewrite
+    would keep passing the row above and silently stop deleting theirs.
     """
     from app.models.job import Job
     from sqlalchemy import select
@@ -374,6 +380,15 @@ async def test_delete_seeded_dlq_fixtures_matches_only_the_structured_marker(
         async with session.begin():
             tenant_id, user_id = await _make_tenant_and_user(session, "marker")
             declared = _job(tenant_id, user_id, payload={"seeded_fixture": True})
+            declared_with_extra_keys = _job(
+                tenant_id,
+                user_id,
+                payload={
+                    "seeded_fixture": True,
+                    "chaos_fixture": "bad_data_job",
+                    "fixture_name": "unfenced-csv",
+                },
+            )
             survivors = [
                 _job(tenant_id, user_id, payload={"tag": "seeded_fixture"}),
                 _job(
@@ -383,12 +398,14 @@ async def test_delete_seeded_dlq_fixtures_matches_only_the_structured_marker(
                 _job(tenant_id, user_id, payload={"seeded_fixture": "banana"}),
                 _job(tenant_id, user_id, payload={"real": True}),
             ]
-            session.add_all([declared, *survivors])
+            session.add_all(
+                [declared, declared_with_extra_keys, *survivors]
+            )
             survivor_ids = {job.id for job in survivors}
 
     deleted = await reset_eval_state._delete_seeded_dlq_fixtures(session_factory)
 
-    assert deleted == 1
+    assert deleted == 2
     async with session_factory() as session:
         remaining = set(
             (await session.execute(select(Job.id))).scalars().all()
@@ -441,7 +458,12 @@ async def test_delete_chaos_owner_users_nulls_audit_fks_but_keeps_resource_id(
                 tenant_id,
                 chaos_user.id,
                 status=JobStatus.DEAD_LETTER.value,
-                payload={"chaos_fixture": "bad_data_job"},
+                # `poison_message`'s shape: a chaos row marked with its
+                # provenance only. `create_bad_data_job` is no longer the
+                # example here — since WO-R2-158 its rows carry the
+                # `seeded_fixture` marker and are DELETEd by the sibling
+                # sweep, so using it would make this row match both.
+                payload={"chaos_fixture": "poison_message"},
             )
             session.add(chaos_job)
             await session.flush()
