@@ -2,11 +2,19 @@
 `create_bad_data_job` — inject a realistic bad-data DLQ entry, either
 already classified `human_required` or not classified at all.
 
-The persistent-bug counterpart to `poison_message` (which produces
-`replay_safe` entries). Doesn't touch Kafka — writes directly to `jobs`
-with `status=dead_letter` and an error string from
+The bad-data half of the lab's permanent-fault pair: this hook's row
+carries a CSV parse failure, `poison_message`'s carries a schema
+violation, and neither is replay-safe. (`poison_message` used to be
+described here as the `replay_safe` producer — it was, and it was wrong;
+WO-R2-166 moved its hint.) Doesn't touch Kafka — writes directly to
+`jobs` with `status=dead_letter` and an error string from
 `app.lab.dlq_failure_stories`, so the row's text and its hint say the
 same thing (WO-R2-146).
+
+A row whose hint and text deliberately *disagree* comes from
+`create_mislabeled_dlq_job`, which is a separate tool for that reason:
+this one's `remediation_hint` is a two-value `Literal` that cannot
+express `replay_safe` at all.
 
 ## Why `remediation_hint` is an argument now
 
@@ -82,7 +90,7 @@ scope + `environment_wide` blast radius label. See ADR 0008 gating.
 
 
 import uuid
-from typing import Literal
+from typing import Final, Literal
 
 from app.core.exceptions import AppError
 from app.core.logging import get_logger
@@ -104,9 +112,11 @@ logger = get_logger(__name__)
 # uuid5 namespace for bad-data fixture ids. Fixed and documented so a
 # scenario can precompute the id it pins:
 # uuid5(ns, f"{tenant_id}:{fixture_name}").
-# Distinct from the eval seed's namespace (aaaaaaaa-…) and
-# `create_stuck_dag`'s (cccccccc-…) so these ids can never collide with a
-# boot-seeded fixture or a chain node.
+# Distinct from the eval seed's namespace (aaaaaaaa-…), `create_stuck_dag`'s
+# (cccccccc-…), `poison_message`'s (eeeeeeee-dead-…) and
+# `create_mislabeled_dlq_job`'s (ffffffff-11ed-…), so these ids can never
+# collide with a boot-seeded fixture, a chain node, or another hook's row
+# under an identical `fixture_name`.
 _NAMESPACE = uuid.UUID("dddddddd-bad0-4000-8000-000000000000")
 
 # The sentinel that means "write NULL into remediation_hint". Spelled as a
@@ -115,7 +125,10 @@ _NAMESPACE = uuid.UUID("dddddddd-bad0-4000-8000-000000000000")
 # unambiguous where a nullable string leaves a caller guessing whether
 # omitting the field and passing null mean the same thing (they do not —
 # omitting it keeps the pre-v0.6.2 `human_required` behaviour).
-UNCLASSIFIED = "unclassified"
+# `Final` so mypy infers `Literal["unclassified"]` rather than `str`, which
+# is what lets a sibling hook write `default=UNCLASSIFIED` on a field typed
+# as the two-value `Literal` instead of restating the string.
+UNCLASSIFIED: Final = "unclassified"
 
 # The story each declared hint stamps. Both are bad-data texts on purpose:
 # the drill's whole subject is a row a reader can classify, and the only
@@ -226,8 +239,9 @@ class CreateBadDataJobOutput(BaseModel):
     description=(
         "Inject a synthetic dead-letter row whose error text is a "
         "permanent data fault (a non-numeric value in an integer CSV "
-        "column). Complement to `poison_message`, which produces "
-        "`replay_safe` entries. `remediation_hint` decides whether the "
+        "column). Complement to `poison_message`, whose row carries a "
+        "schema violation instead; neither is replay-safe, and neither "
+        "can be asked to be. `remediation_hint` decides whether the "
         "row arrives classified: `human_required` (default) stamps the "
         "category, so `replay_dlq_by_category` refuses it immediately; "
         "`unclassified` (or null) leaves `remediation_hint` NULL, so the "

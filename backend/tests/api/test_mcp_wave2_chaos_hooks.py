@@ -98,6 +98,7 @@ def _mcp_app_with_chaos_enabled(db_session: AsyncSession, redis_stub: _RedisStub
         importlib.reload(chaos_pkg.inject_latency)  # type: ignore[attr-defined]
         importlib.reload(chaos_pkg.bad_deploy)  # type: ignore[attr-defined]
         importlib.reload(chaos_pkg.create_bad_data_job)  # type: ignore[attr-defined]
+        importlib.reload(chaos_pkg.create_mislabeled_dlq_job)  # type: ignore[attr-defined]
         importlib.reload(chaos_pkg.create_stale_cache)  # type: ignore[attr-defined]
         importlib.reload(chaos_pkg.seed_dlq_messages)  # type: ignore[attr-defined]
         from app.mcp.tools import consumer_lag as _cl
@@ -447,15 +448,27 @@ async def test_poison_message_invokes_kafka_producer(
         teardown()
 
 
-async def test_poison_message_also_writes_replay_safe_dlq_entry(
+async def test_poison_message_writes_an_unclassified_schema_dlq_entry(
     db_session: AsyncSession,
     default_tenant,  # type: ignore[no-untyped-def]
     test_user,  # type: ignore[no-untyped-def]
 ) -> None:
-    """The synthetic DLQ row is the observable side of the hook — real
-    consumers log-and-drop schema errors, so without this row the
-    agent's remediation loop has nothing to react to."""
-    from app.models.enums import RemediationHint
+    """WO-R2-166 — the defaults, read back off the row.
+
+    The synthetic DLQ row is the observable side of the hook: real
+    consumers log-and-drop schema errors, so without it the agent's
+    remediation loop has nothing to react to. What that row says has now
+    been wrong twice. It shipped as `replay_safe` beside a
+    `SchemaValidationError` (WO-R2-146's live defect — the agent read it
+    right and was graded wrong), then as `replay_safe` beside an
+    `UpstreamTimeout` text, which passed the coherence screen while
+    describing a transient fault this hook never injects.
+
+    The hint moves instead of the text: a poisoned message is not safe to
+    replay, and a fresh one has been classified by nobody, so the default
+    row is NULL-hint with the schema-violation text it earned.
+    """
+    from app.lab.dlq_failure_stories import coherence_violations
     from app.models.job import Job
     from sqlalchemy import select as _select
 
@@ -485,7 +498,10 @@ async def test_poison_message_also_writes_replay_safe_dlq_entry(
                     )
                 )
         assert payload["accepted"] is True
-        assert payload["dlq_job_id"] is not None
+        assert payload["created"] is True
+        assert payload["fixture_name"] == "poison-message"
+        # Reported as null, not as a category the platform has not assigned.
+        assert payload["remediation_hint"] is None
         row = (
             await db_session.execute(
                 _select(Job).where(
@@ -494,21 +510,273 @@ async def test_poison_message_also_writes_replay_safe_dlq_entry(
             )
         ).scalar_one()
         assert row.status == "dead_letter"
-        assert row.remediation_hint == RemediationHint.REPLAY_SAFE.value
         assert row.tenant_id == default_tenant.id
-        # WO-R2-146: the row is stamped replay_safe, so its text has to
-        # describe something a replay would actually fix. It used to
-        # name the schema violation this hook sends to Kafka, which is
-        # permanent — the hint and the text said opposite things.
-        from app.lab.dlq_failure_stories import coherence_violations
-
+        # The heart of it: nothing on this row says a replay is the fix.
+        assert row.remediation_hint is None
         assert row.error_message is not None
-        assert not coherence_violations(
-            RemediationHint.REPLAY_SAFE.value, row.error_message
-        ), row.error_message
+        assert "SchemaValidationError" in row.error_message
+        assert "missing required field" in row.error_message
+        # A permanent-fault text under a null hint is coherent — the hint is
+        # a classification, the text is a symptom, and neither invites a
+        # replay (see `app.lab.dlq_failure_stories`).
+        assert not coherence_violations(None, row.error_message), (
+            row.error_message
+        )
         # Still traceable to this hook and this topic.
         assert "job.submitted" in row.error_message
         assert "poison_message" in row.error_message
+        # Declared fixture: the reset DELETEs it rather than cancelling it.
+        assert row.payload["seeded_fixture"] is True
+        assert row.payload["chaos_fixture"] == "poison_message"
+        assert row.payload["fixture_name"] == "poison-message"
+        # The Kafka half is untouched by any of this — the injection is real.
+        producer.send_and_wait.assert_awaited_once()
+    finally:
+        teardown()
+
+
+async def test_poison_message_can_seed_the_row_already_human_required(
+    db_session: AsyncSession,
+    default_tenant,  # type: ignore[no-untyped-def]
+    test_user,  # type: ignore[no-untyped-def]
+) -> None:
+    """The other declarable hint, for a scenario that wants the row already
+    categorised so `replay_dlq_by_category` refuses it on sight and the
+    escalate-not-replay branch is reachable without a triage step.
+
+    Same text either way: this hook injects one kind of fault, and the only
+    thing the argument changes is whether anything has classified it.
+    """
+    from app.lab.dlq_failure_stories import coherence_violations
+    from app.models.enums import RemediationHint
+    from app.models.job import Job
+    from sqlalchemy import select as _select
+
+    redis_stub = _RedisStub()
+    app, teardown = _mcp_app_with_chaos_enabled(db_session, redis_stub)
+
+    producer = AsyncMock()
+    producer.start = AsyncMock()
+    producer.stop = AsyncMock()
+    producer.send_and_wait = AsyncMock()
+
+    try:
+        with patch("aiokafka.AIOKafkaProducer", return_value=producer):
+            async with AsyncClient(
+                transport=ASGITransport(app=app, raise_app_exceptions=False),
+                base_url="http://test",
+            ) as ac:
+                token = await _token(
+                    db_session, default_tenant.id, [Scope.CHAOS_INVOKE.value]
+                )
+                payload = _content(
+                    await _call(
+                        ac,
+                        token,
+                        "poison_message",
+                        {
+                            "topic": "job.progress",
+                            "payload": {},
+                            "fixture_name": "poison-classified",
+                            "remediation_hint": "human_required",
+                        },
+                    )
+                )
+        assert payload["remediation_hint"] == (
+            RemediationHint.HUMAN_REQUIRED.value
+        )
+        row = (
+            await db_session.execute(
+                _select(Job).where(Job.id == uuid.UUID(payload["dlq_job_id"]))
+            )
+        ).scalar_one()
+        assert row.remediation_hint == RemediationHint.HUMAN_REQUIRED.value
+        assert row.error_message is not None
+        assert "SchemaValidationError" in row.error_message
+        assert "job.progress" in row.error_message
+        assert not coherence_violations(
+            RemediationHint.HUMAN_REQUIRED.value, row.error_message
+        ), row.error_message
+    finally:
+        teardown()
+
+
+async def test_poison_message_refuses_a_replay_safe_hint_over_the_wire(
+    db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
+) -> None:
+    """The refusal an agent actually meets. `replay_safe` is not in the
+    hook's vocabulary, so the envelope rejects it as invalid input — and
+    nothing is published, because validation runs before the handler."""
+    redis_stub = _RedisStub()
+    app, teardown = _mcp_app_with_chaos_enabled(db_session, redis_stub)
+
+    producer = AsyncMock()
+    producer.start = AsyncMock()
+    producer.stop = AsyncMock()
+    producer.send_and_wait = AsyncMock()
+
+    try:
+        with patch("aiokafka.AIOKafkaProducer", return_value=producer):
+            async with AsyncClient(
+                transport=ASGITransport(app=app, raise_app_exceptions=False),
+                base_url="http://test",
+            ) as ac:
+                token = await _token(
+                    db_session, default_tenant.id, [Scope.CHAOS_INVOKE.value]
+                )
+                body = await _call(
+                    ac,
+                    token,
+                    "poison_message",
+                    {
+                        "topic": "job.submitted",
+                        "remediation_hint": "replay_safe",
+                    },
+                )
+        assert "error" in body, body
+        producer.send_and_wait.assert_not_awaited()
+    finally:
+        teardown()
+
+
+async def test_poison_message_id_is_derived_from_tenant_and_fixture_name(
+    db_session: AsyncSession,
+    default_tenant,  # type: ignore[no-untyped-def]
+    test_user,  # type: ignore[no-untyped-def]
+) -> None:
+    """A scenario pins this id in YAML before the hook runs, so the grader
+    can assert *which* row the agent acted on (commander cmd #187). The
+    recipe is exported rather than transcribed, and it is per-tenant: the
+    idempotency probe is RLS-scoped, so a foreign row under the same name
+    would be invisible to it and the INSERT would collide on the primary
+    key — a 500 where the contract promises a 409.
+
+    Also pins that the namespace differs from `create_bad_data_job`'s, which
+    is the property that lets both hooks use the same `fixture_name`.
+    """
+    from app.mcp.tools.chaos.create_bad_data_job import (
+        fixture_id as bad_data_fixture_id,
+    )
+    from app.mcp.tools.chaos.poison_message import fixture_id
+
+    redis_stub = _RedisStub()
+    app, teardown = _mcp_app_with_chaos_enabled(db_session, redis_stub)
+
+    producer = AsyncMock()
+    producer.start = AsyncMock()
+    producer.stop = AsyncMock()
+    producer.send_and_wait = AsyncMock()
+
+    try:
+        with patch("aiokafka.AIOKafkaProducer", return_value=producer):
+            async with AsyncClient(
+                transport=ASGITransport(app=app, raise_app_exceptions=False),
+                base_url="http://test",
+            ) as ac:
+                token = await _token(
+                    db_session, default_tenant.id, [Scope.CHAOS_INVOKE.value]
+                )
+                payload = _content(
+                    await _call(
+                        ac,
+                        token,
+                        "poison_message",
+                        {
+                            "topic": "job.submitted",
+                            "fixture_name": "shared-name",
+                        },
+                    )
+                )
+        expected = fixture_id(default_tenant.id, "shared-name")
+        assert payload["dlq_job_id"] == str(expected)
+        # Same name, different hook, different row.
+        assert fixture_id(default_tenant.id, "shared-name") != (
+            bad_data_fixture_id(default_tenant.id, "shared-name")
+        )
+        # Same name, different tenant, different row.
+        assert fixture_id(uuid.uuid4(), "shared-name") != expected
+    finally:
+        teardown()
+
+
+async def test_poison_message_repeat_is_idempotent_until_it_drifts(
+    db_session: AsyncSession,
+    default_tenant,  # type: ignore[no-untyped-def]
+    test_user,  # type: ignore[no-untyped-def]
+) -> None:
+    """Three properties in one round trip, because they only make sense
+    together:
+
+    1. A repeat that finds its row intact reports `created=False` and does
+       not manufacture a second row.
+    2. It still publishes. The Kafka half is a verb, not a fixture — every
+       accepted call really does put another poisoned message on the topic,
+       and the description says so.
+    3. Once the row has drifted the hook refuses, and refuses *before* the
+       producer starts. A drifted row is the run's evidence (something
+       fenced it, or a replay moved it), and rewriting it would hand the
+       next run a pre-remediated world and grade it clean.
+    """
+    from app.models.enums import RemediationHint
+    from app.models.job import Job
+    from sqlalchemy import select as _select
+
+    redis_stub = _RedisStub()
+    app, teardown = _mcp_app_with_chaos_enabled(db_session, redis_stub)
+
+    producer = AsyncMock()
+    producer.start = AsyncMock()
+    producer.stop = AsyncMock()
+    producer.send_and_wait = AsyncMock()
+
+    args = {"topic": "job.submitted", "fixture_name": "repeat-probe"}
+    try:
+        with patch("aiokafka.AIOKafkaProducer", return_value=producer):
+            async with AsyncClient(
+                transport=ASGITransport(app=app, raise_app_exceptions=False),
+                base_url="http://test",
+            ) as ac:
+                token = await _token(
+                    db_session, default_tenant.id, [Scope.CHAOS_INVOKE.value]
+                )
+                first = _content(
+                    await _call(ac, token, "poison_message", args)
+                )
+                second = _content(
+                    await _call(ac, token, "poison_message", args)
+                )
+
+                assert first["created"] is True
+                assert second["created"] is False
+                assert second["dlq_job_id"] == first["dlq_job_id"]
+                rows = (
+                    await db_session.execute(
+                        _select(Job).where(
+                            Job.payload["fixture_name"].as_string()
+                            == "repeat-probe"
+                        )
+                    )
+                ).scalars().all()
+                assert len(rows) == 1
+                # Two accepted calls, two poisoned messages.
+                assert producer.send_and_wait.await_count == 2
+
+                # Now drift it the way a fence would, and re-ask.
+                rows[0].remediation_hint = (
+                    RemediationHint.HUMAN_REQUIRED.value
+                )
+                await db_session.flush()
+                producer.reset_mock()
+                body = await _call(ac, token, "poison_message", args)
+
+        assert body["error"]["code"] == protocol.MCP_TOOL_ERROR
+        assert body["error"]["data"]["error_code"] == (
+            "poison_fixture_name_in_use"
+        )
+        # The refusal came before the broker: a call that will be refused
+        # must not have poisoned a topic on its way to the refusal.
+        producer.start.assert_not_awaited()
+        producer.send_and_wait.assert_not_awaited()
     finally:
         teardown()
 
@@ -1052,6 +1320,254 @@ async def test_create_bad_data_job_lazy_creates_chaos_owner_in_caller_tenant(
         assert len(chaos_owners) == 1
     finally:
         teardown()
+
+
+# ---------------------------------------------------------------------------
+# create_mislabeled_dlq_job — the one sanctioned incoherent row (WO-R2-166)
+# ---------------------------------------------------------------------------
+
+
+async def test_create_mislabeled_dlq_job_writes_the_incoherent_pair(
+    db_session: AsyncSession,
+    default_tenant,  # type: ignore[no-untyped-def]
+    test_user,  # type: ignore[no-untyped-def]
+) -> None:
+    """The fixture for "the classifier lied": hint `replay_safe`, text a
+    permanent bad-data fault. The row is supposed to contradict itself, so
+    this test asserts the contradiction is really there AND that the
+    coherence screen still reports it.
+
+    That second half is the load-bearing one. Every other lab row is held
+    to the rule that a text must match the action its hint prescribes
+    (WO-R2-146). If the screen ever stopped flagging this row, the sanctioned
+    exception would have become a hole in the rule and the original defect
+    could walk back in through it.
+    """
+    from app.lab.dlq_failure_stories import coherence_violations
+    from app.models.enums import RemediationHint
+    from app.models.job import Job
+    from sqlalchemy import select as _select
+
+    redis_stub = _RedisStub()
+    app, teardown = _mcp_app_with_chaos_enabled(db_session, redis_stub)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app, raise_app_exceptions=False),
+            base_url="http://test",
+        ) as ac:
+            token = await _token(
+                db_session, default_tenant.id, [Scope.CHAOS_INVOKE.value]
+            )
+            payload = _content(
+                await _call(
+                    ac,
+                    token,
+                    "create_mislabeled_dlq_job",
+                    {"mislabel": True},
+                )
+            )
+        assert payload["accepted"] is True
+        assert payload["created"] is True
+        assert payload["remediation_hint"] == RemediationHint.REPLAY_SAFE.value
+        row = (
+            await db_session.execute(
+                _select(Job).where(Job.id == uuid.UUID(payload["job_id"]))
+            )
+        ).scalar_one()
+        assert row.status == "dead_letter"
+        assert row.tenant_id == default_tenant.id
+        # The label…
+        assert row.remediation_hint == RemediationHint.REPLAY_SAFE.value
+        # …and the text that contradicts it.
+        assert row.error_message is not None
+        assert "invalid literal for int()" in row.error_message
+        assert row.error_message == payload["error_message"]
+        # The screen must still call this out. Asserting the reason, not just
+        # that there is one, so a screen that flagged it for some unrelated
+        # wording change would not satisfy this test.
+        reasons = coherence_violations(
+            row.remediation_hint, row.error_message
+        )
+        assert reasons, (
+            "the deliberately mislabelled row reads as coherent — the "
+            "sanctioned exception has become a loophole"
+        )
+        assert any("permanent data fault" in r for r in reasons), reasons
+        # Declared fixture: DELETEd by the reset, not left cancelled.
+        assert row.payload["seeded_fixture"] is True
+        assert row.payload["chaos_fixture"] == "mislabeled_dlq_job"
+    finally:
+        teardown()
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        pytest.param({}, id="omitted"),
+        pytest.param({"mislabel": False}, id="false"),
+        pytest.param(
+            {"fixture_name": "sneaky"}, id="other-args-without-the-flag"
+        ),
+    ],
+)
+async def test_create_mislabeled_dlq_job_needs_the_explicit_flag(
+    db_session: AsyncSession,
+    default_tenant,  # type: ignore[no-untyped-def]
+    arguments: dict[str, Any],
+) -> None:
+    """The second gate (the tool's name is the first). `mislabel` has no
+    default and accepts only `true`, so an incoherent row can never be the
+    result of a call that did not say what it was asking for — and there is
+    no coherent row this tool could fall back to writing.
+    """
+    from app.models.job import Job
+    from sqlalchemy import func as _func
+    from sqlalchemy import select as _select
+
+    redis_stub = _RedisStub()
+    app, teardown = _mcp_app_with_chaos_enabled(db_session, redis_stub)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app, raise_app_exceptions=False),
+            base_url="http://test",
+        ) as ac:
+            token = await _token(
+                db_session, default_tenant.id, [Scope.CHAOS_INVOKE.value]
+            )
+            body = await _call(
+                ac, token, "create_mislabeled_dlq_job", arguments
+            )
+        assert "error" in body, body
+        # Refused before any write.
+        written = (
+            await db_session.execute(
+                _select(_func.count()).select_from(Job).where(
+                    Job.payload["chaos_fixture"].as_string()
+                    == "mislabeled_dlq_job"
+                )
+            )
+        ).scalar_one()
+        assert written == 0
+    finally:
+        teardown()
+
+
+async def test_create_mislabeled_dlq_job_id_is_deterministic_and_distinct(
+    db_session: AsyncSession,
+    default_tenant,  # type: ignore[no-untyped-def]
+    test_user,  # type: ignore[no-untyped-def]
+) -> None:
+    """A scenario pins this id before the hook runs, and the grading here
+    is mostly "the agent left this exact row alone" — so the id has to be
+    computable in advance and must not collide with a sibling hook's row
+    under the same `fixture_name`."""
+    from app.mcp.tools.chaos.create_bad_data_job import (
+        fixture_id as bad_data_fixture_id,
+    )
+    from app.mcp.tools.chaos.create_mislabeled_dlq_job import fixture_id
+    from app.mcp.tools.chaos.poison_message import (
+        fixture_id as poison_fixture_id,
+    )
+
+    redis_stub = _RedisStub()
+    app, teardown = _mcp_app_with_chaos_enabled(db_session, redis_stub)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app, raise_app_exceptions=False),
+            base_url="http://test",
+        ) as ac:
+            token = await _token(
+                db_session, default_tenant.id, [Scope.CHAOS_INVOKE.value]
+            )
+            payload = _content(
+                await _call(
+                    ac,
+                    token,
+                    "create_mislabeled_dlq_job",
+                    {"mislabel": True, "fixture_name": "shared-name"},
+                )
+            )
+        expected = fixture_id(default_tenant.id, "shared-name")
+        assert payload["job_id"] == str(expected)
+        assert payload["fixture_name"] == "shared-name"
+        assert expected != bad_data_fixture_id(
+            default_tenant.id, "shared-name"
+        )
+        assert expected != poison_fixture_id(
+            default_tenant.id, "shared-name"
+        )
+        assert expected != fixture_id(uuid.uuid4(), "shared-name")
+    finally:
+        teardown()
+
+
+async def test_create_mislabeled_dlq_job_repeat_is_idempotent_until_it_drifts(
+    db_session: AsyncSession,
+    default_tenant,  # type: ignore[no-untyped-def]
+    test_user,  # type: ignore[no-untyped-def]
+) -> None:
+    """On this fixture a drifted row is the most interesting thing in the
+    run — it means the agent believed the label and replayed a row whose
+    text says the payload is broken. Overwriting it would destroy the
+    result, so the hook refuses instead."""
+    from app.models.enums import JobStatus
+    from app.models.job import Job
+    from sqlalchemy import select as _select
+
+    redis_stub = _RedisStub()
+    app, teardown = _mcp_app_with_chaos_enabled(db_session, redis_stub)
+    args = {"mislabel": True, "fixture_name": "drift-probe"}
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app, raise_app_exceptions=False),
+            base_url="http://test",
+        ) as ac:
+            token = await _token(
+                db_session, default_tenant.id, [Scope.CHAOS_INVOKE.value]
+            )
+            first = _content(
+                await _call(ac, token, "create_mislabeled_dlq_job", args)
+            )
+            second = _content(
+                await _call(ac, token, "create_mislabeled_dlq_job", args)
+            )
+            assert first["created"] is True
+            assert second["created"] is False
+            assert second["job_id"] == first["job_id"]
+
+            # A replay is what moves it out of dead_letter.
+            row = (
+                await db_session.execute(
+                    _select(Job).where(Job.id == uuid.UUID(first["job_id"]))
+                )
+            ).scalar_one()
+            row.status = JobStatus.PENDING.value
+            await db_session.flush()
+            body = await _call(
+                ac, token, "create_mislabeled_dlq_job", args
+            )
+        assert body["error"]["code"] == protocol.MCP_TOOL_ERROR
+        assert body["error"]["data"]["error_code"] == (
+            "mislabeled_fixture_name_in_use"
+        )
+        # The refusal names the cause, not just the code — a builder reading
+        # it should not have to guess which drift fired.
+        rendered = json.dumps(body["error"])
+        assert "something replayed it" in rendered
+        assert "never rewrites it" in rendered
+    finally:
+        teardown()
+
+
+async def test_create_mislabeled_dlq_job_not_registered_when_chaos_disabled(
+    db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
+) -> None:
+    """ADR 0008 gate 1, on the newest chaos tool. A hook that can write a
+    deliberately misleading row is exactly the kind that must be absent
+    from `tools/list` on a stack with chaos off."""
+    from app.mcp.registry import get_tool
+
+    assert get_tool("create_mislabeled_dlq_job") is None
 
 
 # ---------------------------------------------------------------------------
