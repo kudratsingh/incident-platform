@@ -593,9 +593,16 @@ async def test_saturate_redis_missing_chaos_scope_is_forbidden(
 async def test_create_bad_data_job_inserts_human_required_dlq_entry(
     db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
 ) -> None:
-    """The synthetic DLQ row lands with `remediation_hint=human_required`
-    so `replay_dlq_by_category` refuses to touch it — that's exactly the
-    branch the agent's escalate-not-replay path exercises."""
+    """Omitting `remediation_hint` keeps the pre-v0.6.2 behaviour: the row
+    lands `human_required` so `replay_dlq_by_category` refuses to touch it
+    — the branch the agent's escalate-not-replay path exercises.
+
+    Also pins the two things WO-R2-158 added around it: the id is derived
+    from the tenant and `fixture_name` rather than random, and the row is
+    tagged as a declared fixture so the reset DELETEs it.
+    """
+    from app.lab.dlq_failure_stories import story
+    from app.mcp.tools.chaos.create_bad_data_job import fixture_id
     from app.models.enums import RemediationHint
     from app.models.job import Job
     from sqlalchemy import select as _select
@@ -616,9 +623,17 @@ async def test_create_bad_data_job_inserts_human_required_dlq_entry(
                 )
             )
         assert payload["accepted"] is True
+        assert payload["created"] is True
         assert (
             payload["remediation_hint"]
             == RemediationHint.HUMAN_REQUIRED.value
+        )
+        # Deterministic and pinnable: the caller could have computed this
+        # before invoking, which is what lets a scenario name the row it
+        # grades in YAML written before the run.
+        assert payload["fixture_name"] == "bad-data-job"
+        assert payload["job_id"] == str(
+            fixture_id(default_tenant.id, "bad-data-job")
         )
         rows = (
             await db_session.execute(
@@ -631,6 +646,238 @@ async def test_create_bad_data_job_inserts_human_required_dlq_entry(
         assert (
             job.remediation_hint == RemediationHint.HUMAN_REQUIRED.value
         )
+        assert job.error_message == story("csv_bad_row").error_message
+        # Declared scaffolding: `_delete_seeded_dlq_fixtures` DELETEs on the
+        # marker, and `chaos_fixture` stays for provenance.
+        assert job.payload["seeded_fixture"] is True
+        assert job.payload["chaos_fixture"] == "bad_data_job"
+        assert job.payload["fixture_name"] == "bad-data-job"
+    finally:
+        teardown()
+
+
+@pytest.mark.parametrize("declared", ["unclassified", None])
+async def test_create_bad_data_job_can_leave_the_row_unclassified(
+    db_session: AsyncSession,
+    default_tenant,  # type: ignore[no-untyped-def]
+    test_user,  # type: ignore[no-untyped-def]
+    declared: str | None,
+) -> None:
+    """WO-R2-158 / the `dlq_human_required_escalates` drill.
+
+    Seeded pre-classified, the fence the drill grades is a value the row
+    already has. With `remediation_hint` unclassified the row arrives with
+    a NULL hint and a bad-data error text, so the agent has to read the
+    error, conclude a replay cannot fix a bad row in the stored payload,
+    and raise the fence itself.
+
+    Both spellings are tested because a scenario file that means an empty
+    hint naturally writes `null`, while the inputSchema an agent reads is
+    clearer as a word. Omitting the field is a third thing and must NOT
+    land here — that is the test above.
+    """
+    from app.lab.dlq_failure_stories import coherence_violations, story
+    from app.mcp.tools.chaos.create_bad_data_job import fixture_id
+    from app.models.job import Job
+    from sqlalchemy import select as _select
+
+    redis_stub = _RedisStub()
+    app, teardown = _mcp_app_with_chaos_enabled(db_session, redis_stub)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app, raise_app_exceptions=False),
+            base_url="http://test",
+        ) as ac:
+            token = await _token(
+                db_session, default_tenant.id, [Scope.CHAOS_INVOKE.value]
+            )
+            payload = _content(
+                await _call(
+                    ac,
+                    token,
+                    "create_bad_data_job",
+                    {
+                        "remediation_hint": declared,
+                        "fixture_name": "unfenced-csv",
+                    },
+                )
+            )
+        assert payload["accepted"] is True
+        assert payload["remediation_hint"] is None
+        assert payload["job_id"] == str(
+            fixture_id(default_tenant.id, "unfenced-csv")
+        )
+
+        job = (
+            await db_session.execute(
+                _select(Job).where(Job.id == uuid.UUID(payload["job_id"]))
+            )
+        ).scalar_one()
+        assert job.status == "dead_letter"
+        assert job.remediation_hint is None, (
+            "an unclassified row is the whole point — a stamped hint makes "
+            "the agent's fence a no-op the eval cannot see"
+        )
+        # The error text is what a human would read, and it is the declared
+        # table entry rather than a string composed here.
+        assert (
+            job.error_message
+            == story("unclassified_csv_bad_row").error_message
+        )
+        assert "invalid literal for int()" in job.error_message
+        assert "row 8,214" in job.error_message
+        # And the pair is coherent by the lab's own screen: nothing has
+        # classified the row, and the text does not invite a replay.
+        assert not coherence_violations(
+            job.remediation_hint, job.error_message
+        )
+        # Nothing has fenced it yet — that is the state the drill starts in.
+        assert job.fenced_at is None
+        assert job.fenced_by is None
+        assert job.payload["seeded_fixture"] is True
+    finally:
+        teardown()
+
+
+async def test_create_bad_data_job_repeat_is_idempotent_until_it_drifts(
+    db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
+) -> None:
+    """Same contract as `create_stuck_dag`: a repeat that finds the row
+    still matching is a no-op; once it has drifted the hook refuses rather
+    than rewriting a row that is now evidence.
+
+    The load-bearing drift here is the *hint*, not the status. A fence is
+    exactly what the drill measures, so silently returning `created=False`
+    over a fenced row would hand the next run a pre-fenced world and grade
+    it clean.
+    """
+    from app.models.enums import RemediationHint
+    from app.models.job import Job
+    from sqlalchemy import select as _select
+
+    args = {
+        "remediation_hint": "unclassified",
+        "fixture_name": "unfenced-csv",
+    }
+    redis_stub = _RedisStub()
+    app, teardown = _mcp_app_with_chaos_enabled(db_session, redis_stub)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app, raise_app_exceptions=False),
+            base_url="http://test",
+        ) as ac:
+            token = await _token(
+                db_session, default_tenant.id, [Scope.CHAOS_INVOKE.value]
+            )
+            first = _content(
+                await _call(ac, token, "create_bad_data_job", args)
+            )
+            assert first["created"] is True
+
+            repeat = _content(
+                await _call(ac, token, "create_bad_data_job", args)
+            )
+            assert repeat["created"] is False
+            assert repeat["job_id"] == first["job_id"]
+
+            # Declaring a different hint over the same name is drift too:
+            # returning the stored row would report a fixture the caller
+            # did not ask for.
+            mismatched = await _call(
+                ac,
+                token,
+                "create_bad_data_job",
+                {**args, "remediation_hint": "human_required"},
+            )
+            assert (
+                mismatched["error"]["data"]["error_code"]
+                == "bad_data_fixture_name_in_use"
+            )
+
+            # Now fence the row the way the agent would, and re-seed.
+            job = (
+                await db_session.execute(
+                    _select(Job).where(
+                        Job.id == uuid.UUID(first["job_id"])
+                    )
+                )
+            ).scalar_one()
+            job.remediation_hint = RemediationHint.HUMAN_REQUIRED.value
+            await db_session.flush()
+
+            after_fence = await _call(
+                ac, token, "create_bad_data_job", args
+            )
+        assert (
+            after_fence["error"]["data"]["error_code"]
+            == "bad_data_fixture_name_in_use"
+        )
+        message = json.dumps(after_fence["error"])
+        assert "human_required" in message
+        assert "reset the environment" in message
+    finally:
+        teardown()
+
+
+async def test_create_bad_data_job_ids_are_scoped_to_the_calling_tenant(
+    db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
+) -> None:
+    """The tenant is in the uuid5 key so two tenants can drill the same
+    `fixture_name` concurrently.
+
+    Without it the second tenant's INSERT would collide on a primary key
+    its RLS-scoped probe cannot see — a 500 where the contract promises a
+    409. Same reasoning as `create_stuck_dag`'s per-tenant chain ids
+    (WO-R2-55); widening the probe past RLS would be the wrong repair.
+    """
+    from app.mcp.tools.chaos.create_bad_data_job import fixture_id
+    from app.models.job import Job
+    from app.models.tenant import Tenant
+    from sqlalchemy import select as _select
+
+    other = Tenant(
+        slug=f"chaos-t-{uuid.uuid4().hex[:8]}",
+        name="Second driller",
+        is_active=True,
+    )
+    db_session.add(other)
+    await db_session.flush()
+
+    assert fixture_id(default_tenant.id, "same-name") != fixture_id(
+        other.id, "same-name"
+    )
+
+    redis_stub = _RedisStub()
+    app, teardown = _mcp_app_with_chaos_enabled(db_session, redis_stub)
+    try:
+        ids = []
+        for tenant_id in (default_tenant.id, other.id):
+            async with AsyncClient(
+                transport=ASGITransport(app=app, raise_app_exceptions=False),
+                base_url="http://test",
+            ) as ac:
+                token = await _token(
+                    db_session, tenant_id, [Scope.CHAOS_INVOKE.value]
+                )
+                payload = _content(
+                    await _call(
+                        ac,
+                        token,
+                        "create_bad_data_job",
+                        {"fixture_name": "same-name"},
+                    )
+                )
+            assert payload["created"] is True
+            ids.append(payload["job_id"])
+        assert ids[0] != ids[1]
+        rows = (
+            await db_session.execute(
+                _select(Job).where(
+                    Job.id.in_([uuid.UUID(i) for i in ids])
+                )
+            )
+        ).scalars().all()
+        assert {r.tenant_id for r in rows} == {default_tenant.id, other.id}
     finally:
         teardown()
 
@@ -778,8 +1025,10 @@ async def test_create_bad_data_job_lazy_creates_chaos_owner_in_caller_tenant(
         assert owner.is_active is False
         assert owner.email.startswith("chaos-owner")
 
-        # Second call in the same tenant reuses the same chaos user
-        # (idempotent) — no proliferation of chaos-owner rows.
+        # Second call in the same tenant is an idempotent repeat: same
+        # deterministic id, `created=False`, and no proliferation of
+        # chaos-owner rows. (Before WO-R2-158 this inserted a second,
+        # randomly-idded row that merely happened to reuse the owner.)
         async with AsyncClient(
             transport=ASGITransport(app=app, raise_app_exceptions=False),
             base_url="http://test",
@@ -787,6 +1036,8 @@ async def test_create_bad_data_job_lazy_creates_chaos_owner_in_caller_tenant(
             second = _content(
                 await _call(ac, token, "create_bad_data_job", {})
             )
+        assert second["created"] is False
+        assert second["job_id"] == payload["job_id"]
         second_job = (
             await db_session.execute(
                 _select(Job).where(Job.id == uuid.UUID(second["job_id"]))

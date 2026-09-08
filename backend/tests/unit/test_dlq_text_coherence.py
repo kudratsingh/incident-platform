@@ -43,7 +43,11 @@ from app.lab.dlq_failure_stories import (
     story_for,
     triage_violations,
 )
-from app.mcp.tools.chaos.create_bad_data_job import CreateBadDataJobInput
+from app.mcp.tools.chaos.create_bad_data_job import (
+    CreateBadDataJobInput,
+    _declared_hint,
+    _default_error_for,
+)
 from app.mcp.tools.chaos.create_stuck_dag import CreateStuckDagInput
 from app.mcp.tools.chaos.poison_message import _dlq_error_for_topic
 from app.mcp.tools.chaos.seed_dlq_messages import SeedDlqMessagesInput
@@ -117,8 +121,18 @@ def test_no_writer_still_stamps_the_pair_that_shipped() -> None:
             "the job did not work",
             "does not say why to wait",
         ),
-        # A classified text under "nothing has classified this".
-        (None, "ValueError: invalid literal for int()", "implies a class"),
+        # A "replay me" text under "nothing has classified this". The null
+        # hint's rule is asymmetric — see the two cases below it.
+        (
+            None,
+            "UpstreamTimeout: timed out after 30s, nothing was committed",
+            "invites a replay",
+        ),
+        (
+            None,
+            "RateLimited: 429 Too Many Requests (retry-after: 120s)",
+            "invites a replay",
+        ),
     ],
 )
 def test_the_screen_catches_each_direction_of_contradiction(
@@ -130,6 +144,65 @@ def test_the_screen_catches_each_direction_of_contradiction(
 
 def test_an_unknown_hint_is_a_violation_not_a_pass() -> None:
     assert coherence_violations("replay_later", "anything at all")
+
+
+# ---------------------------------------------------------------------------
+# 1b. The null hint's rule is asymmetric, and that is the point (WO-R2-158)
+# ---------------------------------------------------------------------------
+
+
+def test_an_unclassified_row_may_carry_a_permanent_fault_text() -> None:
+    """The rule used to be "the text must not imply a class", which made
+    the one pair an escalation drill needs unrepresentable.
+
+    A hint is a classification; an error text is the symptom the failing
+    code recorded. "Nobody has classified this" does not disagree with
+    "the symptom is a bad row in the stored payload" — that text is the
+    evidence a triage pass would read to *reach* `human_required`, and it
+    points away from a replay, which is where a null hint already sits.
+    It is also the normal state of an organically dead-lettered job on
+    this platform, where LLM triage is off by default.
+
+    RED before WO-R2-158: reported "implies a class" and the story below
+    could not exist.
+    """
+    reasons = coherence_violations(
+        None,
+        "ValueError: invalid literal for int() with base 10: 'N/A' at "
+        "row 8,214",
+    )
+    assert not reasons, reasons
+
+
+def test_the_unclassified_bad_data_pair_is_an_entry_in_the_table() -> None:
+    """Not merely admissible — declared, so a reader of the table can see
+    which text `create_bad_data_job` stamps for an unclassified row
+    instead of finding it composed at the call site."""
+    pinned = story("unclassified_csv_bad_row")
+    assert pinned.hint is None
+    assert "invalid literal for int()" in pinned.error_message
+    assert "row 8,214" in pinned.error_message
+    assert not coherence_violations(pinned.hint, pinned.error_message)
+    # A null hint may never carry a triage block: that block *is* a
+    # classification, so it contradicts the hint the way a text cannot.
+    assert pinned.triage is None
+    assert not triage_violations(pinned.hint, pinned.triage)
+    assert pinned in DLQ_FAILURE_STORIES[None]
+
+
+def test_the_unclassified_default_still_says_nothing_about_its_class() -> None:
+    """Adding the bad-data variant must not move what a writer given only
+    "uncategorised" stamps. Element 0 of the null tuple stays the
+    worker-exit text, so `default_error_for(None)` is unchanged."""
+    assert default_error_for(None) == story("unclassified_worker_exit").error_message
+    assert story("unclassified_worker_exit").error_message != story(
+        "unclassified_csv_bad_row"
+    ).error_message
+
+
+def test_a_null_hint_still_refuses_a_triage_block() -> None:
+    """The half of the null-hint rule that did NOT loosen."""
+    assert triage_violations(None, story("csv_bad_row").triage)
 
 
 # ---------------------------------------------------------------------------
@@ -206,13 +279,15 @@ def _every_writer_pair() -> list[tuple[str | None, str]]:
         )
         pairs.append((hint, default_error_for(hint)))
 
-    # `create_bad_data_job`: a literal default on a hint fixed in code.
-    pairs.append(
-        (
-            RemediationHint.HUMAN_REQUIRED.value,
-            CreateBadDataJobInput().error_message,
-        )
-    )
+    # `create_bad_data_job`: two declarable hints since WO-R2-158, each
+    # resolving its own text when `error_message` is omitted. Read through
+    # the hook's own resolver rather than the table, so a hook that starts
+    # composing its strings by hand shows up here as an incoherent pair.
+    for declared in ("human_required", "unclassified"):
+        inp = CreateBadDataJobInput(remediation_hint=declared)  # type: ignore[arg-type]
+        assert inp.error_message is None
+        hint = _declared_hint(inp.remediation_hint)
+        pairs.append((hint, _default_error_for(hint)))
 
     # `poison_message`: composes its own string around the topic.
     pairs.append(
@@ -246,7 +321,14 @@ def test_the_walk_covers_every_writer() -> None:
     """Guards the guard: a writer dropped from `_every_writer_pair`
     would silently shrink the check to nothing."""
     pairs = _every_writer_pair()
-    assert len(pairs) == 3 + 1 + 1 + len(seed._dlq_specs())
+    # seed_dlq_messages/create_stuck_dag's three hints + create_bad_data_job's
+    # two declarable hints + poison_message + the seeded pack.
+    assert len(pairs) == 3 + 2 + 1 + len(seed._dlq_specs())
+    # Both of `create_bad_data_job`'s hints are actually in the walk — the
+    # unclassified one is the pair WO-R2-158 added, so a regression that
+    # dropped the argument would show up as a shrinking count above and as
+    # a missing null hint here.
+    assert None in [hint for hint, _ in pairs]
 
 
 def test_create_stuck_dag_default_hint_is_still_covered() -> None:

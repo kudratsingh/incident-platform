@@ -16,12 +16,19 @@ injection whatever we call it, so it inherits the triple gate from
 therefore never fire in production.
 
 Rows are tagged `payload.seeded_fixture = true` so the reset sweep can
-DELETE them rather than cancel them. Chaos rows created by
-`create_bad_data_job` are *cancelled* on sweep because they may be
-attached to a real user and read as that user's history; these are
-explicitly ephemeral scaffolding declared by a scenario, so leaving
-thousands of `cancelled` rows behind across eval runs would be litter,
-not history.
+DELETE them rather than cancel them: they are explicitly ephemeral
+scaffolding declared by a scenario, and leaving thousands of `cancelled`
+rows behind across eval runs would be litter, not history.
+
+This paragraph used to add "chaos rows created by `create_bad_data_job`
+are *cancelled* on sweep because they may be attached to a real user and
+read as that user's history". That stopped being true in v0.6.2, when
+that hook gained a deterministic, scenario-pinned id (WO-R2-158) and
+became a declared fixture like these — it now writes the same marker and
+is DELETEd by the same sweep. The disposal rule turns on whether a row was
+*declared*, not on who happens to own it: `create_stuck_dag` has always
+tagged the marker while resolving its owner through `_fixture_owner`
+below, which prefers a real user in the tenant.
 """
 
 import uuid
@@ -40,9 +47,13 @@ from sqlalchemy import select
 
 logger = get_logger(__name__)
 
-# Marker the reset sweep keys off. Distinct from `chaos_fixture`
-# (create_bad_data_job / poison_message) because the disposal rule
-# differs — see module docstring.
+# Marker the reset sweep DELETEs on. Written by every hook that creates a
+# *declared* fixture — this one, `create_stuck_dag`, `create_bad_data_job`
+# — and imported from here by all of them so there is one spelling.
+# `chaos_fixture` is a different key with a different job: provenance ("which
+# hook wrote this row"), not disposal. `poison_message` carries only
+# `chaos_fixture`, so its row is cancelled rather than deleted; see the
+# module docstring for why declaration is the line.
 SEEDED_FIXTURE_MARKER = "seeded_fixture"
 
 # Canned error strings per hint used to be a dict right here, and it
