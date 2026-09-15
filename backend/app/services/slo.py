@@ -45,6 +45,13 @@ meant the commander could only ever be woken by a human pretending.
 
 De-duplication is by `Alert.dedup_key`, which carries a time bucket, under a
 unique constraint — see `_fast_burn_dedup_key`.
+
+What is measured
+================
+Every objective is computed over rows the platform itself dispatched. Rows a
+lab script wrote straight into the table in a terminal state are excluded from
+both halves of every fraction — see `_LAB_FIXTURE_PAYLOAD_MARKERS`, which is
+what lets the eval world run with evaluation switched ON (WO-R2-132).
 """
 
 import uuid
@@ -61,7 +68,7 @@ from app.models.tenant import DEFAULT_TENANT_ID
 from app.repositories.alert import AlertRepository
 from app.services.alerts import AlertService
 from app.utils.post_commit import run_post_commit
-from sqlalchemy import case, func, select
+from sqlalchemy import TextClause, case, func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -150,7 +157,77 @@ _DISPATCHED_STATUSES = (
 )
 
 
-def _dispatched_in_window(since: datetime) -> tuple[Any, ...]:
+# Payload keys a lab writer stamps on a row it wrote directly into the table
+# in the state it wanted, and the whole of WO-R2-132.
+#
+#   * `eval_fixture`   — `scripts/seed_eval_fixtures.py`, the standing eval
+#     world: 4 dead-lettered jobs, 2 failed, 1 completed and 2 waiting.
+#   * `seeded_fixture` — a scenario's own scaffolding, written by the chaos
+#     hooks (`app/mcp/tools/chaos/seed_dlq_messages.py` owns the constant;
+#     `create_stuck_dag`, `create_bad_data_job`, `poison_message` and
+#     `create_mislabeled_dlq_job` import it). `reset_eval_state` DELETEs
+#     exactly these rows, which is what makes the name a contract rather
+#     than a convention.
+#
+# None of those rows was ever dispatched, ran, failed or completed. They were
+# INSERTed in a terminal state to give a read tool something to read, so they
+# are not evidence about anything this platform did — and counting them is
+# measuring the seeder. That is the same judgement `_DISPATCHED_STATUSES`
+# makes about cancellations, one step earlier in the row's life: a row with no
+# dispatch outcome belongs in neither half of the fraction.
+#
+# Concretely, before this exclusion the eval world was a 14.4x fast burn by
+# construction. 4 of its 5 terminal jobs are dead-lettered, so the completion
+# objective read 20% against a 99% target — an 80x burn — and the evaluator
+# raised a critical alert within one interval of every fresh boot, re-firing
+# hourly on `_fast_burn_dedup_key`'s bucket. The eval world's answer was to
+# switch the evaluator off (`SLO_EVALUATION_INTERVAL_SECONDS=0`), which also
+# switched off the only non-chaos alert producer the agent under test has.
+#
+# Unconditional, with no setting to turn it off: nothing outside the lab
+# writes these markers. The chaos hooks are `CHAOS_ENABLED`-gated and the seed
+# script refuses any target `settings` does not name (`scripts/eval_safety.py`),
+# so in a real deployment the predicate matches nothing and costs one index-less
+# boolean per row in the window. Residual risk is a caller who writes the exact
+# top-level marker into a real job's payload by hand; that row drops out of an
+# objective, which is the mild end of the same risk `_delete_seeded_dlq_fixtures`
+# already carries (it DELETEs such a row).
+_LAB_FIXTURE_PAYLOAD_MARKERS = ("eval_fixture", "seeded_fixture")
+
+
+def _not_a_lab_fixture(session: AsyncSession) -> TextClause:
+    """`True` for every row that is NOT declared lab scaffolding.
+
+    Dialect-branched for the same reason `_delete_seeded_dlq_fixtures` is:
+    the predicate has no portable spelling. `PortableJSON` renders as JSONB
+    on Postgres, so containment is available there and is the safe test —
+    it matches a *top-level* key holding boolean `true` and nothing else,
+    where `(payload ->> 'eval_fixture')::boolean` would raise on a hostile
+    value like `{"eval_fixture": "banana"}` and take the evaluation pass
+    down with it. SQLite (the unit harness) spells the same test
+    `json_extract(payload, '$.eval_fixture') = 1`.
+
+    `COALESCE` around each arm is load-bearing. `payload` is nullable and
+    both spellings return NULL for a NULL payload, so a bare `NOT (...)`
+    would be NULL rather than true and would silently drop every job that
+    carries no payload at all — most of them — out of the denominator.
+    """
+    if session.get_bind().dialect.name == "postgresql":
+        arms = [
+            f"""COALESCE(jobs.payload @> '{{"{marker}": true}}'::jsonb, false)"""
+            for marker in _LAB_FIXTURE_PAYLOAD_MARKERS
+        ]
+    else:
+        arms = [
+            f"COALESCE(json_extract(jobs.payload, '$.{marker}'), 0) = 1"
+            for marker in _LAB_FIXTURE_PAYLOAD_MARKERS
+        ]
+    return text("NOT (" + " OR ".join(arms) + ")")
+
+
+def _dispatched_in_window(
+    session: AsyncSession, since: datetime
+) -> tuple[Any, ...]:
     """The dispatch-latency denominator, as WHERE clauses.
 
     One definition for both computation paths. `_compute_latency_slo` takes
@@ -160,7 +237,11 @@ def _dispatched_in_window(since: datetime) -> tuple[Any, ...]:
     production on one copy and the tests on the other, and could drift
     indefinitely without a single test turning red.
     """
-    return (Job.created_at >= since, Job.status.in_(_DISPATCHED_STATUSES))
+    return (
+        Job.created_at >= since,
+        Job.status.in_(_DISPATCHED_STATUSES),
+        _not_a_lab_fixture(session),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -239,6 +320,7 @@ async def _compute_completion_slo(
     stmt = select(total_expr, failed_expr).where(
         Job.created_at >= since,
         Job.status.in_([JobStatus.COMPLETED, JobStatus.DEAD_LETTER]),
+        _not_a_lab_fixture(session),
     )
     row = (await session.execute(stmt)).one()
     total = int(row.total or 0)
@@ -262,6 +344,9 @@ async def _compute_latency_slo(
     exactly what "we failed to dispatch it" means. Outside that set the same
     NULL means "not dispatched *yet*", or "deliberately never dispatched",
     which is why the denominator and not the numerator is where this is fixed.
+
+    Declared lab fixtures are out of the denominator too — they were never
+    dispatched at all, by anything (`_LAB_FIXTURE_PAYLOAD_MARKERS`).
     """
     assert slo.latency_threshold_seconds is not None
     since = datetime.now(UTC) - timedelta(hours=slo.window_hours)
@@ -280,7 +365,9 @@ async def _compute_latency_slo(
         )
     ).label("failed")
 
-    stmt = select(total_expr, failed_expr).where(*_dispatched_in_window(since))
+    stmt = select(total_expr, failed_expr).where(
+        *_dispatched_in_window(session, since)
+    )
     try:
         row = (await session.execute(stmt)).one()
     except Exception:
@@ -299,7 +386,7 @@ async def _compute_latency_slo_python(
     """Portable fallback for engines that lack EXTRACT(EPOCH FROM ...)."""
     assert slo.latency_threshold_seconds is not None
     stmt = select(Job.created_at, Job.started_at).where(
-        *_dispatched_in_window(since)
+        *_dispatched_in_window(session, since)
     )
     total = 0
     failed = 0
