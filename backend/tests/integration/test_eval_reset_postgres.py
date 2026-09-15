@@ -15,6 +15,13 @@ and two more that the SQLite unit harness can only half-exercise:
   * `_delete_seeded_dlq_fixtures` — the production predicate is JSONB
     containment; SQLite runs a different statement, so the shape that
     actually ships is only covered here (S-02 / D-07).
+  * `_resolve_organic_alerts` — the WO-R2-131 sweep binds five `uuid.UUID`
+    values against a real `uuid` column, which is the half SQLite's
+    `CHAR(32)` rendering cannot stand in for.
+  * `app/services/slo.py`'s lab-fixture exclusion — the production
+    predicate is JSONB containment (`payload @> '{"eval_fixture": true}'`);
+    SQLite runs `json_extract`, so the shape that ships is only covered
+    here, and so is its refusal to raise on a non-boolean value.
   * `_delete_chaos_owner_users` — its documented side effect on
     `audit_logs` is produced by FK referential actions, and SQLite's FK
     enforcement is PRAGMA-dependent (the unit conftest does not enable
@@ -35,6 +42,7 @@ import os
 import subprocess
 import sys
 import uuid
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -636,3 +644,173 @@ async def test_rebuild_read_model_projects_postgres_rows(
     # 4 projected rows × (tenant key + user key).
     assert summary["members"] == 8
     assert redis.ttls[completed_key] > 0
+
+
+# ---------------------------------------------------------------------------
+# _resolve_organic_alerts — WO-R2-131 on the server that actually runs it
+# ---------------------------------------------------------------------------
+
+
+async def _seed_alert_population(session_factory: Any) -> tuple[Any, uuid.UUID]:
+    """The five seeded fixture alerts plus one organic `slo:*` alert.
+
+    Returns (tenant_id, organic_alert_id)."""
+    from app.models.alert import Alert
+
+    async with session_factory() as session:
+        async with session.begin():
+            tenant_id, _ = await _make_tenant_and_user(session, "alerts")
+            session.add_all(
+                Alert(**spec)
+                for spec in seed_eval_fixtures._alert_rows(tenant_id)
+            )
+            organic = Alert(
+                id=uuid.uuid4(),
+                tenant_id=tenant_id,
+                severity="critical",
+                source="slo:job_completion_rate",
+                title="SLO fast burn: Job completion rate",
+                description="burning at 80.0x the sustainable rate",
+                fired_at=datetime.now(UTC) - timedelta(minutes=3),
+                resolved_at=None,
+                dedup_key="slo:job_completion_rate:fast_burn:487000",
+            )
+            session.add(organic)
+    return tenant_id, organic.id
+
+
+async def test_organic_alerts_are_swept_and_the_seeded_baseline_survives(
+    session_factory: Any,
+) -> None:
+    """The WO-R2-131 sweep against real Postgres.
+
+    The unit tier proves the predicate; this proves the binding. The spare
+    list is five `uuid.UUID` values against a real `uuid` column — the exact
+    place the Postgres/SQLite split bites, and the reason this statement is
+    Core `update()` rather than the `text()` its siblings use. `resolved_at`
+    lands as a real `timestamptz` from the server's own clock."""
+    from app.models.alert import Alert
+    from sqlalchemy import select
+
+    tenant_id, organic_id = await _seed_alert_population(session_factory)
+
+    resolved = await reset_eval_state._resolve_organic_alerts(session_factory)
+
+    assert resolved == 1, "only the organic alert was outside the baseline"
+    async with session_factory() as session:
+        rows = {
+            row.id: row
+            for row in (
+                await session.execute(
+                    select(Alert).where(Alert.tenant_id == tenant_id)
+                )
+            ).scalars()
+        }
+    assert rows[organic_id].resolved_at is not None
+    active = [row for row in rows.values() if row.resolved_at is None]
+    assert len(active) == 3, "the world audit's `active alerts 3` baseline"
+    assert {row.source for row in active} == {"kafka", "dlq", "api"}
+
+    assert (
+        await reset_eval_state._resolve_organic_alerts(session_factory) == 0
+    ), "idempotent: a second reset over post-reset state changes nothing"
+
+
+# ---------------------------------------------------------------------------
+# SLO lab-fixture exclusion — the JSONB half of WO-R2-132
+#
+# `app/services/slo.py` branches on the dialect exactly as
+# `_delete_seeded_dlq_fixtures` does, so the statement that ships (JSONB
+# containment) is invisible to the SQLite unit harness, which runs
+# `json_extract`. Same reason this file covers the DELETE predicate: a
+# dialect-branched statement is only tested where it runs.
+# ---------------------------------------------------------------------------
+
+
+async def test_the_evaluator_ignores_lab_fixtures_on_postgres(
+    session_factory: Any,
+) -> None:
+    """A freshly seeded eval world does not burn the budget on Postgres.
+
+    4 dead-lettered of 5 terminal jobs is an 80x burn against a 99%
+    objective, which is what made every fresh boot of the eval world page
+    about itself within one evaluation interval (WO-R2-132)."""
+    from app.models.enums import JobStatus
+    from app.services.slo import compute_all, is_fast_burning
+
+    async with session_factory() as session:
+        async with session.begin():
+            tenant_id, user_id = await _make_tenant_and_user(session, "slo")
+            session.add_all(
+                [
+                    *(
+                        _job(tenant_id, user_id, payload={"eval_fixture": True})
+                        for _ in range(4)
+                    ),
+                    _job(
+                        tenant_id,
+                        user_id,
+                        status=JobStatus.COMPLETED.value,
+                        payload={"eval_fixture": True},
+                    ),
+                ]
+            )
+
+    async with session_factory() as session:
+        states = await compute_all(session)
+
+    completion = next(s for s in states if s.definition.id == "job_completion_rate")
+    assert completion.total == 0
+    assert is_fast_burning(completion) is False
+
+
+async def test_containment_spares_real_rows_and_survives_a_hostile_value(
+    session_factory: Any,
+) -> None:
+    """Containment matches a top-level key holding boolean `true`, nothing
+    else — and does not raise on a value that is not a boolean.
+
+    `(payload ->> 'eval_fixture')::boolean` would have been the obvious
+    spelling and is the one this deliberately avoids: on
+    `{"eval_fixture": "banana"}` the cast raises, which on Postgres aborts
+    the transaction and takes the whole evaluation pass with it. Containment
+    just answers false. The near-miss payloads are the S-02 tightening,
+    restated where it now decides an SLO rather than a DELETE."""
+    from app.models.enums import JobStatus
+    from app.services.slo import compute_all
+
+    near_misses: list[dict[str, Any]] = [
+        {"tag": "eval_fixture"},
+        {"nested": {"eval_fixture": True}},
+        {"eval_fixture": False},
+        {"eval_fixture": "banana"},
+        {"seeded_fixture": 1},
+    ]
+    async with session_factory() as session:
+        async with session.begin():
+            tenant_id, user_id = await _make_tenant_and_user(session, "hostile")
+            session.add_all(
+                [
+                    *(
+                        _job(tenant_id, user_id, payload=payload)
+                        for payload in near_misses
+                    ),
+                    *(
+                        _job(
+                            tenant_id,
+                            user_id,
+                            status=JobStatus.COMPLETED.value,
+                            payload=None,
+                        )
+                        for _ in range(95)
+                    ),
+                ]
+            )
+
+    async with session_factory() as session:
+        states = await compute_all(session)
+
+    completion = next(s for s in states if s.definition.id == "job_completion_rate")
+    assert completion.total == 100, "a near-miss marker excluded a real row"
+    assert completion.failed == 5, "every near-miss row is a counted failure"
+    assert completion.healthy is False

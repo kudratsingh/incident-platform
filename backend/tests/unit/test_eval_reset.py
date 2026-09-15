@@ -27,6 +27,7 @@ import inspect
 import json
 import os
 import sys
+import uuid
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock
 
@@ -834,6 +835,168 @@ async def test_resolve_chaos_alerts_clears_bad_deploy_residue(
     assert total == 1
     assert [a.source for a in active] == ["kafka"]
     assert not [a for a in active if a.source.startswith("chaos:")]
+
+
+# ---------------------------------------------------------------------------
+# _resolve_organic_alerts — WO-R2-131, the distractor that aborted run C
+# ---------------------------------------------------------------------------
+
+
+def test_the_spared_alert_ids_come_from_the_seed_itself() -> None:
+    """The exclusion list is the seeded baseline, read from the seeder.
+
+    Pinned because the whole design rests on it: this sweep resolves
+    everything it does not recognise, so a spare list that had been copied
+    into `reset_eval_state` and left behind would resolve a seeded fixture
+    alert on every reset and quietly move the `active alerts 3` baseline
+    every scenario's precondition reads."""
+    reset = _reset_module()
+    seed = _seed_module()
+
+    spared = reset._seeded_alert_ids()
+
+    assert len(spared) == 5
+    assert set(spared) == {
+        uuid.UUID(str(spec["id"])) for spec in seed._alert_rows(uuid.uuid4())
+    }
+
+
+async def test_organic_alerts_are_resolved_and_the_seeded_five_survive(
+    db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
+) -> None:
+    """Both halves of the WO-R2-131 requirement in one pass.
+
+    An organic `slo:*` alert — the one `chaos:%` could never match, and the
+    one whose three stray copies aborted run C pre-spend on 2026-08-31 — is
+    resolved. The five seeded fixture alerts are untouched, so the world
+    audit's `active alerts 3` baseline is exactly what it was.
+
+    A chaos alert is in the population too: this sweep runs second and would
+    normally find it already resolved, but it must be able to catch it, or
+    the pair leaves a gap if the order ever changes."""
+    reset = _reset_module()
+    seed = _seed_module()
+    from app.models.alert import Alert
+    from app.repositories.alert import AlertRepository
+
+    tenant_id = default_tenant.id
+    now = datetime.now(UTC)
+    specs = seed._alert_rows(tenant_id)
+    seeded_active = {
+        uuid.UUID(str(spec["id"]))
+        for spec in specs
+        if spec["resolved_at"] is None
+    }
+    seeded_resolved = {
+        uuid.UUID(str(spec["id"])): spec["resolved_at"]
+        for spec in specs
+        if spec["resolved_at"] is not None
+    }
+    assert len(seeded_active) == 3, "the seeded baseline is 3 active alerts"
+
+    organic = Alert(
+        tenant_id=tenant_id,
+        severity="critical",
+        source="slo:job_completion_rate",
+        title="SLO fast burn: Job completion rate",
+        description="burning at 80.0x the sustainable rate",
+        fired_at=now - timedelta(minutes=3),
+        resolved_at=None,
+        dedup_key="slo:job_completion_rate:fast_burn:487000",
+    )
+    chaos = Alert(
+        tenant_id=tenant_id,
+        severity="critical",
+        source="chaos:bad_deploy",
+        title="Simulated bad deploy",
+        fired_at=now - timedelta(minutes=5),
+        resolved_at=None,
+    )
+    db_session.add_all([*(Alert(**spec) for spec in specs), organic, chaos])
+    await db_session.flush()
+    organic_id = organic.id
+
+    resolved = await reset._resolve_organic_alerts(_factory(db_session))
+
+    assert resolved == 2, "the slo alert and the chaos alert, nothing else"
+
+    # The raw UPDATE bypassed the identity map; re-read from the DB.
+    db_session.expire_all()
+    rows = {
+        row.id: row
+        for row in (
+            await db_session.execute(
+                select(Alert).where(Alert.tenant_id == tenant_id)
+            )
+        ).scalars()
+    }
+    assert rows[organic_id].resolved_at is not None
+    for alert_id in seeded_active:
+        assert rows[alert_id].resolved_at is None, (
+            "a seeded fixture alert was swept — the world-audit baseline moved"
+        )
+    for alert_id, was_resolved in seeded_resolved.items():
+        assert rows[alert_id].resolved_at is not None
+        assert not _drifted_seconds(rows[alert_id].resolved_at, was_resolved), (
+            "an already-resolved fixture alert had its timestamp re-stamped"
+        )
+
+    active, total = await AlertRepository(db_session).list_active_for_tenant(
+        tenant_id
+    )
+    assert total == 3, "the post-reset surface is the seeded baseline"
+    assert {a.source for a in active} == {"kafka", "dlq", "api"}
+
+    assert await reset._resolve_organic_alerts(_factory(db_session)) == 0, (
+        "second run over post-reset state must be a no-op"
+    )
+
+
+def _drifted_seconds(actual: datetime, target: datetime) -> bool:
+    """True when two timestamps are more than a second apart.
+
+    SQLite hands back a naive datetime for a `DateTime(timezone=True)`
+    column, so the two cannot be subtracted without normalising first."""
+    if actual.tzinfo is None:
+        actual = actual.replace(tzinfo=UTC)
+    if target.tzinfo is None:
+        target = target.replace(tzinfo=UTC)
+    return abs((actual - target).total_seconds()) > 1.0
+
+
+async def test_an_alert_the_agent_raised_is_resolved_never_deleted(
+    db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
+) -> None:
+    """The disposal class, pinned separately from the predicate.
+
+    An alert id is quoted in the invoking scenario's output and in the
+    trajectory a graded run refers to, so deleting one would mutate history
+    the evidence points at (`reset_eval_state` module docstring, ADR 0012's
+    audit amendment). `resolved_at` is the model's own off-switch: the row
+    leaves `list_active_alerts` and stays readable."""
+    reset = _reset_module()
+    from app.models.alert import Alert
+
+    alert = Alert(
+        tenant_id=default_tenant.id,
+        severity="critical",
+        source="slo:job_dispatch_latency",
+        title="SLO fast burn: Job dispatch latency",
+        fired_at=datetime.now(UTC) - timedelta(minutes=2),
+        resolved_at=None,
+    )
+    db_session.add(alert)
+    await db_session.flush()
+    alert_id = alert.id
+
+    await reset._resolve_organic_alerts(_factory(db_session))
+
+    db_session.expire_all()
+    still_there = (
+        await db_session.execute(select(Alert).where(Alert.id == alert_id))
+    ).scalar_one()
+    assert still_there.resolved_at is not None
+    assert still_there.source == "slo:job_dispatch_latency"
 
 
 # ---------------------------------------------------------------------------

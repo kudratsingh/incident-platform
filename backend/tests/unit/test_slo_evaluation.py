@@ -20,10 +20,11 @@ against.
 """
 
 import asyncio
+import sys
 import uuid
 from collections.abc import AsyncGenerator
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, cast
 from unittest.mock import patch
 
 import pytest
@@ -38,6 +39,7 @@ from app.models.user import User
 from app.services import slo as slo_mod
 from app.workers import dispatcher as dispatcher_mod
 from sqlalchemy import select
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -324,6 +326,36 @@ async def test_queued_and_waiting_jobs_stay_out_of_the_denominator(
     assert state.failed == 0
 
 
+class _PostgresishSession:
+    """The two attributes `_dispatched_in_window` reads, on a fake bind.
+
+    `_not_a_lab_fixture` branches on the dialect name, so rendering the
+    Postgres spelling needs a session that claims to be one. Nothing here
+    executes; the statement is compiled, not run."""
+
+    class _Bind:
+        dialect = postgresql.dialect()
+
+    def get_bind(self, *_args: Any, **_kwargs: Any) -> Any:
+        return self._Bind()
+
+
+def _rendered_denominator() -> str:
+    from sqlalchemy import select as sa_select
+
+    stmt = sa_select(Job.id).where(
+        *slo_mod._dispatched_in_window(
+            cast("Any", _PostgresishSession()), datetime.now(UTC)
+        )
+    )
+    return str(
+        stmt.compile(
+            dialect=postgresql.dialect(),
+            compile_kwargs={"literal_binds": True},
+        )
+    )
+
+
 def test_the_sql_denominator_excludes_cancellations_too() -> None:
     """The SQL path is never exercised by this suite, so assert it directly.
 
@@ -333,24 +365,32 @@ def test_the_sql_denominator_excludes_cancellations_too() -> None:
     `_dispatched_in_window`, and this compiles it to make the exclusion
     visible rather than merely intended.
     """
-    from sqlalchemy import select as sa_select
-    from sqlalchemy.dialects import postgresql
-
-    stmt = sa_select(Job.id).where(
-        *slo_mod._dispatched_in_window(datetime.now(UTC))
-    )
-    sql = str(
-        stmt.compile(
-            dialect=postgresql.dialect(),
-            compile_kwargs={"literal_binds": True},
-        )
-    )
+    sql = _rendered_denominator()
 
     assert "'cancelled'" not in sql
     assert "'waiting'" not in sql
     assert "'pending'" not in sql
     assert "'completed'" in sql
     assert "'dead_letter'" in sql
+
+
+def test_the_sql_denominator_excludes_lab_fixtures_by_jsonb_containment() -> None:
+    """The Postgres spelling of the WO-R2-132 exclusion, rendered.
+
+    The unit suite runs SQLite, so `json_extract` is the arm it executes and
+    the arm that actually ships is invisible to it. Containment (`@>`) is the
+    safe test — it matches a top-level key holding boolean `true` only, where
+    a `::boolean` cast would raise on `{"eval_fixture": "banana"}` and take
+    the evaluation pass down with it — and `COALESCE` is what keeps a NULL
+    payload from turning the whole predicate NULL. Behaviour on a real
+    server is asserted in
+    `backend/tests/integration/test_eval_reset_postgres.py`."""
+    sql = _rendered_denominator()
+
+    for marker in slo_mod._LAB_FIXTURE_PAYLOAD_MARKERS:
+        assert f'''jobs.payload @> \'{{"{marker}": true}}\'::jsonb''' in sql
+    assert sql.count("COALESCE") == len(slo_mod._LAB_FIXTURE_PAYLOAD_MARKERS)
+    assert "::boolean" not in sql
 
 
 # ---------------------------------------------------------------------------
@@ -617,3 +657,121 @@ async def test_slo_evaluation_loop_is_registered_in_worker_loop(
         "the SLO loop is not in worker_loop's task list — the objectives are "
         "computed on demand only, and the alert webhook has no producer"
     )
+
+
+# ---------------------------------------------------------------------------
+# The eval world may run with evaluation ON (WO-R2-132)
+#
+# Every other test here builds its population by hand. These two build it from
+# `scripts/seed_eval_fixtures.py`'s own specs, because the claim is about that
+# world specifically: a fresh boot of it, evaluated, must raise nothing. A
+# hand-written copy of the fixture shape would keep passing after the seed
+# changed, which is the failure this packet exists to end.
+# ---------------------------------------------------------------------------
+
+
+def _seed_module() -> Any:
+    """`scripts/` is not a package on disk; make it importable first."""
+    import importlib
+    import os
+
+    root = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "..", "..")
+    )
+    scripts = os.path.join(root, "scripts")
+    if scripts not in sys.path:
+        sys.path.insert(0, scripts)
+    return importlib.import_module("seed_eval_fixtures")
+
+
+async def _seed_the_eval_world(
+    factory: async_sessionmaker[AsyncSession],
+) -> int:
+    """Insert the standing eval fixtures the way the seed script does:
+    the 4 DLQ rows, the 2 failed-trace rows and the 3-node DAG, each with
+    the lifecycle `_lifecycle` derives and the `eval_fixture` payload
+    marker. Returns how many rows landed."""
+    seed = _seed_module()
+    now = datetime.now(UTC)
+    rows: list[Job] = []
+
+    def _add(job_id: uuid.UUID, status: str, spec: dict[str, Any]) -> None:
+        created_at, started_at, completed_at = seed._lifecycle(
+            now, spec["created_offset"], spec["run_seconds"]
+        )
+        rows.append(
+            Job(
+                id=job_id,
+                tenant_id=DEFAULT_TENANT_ID,
+                user_id=_USER_ID,
+                type=JobType.BULK_API_SYNC,
+                status=status,
+                payload={"eval_fixture": True},
+                created_at=created_at,
+                updated_at=completed_at or created_at,
+                started_at=started_at,
+                completed_at=completed_at,
+            )
+        )
+
+    for spec in seed._dlq_specs():
+        _add(spec["job_id"], JobStatus.DEAD_LETTER, spec)
+    for spec in seed._failed_trace_specs():
+        _add(spec["job_id"], JobStatus.FAILED, spec)
+    for spec in seed._dag_specs():
+        _add(seed.stable(spec["name"]), spec["status"], spec)
+
+    async with factory() as session:
+        async with session.begin():
+            session.add_all(rows)
+    return len(rows)
+
+
+async def test_a_freshly_seeded_eval_world_raises_nothing(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """THE assertion for WO-R2-132, in the shape the work order names.
+
+    Two evaluation passes — more than one interval's worth of ticks — over a
+    world containing nothing but the seeded fixtures. Before the exclusion
+    this raised a critical fast-burn alert on `job_completion_rate` on the
+    first pass and delivered a webhook for it, within one
+    `SLO_EVALUATION_INTERVAL_SECONDS` of every boot and again every hour on
+    the next dedup bucket. That is why the eval world ran with
+    `SLO_EVALUATION_INTERVAL_SECONDS=0` — which also switched off the only
+    non-chaos producer of the alert the agent under test is woken by.
+    """
+    seeded = await _seed_the_eval_world(session_factory)
+    assert seeded == 9, "the seeded world is 4 DLQ + 2 failed + 3 DAG rows"
+
+    first = await _run_evaluation(session_factory)
+    second = await _run_evaluation(session_factory)
+
+    assert first == [], "a fresh eval world alerted on its own fixtures"
+    assert second == []
+    assert await _alerts(session_factory) == []
+    assert _RecordingClient.posts == [], "no webhook, so no agent woken"
+
+
+async def test_a_real_burn_beside_the_fixtures_still_alerts(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The exclusion must narrow what is measured, not switch it off.
+
+    Same seeded world, plus 50 real dead-letters in 100 real jobs. The
+    objective sees only the real traffic — total 100, not 105 — and still
+    pages, which is the behaviour a Family A latency scenario will depend
+    on once it injects a fault the platform itself produces."""
+    await _seed_the_eval_world(session_factory)
+    await _seed_jobs(session_factory, status=JobStatus.COMPLETED, count=50)
+    await _seed_jobs(session_factory, status=JobStatus.DEAD_LETTER, count=50)
+
+    created = await _run_evaluation(session_factory)
+
+    assert len(created) == 1
+    alerts = await _alerts(session_factory)
+    assert alerts[0].source == "slo:job_completion_rate"
+    assert alerts[0].extra_data["total"] == 100, (
+        "the seeded fixtures leaked into the denominator"
+    )
+    assert alerts[0].extra_data["failed"] == 50

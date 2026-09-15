@@ -45,20 +45,21 @@ What gets cleared/reset:
      real user, which the chaos-owner-user cleanup below can't reach. Also
      de-noises the planner on non-DLQ scenarios, which read the same
      surface.
-  5. **Chaos-fired alerts** — every `alerts` row whose source matches
-     `chaos:%` and is still active gets `resolved_at` stamped. Without
-     this the alert `bad_deploy` fires is never resolved by anything, so
-     each invocation permanently adds one more active `critical` alert
-     to every later alert-count/noise scenario. Resolved, never deleted
-     — the alert id appears in the invoking scenario's output and
-     trajectories.
-
-     This clears the *chaos* alerts, not the alert surface. Since
-     WO-R2-29 the scheduled SLO evaluator is a second producer, writing
-     `source = 'slo:<objective-id>'`, which `chaos:%` does not match —
-     so an organic fast-burn alert survives every reset and accumulates
-     exactly the way `bad_deploy`'s used to. Restoring the *seeded
-     baseline* is therefore still an open gap: **WO-R2-131**.
+  5. **The alert surface** — restored to the seeded baseline, in two
+     statements. First every still-active `chaos:%` alert gets
+     `resolved_at` stamped: the alert `bad_deploy` fires is resolved by
+     nothing else, so each invocation used to add one more permanent
+     active `critical` alert to every later alert-count/noise scenario.
+     Then every *other* still-active alert whose id is not one of the
+     five seeded fixture alerts is resolved too (**WO-R2-131**) — the
+     scheduled SLO evaluator writes `source = 'slo:<objective-id>'`,
+     which `chaos:%` never matched, so an organic fast-burn alert used
+     to survive every reset and accumulate exactly the way
+     `bad_deploy`'s did. Three stray ones aborted a paid run pre-spend
+     on 2026-08-31. The second sweep excludes the baseline rather than
+     enumerating producers, so the next producer is covered the day it
+     ships. Resolved, never deleted — the alert id appears in the
+     invoking scenario's output and trajectories.
   6. **Idempotency records** — with `--purge-idempotency`, `DELETE`s
      every `idempotency_records` row for the seeded incident-commander
      service account. Off by default; the 24h TTL from [ADR 0010]
@@ -126,6 +127,7 @@ import asyncio
 import json
 import os
 import sys
+import uuid
 from typing import Any
 
 # Allow running from project root without installing the package.
@@ -405,18 +407,22 @@ async def _resolve_chaos_alerts(session_factory: Any) -> int:
     active critical alert behind, contaminating the alert-count and
     noise scenarios of every campaign that followed.
 
-    Scope, stated exactly: this resolves chaos alerts. It does **not**
-    return the active-alert surface to the seeded baseline, and has not
-    since WO-R2-29 gave the platform a second alert producer. The
-    scheduled SLO evaluator writes `source = f"slo:{definition.id}"`
-    (`app/services/slo.py`), which `chaos:%` does not match, so an
-    organic fast-burn alert is invisible to this sweep and survives
-    every reset — the same permanent-distractor failure this function
-    was written to end, reintroduced through a source string it does not
-    cover. Widening the predicate (or resolving everything and letting
-    the fixture reseed put the seeded alerts back) is **WO-R2-131**.
-    Until that lands, a live campaign must check the alert surface by
-    hand between scenarios.
+    Scope, stated exactly: this resolves chaos alerts, and only chaos
+    alerts. It is not what returns the active-alert surface to the seeded
+    baseline — `_resolve_organic_alerts` below is, and it runs on the
+    next line. The split is kept because "how much chaos residue did this
+    reset find" is a distinct number worth reporting, and because a
+    predicate written against a *known* producer is the cheaper thing to
+    read when a chaos compensator regresses.
+
+    Until WO-R2-131 this was the only alert sweep, and a source string it
+    did not cover was enough to defeat it: the scheduled SLO evaluator
+    writes `source = f"slo:{definition.id}"` (`app/services/slo.py`),
+    `chaos:%` does not match that, and so an organic fast-burn alert
+    survived every reset — the same permanent-distractor failure this
+    function was written to end, reintroduced one producer later. That is
+    why its successor is written as an exclusion of the seeded baseline
+    rather than as a list of the sources it knows about.
 
     Resolve rather than DELETE: the alert id is quoted in the invoking
     scenario's output and trajectories, so deleting would mutate history
@@ -444,6 +450,97 @@ async def _resolve_chaos_alerts(session_factory: Any) -> int:
                     "WHERE source LIKE 'chaos:%' "
                     "AND resolved_at IS NULL"
                 )
+            )
+            return int(result.rowcount or 0)
+
+
+def _seeded_alert_ids() -> list[uuid.UUID]:
+    """The ids of the five fixture alerts, from the seeder's own specs.
+
+    Read from `seed_eval_fixtures._alert_rows` rather than restated here,
+    for the reason `_sweep_nonfixture_dlq` reads `_dlq_specs()`: the seed
+    is the definition of the baseline, and a second copy of it in this
+    file is a copy that can drift. The tenant argument only lands on
+    inserted rows — the ids are `stable()` UUID5s and do not depend on
+    it, which is the same call shape `_rebaseline_timestamps` uses.
+    """
+    from scripts import seed_eval_fixtures  # type: ignore[import-not-found]
+
+    return [
+        uuid.UUID(str(spec["id"]))
+        for spec in seed_eval_fixtures._alert_rows(uuid.uuid4())
+    ]
+
+
+async def _resolve_organic_alerts(session_factory: Any) -> int:
+    """Stamp `resolved_at` on every still-active alert that is not one of
+    the seeded fixture alerts. **WO-R2-131.**
+
+    The gap this closes, in the shape it actually bit: run C of the paid
+    sequence (2026-08-31) was aborted pre-spend because three stray SLO
+    alerts were sitting in the world. `_resolve_chaos_alerts` had not
+    missed them through carelessness — it matched `source LIKE 'chaos:%'`,
+    and the scheduled evaluator that produced them writes
+    `source = 'slo:<objective-id>'`. A sweep enumerating the producers it
+    knows about is only ever correct until the next producer, and the
+    platform had gained one two waves earlier.
+
+    So this one enumerates the **baseline** instead, which is a closed set
+    of five rows with `stable()` ids, and resolves everything else. A
+    producer added tomorrow is covered on the day it ships, without anyone
+    remembering to widen a predicate. The cost is the mirror-image
+    failure: a *sixth* seeded fixture alert would be swept until its id
+    joined `_alert_rows`. That is a change to the seed file itself, one
+    line away from the list this reads, rather than a change in a distant
+    module — which is the direction this trade should point.
+
+    Spared by id, not by source. Source is not identity: the seeded
+    fixtures use `kafka`/`dlq`/`api`/`db`, and an organically-produced
+    alert may legitimately reuse any of those strings, in which case
+    sparing by source would leave exactly the distractor this exists to
+    remove. The five ids are `uuid5` values with no tenant in them, so
+    this stays environment-wide like every other statement here.
+
+    Belt and braces, not a single point of failure: `seed(reset=True)`
+    re-baselines `alerts.fired_at`/`resolved_at` from `_alert_rows`
+    (`seed_eval_fixtures._rebaseline_timestamps`), so a seeded alert that
+    *were* resolved by mistake is restored to `resolved_at = NULL` on the
+    same reset. The explicit exclusion is what makes the sparing provable
+    without relying on that.
+
+    Resolve, never DELETE — same reasoning as the sibling above: the alert
+    id is quoted in the invoking scenario's output and trajectories, and
+    `AlertRepository.list_active_for_tenant` filters on
+    `resolved_at IS NULL`, so a resolved row leaves the agent's surface
+    while staying auditable.
+
+    Chaos alerts are already resolved by the time this runs, so it
+    normally counts only organic residue; it would catch them too if the
+    order were ever reversed. Idempotent: a second run finds nothing
+    active outside the baseline and returns 0.
+
+    Core `update()` rather than `text()` because the exclusion binds five
+    UUIDs, and `jobs.id`-style parameter binding is exactly where the
+    Postgres/SQLite split bites (`uuid[]` on one, `CHAR(32)` on the
+    other). The statement it renders is the same `UPDATE alerts SET
+    resolved_at = CURRENT_TIMESTAMP WHERE resolved_at IS NULL AND id NOT
+    IN (...)` on both.
+
+    Returns the number of alerts resolved."""
+    from app.models.alert import Alert  # type: ignore[import-not-found]
+    from sqlalchemy import func, update
+
+    spared = _seeded_alert_ids()
+    async with session_factory() as session:
+        async with session.begin():
+            result = await session.execute(
+                update(Alert)
+                .where(
+                    Alert.resolved_at.is_(None),
+                    Alert.id.not_in(spared),
+                )
+                .values(resolved_at=func.current_timestamp())
+                .execution_options(synchronize_session=False)
             )
             return int(result.rowcount or 0)
 
@@ -723,6 +820,11 @@ async def reset(
         # Order-independent of the seed: the seeded fixture alerts use
         # non-chaos sources, so this can neither race nor re-resolve them.
         chaos_alerts_resolved = await _resolve_chaos_alerts(factory)
+        # And everything else still active that is not one of the five
+        # seeded fixture alerts (WO-R2-131). Order-independent of the seed
+        # for a stronger reason: it spares by stable() id, which does not
+        # depend on the rows existing yet.
+        organic_alerts_resolved = await _resolve_organic_alerts(factory)
         seed_summary = await seed_eval_fixtures.seed(
             database_url=database_url,
             redis_url=redis_url,
@@ -763,6 +865,7 @@ async def reset(
         "timestamps_rebaselined": seed_summary["timestamps_rebaselined"],
         "empty_dlq_baseline": _empty_dlq_baseline(),
         "job_cache_cleared": job_cache_cleared,
+        "organic_alerts_resolved": organic_alerts_resolved,
         "read_model_keys_rebuilt": read_model_keys,
         "seeded_dlq_deleted": seeded_dlq_deleted,
         "idempotency_purged": idempotency_purged,
