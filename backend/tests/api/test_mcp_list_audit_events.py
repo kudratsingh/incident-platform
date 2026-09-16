@@ -152,9 +152,19 @@ async def test_returns_all_rows_for_tenant(
     db_session: AsyncSession,
     default_tenant,  # type: ignore[no-untyped-def]
 ) -> None:
+    """Every stream, for the principal entitled to every stream.
+
+    `chaos:invoke` is in the token because the `chaos.` stream is
+    withheld from principals that cannot fire chaos (WO-R3-187) — the
+    evaluator holds it, the agent under test does not. The withholding
+    itself is tested in `test_mcp_chaos_audit_visibility.py`; this case
+    stays the unfiltered baseline it always was.
+    """
     await _seed(db_session, default_tenant.id)
     token = await _token(
-        db_session, default_tenant.id, [Scope.INCIDENTS_READ.value]
+        db_session,
+        default_tenant.id,
+        [Scope.INCIDENTS_READ.value, Scope.CHAOS_INVOKE.value],
     )
     payload = _content(await _call(mcp_client, token, {}))
     actions = {e["action"] for e in payload["events"]}
@@ -188,10 +198,17 @@ async def test_action_exact_match_takes_precedence(
     default_tenant,  # type: ignore[no-untyped-def]
 ) -> None:
     """When both `action` and `action_prefix` are set, `action` wins —
-    the tool suppresses prefix rather than AND-ing them."""
+    the tool suppresses prefix rather than AND-ing them.
+
+    Under a `chaos:invoke` token so the exact action asked for is one
+    this principal may read; the point being tested is the precedence,
+    not the visibility rule.
+    """
     await _seed(db_session, default_tenant.id)
     token = await _token(
-        db_session, default_tenant.id, [Scope.INCIDENTS_READ.value]
+        db_session,
+        default_tenant.id,
+        [Scope.INCIDENTS_READ.value, Scope.CHAOS_INVOKE.value],
     )
     payload = _content(
         await _call(

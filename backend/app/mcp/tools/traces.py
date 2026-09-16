@@ -9,6 +9,13 @@ matching trace IDs — cheap enough to run against the jobs index.
 
 Both scoped to the caller's tenant. Both require `incidents:read`.
 
+`get_trace`'s audit half applies the same stream withholding
+`list_audit_events` does (`app.services.operator_audit.
+hidden_audit_action_prefixes`): a principal without `chaos:invoke` sees
+neither the lab's rows nor their count here, because a trace is another
+route into the same table and one chaos invocation's `request_id` is
+precisely the trace an investigating agent would follow.
+
 Both are bounded, and both say so (WO-R2-53). The agent cannot read this
 docstring — the tool *description* is the whole interface — so a window
 that behaves differently from what the description claims is a functional
@@ -24,6 +31,7 @@ from app.core.scopes import Scope
 from app.mcp.registry import ToolContext, tool
 from app.repositories.audit import AuditRepository
 from app.repositories.job import JobRepository
+from app.services.operator_audit import hidden_audit_action_prefixes
 from pydantic import BaseModel, ConfigDict, Field
 
 # ---------------------------------------------------------------------------
@@ -139,6 +147,14 @@ async def get_trace(inp: GetTraceInput, ctx: ToolContext) -> GetTraceOutput:
             limit=MAX_TRACE_AUDIT_ROWS,
             request_id=inp.trace_id,
             tenant_id=ctx.principal.tenant_id,
+            # Same withholding as `list_audit_events`, for the same
+            # reason and from the same rule — a trace is just another way
+            # to ask `audit_logs` a question, and one chaos invocation's
+            # request_id is exactly the trace an investigating agent
+            # follows. Excluded rows are out of `total_audit_events` too,
+            # so `truncated` stays a statement about what was capped
+            # rather than about what was hidden.
+            exclude_action_prefixes=hidden_audit_action_prefixes(ctx.principal),
         )
         for row in rows:
             audit_rows.append(

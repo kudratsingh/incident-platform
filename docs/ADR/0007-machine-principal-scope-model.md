@@ -207,3 +207,11 @@ No `test_scope_enforcement.py` has ever existed. The two auth paths *are* covere
 **The per-SA rate limit is not merely untested — it does not exist.** There is no per-service-account rate limiter in the codebase; rate limiting is per tenant (`backend/app/utils/quota.py`, `backend/tests/unit/test_quota.py`). The parenthetical asserted an ordering property between two limiters when only one of them was ever built. It is struck, not relocated: if a per-SA limit is wanted it is new work, not a missing test.
 
 `backend/tests/unit/test_docs_adr_paths.py` now fails on any ADR citing a file path that does not exist, which would have caught the integration-test pointer had it been written as a path rather than as prose.
+
+## Update (2026-09-15, WO-R3-187 / owner decision O-4) — the eval is two machine principals
+
+The scope model is untouched: still five fixed, non-hierarchical scopes, still tokens carrying a subset of their account's set. What changed is how many principals the eval uses, and it is worth recording here because the 2026-08 note above describes a single `incident-commander` account holding four scopes.
+
+`scripts/seed_incident_commander.py` now provisions two: `incident-commander` (`telemetry:read`, `incidents:read`, `actions:execute`) is the agent under test, and `incident-commander-chaos` (`telemetry:read`, `incidents:read`, `chaos:invoke`) is the evaluator that seeds and resets its faults. The script still provisions `chaos:invoke` through the service layer, so point 3 above holds — it is the chaos account's grant now rather than the agent's — and it removes that scope from the agent account if it finds it there.
+
+The reason is a read-path decision rather than a scope-model one: the MCP read tools withhold the `chaos.` audit stream from principals without `chaos:invoke`, which is inert unless the two roles are two principals. Non-hierarchical scopes are what make the split expressible at all — `actions:execute` implying `chaos:invoke` would have left nowhere to stand. Reasoning in the 2026-09-15 amendments to [ADR 0008](0008-chaos-gating.md) and [ADR 0012](0012-the-lab-is-invisible-to-the-agent.md).

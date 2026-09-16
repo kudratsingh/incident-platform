@@ -2,9 +2,8 @@
 `list_audit_events` — read the platform's audit log.
 
 Every significant action lands here: user actions (`job.created`,
-`job.replayed`, `service_account.*`), machine actions
-(`agent.tool_invoked`, `agent.action_*`), and chaos activity
-(`chaos.tool_invoked`, `chaos.tool_denied`). The agent needs access
+`job.replayed`, `service_account.*`) and machine actions
+(`agent.tool_invoked`, `agent.action_*`). The agent needs access
 so it can:
 
   - Reconcile after a crash — "what did I do before I went down?"
@@ -14,8 +13,19 @@ so it can:
 
 Scoped to the caller's tenant. Uses `AuditRepository.list_logs`
 which already carries the `principal_type` + `action` + `tenant_id`
-filters from PR #54; this PR adds `action_prefix` for `agent.*` /
-`chaos.*` grouping.
+filters from PR #54; `action_prefix` groups a whole stream — `agent.`
+for everything one machine principal did.
+
+**Not every row is every caller's to read.** The lab's own activity
+stream is withheld from a principal that cannot fire the lab:
+`hidden_audit_action_prefixes` in `app.services.operator_audit` is the
+rule, and it is applied in SQL so the `total` a caller gets counts only
+the rows it may read. The agent under test investigates a fault; being
+able to look up who injected it, with which tool and which arguments,
+made this read surface the lab's loudest announcement of itself (ADR
+0012 rule 1 screened descriptions and schemas, never response bodies).
+Human operators are unaffected — the admin Audit tab reads the REST
+audit API, not this tool, and an operator is supposed to see everything.
 
 Requires `incidents:read` (the incident-response read surface).
 See ADR 0007 for the scope taxonomy.
@@ -27,6 +37,7 @@ from typing import Any, Literal
 from app.core.scopes import Scope
 from app.mcp.registry import ToolContext, tool
 from app.repositories.audit import AuditRepository
+from app.services.operator_audit import hidden_audit_action_prefixes
 from pydantic import BaseModel, ConfigDict, Field
 
 # The two principal shapes that write to `audit_logs`, mirroring
@@ -126,6 +137,13 @@ async def list_audit_events(
         # Suppress prefix when a specific action was given so the two
         # filters don't fight each other.
         action_prefix=inp.action_prefix if inp.action is None else None,
+        # Streams this principal may not read, AND-ed with whatever it
+        # asked for. A caller that filters for a withheld stream — by
+        # prefix or by an exact action — gets an empty page with
+        # `total: 0`, not an error: "nothing matched your filter" is a
+        # true answer, and a refusal would answer the question the
+        # withholding exists to refuse.
+        exclude_action_prefixes=hidden_audit_action_prefixes(ctx.principal),
         principal_type=inp.principal_type,
         tenant_id=ctx.principal.tenant_id,
     )
