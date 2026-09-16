@@ -1,4 +1,5 @@
 import uuid
+from collections.abc import Sequence
 from typing import Any
 
 from app.core.logging import get_logger
@@ -92,10 +93,19 @@ class AuditRepository(BaseRepository[AuditLog]):
         job_id: uuid.UUID | None = None,
         action: str | None = None,
         action_prefix: str | None = None,
+        exclude_action_prefixes: Sequence[str] = (),
         principal_type: str | None = None,
         tenant_id: uuid.UUID | None = None,
         request_id: str | None = None,
     ) -> tuple[list[AuditLog], int]:
+        """Rows matching the filters, newest first, plus the full count.
+
+        Every filter is a SQL predicate and `total` is counted under the
+        same `WHERE`, including `exclude_action_prefixes` — the caller's
+        view of "how many rows exist" is the view it is allowed to have.
+        Who may see which stream is not decided here: the MCP read tools
+        pass `app.services.operator_audit.hidden_audit_action_prefixes`.
+        """
         filters = []
         if user_id is not None:
             filters.append(AuditLog.user_id == user_id)
@@ -107,6 +117,16 @@ class AuditRepository(BaseRepository[AuditLog]):
             # `agent.*` / `chaos.*` grouping — used by the MCP audit
             # tool to isolate machine-principal activity streams.
             filters.append(AuditLog.action.like(f"{action_prefix}%"))
+        for excluded in exclude_action_prefixes:
+            # The inverse of the grouping above: whole streams a caller
+            # may not see at all. Applied as a predicate, so `_count`
+            # below reports the number of rows the caller may read —
+            # a `total` that counted withheld rows would disclose them.
+            # AND-ed with any `action` / `action_prefix` the caller
+            # supplied, which is what makes an excluded prefix return an
+            # empty page rather than an error: the caller's own filter is
+            # honoured and simply matches nothing.
+            filters.append(~AuditLog.action.like(f"{excluded}%"))
         if principal_type is not None:
             filters.append(AuditLog.principal_type == principal_type)
         if tenant_id is not None:

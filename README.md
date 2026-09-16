@@ -247,7 +247,7 @@ docker compose up --build
 | `make test-integration` | The Docker-gated integration tier (Testcontainers brings up its own Postgres + Redpanda; the compose stack is **not** required) |
 | `make lint` / `make typecheck` | ruff / mypy --strict, same invocations as CI |
 | `make migrate` | Apply pending Alembic migrations (idempotent) |
-| `make seed-incident-commander` | Create or re-seed the `incident-commander` service account (existing scopes are merged, never narrowed — set `SA_REPLACE_SCOPES=1` to narrow deliberately) and print a fresh scoped token (paste into the agent's `.env` as `PLATFORM_TOKEN`) |
+| `make seed-incident-commander` | Create or re-seed **both** eval service accounts and print a fresh scoped token for each: `incident-commander` as `PLATFORM_TOKEN` (reads + `actions:execute`) and `incident-commander-chaos` as `PLATFORM_CHAOS_TOKEN` (reads + `chaos:invoke`). Existing scopes are merged, never narrowed — except `chaos:invoke` on the agent account, which is removed and announced, because the agent must not be able to fire the lab or read that it fired (owner decision O-4). Set `SA_REPLACE_SCOPES=1` to narrow the rest deliberately |
 | `make seed-eval-fixtures` | Populate the platform with realistic data for the incident-commander agent's live eval suite |
 | `make mcp-probe STEP=<preset>` | Smoke-test one MCP surface via `scripts/mcp_probe.sh`. `STEP` is one of `initialize`, `tools`, `lag`, `dlq`, `audit`, `forbidden` |
 

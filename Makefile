@@ -85,7 +85,7 @@ migrate-local:  ## Apply migrations from the host venv against a local Postgres
 	# to document a `cd backend` that could never have worked.
 	ALEMBIC_DATABASE_URL="$(OWNER_DATABASE_URL)" $(PYTHON) -m alembic upgrade head
 
-seed-incident-commander:  ## Create the incident-commander SA + print a fresh token
+seed-incident-commander:  ## Create both eval SAs (agent + chaos runner) + print a fresh token for each
 	docker compose exec app python /app/scripts/seed_incident_commander.py
 
 seed-eval-fixtures:  ## Populate the platform with realistic data for the agent's live eval suite
