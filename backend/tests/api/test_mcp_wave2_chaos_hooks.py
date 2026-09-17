@@ -522,9 +522,11 @@ async def test_poison_message_writes_an_unclassified_schema_dlq_entry(
         assert not coherence_violations(None, row.error_message), (
             row.error_message
         )
-        # Still traceable to this hook and this topic.
+        # The topic is visible, but the injecting hook is not.
         assert "job.submitted" in row.error_message
-        assert "poison_message" in row.error_message
+        assert "poison_message" not in row.error_message
+        assert "chaos" not in row.error_message.lower()
+        assert "producer must correct the payload" in row.error_message
         # Declared fixture: the reset DELETEs it rather than cancelling it.
         assert row.payload["seeded_fixture"] is True
         assert row.payload["chaos_fixture"] == "poison_message"
