@@ -99,11 +99,10 @@ jobs:
         run: pytest --cov=backend/app --cov-report=term-missing --cov-fail-under=70
 
   # The Docker-gated tier: real Postgres 16 and real Redpanda, brought up per
-  # module by Testcontainers. These five files are the only proofs the repo
-  # has of Postgres RLS tenant isolation, audit-log immutability and outbox
-  # single-writer exclusivity, and until this job existed none of them ran in
-  # any automated run — `testpaths` excluded the directory and the three
-  # RUN_* gates were set nowhere.
+  # module by Testcontainers. The eight files cover Postgres RLS isolation,
+  # audit immutability, MCP transactions, migration roles and outbox/Kafka
+  # delivery. This tier originally ran nowhere: `testpaths` excluded the
+  # directory and the three RUN_* gates were set nowhere.
   #
   # The tier stays opt-in locally (a developer without Docker still gets a
   # clean unit/API run) but is mandatory here: every gate its tests consult
@@ -131,7 +130,7 @@ jobs:
       - name: Install dependencies
         run: pip install -e ".[dev]"
 
-      # Two of the five files (test_kafka_e2e, test_outbox_relay_concurrency)
+      # Four files (Kafka, relay concurrency, MCP envelope and outbox dead-letter)
       # gate purely on Docker being reachable, with no env override. If the
       # daemon were missing they would skip silently and the census below
       # would fail with a confusing count, so assert the real precondition
@@ -164,7 +163,7 @@ jobs:
           import sys
           import xml.etree.ElementTree as ET
 
-          # The five files this job exists to run. A rename or deletion must
+          # The eight files this job exists to run. A rename or deletion must
           # be a deliberate edit here, not a silently shrinking test count.
           EXPECTED = {
               "test_rls_enforcement",
@@ -172,6 +171,9 @@ jobs:
               "test_kafka_e2e",
               "test_migration_lock_pg",
               "test_outbox_relay_concurrency",
+              "test_mcp_envelope_postgres",
+              "test_migration_role_pg",
+              "test_outbox_dead_letter",
           }
 
           try:
