@@ -10,23 +10,23 @@ For the Kafka side (event log, lifecycle topics), see [`docs/KAFKA.md`](KAFKA.md
 ## Schema diagram
 
 ```
-                    tenants
-                   /       \
-                  /         \
-              users         jobs ─── job_dependencies (self-join)
-                |             |
-                |             ├── audit_logs
-                |             ├── outbox_events
-                |             ├── job_events       (event sourcing)
-                |             ├── job_triages
-                |             └── (saga_id → sagas)
-                |
-              (auth)
-                |
-              sagas
-                |
-              incident_summaries
+                                  tenants
+                 ┌──────────────┬─────┴──────┬──────────────┐
+                 │              │            │              │
+               users          jobs ─── job_dependencies   alerts
+                 │              │         (self-join)     deploy_markers (tenant_id nullable)
+                 │              ├── audit_logs            incident_summaries
+                 │              ├── outbox_events         idempotency_records
+                 │              ├── job_events  (event sourcing)
+                 │              ├── job_triages
+                 │              └── (saga_id → sagas)
+                 │
+          service_accounts
+                 │
+          service_account_tokens
 ```
+
+Fifteen tables. `users` and `service_accounts` are the two principal tables — one human, one machine — and `service_account_tokens` hangs off the latter. `jobs` is the domain centre; `alerts`, `deploy_markers` and `idempotency_records` sit beside it rather than under it, because they are written by the operator path rather than by a job's lifecycle.
 
 Every domain table carries `tenant_id` as a FK to `tenants` so tenancy is enforced at the constraint layer (combined with RLS — see [ADR 0003](ADR/0003-rls-as-defense-in-depth.md)).
 
@@ -355,6 +355,102 @@ The UNIQUE constraint is what makes Kafka redelivery a no-op: a second triage fo
 ### Why we persist rather than recompute on each admin view
 
 LLM calls are expensive and slow. Every admin opening the Digests tab would re-bill the API. Persisting once + serving many is the right trade.
+
+---
+
+## `alerts` — the incident signal a producer asserts
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | UUID PK | |
+| `tenant_id` | UUID NOT NULL FK → tenants.id | Indexed. |
+| `severity` | String(16) NOT NULL | Indexed. One of `low` / `info` / `warning` / `critical` — the whole vocabulary, and deliberately no wider ([ADR 0025](ADR/0025-alert-severity-vocabulary.md)). |
+| `source` | String(64) NOT NULL | Indexed. Where the signal came from, e.g. `kafka`, `dlq`, `api`, `db`, `slo:<id>`, `chaos:<hook>`. |
+| `title` | String(255) NOT NULL | |
+| `description` | String(2048) NULLABLE | |
+| `fired_at` | DateTime NOT NULL | |
+| `resolved_at` | DateTime NULLABLE | NULL means still active. `list_active_alerts` filters on it. |
+| `extra_data` | JSONB NULLABLE | Producer-specific context. |
+| `request_id` | String(255) NULLABLE | Correlates the alert with the request that raised it. |
+| `dedup_key` | String(128) NULLABLE | See below. |
+
+### Indexes and constraints
+
+- `uq_alerts_tenant_dedup_key` — UNIQUE `(tenant_id, dedup_key)`. This is what stops a sustained SLO burn paging once per evaluation tick: the loop buckets its key by hour, so a second insert in the same window loses the race and is swallowed. It also stops two worker replicas evaluating the same window from both alerting. A NULL `dedup_key` is exempt, which is how one-off alerts stay possible.
+
+Every alert is also the trigger for a signed webhook, so this table is the entry point to the whole incident path the agent is evaluated against.
+
+---
+
+## `deploy_markers` — what shipped, and when
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | UUID PK | |
+| `tenant_id` | UUID NULLABLE FK → tenants.id | **Nullable on purpose**: a deploy is platform-wide, not tenant-scoped. The RLS policy on this table admits `tenant_id IS NULL` rows for that reason ([ADR 0015](ADR/0015-force-rls-and-nonowner-app-role.md)). |
+| `version` | String(64) NOT NULL | |
+| `revision` | String(64) NULLABLE | Commit sha. |
+| `image_tag` | String(128) NULLABLE | |
+| `environment` | String(32) NOT NULL | Indexed. `prod`, `staging`, … |
+| `deployed_at` | DateTime NOT NULL | |
+| `notes` | String(1024) NULLABLE | Free text. The eval fixtures use it to plant a correlation an investigating agent can find. |
+| `extra_data` | JSONB NULLABLE | |
+
+Read by the `get_deploy_history` MCP tool. Nothing in the platform writes it automatically — rows come from the seeding script or from an operator.
+
+---
+
+## `idempotency_records` — the claim that authorises one MCP action
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | UUID PK | |
+| `tenant_id` | UUID NOT NULL FK → tenants.id ON DELETE RESTRICT | Indexed. |
+| `principal_id` | UUID NOT NULL | Plain UUID, no FK — points at `users.id` or `service_accounts.id` depending on the principal. Same convention as `audit_logs.principal_id` ([ADR 0007](ADR/0007-machine-principal-scope-model.md)). |
+| `tool_name` | String(128) NOT NULL | |
+| `idempotency_key` | String(255) NOT NULL | Caller-supplied. |
+| `arguments_hash` | String(64) NOT NULL | Binds the key to the exact arguments, so the same key with different arguments is a conflict rather than a silent replay. |
+| `response_json` | JSONB NULLABLE | **NULL means "claimed, not yet answered".** |
+| `created_at` | DateTime NOT NULL | |
+| `expires_at` | DateTime NULLABLE | The idempotency reaper deletes expired rows hourly. |
+
+### Indexes and constraints
+
+- `uq_idempotency_scope` — UNIQUE `(tenant_id, principal_id, idempotency_key)`.
+
+Read the shape carefully before touching `app/mcp/handlers.py`: the row is inserted **before** the action runs, and winning that insert is what authorises execution ([ADR 0010](ADR/0010-idempotency-record-lifecycle.md), 2026-08-30 addendum). On Postgres a second concurrent caller blocks on the first's uncommitted row rather than failing, which is the serialisation. Any path that does not complete a claim must release it, because the envelope commits the request transaction even when the tool errors.
+
+---
+
+## `service_accounts` and `service_account_tokens` — machine principals
+
+`service_accounts`:
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | UUID PK | |
+| `tenant_id` | UUID NOT NULL FK → tenants.id | |
+| `name` | String(128) NOT NULL | e.g. `incident-commander`. |
+| `scopes` | JSON NOT NULL | The account's default grant. Five possible values, non-hierarchical and additive ([ADR 0007](ADR/0007-machine-principal-scope-model.md)). |
+| `is_active` | Boolean NOT NULL | |
+| `created_by_user_id` | UUID NULLABLE FK → users.id | |
+
+- `uq_service_accounts_tenant_name` — UNIQUE `(tenant_id, name)`.
+
+`service_account_tokens`:
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | UUID PK | |
+| `service_account_id` | UUID NOT NULL FK → service_accounts.id | |
+| `token_hash` | String(64) UNIQUE NOT NULL, indexed | SHA-256 of the plaintext bearer token — only the hash is stored, so the `sa_<random>` value is unrecoverable after it is printed at mint time. Unique and indexed because this lookup is on the hot path of every authenticated MCP request. |
+| `scopes` | JSON NOT NULL | The subset of the account's scopes chosen at mint time. The service layer enforces the subset rule: a token can narrow, never widen. |
+| `expires_at` | DateTime NULLABLE | NULL means never expires. The default expiry is applied in the service layer, not the schema, so the policy can change without a migration. |
+| `revoked_at` | DateTime NULLABLE | |
+| `last_used_at` | DateTime NULLABLE | |
+| `created_at` | DateTime NOT NULL | |
+
+The pre-auth read of `service_accounts` is the one narrow SELECT-only exception to strict `tenant_isolation`, because authentication happens before a tenant context exists ([ADR 0026](ADR/0026-strict-tenant-isolation-and-declared-platform-scope.md)).
 
 ---
 

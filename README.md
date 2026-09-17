@@ -9,7 +9,8 @@ Built as an intentional showcase of senior-level distributed-systems patterns: t
 ## What's inside
 
 - **HTTP API** in FastAPI serving `/api/v1/*` behind an ALB.
-- **Worker process** running 8 concurrent Kafka consumer groups + 9 background loops (outbox relay, delayed-retry promote, DLQ-replay promote, resume-waiting sweep, stale-PENDING backstop, stale-RUNNING crash-recovery sweep, metrics, LLM digest, idempotency reaper).
+- **Worker process** running 8 concurrent Kafka consumer groups + 11 background loops (outbox relay, delayed-retry promote, DLQ-replay promote, resume-waiting sweep, stale-PENDING backstop, stale-RUNNING crash-recovery sweep, lease renewal, SLO evaluation, metrics, LLM digest, idempotency reaper).
+- **MCP tool server** at `backend/app/mcp/`, deployed as a second process from the same image. It is the agent-facing surface: scoped service-account tokens, per-principal rate limits, and an audit row for every tool call. See [ADR 0006](docs/ADR/0006-mcp-server-standalone-process.md) and [ADR 0007](docs/ADR/0007-machine-principal-scope-model.md).
 - **React SPA** admin console with live SSE progress, saga DAG timelines, DLQ triage, natural-language admin search, and incident digest cards.
 - **Multi-tenancy** with application-layer filtering + Postgres row-level security as defense-in-depth.
 - **LLM features** (Claude via Anthropic SDK): DLQ triage, retry-policy advisor, natural-language admin queries, periodic incident summaries — all off-by-default and fail-open.
@@ -48,15 +49,30 @@ There is deliberately no headline test count here. The number was refreshed thre
               │    read-model, dep-resolver,           │
               │    saga-coord, llm-triage              │
               │                                        │
-              │  9 background loops:                   │
+              │  11 background loops:                  │
               │    outbox relay, promote-delayed,      │
               │    promote-replay, resume-waiting,     │
               │    stale-pending, stale-running,       │
+              │    lease-renewal, slo-eval,            │
               │    metrics, digest, idempotency-reaper │
               └───────────────────────────────────────┘
 ```
 
 Full architecture with request lifecycles, concurrency model, and failure-mode catalog is in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+
+---
+
+## The agent-facing MCP surface
+
+The platform is also the managed system for [Incident Commander](https://github.com/kudratsingh/incident-commander), an autonomous on-call agent that investigates and remediates incidents here. It gets no special access: it is an ordinary external client holding a scoped service-account token, and everything it can do is a tool on this surface.
+
+- **Where it lives** — `backend/app/mcp/`, deployed as a second process from the same image ([ADR 0006](docs/ADR/0006-mcp-server-standalone-process.md)). Same commit, same schemas, same service layer; its own ECS service, pool and alarm.
+- **What it serves** — 20 tools by default: 13 read tools (consumer lag, DLQ contents, traces, deploy history, DAG state, Redis/Postgres health, incidents, alerts, audit events, cache key info) and 7 Tier-1 action tools (`restart_consumer_group`, `replay_dlq_messages`, `replay_dlq_by_ids`, `replay_dlq_by_category`, `pause_dag`, `invalidate_cache_key`, `mark_dlq_permanent`). With `CHAOS_ENABLED=true` a further 10 lab hooks register, for a total of 30 — they are never registered in production ([ADR 0008](docs/ADR/0008-chaos-gating.md)).
+- **Who may call what** — five non-hierarchical scopes on the service account: `telemetry:read`, `incidents:read`, `actions:propose`, `actions:execute`, `chaos:invoke` ([ADR 0007](docs/ADR/0007-machine-principal-scope-model.md)). Each tool declares the one it requires.
+- **Limits** — per-principal rate limiting (`MCP_RATE_LIMIT_PER_PRINCIPAL`, default 120/min) and an `Idempotency-Key` claim on every mutating call ([ADR 0010](docs/ADR/0010-idempotency-record-lifecycle.md)).
+- **Audit** — every call writes an `agent.tool_invoked` row, and a call whose audit write fails does not commit. The lab's own `chaos.*` rows are withheld from any principal that cannot fire chaos, so an agent under evaluation cannot read which hook caused its incident ([ADR 0012](docs/ADR/0012-the-lab-is-invisible-to-the-agent.md)).
+
+`CLAUDE.md` § "Agent-facing surface" has the naming rules, the scope table and the standing constraints on tool descriptions.
 
 ---
 
@@ -81,7 +97,7 @@ Full architecture with request lifecycles, concurrency model, and failure-mode c
 
 ## Feature highlights by phase
 
-Twelve of thirteen planned phases are shipped:
+Nine of the fourteen planned phases are shipped (1–7, 10 and 12). `CLAUDE.md`'s status table is the authority; this is the short version:
 
 **Phase 1–3 · Foundations** — clean backend, background execution across asyncio / threads / multiprocessing, live SSE progress, React admin console with request-correlation IDs.
 
@@ -89,7 +105,7 @@ Twelve of thirteen planned phases are shipped:
 
 **Phase 5 · Hardening** — sliding-window rate limiting, cache layer, load testing via Locust, `mypy --strict`, 70% coverage gate.
 
-**Phase 6 · Observability & Reliability** — OpenTelemetry distributed tracing (browser → API → worker → DB → external API), custom CloudWatch metrics + 7 alarms, SLOs with 14.4× fast-burn alarms, 7 machine-readable runbooks linked from alarm descriptions, circuit breaker for external calls.
+**Phase 6 · Observability & Reliability** — OpenTelemetry distributed tracing (browser → API → worker → DB → external API), custom CloudWatch metrics + 10 alarms, SLOs with 14.4× fast-burn alarms, 8 machine-readable runbooks linked from alarm descriptions, circuit breaker for external calls.
 
 **Phase 7 · Kafka + advanced patterns** — transactional outbox (`outbox_events` table), CQRS read model in Redis, event sourcing (`job_events` immutable log), saga pattern with compensation, job dependency DAGs (`WAITING` → `PENDING` on parent completion), JSON Schema registry, backpressure via consumer-group lag, Testcontainers integration test.
 
@@ -110,7 +126,7 @@ All LLM features use `messages.parse()` with Pydantic schemas, `claude-opus-4-7`
 - Self-service tenant creation at `/auth/register`.
 - Admin Tenants tab with drill-down page, inline rate/quota editors, create-tenant modal.
 
-**Phases 8, 9, 11, 13** — platform engineering & scale, security hardening, real-time stream analytics, disaster recovery & chaos — planned, sized in [`docs/ROADMAP.md`](docs/ROADMAP.md).
+**Phases 8, 9, 11, 13** — platform engineering & scale, security hardening, real-time stream analytics, disaster recovery & chaos — planned, sized in [`docs/ROADMAP.md`](docs/ROADMAP.md). **Phase 14** (real job processors) is deliberately deferred: today's processors simulate work with sleeps, progress updates and scripted failure paths, which is what makes the incident-commander eval scenarios deterministic.
 
 ---
 
@@ -123,8 +139,11 @@ All LLM features use `messages.parse()` with Pydantic schemas, `claude-opus-4-7`
 - [`docs/KAFKA.md`](docs/KAFKA.md) — topic catalog, schema-evolution rules, 8-consumer-group ops
 - [`docs/REDIS.md`](docs/REDIS.md) — key catalog with TTLs; what degrades when Redis dies
 - [`docs/ROADMAP.md`](docs/ROADMAP.md) — ~80 categorized extension ideas
-- [`docs/ADR/`](docs/ADR/) — architecture decision records: outbox vs. CDC, JSON Schema vs. Protobuf, RLS as defense-in-depth, composite partition keys, LLM fail-open policy, machine-principal scopes, chaos gating, production Kafka posture, and more
-- [`runbooks/`](runbooks/) — machine-readable on-call playbooks for every CloudWatch alarm + SLO
+- [`docs/ADR/`](docs/ADR/) — 26 architecture decision records: outbox vs. CDC, JSON Schema vs. Protobuf, RLS as defense-in-depth, composite partition keys, LLM fail-open policy, machine-principal scopes, chaos gating, production Kafka posture, and more. [`docs/ADR/README.md`](docs/ADR/README.md) is the index with every status
+- [`docs/postmortems/`](docs/postmortems/) — one file per incident, written at the time or backfilled
+- [`docs/lessons/`](docs/lessons/) — case studies from how this repo was built
+- [`docs/README.md`](docs/README.md) — one line per document, if you do not know which of these you want
+- [`runbooks/`](runbooks/) — machine-readable on-call playbooks; 8 files covering the 10 CloudWatch alarms and both SLOs
 
 ---
 
@@ -213,20 +232,26 @@ exactly as they were; clearing the query re-enables them and refetches.
 
 ### Environment variables
 
-Backend reads from environment directly. Key variables:
+Backend reads from environment directly. `backend/app/config.py` is the full list — the table below is the subset you are most likely to set. Note that `.env.example` predates several of these and does not list them.
 
 | Variable | Default | Description |
 |---|---|---|
 | `DATABASE_URL` | `postgresql+asyncpg://...` | asyncpg connection string |
 | `REDIS_URL` | `redis://localhost:6379/0` | Redis connection. In production the scheme is `rediss://` (TLS) with the ElastiCache AUTH token embedded, injected from Secrets Manager |
 | `KAFKA_BOOTSTRAP_SERVERS` | `localhost:9092` | Broker bootstrap. Points at local Redpanda; no production broker exists yet, and Terraform omits this variable from the task definition unless `kafka_bootstrap_servers` is set ([ADR 0018](docs/ADR/0018-production-kafka-posture.md)) |
+| `ALEMBIC_DATABASE_URL` | falls back to `DATABASE_URL` | Owner connection for migrations. Since [ADR 0015](docs/ADR/0015-force-rls-and-nonowner-app-role.md) the runtime `DATABASE_URL` is the non-owner `incident_app` role, which cannot create tables |
+| `INCIDENT_APP_DB_PASSWORD` | — | Password synced onto the `incident_app` role at boot by `app.core.db_bootstrap` |
 | `SECRET_KEY` | — | JWT signing key (required) |
-| `ANTHROPIC_API_KEY` | — | Required only if enabling LLM features |
+| `ANTHROPIC_API_KEY` | — | Required only if enabling LLM features. Not a `Settings` field — the Anthropic SDK reads it straight from the environment |
 | `LLM_TRIAGE_ENABLED` | `False` | DLQ triage feature flag |
 | `LLM_RETRY_POLICY_ENABLED` | `False` | Retry policy feature flag |
 | `LLM_NL_QUERY_ENABLED` | `False` | Natural-language query feature flag |
 | `LLM_DIGEST_ENABLED` | `False` | Incident digest feature flag |
 | `BACKPRESSURE_LAG_THRESHOLD` | `1000` | Reject new jobs when consumer lag exceeds this |
+| `CHAOS_ENABLED` | `False` | Registers the 10 chaos MCP tools. One of three gates — see [ADR 0008](docs/ADR/0008-chaos-gating.md). Terraform refuses `true` in the production workspace |
+| `MCP_RATE_LIMIT_PER_PRINCIPAL` | `120` | MCP calls per minute per service account, enforced in `standalone.py` |
+| `SLO_EVALUATION_INTERVAL_SECONDS` | `300.0` | How often the SLO loop runs. `0` disables it |
+| `STALE_RUNNING_THRESHOLD_SECONDS` | `900` | How long a `RUNNING` job may go without a heartbeat before the crash-recovery sweep dead-letters it |
 | `ENVIRONMENT` | `development` | `development` / `production` |
 
 ### Full stack via Docker Compose
@@ -247,7 +272,7 @@ docker compose up --build
 | `make test-integration` | The Docker-gated integration tier (Testcontainers brings up its own Postgres + Redpanda; the compose stack is **not** required) |
 | `make lint` / `make typecheck` | ruff / mypy --strict, same invocations as CI |
 | `make migrate` | Apply pending Alembic migrations (idempotent) |
-| `make seed-incident-commander` | Create or re-seed **both** eval service accounts and print a fresh scoped token for each: `incident-commander` as `PLATFORM_TOKEN` (reads + `actions:execute`) and `incident-commander-chaos` as `PLATFORM_CHAOS_TOKEN` (reads + `chaos:invoke`). Existing scopes are merged, never narrowed — except `chaos:invoke` on the agent account, which is removed and announced, because the agent must not be able to fire the lab or read that it fired (owner decision O-4). Set `SA_REPLACE_SCOPES=1` to narrow the rest deliberately |
+| `make seed-incident-commander` | Create or re-seed **both** eval service accounts and print a fresh scoped token for each: `incident-commander` as `PLATFORM_TOKEN` (`telemetry:read` + `incidents:read`) and `incident-commander-chaos` as `PLATFORM_CHAOS_TOKEN` (those two + `chaos:invoke`). Existing scopes are merged, never narrowed — except `chaos:invoke` on the agent account, which is removed and announced, because the agent must not be able to fire the lab or read that it fired (owner decision O-4). Set `SA_REPLACE_SCOPES=1` to narrow the rest deliberately. A fresh agent account gets no `actions:execute`, so add it via `SA_SCOPES` if you want the agent to run Tier-1 remediations |
 | `make seed-eval-fixtures` | Populate the platform with realistic data for the incident-commander agent's live eval suite |
 | `make mcp-probe STEP=<preset>` | Smoke-test one MCP surface via `scripts/mcp_probe.sh`. `STEP` is one of `initialize`, `tools`, `lag`, `dlq`, `audit`, `forbidden` |
 
@@ -329,9 +354,11 @@ Load tests live in `backend/tests/load/` (Locust).
 │       ├── api/                    typed API client (auth, jobs, sagas, admin)
 │       ├── components/             Layout, StatusBadge, ProgressBar, JobForm, Toast, ...
 │       ├── hooks/                  useAuth, useJobStream (SSE)
-│       └── pages/                  Login, Register, Dashboard, JobDetail, Admin, Sagas, TenantDetail
+│       ├── pages/                  Login, Register, Dashboard, JobDetail, Admin, AdminTenantDetail, Sagas, SagaNew, SagaDetail
+│       └── test/                   vitest suites, run by the `frontend` CI job
 ├── infra/                          Terraform for the full AWS stack
-├── .github/workflows/              CI: lint, type, test, integration, frontend, infra, build, deploy
+├── .github/workflows/              CI jobs: frontend, lint, test, integration, infra, workflows, deploy
+│                                   plus release.yml (tag → GHCR image)
 ├── docker-compose.yml
 └── pyproject.toml
 ```
@@ -346,7 +373,8 @@ Core surface:
 
 | Method | Route | Description |
 |---|---|---|
-| `POST` | `/auth/register` | Register — optionally creates a new tenant workspace |
+| `POST` | `/auth/register` | Register — founds a new tenant or joins the default one ([ADR 0024](docs/ADR/0024-tenant-enrolment-policy.md)) |
+| `POST` | `/auth/tenant/members` | Admin-only: enrol a user into the caller's own tenant |
 | `POST` | `/auth/login` | Login (returns access + refresh + tenant_id claim) |
 | `POST` | `/auth/refresh` | Refresh access token |
 | `GET` | `/auth/me` | Current user + tenant slug |
@@ -356,6 +384,7 @@ Core surface:
 | `POST` | `/jobs/{id}/stream-token` | Mint a 60s single-purpose token for the SSE stream (authorizes the job) |
 | `GET` | `/jobs/{id}/stream` | SSE live-progress stream (auth via `?token=` stream token, ADR 0014) |
 | `POST` | `/sagas` | Create multi-step workflow with dependencies |
+| `GET` | `/sagas` | List sagas |
 | `GET` | `/sagas/{id}` | Saga detail with step chain |
 | `GET` | `/admin/jobs` | Admin: search all jobs (accepts `?tenant_id=` for platform admins) |
 | `POST` | `/admin/jobs/{id}/replay` | Admin: replay a failed job |
@@ -372,7 +401,11 @@ Core surface:
 | `GET` | `/admin/tenants` | Platform-admin only: list all tenants |
 | `POST` | `/admin/tenants` | Platform-admin only: create a tenant |
 | `PATCH` | `/admin/tenants/{id}` | Platform-admin only: update rate limits / quota |
+| `POST` | `/admin/service-accounts` | Platform-admin only: create a machine principal ([ADR 0007](docs/ADR/0007-machine-principal-scope-model.md)) |
+| `POST` | `/admin/service-accounts/{id}/tokens` | Mint a scoped `sa_…` bearer token |
 | `GET` | `/audit/logs` | Audit trail |
+
+`GET /healthz` and `GET /healthz/worker` sit outside `/api/v1` and are excluded from the OpenAPI schema.
 
 ---
 
@@ -418,7 +451,7 @@ Terraform provisions the AWS stack in `infra/`:
 - S3 for artifacts
 - ALB with target-group health checks
 - ACM (planned in Phase 8), IAM roles per service, Secrets Manager for DB password + JWT + Anthropic key
-- CloudWatch metrics + 7 alarms (5 baseline + 2 SLO fast-burn) with runbook URLs in their descriptions
+- CloudWatch metrics + 10 alarms (8 baseline + 2 SLO fast-burn) with runbook URLs in their descriptions; `runbooks/` holds the 8 playbooks they point at (two alarms share a playbook with a sibling)
 - SNS topic for alarm delivery
 
 **Not provisioned: Kafka.** There is no broker in `infra/` — no MSK cluster, no self-managed nodes. A deployed stack therefore accepts jobs and never executes them, because every client falls back to `localhost:9092`. This is a recorded decision, not an oversight: see [ADR 0018](docs/ADR/0018-production-kafka-posture.md) for why, and for what to do when a production broker is actually wanted.
