@@ -72,6 +72,7 @@ async def _list_incidents_query(
     source: str | None,
     limit: int,
 ) -> tuple[list[Alert], int]:
+    """The matching alerts, newest first, and the true total behind them."""
     filters = [Alert.tenant_id == tenant_id]
     if not include_resolved:
         filters.append(Alert.resolved_at.is_(None))

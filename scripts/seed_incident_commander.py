@@ -140,6 +140,8 @@ _AGENT_FORBIDDEN_SCOPES: frozenset[str] = frozenset({Scope.CHAOS_INVOKE.value})
 
 
 def _parse_scopes(raw: str, *, forbidden: frozenset[str] = frozenset()) -> list[str]:
+    """Turn a comma-separated scope string into a checked list, stopping if it
+    names a scope this principal is not allowed to hold."""
     scopes = [s.strip() for s in raw.split(",") if s.strip()]
     try:
         validate_scopes(scopes)
@@ -165,6 +167,7 @@ def _parse_scopes(raw: str, *, forbidden: frozenset[str] = frozenset()) -> list[
 async def _resolve_tenant(
     session: AsyncSession, slug: str
 ) -> Tenant:
+    """The tenant to seed into, or a clear exit explaining why there is none."""
     tenant = await TenantRepository(session).get_by_slug(slug)
     if tenant is None:
         raise SystemExit(
@@ -322,6 +325,8 @@ async def _mint(
     service_account,  # type: ignore[no-untyped-def]
     ttl_days: int | None,
 ) -> str:
+    """Mint one bearer token for the account and return the plaintext — the
+    only moment it is ever readable."""
     service = ServiceAccountService(
         ServiceAccountRepository(session),
         ServiceAccountTokenRepository(session),
@@ -386,6 +391,8 @@ def _print_banner(accounts: list[tuple[str, str, list[str], bool, str]]) -> None
 
 
 async def main() -> None:
+    """Check the target is safe, bring both accounts to their declared scopes,
+    mint a token for each and print the pair once."""
     import argparse
 
     parser = argparse.ArgumentParser(
