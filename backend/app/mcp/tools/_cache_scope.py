@@ -49,6 +49,29 @@ def tenant_segment(key: str) -> str | None:
     return None
 
 
+def job_segment(key: str) -> str | None:
+    """The job segment of `key`, or `None` if this family has none.
+
+    The sibling of `tenant_segment`, and here for the same reason: the
+    shape of `cache:job:{tenant_id}:{job_id}` is knowledge that belongs
+    in one module. `get_cache_key_info` uses it to name the one record a
+    per-job cache entry is a copy of, without reading the entry — the
+    payload is tenant data and stays unread.
+
+    Returns the raw segment, not a UUID: whether it parses is the
+    caller's question, and `tests/unit/test_cache_key_allowlist.py`
+    derives a real key from `JobCache._key` so a rename to that shape
+    breaks a test rather than silently returning the wrong segment.
+    """
+    for prefix in _TENANT_SCOPED_PREFIXES:
+        if key.startswith(prefix):
+            rest = key[len(prefix) :].split(":", 1)
+            if len(rest) != 2 or not rest[1]:
+                return None
+            return rest[1]
+    return None
+
+
 def assert_key_in_tenant(
     key: str, *, tenant_id: uuid.UUID, error: type[AppError]
 ) -> None:
@@ -84,4 +107,4 @@ def assert_key_in_tenant(
         )
 
 
-__all__ = ["assert_key_in_tenant", "tenant_segment"]
+__all__ = ["assert_key_in_tenant", "job_segment", "tenant_segment"]

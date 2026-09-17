@@ -610,6 +610,29 @@ class JobRepository(BaseRepository[Job]):
 
         return cancelled
 
+    async def existing_ids_for_tenant(
+        self, job_ids: Collection[uuid.UUID], tenant_id: uuid.UUID
+    ) -> set[uuid.UUID]:
+        """Which of `job_ids` this tenant actually has rows for.
+
+        Ids only — no row is loaded and nothing about a job is returned,
+        because the one caller (`get_cache_key_info`) answers "does the
+        platform still hold this record?" and must not turn into a way to
+        read one. Tenant-scoped like `get_for_tenant`: an id belonging to
+        another tenant reads as absent rather than raising, which is the
+        same answer the caller would get from a deleted row and the only
+        answer that does not disclose a sibling tenant's data.
+
+        An empty input is answered without a query.
+        """
+        ids = set(job_ids)
+        if not ids:
+            return set()
+        result = await self.session.execute(
+            select(Job.id).where(Job.id.in_(ids), Job.tenant_id == tenant_id)
+        )
+        return set(result.scalars().all())
+
     async def dlq_stats(self, tenant_id: uuid.UUID) -> tuple[int, dict[str, int]]:
         """Total DLQ count plus per-job-type breakdown, scoped to one tenant."""
         stmt = (
