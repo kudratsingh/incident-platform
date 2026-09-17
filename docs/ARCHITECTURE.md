@@ -11,7 +11,7 @@ For per-component reference, see [`docs/DATA_MODEL.md`](DATA_MODEL.md), [`docs/K
 The platform runs as **four logical processes**, three of them separate deployables:
 
 1. **API process** — FastAPI behind an ALB. Serves `/api/v1/*`. One ECS task with autoscaling target on CPU.
-2. **Worker** — `worker_loop` from `app/workers/dispatcher.py`. Hosts eight Kafka consumer groups + nine background loops. Logically separate, but **not a separate deployable yet**: it runs as a supervised task inside every API process (see "More than one process runs this" below; the dedicated worker deployable and queue-depth autoscaling are Phase 8 items). That is why worker liveness is reported on the API's own `/healthz/worker` — a dead worker is a degraded *API task*, and the probe that governs restarts has to be able to say so ([ADR 0009](ADR/0009-consumer-lifecycle-and-supervision.md), 2026-08-30 amendment: the signal moved off the deep check so that a Redis outage could not recycle every task with it).
+2. **Worker** — `worker_loop` from `app/workers/dispatcher.py`. Hosts eight Kafka consumer groups + eleven background loops. Logically separate, but **not a separate deployable yet**: it runs as a supervised task inside every API process (see "More than one process runs this" below; the dedicated worker deployable and queue-depth autoscaling are Phase 8 items). That is why worker liveness is reported on the API's own `/healthz/worker` — a dead worker is a degraded *API task*, and the probe that governs restarts has to be able to say so ([ADR 0009](ADR/0009-consumer-lifecycle-and-supervision.md), 2026-08-30 amendment: the signal moved off the deep check so that a Redis outage could not recycle every task with it).
 3. **MCP server** — `app/mcp/standalone.py` under uvicorn on port 8001, serving the agent-facing tool surface at `/mcp`. Its own ECS service and task definition, its own security group, target group and `mcp-tasks-low` alarm, from the **same image as the API with a different command** ([ADR 0006](ADR/0006-mcp-server-standalone-process.md); provisioned in WO-R2-68 — before that the ADR described a topology `infra/` did not contain). Same ALB, `/mcp*` listener rule, so `PLATFORM_MCP_URL` is a distinct URL from `PLATFORM_REST_URL` without a second load balancer. It runs no worker and no consumers, and deliberately does not carry the owner database credential: it never migrates.
 4. **Frontend** — Nginx serving the React SPA. Same ALB, different listener rule.
 
@@ -305,7 +305,7 @@ The platform uses **all three Python concurrency models deliberately**, picked p
 The API process is fully asyncio. So is the entire worker process. Reasoning:
 
 - HTTP I/O dominates the API path (DB / Redis / Kafka / Anthropic).
-- The worker's eight Kafka consumers and nine loops are all I/O-bound.
+- The worker's eight Kafka consumers and eleven loops are all I/O-bound.
 - Switching between them on socket reads is what FastAPI + aiokafka were designed for.
 
 Within the worker, every consumer runs as a separate asyncio task (`asyncio.create_task(c.run())`). The `worker_loop` orchestrates startup, graceful shutdown (cancels all tasks, waits for in-flight messages), and per-task error isolation (one consumer's failure doesn't kill others).
@@ -372,9 +372,9 @@ Register the new processor in `_PROCESSORS` in `dispatcher.py`.
 
 1. Starts eight Kafka consumers (each with its own consumer group, started best-effort — one's failure doesn't kill the others).
 2. Validates the dispatcher consumer specifically — if that one fails to start, the worker exits since no jobs can run.
-3. Spawns the nine background loops as asyncio tasks.
+3. Spawns the eleven background loops as asyncio tasks.
 
-The seventeen tasks run concurrently. They share:
+The nineteen tasks run concurrently. They share:
 
 - The same `session_factory` (so they share connection pool semantics; each task acquires/releases per transaction).
 - The same Redis client.

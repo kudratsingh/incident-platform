@@ -24,7 +24,7 @@ This file (`CLAUDE.md`) is the high-signal index. Treat it as the entry point �
 - [`docs/DATA_MODEL.md`](docs/DATA_MODEL.md) — every table, every column, every index, every constraint, with a one-line *why*
 - [`docs/KAFKA.md`](docs/KAFKA.md) — topic catalog, schema-evolution rules, partition strategy, consumer-group catalog with failure isolation
 - [`docs/REDIS.md`](docs/REDIS.md) — key catalog (writer / reader / TTL / eviction-safe?), what degrades when Redis dies
-- [`docs/ADR/`](docs/ADR/) — architecture decision records. Read these to understand *why* the platform looks the way it does:
+- [`docs/ADR/`](docs/ADR/) — architecture decision records. Read these to understand *why* the platform looks the way it does. [`docs/ADR/README.md`](docs/ADR/README.md) is the full index with every status; all 26 are listed below:
   - [0001 — Outbox over CDC](docs/ADR/0001-outbox-vs-cdc.md)
   - [0002 — JSON Schema over Protobuf](docs/ADR/0002-json-schema-vs-protobuf.md)
   - [0003 — Postgres RLS as defense-in-depth](docs/ADR/0003-rls-as-defense-in-depth.md)
@@ -33,20 +33,29 @@ This file (`CLAUDE.md`) is the high-signal index. Treat it as the entry point �
   - [0006 — MCP server as a standalone process from the platform codebase](docs/ADR/0006-mcp-server-standalone-process.md)
   - [0007 — Machine principals with a scope model separate from human roles](docs/ADR/0007-machine-principal-scope-model.md)
   - [0008 — Chaos framework is triple-gated and never in production](docs/ADR/0008-chaos-gating.md)
+  - [0009 — Consumer lifecycle and supervision](docs/ADR/0009-consumer-lifecycle-and-supervision.md) — best-effort start with backoff, and the 2026-08-30 self-amendment that moved worker liveness off the deep health check
   - [0010 — Idempotency record lifecycle](docs/ADR/0010-idempotency-record-lifecycle.md)
   - [0011 — DAG pause is enforced by the resolver, not just recorded](docs/ADR/0011-dag-pause-enforcement.md)
   - [0012 — The lab is invisible to the agent](docs/ADR/0012-the-lab-is-invisible-to-the-agent.md) — rule 1 shipped v0.4.9 and now covers response bodies as well as descriptions (2026-09-15 amendment); rule 2 deferred to post-rerun
+  - [0013 — Release before rerun](docs/ADR/0013-release-before-rerun.md) — the 2026-08 campaign ships a release first, then the commander re-pins, then the eval runs
+  - [0014 — SSE stream auth is a short-lived, job-bound stream token](docs/ADR/0014-sse-stream-token-transport.md) — `POST /jobs/{id}/stream-token` mints it; the stream takes it as a query parameter because `EventSource` cannot send headers
+  - [0015 — FORCE RLS, the non-owner `incident_app` role, and DB-level `audit_logs` immutability](docs/ADR/0015-force-rls-and-nonowner-app-role.md) — amended in part by 0026
+  - [0016 — Defer principal-scoped `tools/list` and blast-radius gate 3](docs/ADR/0016-defer-principal-scoped-tools-list.md) — records the two standing contradictions it accepts
+  - [0017 — Saga compensation steps are real jobs, and a COMPENSATING saga settles COMPENSATED or FAILED](docs/ADR/0017-saga-compensation-settlement.md)
   - [0018 — Production Kafka is not provisioned](docs/ADR/0018-production-kafka-posture.md) — no broker in `infra/`, ECS deploy gated off, `KAFKA_BOOTSTRAP_SERVERS` omitted unless set
   - [0019 — Stale-RUNNING recovery sweep dead-letters, never re-publishes](docs/ADR/0019-stale-running-recovery-sweep.md) — worker-crash orphans go to the DLQ, not back onto `job.submitted`; revisit once a job can prove it did not partially execute
+  - [0020 — The outbox relay is single-writer via a Postgres advisory-lock leader gate](docs/ADR/0020-outbox-relay-single-writer.md) — the sweeps stay compare-and-set guarded
+  - [0021 — Processor execution is bounded, and dispatch never blocks the poll loop](docs/ADR/0021-bounded-execution-and-non-blocking-dispatch.md) — amends 0019 §3
   - [0022 — Promotable-only resume sweep, and a stranded parent cascades CANCELLED](docs/ADR/0022-promotable-only-resume-sweep-and-dependency-cascade.md) — amends 0011; the sweep's limit now bounds promotable work, and `CANCELLED` gains a second, non-saga writer
   - [0023 — A dispatcher sweep only acts on a row it can prove it owns, and only once per window](docs/ADR/0023-dispatcher-sweep-ownership.md) — amends 0019 and 0021; `requeued_at` de-duplicates the stale-PENDING backstop, `heartbeat_at` plus a compare-and-set stop one replica dead-lettering another's running job
   - [0024 — Public registration may found a tenant or join the default one, and nothing else](docs/ADR/0024-tenant-enrolment-policy.md) — unauthenticated `tenant_slug` no longer enrols into an arbitrary existing tenant (403); existing-tenant enrolment moves behind `POST /auth/tenant/members`, admin-only, tenant taken from the token
   - [0025 — The alert severity vocabulary is `low | info | warning | critical`](docs/ADR/0025-alert-severity-vocabulary.md) — user decision; `low` added so the commander's noise branch is reachable from a real alert, `medium`/`high` declined as duplicates of `warning`/`critical`, `unknown` declined as a receiver's default rather than a producer's assertion
   - [0026 — Strict `tenant_isolation`: an unscoped statement is refused, and cross-tenant work declares itself](docs/ADR/0026-strict-tenant-isolation-and-declared-platform-scope.md) — the ADR 0003 bootstrap branch made every tenant policy fail open (plat #192 proved it live); policies now match on the tenant alone, the worker loops / migrations / seed scripts declare `app.tenant_scope = 'platform'`, and only the pre-auth `service_accounts` read keeps a narrow SELECT-only exception
-- [`docs/postmortems/`](docs/postmortems/) — one file per incident (backfilled or written at the time). Format: Impact / Timeline / Root cause / Detection gap / Fix / Prevention rule adopted.
-  - [0009 — Consumer lifecycle and supervision](docs/ADR/0009-consumer-lifecycle-and-supervision.md)
+- [`docs/postmortems/`](docs/postmortems/) — one file per incident (backfilled or written at the time). Format: Impact / Timeline / Root cause / Detection gap / Fix / Prevention rule adopted. Two so far: [0001 — v0.4.1 schema drift](docs/postmortems/0001-v0.4.1-schema-drift.md) and [0002 — the phantom supervisor](docs/postmortems/0002-phantom-supervisor.md). Both are dated records of what happened; they are history, not current state.
+- [`docs/lessons/`](docs/lessons/) — case studies. [parallel-agent-campaigns.md](docs/lessons/parallel-agent-campaigns.md) is what went wrong running several agents over one checkout.
 - [`docs/ROADMAP.md`](docs/ROADMAP.md) — open extension ideas, sized + categorized
-- [`runbooks/`](runbooks/) — machine-readable on-call playbooks for every CloudWatch alarm + SLO
+- [`docs/README.md`](docs/README.md) — one line per document, for when you do not know which of the above you want
+- [`runbooks/`](runbooks/) — machine-readable on-call playbooks; 8 files covering the 10 CloudWatch alarms and both SLOs
 - **Workspace hub first:** this repo lives inside the `audit-ws` workspace, whose auto-loaded
   `CLAUDE.md` makes `../context/START-HERE.md` → `STATE.md` → `LESSONS.md` → `PROTOCOL.md` the
   mandatory reading order for every session, before this repo's own index below. Cross-repo state,
@@ -94,7 +103,7 @@ What's actually shipped (as of the most recent merge):
   6. `dependency-resolver` — promotes `WAITING` jobs to `PENDING` when their parents complete
   7. `saga-coordinator` — drives saga-level state and compensation on failure
   8. `llm-triage` (Phase 10) — calls Claude on every `job.dlq` to write a `JobTriage` row
-- **Nine background loops** also running in the same process:
+- **Eleven background loops** also running in the same process:
   - **Outbox relay** — polls `outbox_events` every second and publishes to Kafka
   - **Delayed-retry promote** — moves exponentially-backed-off retries from a Redis sorted-set back into Kafka via the outbox
   - **DLQ replay promote** — fires operator-scheduled DLQ replays whose delay window has elapsed. **Claims, never pops** (WO-R2-21): due entries move to `jobs:dlq_replay_inflight` under a 60s claim and are `ack`ed on every outcome the pass can observe, so only a worker that dies mid-replay leaves a claim — and that one is reclaimed on a later tick instead of being silently discarded. It still does not re-enqueue a replay that failed on its merits. Writer side is ordered to match: audit row first, then the ZSET entry, in a savepoint with a `ZREM` compensation ([`docs/REDIS.md`](docs/REDIS.md#reader-semantics-for-jobsdlq_replay_delayed--claim-dont-pop))
@@ -190,10 +199,12 @@ State pagination explicitly too: whether an `offset` exists, and whether `total`
 
 **The eval runs as two principals, and the split is load-bearing** (WO-R3-187, owner decision O-4, 2026-09-15). `scripts/seed_incident_commander.py` (`make seed-incident-commander`) mints one token for each:
 
-| Service account | Scopes | `.env` name | Who it is |
+| Service account | Scopes the seeder grants by default | `.env` name | Who it is |
 |---|---|---|---|
-| `incident-commander` | `telemetry:read`, `incidents:read`, `actions:execute` | `PLATFORM_TOKEN` | the agent under test |
+| `incident-commander` | `telemetry:read`, `incidents:read` | `PLATFORM_TOKEN` | the agent under test |
 | `incident-commander-chaos` | `telemetry:read`, `incidents:read`, `chaos:invoke` | `PLATFORM_CHAOS_TOKEN` | the evaluator that seeds, verifies and resets the world |
+
+Read that first column exactly as written: it is the **seeder's default**, not what a running stack holds. On a re-run the script *unions* its defaults into whatever the live account already has and never drops a grant silently (`SA_REPLACE_SCOPES=1` is the deliberate-narrowing escape hatch), so an account minted before the split keeps `actions:execute` and the remediation scenarios keep working. A **fresh** bootstrap does not grant it, and every Tier-1 action tool declares `required_scope=Scope.ACTIONS_EXECUTE` — so a brand-new agent account can read but not act until `actions:execute` is added, e.g. `SA_SCOPES=telemetry:read,incidents:read,actions:execute make seed-incident-commander`. The one narrowing the script always performs is removing `chaos:invoke` from the agent account, and it says so on stderr.
 
 The agent account held `chaos:invoke` until this split — it arrived with the self-seeding chaos scenarios so live remediation evals could break the platform and fix it without an operator in the loop, and `actions:execute` arrived with the Wave 3 Tier-1 actions (it was read-only at Step 0). Holding it is now a defect the seeder corrects: the MCP read tools withhold the `chaos.` audit stream from any principal without `chaos:invoke` (`app/services/operator_audit.py::hidden_audit_action_prefixes`), and a single all-scope token makes that predicate inert — which is exactly how the leak survived (`list_audit_events` told an investigating agent which hook had injected its fault, and with what arguments). Verify the live grants with `SELECT name, scopes FROM service_accounts` rather than trusting this table; it drifted once already.
 
@@ -230,7 +241,7 @@ Notably **not** granted, to either principal: `actions:propose`. Tier-2 actions 
 
 ### Frontend
 - **React + Vite + TypeScript + Tailwind**
-- Pages: `LoginPage`, `RegisterPage`, `DashboardPage` (job list + create form), `JobDetailPage` (live SSE progress + Kafka event timeline), `AdminPage` (overview / jobs / DLQ / runbooks / users / audit tabs), `SagasPage` / `SagaNewPage` / `SagaDetailPage` (multi-step workflow management).
+- Nine pages: `LoginPage`, `RegisterPage`, `DashboardPage` (job list + create form), `JobDetailPage` (live SSE progress + Kafka event timeline), `AdminPage` (overview / jobs / DLQ / runbooks / users / tenants / digests / audit tabs), `AdminTenantDetailPage` (per-tenant drill-down), `SagasPage` / `SagaNewPage` / `SagaDetailPage` (multi-step workflow management).
 - Shared components: `Layout`, `StatusBadge`, `ProgressBar`, `TraceId`, `Toast`, `JobForm`, `ProtectedRoute`, `ErrorBoundary`, `Skeleton`.
 
 ### Infrastructure
@@ -245,7 +256,7 @@ Notably **not** granted, to either principal: `actions:propose`. Tier-2 actions 
 - `mypy --strict` in CI on the `app` package.
 - `ruff check backend/` in CI.
 - Coverage gate at 70% (see `pyproject.toml`) — enforced on the unit + API job only; the integration job runs `--no-cov`.
-- Current test count: **726** passing (447 unit + 254 API + 25 integration).
+- No headline test count is written down here, for the reason `README.md` gives: it has been refreshed three times and was stale within a release every time. `make test` reports the count for your checkout; `.github/workflows/ci.yml` is the authority on what runs.
 - The integration tier runs in its own CI job (`integration`), which exports every `RUN_*` gate and then **fails if any test skipped** — a fully-skipped run exits 0 in pytest, which is how this tier stayed invisible until it was wired up.
 
 ---
@@ -296,13 +307,15 @@ The actual runtime topology after Phase 7:
            │     7. saga-coordinator    → compensation       │
            │     8. llm-triage          → job_triages rows   │
            │                                                 │
-           │   Nine supporting loops:                        │
+           │   Eleven supporting loops:                      │
            │     • outbox relay (DB → Kafka)                 │
            │     • delayed-retry promote (Redis → outbox)    │
            │     • dlq replay promote (scheduled replays)    │
            │     • resume-waiting sweep (pause lifted)       │
            │     • stale-PENDING backstop (lost timers)      │
            │     • stale-RUNNING sweep (crash orphans → DLQ) │
+           │     • lease renewal (heartbeat on RUNNING jobs) │
+           │     • SLO evaluation (fast-burn → Alert)        │
            │     • metrics loop (gauges + lag cache)         │
            │     • digest loop (per-tenant LLM summary)      │
            │     • idempotency reaper (expired records)      │
@@ -342,7 +355,7 @@ The actual runtime topology after Phase 7:
 - Non-DLQ `job.failed` events render as `retrying` (with backoff countdown text); DLQ as `dead_letter`. This distinction comes from the SSE consumer mapping, not the worker.
 
 ### 4. Admin Incident Console
-- Tabs: **Overview** (CQRS stats cards + SLO scorecards), **Jobs** (filter by status / trace ID / type), **DLQ** (with per-type breakdown pills and per-row Replay/Resolve), **Runbooks** (clickable list with a modal showing the diagnosis steps), **Users**, **Audit** (clickable rows opening a metadata modal).
+- Eight tabs, in render order: **Overview** (CQRS stats cards + SLO scorecards), **Jobs** (filter by status / trace ID / type), **DLQ** (with per-type breakdown pills and per-row Replay/Resolve), **Runbooks** (clickable list with a modal showing the diagnosis steps), **Users**, **Tenants** (platform admins only), **Digests** (LLM incident summaries), **Audit** (clickable rows opening a metadata modal). The `Tab` union in `AdminPage.tsx` is the authority.
 - Replay (`/admin/jobs/{id}/replay`) resets `retry_count` to 0 and records the previous values in the audit log's `extra_data`.
 - Event-sourced **job timeline** on `JobDetailPage` (admin only) hits `/admin/jobs/{id}/timeline` and renders every Kafka event for that job in offset order with topic/partition/offset metadata.
 
@@ -421,18 +434,18 @@ Logs must be queryable by trace ID end-to-end: browser → API → worker → re
 ## Testing Strategy
 
 ### Layers
-1. **Unit tests** (`backend/tests/unit/`) — services, processors, validators, repositories, consumers. 447 tests. No I/O.
-2. **API contract tests** (`backend/tests/api/`) — full FastAPI app with dependency overrides; SQLite in-memory DB; mocked Redis. 254 tests.
-3. **Integration tests** (`backend/tests/integration/`) — Testcontainers with real Postgres 16 (RLS enforcement, eval-reset SQL, migration advisory lock, outbox relay exclusivity) and Redpanda (Kafka round-trip). 25 tests across five files. Docker-gated; run locally with `make test-integration`, and in CI by the `integration` job.
+1. **Unit tests** (`backend/tests/unit/`) — services, processors, validators, repositories, consumers. No I/O.
+2. **API contract tests** (`backend/tests/api/`) — full FastAPI app with dependency overrides; SQLite in-memory DB; mocked Redis.
+3. **Integration tests** (`backend/tests/integration/`) — Testcontainers with real Postgres 16 (RLS enforcement, eval-reset SQL, migration advisory lock, outbox relay exclusivity, outbox dead-letter, the MCP envelope, the migration role) and Redpanda (Kafka round-trip). Eight test files. Docker-gated; run locally with `make test-integration`, and in CI by the `integration` job.
 4. **Load tests** (`backend/tests/load/`) — Locust scenarios for the job submission path.
 5. **Failure-mode tests** — circuit-breaker open/close, schema validation rejecting bad payloads, redelivery dedup via unique constraints.
 
 ### Tooling
 - `pytest` fixtures and parametrization.
 - Factories for test data (inline `_make_*` helpers; could grow into proper factories later).
-- Testcontainers for the whole integration tier — Postgres 16 in four files, Redpanda in one (Docker availability is skip-gated).
+- Testcontainers for the whole integration tier — Postgres 16 in seven files, Redpanda in one (Docker availability is skip-gated).
 - Coverage gate at 70% in `pyproject.toml`.
-- Unit + API tests run on every PR via the `test` job in `ci.yml`; the integration tier runs on every PR via the `integration` job, which sets `RUN_RLS_TEST` / `RUN_EVAL_RESET_TEST` / `RUN_MIGRATION_LOCK_TEST` and then asserts that all five files contributed tests and none skipped.
+- Unit + API tests run on every PR via the `test` job in `ci.yml`; the integration tier runs on every PR via the `integration` job, which sets `RUN_RLS_TEST` / `RUN_EVAL_RESET_TEST` / `RUN_MIGRATION_LOCK_TEST` and then asserts that the files it names contributed tests and none skipped. **That census has fallen behind the directory:** `ci.yml`'s `EXPECTED` set still lists only the five original files, so `test_mcp_envelope_postgres.py`, `test_migration_role_pg.py` and `test_outbox_dead_letter.py` could silently stop contributing without failing the job.
 
 ---
 
@@ -499,7 +512,7 @@ Concrete implementation pointers for each pattern this project demonstrates end-
 | **Saga pattern** | `app/services/saga.py` (creation) + `app/workers/saga_coordinator.py` (lifecycle + compensation) | `{type}.compensate` jobs enqueued in reverse order on DLQ |
 | **Job dependency DAG** | `job_dependencies` table; `DependencyResolver` consumer; `JobStatus.WAITING` | Cycle-free by construction (deps reference only existing jobs) |
 | **Schema evolution** | `backend/app/schemas/kafka/*.schema.json` validated on both producer and consumer | `additionalProperties: true` for backward compatibility |
-| **Dead-letter queue** | `job.dlq` topic; `dead_letter` job status; `/admin/dlq/*` endpoints; `LlmTriageConsumer` (Phase 10) analyses each entry | Admin replay resets `retry_count`; unregistered `.compensate` types also route here |
+| **Dead-letter queue** | `job.dlq` topic; `dead_letter` job status; `GET /admin/dlq/stats` for the counts and `GET /admin/jobs?status=dead_letter` for the rows; `LlmTriageConsumer` (Phase 10) analyses each entry | Admin replay resets `retry_count`; unregistered `.compensate` types also route here |
 | **Fan-out / fan-in** | Seven Kafka consumer groups subscribed to the lifecycle topics, all processing independently | No coordination needed; each group has its own offset |
 | **Consumer group isolation** | Each consumer in `worker_loop` is its own group; failure of one doesn't affect others | `_supervise_consumer` owns start(): a consumer that fails to start at boot is retried with backoff, not dropped |
 | **Distributed locking** | Redis `SETNX` for job deduplication (open opportunity in the rate-limit code path) | Idempotency key is the primary dedup mechanism today |
@@ -576,9 +589,9 @@ All four services use `client.messages.parse(..., output_format=SomePydanticMode
 - **OpenTelemetry** distributed tracing — spans across API → worker → DB → Redis, exported to OTLP (AWS X-Ray or Jaeger).
 - **Custom metrics** — `JobCompleted`, `JobFailed`, `JobDeadLettered`, `QueueDepth`, `InFlightJobs`, `ConsumerLag`, `RequestLatency` on the `IncidentPlatform` CloudWatch namespace. `emit_count` / `emit_gauge` do no I/O — they sanitise dimensions and queue the datum; one background task per process flushes an aggregated `StatisticSet` every 60s. Dimension values are bounded by a declared allow-list plus a hard cap; anything else becomes `other`. See [Cost model (CloudWatch custom metrics)](docs/ARCHITECTURE.md#cost-model-cloudwatch-custom-metrics) before adding a metric or a dimension.
 - **SLOs + error budgets** ✅ — `job_completion_rate` ≥ 99% and `job_dispatch_latency` ≥ 95% within 30 s, both over rolling 24h. `GET /admin/slos` returns current state, budget remaining %, and burn rate; the worker also evaluates them on a schedule and alerts on a fast burn. Cancelled jobs are excluded from both objectives — a saga rollback or a dependency cascade is a decision not to dispatch, not a failure to.
-- **CloudWatch alarms** ✅ — five baseline alarms (`alb-5xx`, `backend-tasks-low`, `rds-cpu-high`, `redis-memory-low`, `queue-depth-high`) plus two SLO fast-burn alarms (14.4× over 1h windows). All notify via SNS topic `${app_name}-alarms`.
+- **CloudWatch alarms** ✅ — eight baseline alarms (`alb-5xx`, `backend-tasks-low`, `mcp-tasks-low`, `rds-cpu-high`, `redis-memory-low`, `queue-depth-high`, `outbox-relay-stalled`, `outbox-dead-lettered`) plus two SLO fast-burn alarms (14.4× over 1h windows) — ten in `infra/cloudwatch.tf`. All notify via SNS topic `${app_name}-alarms`.
 - **Circuit breaker** ✅ — `app/utils/circuit_breaker.py` wraps external API calls; opens on N consecutive failures, half-open probe, auto-recover.
-- **Structured runbooks** ✅ — `runbooks/*.yaml` at repo root; one per alarm + one per SLO breach (7 total). Each has summary, symptoms, diagnosis steps (with copy-pasteable shell commands), mitigation, escalation, related dashboards. Alarm descriptions reference `/admin/runbooks/{id}` so on-call has a one-click path from PagerDuty.
+- **Structured runbooks** ✅ — `runbooks/*.yaml` at repo root; 8 files covering the ten alarms and both SLO breaches (`mcp-tasks-low` shares `rb-ecs-tasks-low`, `outbox-dead-lettered` shares `rb-outbox-relay-stalled`). Each has summary, symptoms, diagnosis steps (with copy-pasteable shell commands), mitigation, escalation, related dashboards. Alarm descriptions reference `/admin/runbooks/{id}` so on-call has a one-click path from PagerDuty.
 - **Focus:** production observability, on-call readiness, failure isolation.
 
 ### Phase 7: Kafka + Advanced Architecture Patterns ✅
@@ -637,7 +650,10 @@ All four services use `client.messages.parse(..., output_format=SomePydanticMode
 - **Sub-second p99** target on the live dashboard endpoints.
 - **Focus:** streaming semantics (windowing, watermarks), low-latency reads at scale, OLTP / OLAP separation.
 
-### Phase 12: Multi-tenancy 🟡
+### Phase 12: Multi-tenancy ✅
+
+Shipped across PRs `#35`–`#38` (see the per-PR breakdown under "Current Implementation Status"). One bullet below did **not** ship and has no owner: per-tenant billing telemetry — there is no `usage.*` event and no chargeable-action aggregate anywhere in `backend/app/`. Everything else on this list is live.
+
 - **Tenant model** — `tenants` table; every existing tenant-scoped table gets a `tenant_id` FK; all queries scoped by tenant.
 - **Postgres row-level security** — RLS policies on every tenant-scoped table; backend connects with a tenant-scoped role; impossible to leak data across tenants even with a query bug.
 - **Per-tenant Kafka partitioning** — change the partition key from `user_id` to `tenant_id` (or hash of `(tenant_id, user_id)`); per-tenant ordering guaranteed.
@@ -690,9 +706,10 @@ Deferred until the incident-commander agent is wired up and driving eval scenari
 │   ├── pack-selftest.sh            # proves pack.sh still scrubs, and still catches
 │   └── archives/                   # gitignored + immutable; absent from a fresh clone
 │
-├── runbooks/                       # machine-readable runbooks (one per alarm + SLO)
+├── runbooks/                       # machine-readable runbooks (8, covering the 10 alarms + both SLOs)
 │   ├── rb-alb-5xx.yaml
-│   ├── rb-ecs-tasks-low.yaml
+│   ├── rb-ecs-tasks-low.yaml       # also linked by the mcp-tasks-low alarm
+│   ├── rb-outbox-relay-stalled.yaml # also linked by the outbox-dead-lettered alarm
 │   ├── rb-rds-cpu-high.yaml
 │   ├── rb-redis-memory-low.yaml
 │   ├── rb-queue-depth-high.yaml
@@ -700,19 +717,10 @@ Deferred until the incident-commander agent is wired up and driving eval scenari
 │   └── rb-slo-dispatch-latency.yaml
 │
 ├── backend/
-│   ├── alembic/                    # DB migrations (11, head: e1d24a8b50c2)
-│   │   └── versions/
-│   │       ├── a01d04e830dc_initial_schema.py
-│   │       ├── b2a8f9c7e103_outbox_events.py
-│   │       ├── c3e9f1a4d802_job_events.py
-│   │       ├── d4b1a8e60305_dag_and_sagas.py
-│   │       ├── e7f4c2a91b08_job_triages.py
-│   │       ├── f8a1c4e23507_multi_tenancy.py
-│   │       ├── a9c2d1e83104_per_tenant_idempotency.py
-│   │       ├── b3d8e7a52116_tenant_quotas.py
-│   │       ├── c4f8e9a52340_row_level_security.py
-│   │       ├── d9c01a7e4f30_platform_admin.py
-│   │       └── e1d24a8b50c2_incident_summaries.py
+│   ├── alembic/                    # DB migrations — 30 revisions, head f1c7b93a4d26
+│   │   └── versions/               # `alembic history` is the authority on the chain;
+│   │                               # the first is a01d04e830dc_initial_schema.py and the
+│   │                               # latest is f1c7b93a4d26_jobs_max_attempts_rename.py
 │   ├── app/
 │   │   ├── main.py                 # FastAPI app factory + lifespan (start_producer, worker_loop)
 │   │   ├── config.py               # Settings / env config (pydantic-settings)
@@ -777,7 +785,7 @@ Deferred until the incident-commander agent is wired up and driving eval scenari
 │   │   │   └── incident_digest.py  # Phase 10 — periodic per-tenant digests
 │   │   │
 │   │   ├── workers/
-│   │   │   ├── dispatcher.py       # JobDispatcherConsumer + worker_loop (starts all 8 consumers + 11 loops)
+│   │   │   ├── dispatcher.py       # JobDispatcherConsumer + worker_loop (starts all 8 consumers + all 11 loops)
 │   │   │   ├── async_tasks.py      # asyncio — bulk_api_sync
 │   │   │   ├── thread_adapters.py  # threading — csv_upload
 │   │   │   ├── cpu_processors.py   # multiprocessing — doc_analysis, report_gen
@@ -801,9 +809,9 @@ Deferred until the incident-commander agent is wired up and driving eval scenari
 │   │   └── utils/                  # rate_limit, quota, cache, decorators, mixins, backpressure, circuit_breaker
 │   │
 │   └── tests/
-│       ├── unit/                   # 447 tests
-│       ├── api/                    # 254 tests
-│       ├── integration/            # 25 tests — Testcontainers (Docker-gated: Postgres ×4 files, Redpanda ×1)
+│       ├── unit/                   # no I/O, mocked deps
+│       ├── api/                    # full FastAPI app, dependency overrides
+│       ├── integration/            # 8 files — Testcontainers (Docker-gated: Postgres ×7 files, Redpanda ×1)
 │       ├── load/                   # Locust
 │       └── conftest.py             # SQLite-in-memory + dependency overrides + default_tenant fixture
 │
@@ -822,7 +830,8 @@ Deferred until the incident-commander agent is wired up and driving eval scenari
 │       │   ├── RegisterPage.tsx
 │       │   ├── DashboardPage.tsx
 │       │   ├── JobDetailPage.tsx   # SSE progress + Kafka event timeline (admin)
-│       │   ├── AdminPage.tsx       # tabs: overview / jobs / dlq / runbooks / users / audit
+│       │   ├── AdminPage.tsx       # tabs: overview / jobs / dlq / runbooks / users / tenants / digests / audit
+│       │   ├── AdminTenantDetailPage.tsx  # per-tenant drill-down (platform admin)
 │       │   ├── SagasPage.tsx
 │       │   ├── SagaNewPage.tsx
 │       │   └── SagaDetailPage.tsx
@@ -844,7 +853,7 @@ Deferred until the incident-commander agent is wired up and driving eval scenari
 │   ├── elasticache.tf
 │   ├── alb.tf
 │   ├── ecs.tf                      # Cluster, task definitions, Fargate services
-│   └── cloudwatch.tf               # SNS topic + 7 alarms (5 baseline + 2 SLO fast-burn)
+│   └── cloudwatch.tf               # SNS topic + 10 alarms (8 baseline + 2 SLO fast-burn)
 │
 └── scripts/                        # seed data, migrations, ops helpers
     ├── entrypoint.sh               # alembic upgrade head → db_bootstrap password sync → uvicorn
@@ -856,7 +865,7 @@ Deferred until the incident-commander agent is wired up and driving eval scenari
 
 ## Working with This Project — A Few Practical Notes
 
-- **Running `eval-reset` against the pinned image (`v0.4.9`):** it needs `-e PYTHONPATH=/app:/app/backend`. The image bakes in `scripts/`, but `python /app/scripts/reset_eval_state.py` puts `/app/scripts` on `sys.path`, not `/app`, so `from scripts import seed_eval_fixtures` raises `ModuleNotFoundError: No module named 'scripts'`. The commander's `make eval-reset` passes the override already — **keep it for the rerun.** A `sys.path` fix is on `master` but is not in any released image, so "scripts are baked in, the workaround is retired" is only half true until the next tag. Verified against the published digest, both ways.
+- **`eval-reset` and `PYTHONPATH` — history, kept for the shape of the bug (2026-08).** Against the then-pinned `v0.4.9` image, `make eval-reset` needed `-e PYTHONPATH=/app:/app/backend`: the image baked in `scripts/`, but `python /app/scripts/reset_eval_state.py` puts `/app/scripts` on `sys.path` rather than `/app`, so `from scripts import seed_eval_fixtures` raised `ModuleNotFoundError`. The `sys.path` fix shipped in a later release, so the workaround is no longer load-bearing on a current image — but the commander still passes the override, and there is no reason to remove it. Worth remembering because the failure was invisible until the reset ran inside the container.
 - **The scripts under `scripts/` are gated on their target, not on `ENVIRONMENT`.** `reset_eval_state.py`, `seed_eval_fixtures.py`, `seed_load_test_users.py` and `seed_incident_commander.py` all call `scripts/eval_safety.py`, which refuses when `ENVIRONMENT=production` **and** when the `DATABASE_URL`/`REDIS_URL` in play is not the one `settings` names. The label check alone was the bug (WO-R2-18): it inspected the local process while the DSN chose which database got emptied, so an operator in a normal `development` shell passed it unconditionally. Target identity is `(scheme, host, port, database)` — driver suffix, credentials and query string are deliberately ignored, so the two-URL scheme below (owner vs `incident_app` role) does not read as a different target. Pass `--i-know-what-im-doing` for a deliberate cross-stack run; it does **not** override the production check. Each script prints its redacted target before writing (`reset_eval_state.py` prints it on **stderr**, so the JSON summary on stdout stays parseable by `make eval-reset`).
 - **Release ordering for the 2026-08 fix campaign: fixes → new version → re-pin → eval** ([ADR 0013](docs/ADR/0013-release-before-rerun.md), maintainer decision 2026-08-08, superseding the earlier "don't cut a tag before the clean-baseline rerun" note). All campaign fixes merge first; the owner cuts `v0.5.0`; the commander re-pins by digest and reblesses its contract snapshot in one planned re-sync PR (expected diff: `+seed_dlq_messages` plus the enumerated description deltas); only then does the eval run, and that run becomes the new baseline. `master` serving 27 tools vs `v0.4.9`'s 26 is the expected, ledgered rebless delta — not a reason to hold the tag. What the ordering gives up (pre-tag live validation, remedied by a `v0.5.1` cycle if the post-release run finds a live-only bug) is recorded in the ADR. Post-`v0.5.0` drift: `master` served **29** tools with `CHAOS_ENABLED=true` (9 of them chaos) up to v0.6.2, and **30** (10 chaos) after WO-R2-166 below — `get_cache_key_info` (#146) and `create_stuck_dag` (the chaos hook that manufactures a genuinely stuck DAG chain for `remediate_runaway_saga_success`) both landed after the tag and ride the next release as ledgered `+get_cache_key_info` / `+create_stuck_dag` rebless deltas. Count it with `list_tools()` rather than trusting this number; it has drifted before. WO-R2-54 adds two more field-level deltas of the same kind: `invalidate_cache_key` and `get_cache_key_info` both say in their `description` and their `key` field description that tenant-scoped keys are reachable only within the caller's own tenant. No schema *shape* change and no tool-count change — but those description strings are pinned, so they land at the same re-pin. The behaviour behind them is a new refusal, not a new field: a cross-tenant `cache:job:` key now returns the existing `cache_key_forbidden` code where it previously succeeded. Separately, WO-R2-32 widens each `tools/list` *entry* rather than the tool count: every tool now advertises `required_scope` and `is_idempotent` alongside `inputSchema`/`outputSchema`. Additive — existing pinned keys are unchanged — but the commander sees it at the same re-pin, so it is a field-level rebless delta on top of the tool-level ones above. WO-R2-55 adds one more of that kind, on a tool that is itself still an unmerged-into-the-baseline delta: `create_stuck_dag`'s `description` and its `chain_name` field description now say ids derive from `{tenant_id}:{chain_name}:{role}` rather than `{chain_name}:{role}`. Shape unchanged, tool count unchanged — but a scenario that pre-computes the root id must now feed the tenant id into the uuid5 key, so this is a rebless delta *and* a caller-visible contract change. Two behaviour changes ride with it: the same `chain_name` in two tenants now builds two independent chains instead of colliding, and a repeat call whose `waiting_steps` is smaller than the stored chain is refused with `stuck_chain_name_in_use` instead of reporting the chain intact. WO-R2-158 adds the first batch of deltas since v0.6.1 that move **schemas** rather than only description strings, so the ledger needs the field list: `list_dlq_messages`' `DlqEntry` gains `fenced_at` + `fenced_by` (output only — no new filter, no input change); `mark_dlq_permanent`'s output gains `fenced_at`; `create_bad_data_job` gains `fixture_name` + `remediation_hint` on input and `fixture_name` + `created` on output, with `remediation_hint` widening from `str` to `str | None`. Description deltas on all three, plus one behaviour change with teeth: `mark_dlq_permanent` on a row already `human_required` used to take an `already_marked` early return and write **nothing** — not the row, not even an audit row — and now always stamps the fence and always audits, so a previously silent no-op is a visible write. The other behaviour change is disposal: `create_bad_data_job` rows now carry `payload.seeded_fixture` and are DELETEd by the eval reset instead of cancelled. The shape list is pinned by `backend/tests/unit/test_fence_tool_descriptions.py::test_the_output_shape_deltas_are_exactly_these`. WO-R2-166 adds the next batch, and it is the first since v0.5.0 to move the **tool count**: `create_mislabeled_dlq_job` is a new chaos tool, so `master` with `CHAOS_ENABLED=true` serves **30** tools (10 of them chaos) and the ledgered delta is `+create_mislabeled_dlq_job`. Alongside it, `poison_message` gains `fixture_name` + `remediation_hint` on input and `fixture_name` + `remediation_hint` + `created` on output, with a rewritten description; `create_bad_data_job`'s description loses the sentence that called `poison_message` a `replay_safe` producer. Three behaviour changes ride with them, all agent-visible: (1) `poison_message`'s dead-letter row is no longer `replay_safe` — it is NULL-hinted by default, `human_required` on request, and `replay_safe` cannot be asked for, because the hook injects a schema violation and a schema violation never becomes replayable (this reverses what the tool advertised for four releases, so a re-pin that does not mention it is a surprise); (2) two new refusal codes reach the commander's ChaosClient — `poison_fixture_name_in_use` and `mislabeled_fixture_name_in_use`, both 409 — and an unknown code is bucketed as a transport fault there, so they belong in the ledger; (3) disposal again — `poison_message` rows now carry `payload.seeded_fixture` and are DELETEd by the eval reset instead of cancelled, which means no chaos hook writes an undeclared DLQ row any more and `_sweep_nonfixture_dlq` is left catching only organic dead-letters and pre-marker legacy rows. The shape list and the refusal codes are pinned by `backend/tests/unit/test_poison_and_mislabel_tool_descriptions.py::test_the_shape_deltas_are_exactly_these` and `::test_the_new_refusal_codes_are_exactly_these`. **WO-R3-187 adds a delta of a kind the ledger has not carried before: none of it is in `tools/list`.** The chaos-audit withholding and the two-token split change no tool name, description or schema — the registry's `tools/list` is byte-identical to v0.6.4 on both sides of the branch (30 tools with `CHAOS_ENABLED=true`, same sha256), so there is nothing to rebless. What changes is what a **response** contains for a principal without `chaos:invoke`: `list_audit_events` and `get_trace` no longer return `chaos.` rows, and no longer count them in `total` / `total_audit_events`. The commander still re-pins by digest for the behaviour, and its half of the order (agent token minus `chaos:invoke`, `PLATFORM_CHAOS_TOKEN` for the runner) is what makes the withholding reachable at all.
 - **Run the backend locally:** `docker compose up postgres redis redpanda minio -d`, then `./.venv/bin/uvicorn app.main:app --reload --app-dir backend`. Set `KAFKA_BOOTSTRAP_SERVERS=localhost:9092` and run the worker as a separate process (the same `app.main` lifespan starts both, so for local dev you typically just run the API and the worker fires in the same process).
@@ -980,9 +989,9 @@ When adding a new error: subclass `AppError`, set `status_code` + `error_code`, 
 
 Three layers, each with a clear purpose. Picking the right one matters:
 
-- **Unit (`backend/tests/unit/`)** — services, processors, validators, repositories, consumers. **No I/O**. SQLite in-memory if a DB is needed (via the `db_session` fixture); mocks for Redis/Kafka/Anthropic. 447 tests.
-- **API contract (`backend/tests/api/`)** — full FastAPI app via httpx ASGITransport, dependency overrides swap in SQLite + mock Redis. Tests request/response shape + auth + error envelope. 254 tests.
-- **Integration (`backend/tests/integration/`)** — real Postgres or Redpanda via Testcontainers. 25 tests across five files. Tests the things only a real DB / broker can prove (RLS enforcement and tenant isolation, audit-log immutability, outbox single-writer exclusivity, the migration advisory lock, Kafka redelivery, schema validation end-to-end). Docker-gated, and three of the five files carry an **opt-in** env gate as well: `RUN_RLS_TEST`, `RUN_EVAL_RESET_TEST`, `RUN_MIGRATION_LOCK_TEST`. Those files are skipped when the variable is **unset** — set it to `1` to run them, which is what `make test-integration` and the `integration` CI job both do.
+- **Unit (`backend/tests/unit/`)** — services, processors, validators, repositories, consumers. **No I/O**. SQLite in-memory if a DB is needed (via the `db_session` fixture); mocks for Redis/Kafka/Anthropic.
+- **API contract (`backend/tests/api/`)** — full FastAPI app via httpx ASGITransport, dependency overrides swap in SQLite + mock Redis. Tests request/response shape + auth + error envelope.
+- **Integration (`backend/tests/integration/`)** — real Postgres or Redpanda via Testcontainers. Eight test files. Tests the things only a real DB / broker can prove (RLS enforcement and tenant isolation, audit-log immutability, outbox single-writer exclusivity, the migration advisory lock, Kafka redelivery, schema validation end-to-end). Docker-gated, and three of the eight files carry an **opt-in** env gate as well: `RUN_RLS_TEST`, `RUN_EVAL_RESET_TEST`, `RUN_MIGRATION_LOCK_TEST`. Those files are skipped when the variable is **unset** — set it to `1` to run them, which is what `make test-integration` and the `integration` CI job both do.
 
 When in doubt: write a unit test. Move up only when you need the real thing.
 
