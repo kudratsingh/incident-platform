@@ -2107,7 +2107,7 @@ LAG_SAMPLES_KEY = f"{BACKPRESSURE_LAG_KEY}:samples"
 LAG_SAMPLES_KEEP = 5
 
 
-async def _record_lag_sample(redis: Any, lag: int, *, now: datetime | None = None) -> None:
+async def _record_lag_sample(redis: Any, lag: int) -> None:
     """Prepend one timestamped measurement to the capped sample window.
 
     Read-modify-write on purpose: the window is a diagnostic aid, not a
@@ -2116,7 +2116,7 @@ async def _record_lag_sample(redis: Any, lag: int, *, now: datetime | None = Non
     JSON list is replaced rather than parsed around — a malformed window
     is not evidence of anything and must not stop the loop recording.
     """
-    measured_at = (now or datetime.now(UTC)).isoformat()
+    measured_at = datetime.now(UTC).isoformat()
     samples: list[Any] = []
     raw = await redis.get(LAG_SAMPLES_KEY)
     if raw is not None:
