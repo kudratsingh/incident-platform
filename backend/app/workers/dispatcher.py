@@ -33,6 +33,7 @@ from app.config import get_settings
 from app.core import metrics
 from app.core.leader_lock import OUTBOX_RELAY_LOCK_KEY, advisory_leader_lock
 from app.core.logging import get_logger, job_id_var, trace_id_var
+from app.core.outbox_heartbeat import record_relay_tick
 from app.core.tracing import extract_context, get_tracer
 from app.models.enums import TERMINAL_JOB_STATUSES, JobStatus, JobType
 from app.models.job import Job
@@ -1981,6 +1982,16 @@ async def _outbox_relay_tick(
         async with session.begin():
             repo = OutboxRepository(session)
             events = await repo.fetch_unpublished(limit=OUTBOX_RELAY_BATCH)
+
+    # "A pass ran." Recorded here — inside the tick, after the fetch that
+    # proves the queue was reachable — rather than in the loop around it,
+    # because the loop keeps turning when the relay is skipping its work and a
+    # stamp written up there would report that state as healthy. It is written
+    # whether or not there was anything to deliver, which is the whole point:
+    # an idle relay and a stopped one both publish nothing, and this is the
+    # only thing that tells a reader in another process which one it is
+    # (ADR 0028). Never fatal — see `record_relay_tick`.
+    await record_relay_tick()
 
     await _emit_outbox_gauges(session_factory)
 

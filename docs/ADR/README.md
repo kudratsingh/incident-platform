@@ -33,6 +33,7 @@ Status is stated in each file's own header; the table below mirrors it. All 26 a
 | [0025](0025-alert-severity-vocabulary.md) | The alert severity vocabulary is `low \| info \| warning \| critical` | Accepted | — |
 | [0026](0026-strict-tenant-isolation-and-declared-platform-scope.md) | Strict `tenant_isolation`: an unscoped statement is refused, cross-tenant work declares itself | Accepted | Amends 0003 and 0015 |
 | [0027](0027-control-loop-pause-closed-enum.md) | One hook pauses a background loop, and the enum of loops is closed | Accepted | Adds `BlastRadius.SINGLE_LOOP`; the enum excludes the Kafka consumer groups `kill_consumer` already stops |
+| [0028](0028-outbox-relay-heartbeat-and-delivery-reading.md) | The outbox relay records each pass, and one reading reports delivery | Accepted | Adds `outbox:relay:last_tick` and the `get_outbox_status` tool; builds on 0020 and 0027 |
 
 ## Writing one
 
