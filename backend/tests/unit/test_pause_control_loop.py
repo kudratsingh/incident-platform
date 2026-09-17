@@ -278,6 +278,67 @@ def test_the_key_helper_accepts_the_enum_and_its_value_identically() -> None:
 
 
 # ---------------------------------------------------------------------------
+# The closed set, refused before the handler runs
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "loop_name",
+    ["dependency_resolver", "saga_coordinator", "read_model", "", "outbox-relay"],
+)
+def test_a_name_outside_the_enum_is_refused_at_parse_time(loop_name: str) -> None:
+    """The enum is a safety boundary, and a boundary that accepts is not one.
+
+    `loop_name` is typed as `ControlLoopName`, so Pydantic refuses anything else
+    while building the input model — before the handler, and therefore before any
+    Redis write. That matters more than it looks: a key nothing reads would be
+    accepted with `accepted: true`, and the caller would believe a fault landed
+    where none did, which is the failure mode this file's static half exists to
+    prevent one layer up.
+
+    The first three names are the Kafka consumer groups the plan's draft enum
+    carried (ADR 0027, divergence H2). They are the ones a caller written against
+    the plan will actually try — `dependency_resolver` especially, since Family C
+    stalls that group — and the refusal has to teach, so the message is asserted
+    to name the closed set rather than only to fail.
+    """
+    from app.mcp.tools.chaos.pause_control_loop import PauseControlLoopInput
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError) as exc:
+        PauseControlLoopInput(loop_name=loop_name)  # type: ignore[arg-type]
+
+    rendered = str(exc.value)
+    assert ControlLoopName.OUTBOX_RELAY.value in rendered
+    assert ControlLoopName.RESUME_UNBLOCKED_WAITING.value in rendered
+
+
+def test_make_eval_reset_sweeps_the_kill_key_the_pause_composes_with() -> None:
+    """Family C needs two chaos keys at once, and one scan has to clear both.
+
+    A `WAITING` child is only stranded while the `dependency-resolver` consumer
+    group is killed AND this sweep is paused (ADR 0027's 2026-09-17 amendment), so
+    this is the first world whose teardown depends on two keys from two different
+    mechanisms. Asserted against the reset script's real pattern tuple: a
+    narrowing that left the kill key behind would strand a child in the *next*
+    scenario with nothing to correlate it to.
+    """
+    from app.config import get_settings
+    from app.workers.kafka_consumer import kill_key_for
+    from tests.unit.test_eval_reset import _reset_module
+
+    patterns = _reset_module()._CHAOS_KEY_PATTERNS
+    keys = (
+        pause_key_for(ControlLoopName.RESUME_UNBLOCKED_WAITING),
+        kill_key_for(get_settings().kafka_consumer_group_dependency),
+    )
+    for key in keys:
+        assert any(fnmatch.fnmatch(key, p) for p in patterns), (
+            f"{key} matches no pattern in {patterns}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # The check itself
 # ---------------------------------------------------------------------------
 
