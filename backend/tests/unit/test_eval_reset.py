@@ -1911,3 +1911,101 @@ async def test_reset_leaves_a_matching_triage_row_alone(
     await db_session.flush()
 
     assert await seed._reset_dlq_state(db_session) == 0
+
+
+# ---------------------------------------------------------------------------
+# WO-R3-267 — the hot_set the reset re-populates must READ as healthy
+# ---------------------------------------------------------------------------
+
+
+class _TinyRedis:
+    """Just enough for `_seed_hot_set` to write and the record check to
+    read: `set` and `get`, values held as written."""
+
+    def __init__(self) -> None:
+        self.store: dict[str, str] = {}
+
+    async def set(self, key: str, value: str, ex: int | None = None) -> bool:
+        self.store[key] = value
+        return True
+
+    async def get(self, key: str) -> str | None:
+        return self.store.get(key)
+
+
+async def test_reset_leaves_the_hot_set_reading_as_healthy(
+    db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
+) -> None:
+    """The consistency the reset owes the new evidence.
+
+    `get_cache_key_info` now reports how many of the job records an entry
+    names the database still holds, and the whole point of the reset is
+    that the next run starts from a world whose readings are the healthy
+    ones. The seed derives the hot_set from `_dlq_specs()` and the reset
+    re-baselines those same rows, so after a reset every member must
+    resolve — asserted through the tool's own resolver rather than a
+    re-implementation of it, because a copy would drift.
+
+    This is the reading-level counterpart to
+    `test_seed_hot_set_populates_expected_key`, which pins the id set:
+    that one says the members are the right ids, this one says a caller
+    asking the platform about them gets "all present".
+    """
+    from app.dependencies import Principal
+    from app.mcp.registry import ToolContext
+    from app.mcp.tools.cache_key_info import resolve_record_references
+
+    seed = _seed_module()
+    await seed._seed_dlq(db_session, default_tenant, test_user)
+    await db_session.flush()
+
+    redis = _TinyRedis()
+    await seed._seed_hot_set(redis)
+    key = seed._HOT_SET_KEY
+
+    ctx = ToolContext(
+        db=db_session,
+        redis=redis,  # type: ignore[arg-type]
+        principal=Principal(
+            kind="service_account", tenant_id=default_tenant.id
+        ),
+    )
+    referenced, found = await resolve_record_references(key, "string", ctx=ctx)
+
+    assert referenced == len(json.loads(redis.store[key]))
+    assert found == referenced, (
+        "the reset re-populated the hot_set with ids the database does not "
+        "hold — the next run would open on a reading that says the copy is "
+        "out of date"
+    )
+
+
+async def test_the_hot_set_reading_is_not_healthy_by_construction(
+    db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
+) -> None:
+    """The negative control for the test above.
+
+    A resolver that answered "all present" regardless would pass it, and
+    the reset consistency claim would be vacuous. With the same key and
+    no rows behind it, the reading has to come back all-absent.
+    """
+    from app.dependencies import Principal
+    from app.mcp.registry import ToolContext
+    from app.mcp.tools.cache_key_info import resolve_record_references
+
+    seed = _seed_module()
+    redis = _TinyRedis()
+    await seed._seed_hot_set(redis)
+
+    ctx = ToolContext(
+        db=db_session,
+        redis=redis,  # type: ignore[arg-type]
+        principal=Principal(
+            kind="service_account", tenant_id=default_tenant.id
+        ),
+    )
+    referenced, found = await resolve_record_references(
+        seed._HOT_SET_KEY, "string", ctx=ctx
+    )
+    assert referenced and referenced > 0
+    assert found == 0
