@@ -28,7 +28,11 @@ What gets cleared/reset:
      are effects the *agent* left behind rather than chaos state, and
      both bleed into the next scenario: a timer fires mid-run and
      shrinks the DLQ unprompted, a stale pause holds the next DAG in
-     WAITING (enforced since ADR 0011).
+     WAITING (enforced since ADR 0011). The recorded window of recent
+     consumer-lag measurements
+     (`kafka:consumer_lag:worker-dispatcher:samples`) goes with them: it
+     is not the agent's residue but it bleeds the same way, showing the
+     next run a lag trend measured during the previous one.
   4. **Declared fixtures and non-fixture DLQ rows** — two disposal
      classes, deliberately different (ADR 0012 rule 2). A row a scenario
      *declared* for itself carries the top-level `seeded_fixture` payload
@@ -198,6 +202,25 @@ _JOB_CACHE_PATTERN = "cache:job:*"
 _SCHEDULED_REPLAY_KEY = "jobs:dlq_replay_delayed"
 _INFLIGHT_REPLAY_KEY = "jobs:dlq_replay_inflight"
 
+# The metrics loop's window of recent timestamped lag measurements for
+# the one refreshed group (WO-R3-254). Mirror of
+# `app/workers/dispatcher.py:LAG_SAMPLES_KEY`, kept as a literal for the
+# same reason as the two keys above — no import dependency on the worker
+# package — and pinned against it by
+# `tests/unit/test_consumer_lag_history.py`.
+#
+# The lag VALUE key is deliberately not touched, here or in the seeder:
+# the loop owns it under a 90s TTL, and a durable fixture written over it
+# would pin a number the loop can no longer correct. The window gets the
+# opposite treatment for the same reason it exists — it spans minutes,
+# not seconds, so measurements taken before a reset would otherwise be
+# the first "trend" the next run sees, from a world that no longer
+# exists. Cleared, not rebuilt: nothing but the loop can say when a
+# measurement was taken, and it records a fresh one within ~60s. Until
+# then `get_consumer_lag` reports the current value with no measurement
+# time and an empty window, which is the truth.
+_LAG_SAMPLES_KEY = "kafka:consumer_lag:worker-dispatcher:samples"
+
 
 def _empty_dlq_baseline() -> bool:
     """Whether the inter-scenario baseline is an empty DLQ.
@@ -264,6 +287,20 @@ async def _clear_scheduled_replays(redis: aioredis.Redis) -> int:
             await redis.delete(key)
             pending += held
     return pending
+
+
+async def _clear_lag_samples(redis: aioredis.Redis) -> int:
+    """Drop the recorded window of recent consumer-lag measurements.
+
+    Same class of cross-scenario bleed as the timers and pauses above,
+    one surface further out: the window is what `get_consumer_lag`
+    returns as `recent_samples`, so a window carried across a reset
+    shows the next run a climb or a drain that belongs to the previous
+    one. See `_LAG_SAMPLES_KEY` for why the value key beside it is left
+    alone.
+
+    Returns 1 if a window was there, 0 if not."""
+    return int(await redis.delete(_LAG_SAMPLES_KEY) or 0)
 
 
 async def _clear_dag_pauses(redis: aioredis.Redis) -> int:
@@ -817,6 +854,7 @@ async def reset(
         job_cache_cleared = await _clear_job_read_cache(redis)
         timers_cleared = await _clear_scheduled_replays(redis)
         pauses_cleared = await _clear_dag_pauses(redis)
+        lag_samples_cleared = await _clear_lag_samples(redis)
         # Order-independent of the seed: the seeded fixture alerts use
         # non-chaos sources, so this can neither race nor re-resolve them.
         chaos_alerts_resolved = await _resolve_chaos_alerts(factory)
@@ -865,6 +903,7 @@ async def reset(
         "timestamps_rebaselined": seed_summary["timestamps_rebaselined"],
         "empty_dlq_baseline": _empty_dlq_baseline(),
         "job_cache_cleared": job_cache_cleared,
+        "lag_samples_cleared": lag_samples_cleared,
         "organic_alerts_resolved": organic_alerts_resolved,
         "read_model_keys_rebuilt": read_model_keys,
         "seeded_dlq_deleted": seeded_dlq_deleted,

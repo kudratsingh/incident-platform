@@ -21,6 +21,7 @@ Concurrency model selection (this is the core design decision):
 """
 
 import asyncio
+import json
 import time
 import uuid
 from collections.abc import Callable
@@ -2081,6 +2082,58 @@ async def _outbox_relay_loop(
 BACKPRESSURE_LAG_KEY = "kafka:consumer_lag:worker-dispatcher"
 BACKPRESSURE_LAG_TTL = 90  # seconds — must exceed metrics loop interval (60s)
 
+# The same number, with the time it was measured, kept for the last few
+# passes. `BACKPRESSURE_LAG_KEY` is one undated integer overwritten every
+# ~60s: a reader could see the current lag and nothing else, so "lag is
+# climbing" was unverifiable from the platform — three reads inside one
+# minute return the one value the loop last wrote, which reads as "flat"
+# and is really "not re-measured yet" (WO-R3-254).
+#
+# Deliberately a SECOND key. The value key's shape and meaning are fixed
+# by `check_backpressure` (and by every other reader of it), so the
+# history is written beside it rather than into it.
+#
+# JSON list, newest first: [{"lag": int, "measured_at": ISO-8601 UTC}].
+# One string rather than a Redis list so every reader that already has
+# GET has the history too, and so one SET replaces the whole window.
+# Same TTL as the value, refreshed on every write: the pair is
+# fresh-or-absent together, and a stopped loop takes both with it
+# instead of leaving a history nothing is extending.
+LAG_SAMPLES_KEY = f"{BACKPRESSURE_LAG_KEY}:samples"
+# Five at ~60s apart is ~5 minutes of trend — enough to see a climb, small
+# enough that the whole window is one short value. Mirrored by the reader
+# (`app/mcp/tools/consumer_lag.py`); `test_consumer_lag_history.py` pins
+# the pair together.
+LAG_SAMPLES_KEEP = 5
+
+
+async def _record_lag_sample(redis: Any, lag: int, *, now: datetime | None = None) -> None:
+    """Prepend one timestamped measurement to the capped sample window.
+
+    Read-modify-write on purpose: the window is a diagnostic aid, not a
+    correctness input, so a lost race between two worker replicas costs
+    one sample and nothing else. Anything already stored that is not a
+    JSON list is replaced rather than parsed around — a malformed window
+    is not evidence of anything and must not stop the loop recording.
+    """
+    measured_at = (now or datetime.now(UTC)).isoformat()
+    samples: list[Any] = []
+    raw = await redis.get(LAG_SAMPLES_KEY)
+    if raw is not None:
+        if isinstance(raw, bytes | bytearray):
+            raw = raw.decode()
+        try:
+            loaded = json.loads(raw)
+        except (TypeError, ValueError):
+            loaded = None
+        if isinstance(loaded, list):
+            samples = [s for s in loaded if isinstance(s, dict)]
+    samples.insert(0, {"lag": int(lag), "measured_at": measured_at})
+    del samples[LAG_SAMPLES_KEEP:]
+    await redis.set(
+        LAG_SAMPLES_KEY, json.dumps(samples), ex=BACKPRESSURE_LAG_TTL
+    )
+
 
 async def _digest_loop(session_factory: async_sessionmaker[AsyncSession]) -> None:
     """Periodic incident-summary digest worker.
@@ -2204,7 +2257,10 @@ async def _metrics_loop(redis: Any, consumer: JobDispatcherConsumer) -> None:
     """Emit queue/in-flight/consumer-lag gauges every ~60s.
 
     Lag is also cached in Redis so the API can read it cheaply for the
-    backpressure check (no per-request Kafka query).
+    backpressure check (no per-request Kafka query), and each measurement
+    is appended to a short timestamped window so a reader can tell a
+    climbing lag from a flat one without being able to wait a minute
+    itself (`LAG_SAMPLES_KEY`).
     """
     while True:
         try:
@@ -2223,6 +2279,18 @@ async def _metrics_loop(redis: Any, consumer: JobDispatcherConsumer) -> None:
             if lag is not None:
                 await metrics.emit_gauge("ConsumerLag", float(lag))
                 await redis.set(BACKPRESSURE_LAG_KEY, lag, ex=BACKPRESSURE_LAG_TTL)
+                # Value first, history second: backpressure's key is the
+                # one with a caller waiting on it. The history is best
+                # effort — if it fails, the reading is still correct and
+                # still cached, it just has no recorded time, which the
+                # reader reports honestly rather than guessing.
+                try:
+                    await _record_lag_sample(redis, lag)
+                except Exception as exc:
+                    logger.warning(
+                        "consumer lag sample not recorded",
+                        extra={"error": str(exc)},
+                    )
         except asyncio.CancelledError:
             break
         except Exception as exc:

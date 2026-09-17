@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest_asyncio
@@ -206,6 +207,11 @@ async def test_tools_list_includes_output_schema_per_tool(
     assert "consumer_group" in props
     assert "lag" in props
     assert "cache_key" in props
+    # WO-R3-254 — the reading carries its time and the window before it.
+    # Advertised, not just returned: the commander pins this schema.
+    assert "measured_at" in props
+    assert "age_seconds" in props
+    assert "recent_samples" in props
 
 
 # ---------------------------------------------------------------------------
@@ -282,6 +288,80 @@ async def test_tools_call_happy_path_returns_cached_lag(
     payload = json.loads(content[0]["text"])
     assert payload["consumer_group"] == "worker-dispatcher"
     assert payload["lag"] == 42
+
+
+async def test_tools_call_lag_carries_its_measurement_time_and_recent_samples(
+    mcp_client,  # type: ignore[no-untyped-def]
+    db_session: AsyncSession,
+    default_tenant,
+) -> None:
+    """WO-R3-254 — the wire shape, end to end.
+
+    The caller cannot let time pass, so a bare number made "is the lag
+    climbing?" unanswerable: three reads inside one refresh window return
+    the one value the loop last wrote. The response now carries when that
+    value was measured and the short window of measurements before it, so
+    the trend comes out of a single call.
+    """
+    ac, redis_stub = mcp_client
+    measured_at = datetime.now(UTC)
+    redis_stub._store[BACKPRESSURE_LAG_KEY] = "290"
+    redis_stub._store[f"{BACKPRESSURE_LAG_KEY}:samples"] = json.dumps(
+        [
+            {"lag": 290, "measured_at": measured_at.isoformat()},
+            {
+                "lag": 180,
+                "measured_at": (measured_at - timedelta(seconds=61)).isoformat(),
+            },
+            {
+                "lag": 95,
+                "measured_at": (measured_at - timedelta(seconds=122)).isoformat(),
+            },
+        ]
+    )
+    token = await _mint_token(
+        db_session, default_tenant, [Scope.TELEMETRY_READ.value]
+    )
+    resp = await ac.post(
+        "/mcp",
+        json=_rpc("tools/call", {"name": "get_consumer_lag", "arguments": {}}),
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    payload = json.loads(resp.json()["result"]["content"][0]["text"])
+
+    assert payload["lag"] == 290
+    assert payload["measured_at"] is not None
+    assert datetime.fromisoformat(payload["measured_at"]) == measured_at
+    assert 0 <= payload["age_seconds"] <= 10
+    assert [s["lag"] for s in payload["recent_samples"]] == [290, 180, 95]
+    assert all("measured_at" in s for s in payload["recent_samples"])
+
+
+async def test_tools_call_lag_without_recorded_samples_says_so(
+    mcp_client,  # type: ignore[no-untyped-def]
+    db_session: AsyncSession,
+    default_tenant,
+) -> None:
+    """Value present, nothing recorded — the state for the first minute
+    after a worker restart, and right after an eval reset. The number is
+    real and is returned; the time it was measured is unknown and is
+    reported as unknown rather than guessed."""
+    ac, redis_stub = mcp_client
+    redis_stub._store[BACKPRESSURE_LAG_KEY] = "29"
+    token = await _mint_token(
+        db_session, default_tenant, [Scope.TELEMETRY_READ.value]
+    )
+    resp = await ac.post(
+        "/mcp",
+        json=_rpc("tools/call", {"name": "get_consumer_lag", "arguments": {}}),
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    payload = json.loads(resp.json()["result"]["content"][0]["text"])
+
+    assert payload["lag"] == 29
+    assert payload["measured_at"] is None
+    assert payload["age_seconds"] is None
+    assert payload["recent_samples"] == []
 
 
 async def test_tools_call_returns_null_lag_when_cache_empty(

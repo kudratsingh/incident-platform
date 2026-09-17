@@ -515,6 +515,64 @@ async def test_clear_dag_pauses_removes_pause_flags() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Recorded consumer-lag measurements — WO-R3-254
+# ---------------------------------------------------------------------------
+
+
+async def test_clear_lag_samples_drops_the_recorded_window() -> None:
+    """The metrics loop keeps ~5 minutes of timestamped lag measurements
+    and `get_consumer_lag` returns them as `recent_samples`. Carried
+    across a reset, the first trend the next run reads is one the
+    previous run produced — the same cross-scenario bleed as a leftover
+    replay timer, one surface further out."""
+    reset = _reset_module()
+    redis = AsyncMock()
+    redis.delete = AsyncMock(return_value=1)
+
+    assert await reset._clear_lag_samples(redis) == 1
+    assert [c.args[0] for c in redis.delete.await_args_list] == [
+        reset._LAG_SAMPLES_KEY
+    ]
+
+
+async def test_clear_lag_samples_is_a_noop_when_nothing_was_recorded() -> None:
+    reset = _reset_module()
+    redis = AsyncMock()
+    redis.delete = AsyncMock(return_value=0)
+
+    assert await reset._clear_lag_samples(redis) == 0
+
+
+def test_the_reset_clears_the_window_the_metrics_loop_writes() -> None:
+    """Asserted against the worker's constant, not a re-typed string —
+    the script duplicates the literal so it has no import dependency on
+    the worker package, which makes this test the only thing standing
+    between that duplication and a silent divergence (R2-76's lesson,
+    applied to the key added by WO-R3-254)."""
+    from app.workers.dispatcher import LAG_SAMPLES_KEY
+
+    assert _reset_module()._LAG_SAMPLES_KEY == LAG_SAMPLES_KEY
+
+
+def test_the_reset_leaves_the_lag_value_key_alone() -> None:
+    """Deliberate asymmetry, stated as a test because the two keys look
+    interchangeable: the value is loop-owned under a 90s TTL and a reset
+    that deleted it would blind backpressure for a minute for nothing,
+    while the window spans minutes and is exactly the state that bleeds.
+    Nothing in the script may name the value key."""
+    from app.utils.backpressure import BACKPRESSURE_LAG_KEY
+
+    source = inspect.getsource(_reset_module())
+    # Quoted on both sides on purpose: the window key starts with the
+    # value key, so an unquoted substring search would match it and this
+    # test would fail on the very key it is here to allow.
+    assert f'"{BACKPRESSURE_LAG_KEY}"' not in source, (
+        "reset_eval_state names the lag VALUE key — the metrics loop owns "
+        "it under a TTL and the reset must not touch it"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Empty-DLQ baseline mode — commander ADR 0010 / platform ADR 0012
 # ---------------------------------------------------------------------------
 
