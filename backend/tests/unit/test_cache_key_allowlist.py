@@ -14,7 +14,11 @@ import uuid
 import pytest
 from app.core.exceptions import AppError
 from app.mcp.tools import cache_key_info as cache_key_info_module
-from app.mcp.tools._cache_scope import assert_key_in_tenant, tenant_segment
+from app.mcp.tools._cache_scope import (
+    assert_key_in_tenant,
+    job_segment,
+    tenant_segment,
+)
 from app.mcp.tools.actions import (
     invalidate_cache_key as invalidate_cache_key_module,
 )
@@ -177,3 +181,40 @@ def test_both_cache_tools_share_one_scope_check() -> None:
         invalidate_cache_key_module.assert_key_in_tenant
         is cache_key_info_module.assert_key_in_tenant
     )
+
+
+# ---------------------------------------------------------------------------
+# WO-R3-267 — the job half of the same key, read out of the same builder
+# ---------------------------------------------------------------------------
+
+
+def test_the_job_segment_is_read_out_of_the_real_job_cache_key() -> None:
+    """`get_cache_key_info` names the one record a per-job entry is a copy
+    of from the KEY, never from the payload — the payload is tenant data.
+    That makes the segment's position load-bearing a second time, so it
+    gets the same tripwire the tenant segment has: a change to
+    `JobCache._key`'s layout breaks a test instead of quietly making the
+    record check ask about the wrong id."""
+    job_id = uuid.uuid4()
+    key = JobCache._key(job_id, uuid.uuid4())
+    assert job_segment(key) == str(job_id)
+
+
+def test_platform_global_keys_carry_no_job_segment() -> None:
+    """These name no single record, so the check falls through to the
+    entry's stored list — or to a null when there is nothing to read."""
+    for key in (
+        _DEFAULT_HOT_SET_KEY,
+        BACKPRESSURE_LAG_KEY,
+        "read_model:something",
+    ):
+        assert job_segment(key) is None, key
+
+
+def test_a_truncated_per_job_key_names_no_record() -> None:
+    """A key that stops at the tenant has no job in it. Returning the
+    tenant id as though it were a job id would make the tool ask the
+    database a question about the wrong thing and report the answer as
+    fact."""
+    assert job_segment(f"cache:job:{uuid.uuid4()}") is None
+    assert job_segment(f"cache:job:{uuid.uuid4()}:") is None
