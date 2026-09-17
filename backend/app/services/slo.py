@@ -84,6 +84,8 @@ FAST_BURN_THRESHOLD = 14.4
 
 @dataclass(frozen=True, slots=True)
 class SLODefinition:
+    """One promise the platform makes, and the window it is measured over."""
+
     id: str
     name: str
     description: str
@@ -246,6 +248,9 @@ def _dispatched_in_window(
 
 @dataclass(frozen=True, slots=True)
 class SLOState:
+    """How one objective is doing right now: the counts behind it, the budget
+    left and how fast it is burning."""
+
     definition: SLODefinition
     total: int
     failed: int
@@ -261,6 +266,7 @@ class SLOState:
 
 
 async def compute_all(session: AsyncSession) -> list[SLOState]:
+    """Measure every declared objective over its own window."""
     out: list[SLOState] = []
     for slo in SLOS:
         if slo.latency_threshold_seconds is not None:
@@ -311,6 +317,8 @@ def _state(slo: SLODefinition, total: int, failed: int) -> SLOState:
 async def _compute_completion_slo(
     session: AsyncSession, slo: SLODefinition
 ) -> SLOState:
+    """Share of settled jobs in the window that completed rather than died.
+    Cancellations and seeded lab rows are in neither half of the fraction."""
     since = datetime.now(UTC) - timedelta(hours=slo.window_hours)
     total_expr = func.count().label("total")
     failed_expr = func.sum(

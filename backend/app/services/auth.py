@@ -1,3 +1,9 @@
+"""Auth service — registration, login, token refresh and tenant enrolment.
+
+Every path here also writes the audit row for what it did, and names the tenant
+on its own transaction so the row is written under row-level security.
+"""
+
 import uuid
 
 from app.core.exceptions import (
@@ -25,6 +31,8 @@ logger = get_logger(__name__)
 
 
 class AuthService:
+    """Who may hold an account here, and what a valid login is worth."""
+
     def __init__(
         self,
         user_repo: UserRepository,
@@ -43,6 +51,8 @@ class AuthService:
         new_tenant_name: str | None = None,
         ip_address: str | None = None,
     ) -> User:
+        """Sign someone up, either founding a brand-new tenant or joining the
+        shared default one. Any other tenant needs an invitation."""
         # Registration never takes a caller-supplied role (X-01 / F1-04).
         # Everyone starts as a plain user; the single, bounded exception is
         # the founder branch below, which is decided here — not by the
@@ -186,6 +196,7 @@ class AuthService:
     async def login(
         self, email: str, password: str, ip_address: str | None = None
     ) -> tuple[str, str]:
+        """Check the password and return a fresh (access, refresh) token pair."""
         user = await self.user_repo.get_by_email(email)
         if not user or not verify_password(password, user.hashed_password):
             raise AuthenticationError("Invalid email or password")
@@ -218,6 +229,8 @@ class AuthService:
         return access_token, refresh_token
 
     async def refresh(self, refresh_token: str) -> tuple[str, str]:
+        """Trade a valid refresh token for a new pair, if the account is still
+        active."""
         payload = decode_token(refresh_token, expected_type="refresh")
         user_id = payload["sub"]
         user = await self.user_repo.get_by_id(uuid.UUID(user_id))

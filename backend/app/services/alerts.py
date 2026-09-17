@@ -62,11 +62,16 @@ logger = get_logger(__name__)
 
 
 class AlertValidationError(AppError):
+    """The alert was rejected before it was written — bad severity, no title."""
+
     status_code = 400
     error_code = "alert_invalid"
 
 
 class AlertService:
+    """Records alerts and, once the transaction commits, pushes them to the
+    webhook."""
+
     def __init__(self, alert_repo: AlertRepository) -> None:
         self.alert_repo = alert_repo
 

@@ -1,3 +1,10 @@
+"""Job service — the single place a job is created, read, replayed or resolved.
+
+Sits between the API routers, the admin console and the MCP action tools on one
+side and the repositories on the other; the job row, its audit row and its
+outbox event are always written together.
+"""
+
 import uuid
 from functools import partial
 from typing import Any
@@ -22,6 +29,9 @@ logger = get_logger(__name__)
 
 
 class JobService:
+    """Job operations every caller shares, so the rules around them — tenant
+    scope, audit, cache invalidation — cannot differ by entry point."""
+
     def __init__(
         self,
         job_repo: JobRepository,
@@ -49,6 +59,12 @@ class JobService:
         saga_id: uuid.UUID | None = None,
         saga_step_index: int | None = None,
     ) -> Job:
+        """Create a job, or hand back the one an earlier call with the same
+        idempotency key already made.
+
+        A job whose parents are unfinished — or whose chain is paused — starts
+        WAITING and is announced later; anything else is announced now.
+        """
         # `None` means "the platform default", which is `MAX_JOB_ATTEMPTS`
         # — not a literal 3 restated here (WO-R2-76). Callers that want a
         # different ceiling for one job (the saga coordinator, per step)
@@ -225,6 +241,8 @@ class JobService:
         user_role: str,
         tenant_id: uuid.UUID,
     ) -> Job:
+        """One job from the caller's own tenant. Someone else's job is refused
+        unless the caller is support or admin."""
         # Tenant scope first — a cross-tenant lookup is a 404, never an
         # AuthorizationError, so the caller can't even infer the row exists.
         job = await self.job_repo.get_for_tenant(job_id, tenant_id)
@@ -251,6 +269,8 @@ class JobService:
         retry_count_min: int | None = None,
         retry_count_max: int | None = None,
     ) -> tuple[list[Job], int]:
+        """A filtered page of jobs plus the total. Ordinary users only ever see
+        their own; support and admin see the whole tenant."""
         # Non-admins can only see their own jobs
         effective_user_id: uuid.UUID | None
         if user_role in (UserRole.ADMIN, UserRole.SUPPORT):
@@ -439,6 +459,7 @@ class JobService:
     async def resolve_incident(
         self, job_id: uuid.UUID, requesting_user_id: uuid.UUID, tenant_id: uuid.UUID
     ) -> Job:
+        """Close a job out by hand: mark it completed and record who did it."""
         job = await self.job_repo.get_for_tenant(job_id, tenant_id)
         if not job:
             raise NotFoundError(f"Job {job_id} not found")
