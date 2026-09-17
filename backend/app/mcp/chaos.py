@@ -37,6 +37,13 @@ class BlastRadius(StrEnum):
     will wire alarms on the rate of higher-blast invocations."""
 
     SINGLE_CONSUMER = "single_consumer"
+    #: Narrower than SINGLE_CONSUMER, and added for `pause_control_loop`
+    #: (ADR 0027). A Kafka consumer group is a whole subscription: killing one
+    #: stops every message on its topics. A background loop is one named
+    #: coroutine inside the worker — the process, its consumers and the other
+    #: ten loops carry on. Labelling that `single_consumer` would overstate it
+    #: on every audit row.
+    SINGLE_LOOP = "single_loop"
     SINGLE_SERVICE = "single_service"
     SHARED_DEPENDENCY = "shared_dependency"
     ENVIRONMENT_WIDE = "environment_wide"

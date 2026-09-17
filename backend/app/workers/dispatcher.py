@@ -53,6 +53,7 @@ from app.workers import (
     thread_adapters,
 )
 from app.workers.audit_consumer import AuditConsumer
+from app.workers.control_loop_pause import ControlLoopName, loop_is_paused
 from app.workers.dependency_resolver import DependencyResolver
 from app.workers.event_log_consumer import EventLogConsumer
 from app.workers.kafka_consumer import BaseKafkaConsumer, _check_chaos_kill_strict
@@ -1056,7 +1057,12 @@ async def _promote_delayed_loop(
         # the worker has to "the loops are wedged" (`workers/supervisor.py`).
         worker_tick()
         try:
-            await _promote_delayed_once(session_factory, redis)
+            # AFTER worker_tick(), never before: that call is the heartbeat the
+            # deep health check reads for every loop, so a single-loop pause
+            # that skipped it would report the whole worker wedged
+            # (`workers/control_loop_pause.py`).
+            if not await loop_is_paused(ControlLoopName.DELAYED_RETRY_PROMOTE):
+                await _promote_delayed_once(session_factory, redis)
         except asyncio.CancelledError:
             break
         except Exception as exc:
@@ -1235,9 +1241,12 @@ async def _resume_unblocked_waiting_loop(
     cursor: _ResumeCursor | None = None
     while True:
         try:
-            cursor = await _resume_unblocked_waiting_once(
-                session_factory, redis, cursor
-            )
+            # The cursor is deliberately NOT reset while paused: it is a
+            # fairness hint, and a pause is not a failure to re-scan from.
+            if not await loop_is_paused(ControlLoopName.RESUME_UNBLOCKED_WAITING):
+                cursor = await _resume_unblocked_waiting_once(
+                    session_factory, redis, cursor
+                )
         except asyncio.CancelledError:
             break
         except Exception as exc:
@@ -1365,7 +1374,8 @@ async def _requeue_stale_pending_loop(
     `jobs:delayed` guard is load-bearing."""
     while True:
         try:
-            await _requeue_stale_pending_once(session_factory, redis)
+            if not await loop_is_paused(ControlLoopName.STALE_PENDING_BACKSTOP):
+                await _requeue_stale_pending_once(session_factory, redis)
         except asyncio.CancelledError:
             break
         except Exception as exc:
@@ -1689,11 +1699,12 @@ async def _renew_running_leases_loop(
     settings = get_settings()
     while True:
         try:
-            await _renew_running_leases_once(
-                session_factory,
-                dispatcher,
-                settings.stale_running_threshold_seconds,
-            )
+            if not await loop_is_paused(ControlLoopName.LEASE_RENEWAL):
+                await _renew_running_leases_once(
+                    session_factory,
+                    dispatcher,
+                    settings.stale_running_threshold_seconds,
+                )
         except asyncio.CancelledError:
             break
         except Exception as exc:
@@ -1718,11 +1729,12 @@ async def _stale_running_sweep_loop(
     settings = get_settings()
     while True:
         try:
-            await _sweep_stale_running_once(
-                session_factory,
-                dispatcher,
-                settings.stale_running_threshold_seconds,
-            )
+            if not await loop_is_paused(ControlLoopName.STALE_RUNNING_SWEEP):
+                await _sweep_stale_running_once(
+                    session_factory,
+                    dispatcher,
+                    settings.stale_running_threshold_seconds,
+                )
         except asyncio.CancelledError:
             break
         except Exception as exc:
@@ -1872,7 +1884,8 @@ async def _promote_dlq_replay_loop(
     """
     while True:
         try:
-            await _promote_dlq_replay_once(session_factory, redis)
+            if not await loop_is_paused(ControlLoopName.DLQ_REPLAY_PROMOTE):
+                await _promote_dlq_replay_once(session_factory, redis)
         except asyncio.CancelledError:
             break
         except Exception as exc:
@@ -2072,7 +2085,15 @@ async def _outbox_relay_loop(
         try:
             async with gate() as is_leader:
                 if is_leader:
-                    await _outbox_relay_tick(session_factory)
+                    # INSIDE the gate, not in front of it. Checking first
+                    # would make a paused replica stop contending for
+                    # leadership, handing it to another replica — the pause
+                    # would still hold there, because the key is global, but
+                    # leadership would have moved for a reason that has
+                    # nothing to do with leadership. Here the gate behaves
+                    # identically whether the loop is paused or not.
+                    if not await loop_is_paused(ControlLoopName.OUTBOX_RELAY):
+                        await _outbox_relay_tick(session_factory)
                 else:
                     logger.debug("outbox relay tick skipped — not the leader")
         except asyncio.CancelledError:
@@ -2153,6 +2174,12 @@ async def _digest_loop(session_factory: async_sessionmaker[AsyncSession]) -> Non
             settings = get_settings()
             interval_seconds = max(60, settings.llm_digest_interval_hours * 3600)
             await asyncio.sleep(interval_seconds)
+            # After the sleep, because that is where the work is. Note the
+            # consequence the tool reports rather than hides: this interval is
+            # hours, so a pause shorter than it expires before a tick ever
+            # reads the key (`control_loop_pause.tick_interval_seconds`).
+            if await loop_is_paused(ControlLoopName.DIGEST):
+                continue
             if not incident_digest.is_enabled():
                 continue
             written = await incident_digest.run_digest_for_all_active_tenants(
@@ -2207,6 +2234,8 @@ async def _slo_evaluation_loop(
                 await asyncio.sleep(_SLO_DISABLED_RECHECK_SECONDS)
                 continue
             await asyncio.sleep(interval)
+            if await loop_is_paused(ControlLoopName.SLO_EVALUATION):
+                continue
             created = await slo.run_evaluation(session_factory)
             if created:
                 logger.warning(
@@ -2241,6 +2270,8 @@ async def _idempotency_reaper_loop(
     while True:
         try:
             await asyncio.sleep(_IDEMPOTENCY_REAPER_INTERVAL_SECONDS)
+            if await loop_is_paused(ControlLoopName.IDEMPOTENCY_REAPER):
+                continue
             async with session_factory() as session:
                 async with session.begin():
                     reaped = await IdempotencyRepository(session).delete_expired()
@@ -2257,6 +2288,12 @@ async def _idempotency_reaper_loop(
             )
 
 
+#: Seconds between metrics passes. Was an inline literal; named so
+#: `BACKPRESSURE_LAG_TTL`'s "must exceed the metrics loop interval" comment
+#: has something to point at, and so `control_loop_pause` can mirror it.
+_METRICS_LOOP_INTERVAL = 60.0
+
+
 async def _metrics_loop(redis: Any, consumer: JobDispatcherConsumer) -> None:
     """Emit queue/in-flight/consumer-lag gauges every ~60s.
 
@@ -2268,7 +2305,9 @@ async def _metrics_loop(redis: Any, consumer: JobDispatcherConsumer) -> None:
     """
     while True:
         try:
-            await asyncio.sleep(60.0)
+            await asyncio.sleep(_METRICS_LOOP_INTERVAL)
+            if await loop_is_paused(ControlLoopName.METRICS):
+                continue
             delayed = await queue.delayed_length(redis)
             lag = await consumer.consumer_lag()
             await metrics.emit_gauge("QueueDepth", float(delayed))
@@ -2455,6 +2494,13 @@ async def worker_loop(
                                         raises a de-duplicated Alert on a
                                         fast burn — the alert webhook's only
                                         non-chaos producer (WO-R2-29).
+
+    Each of those eleven loops reads `chaos:pause:<loop>` once per iteration and
+    skips its work while the key is set — one closed enum, one key pattern, one
+    check per loop (`workers/control_loop_pause.py`, ADR 0027). Registered only
+    under `CHAOS_ENABLED=true`; otherwise the check is an in-process boolean and
+    never a Redis round-trip. The eight consumer groups are NOT in that enum:
+    `kill_consumer` has stopped any consumer group by its group id since Wave 1.
 
     Cancel signal: cancel all, wait for in-flight jobs, stop all consumers.
     """

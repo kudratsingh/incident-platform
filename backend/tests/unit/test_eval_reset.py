@@ -414,9 +414,10 @@ def test_every_chaos_key_helper_lives_under_the_chaos_namespace() -> None:
     helper can produce is under `chaos:*`. A future helper that escapes
     the namespace escapes the reset silently — so assert the property
     statically rather than trusting a hand-typed pattern list."""
+    from app.workers.control_loop_pause import pause_key_for
     from app.workers.kafka_consumer import kill_key_for, latency_key_for
 
-    for helper in (kill_key_for, latency_key_for):
+    for helper in (kill_key_for, latency_key_for, pause_key_for):
         assert fnmatch.fnmatch(helper("any-group"), "chaos:*"), (
             f"{helper.__name__} produces a key outside chaos:* — either move "
             "it back under that namespace or add a pattern for it"
@@ -431,12 +432,14 @@ async def test_clear_chaos_keys_scans_and_deletes_matching_patterns() -> None:
     nothing (D-13), and the test cemented the fiction.
     """
     reset = _reset_module()
+    from app.workers.control_loop_pause import ControlLoopName, pause_key_for
     from app.workers.kafka_consumer import kill_key_for, latency_key_for
 
     redis = AsyncMock()
     matched = [
         kill_key_for("worker-dispatcher").encode(),
         latency_key_for("audit-writer").encode(),
+        pause_key_for(ControlLoopName.OUTBOX_RELAY).encode(),
         b"chaos:bad_deploy",
     ]
     # Real Redis returns (cursor, keys) tuples and terminates on cursor=0.
