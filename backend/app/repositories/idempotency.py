@@ -1,3 +1,6 @@
+"""Storage for idempotency claims — the rows that let a repeated Tier-1 call
+return the first call's answer instead of running again."""
+
 import uuid
 from datetime import UTC, datetime
 from typing import Any
@@ -19,6 +22,8 @@ class IdempotencyRepository(BaseRepository[IdempotencyRecord]):
         principal_id: uuid.UUID,
         idempotency_key: str,
     ) -> IdempotencyRecord | None:
+        """The record for this key, scoped to the tenant and principal that
+        own it."""
         result = await self.session.execute(
             select(IdempotencyRecord).where(
                 IdempotencyRecord.tenant_id == tenant_id,

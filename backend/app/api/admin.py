@@ -1,3 +1,11 @@
+"""The operator console's HTTP surface: jobs and the DLQ, replay and resolve,
+SLOs and runbooks, the event timeline, tenants, users and the audit tab.
+
+The handlers here are thin — support and admin are checked by the dependency,
+the tenant a platform admin is acting on is resolved once, and the work itself
+belongs to the services.
+"""
+
 import uuid
 from typing import Any
 

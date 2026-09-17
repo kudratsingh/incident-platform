@@ -752,6 +752,8 @@ class JobDispatcherConsumer(BaseKafkaConsumer):
         value: dict[str, Any],
         **_kafka_meta: Any,
     ) -> None:
+        """Hand one submitted job to a background task and return at once, so
+        the poll loop keeps polling however busy the worker is."""
         job_id_str = value.get("job_id") if isinstance(value, dict) else None
         if not job_id_str:
             logger.warning(
@@ -790,6 +792,8 @@ class JobDispatcherConsumer(BaseKafkaConsumer):
         task.add_done_callback(self.in_flight.discard)
 
     async def _run_and_release(self, job_id_str: str) -> None:
+        """Wait for a concurrency slot, run the job, and always give the slot
+        and the in-flight claim back."""
         # The concurrency slot is taken HERE, inside the task — the poll loop
         # has already moved on. Waiting for capacity is work the dispatcher
         # does in the background, not something the consumer does instead of

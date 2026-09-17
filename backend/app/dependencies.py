@@ -1,3 +1,10 @@
+"""The shared FastAPI dependencies: the database session every request runs in,
+and the identity — human or machine — it runs as.
+
+Both auth paths end in the same place: context vars set for the logs and
+`app.tenant_id` set for Postgres row-level security.
+"""
+
 import uuid
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
@@ -44,6 +51,8 @@ _async_session = async_sessionmaker(_engine, expire_on_commit=False)
 
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
+    """One database session per request, inside one transaction. Work a service
+    deferred until the commit lands runs here, and only on success."""
     async with _async_session() as session:
         async with session.begin():
             yield session
@@ -70,6 +79,8 @@ async def get_current_user(
     token: str = Depends(_oauth2_scheme),
     db: AsyncSession = Depends(get_db),
 ) -> User:
+    """The human behind this request, from the access token, with their tenant
+    put on the session so row-level security binds every later query."""
     payload = decode_token(token, expected_type="access")
 
     try:

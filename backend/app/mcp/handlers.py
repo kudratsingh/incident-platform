@@ -146,6 +146,12 @@ def handle_initialize(
 
 
 def handle_tools_list(request_id: str | int | None) -> p.JsonRpcResponse:
+    """Advertise every registered tool: its description, both schemas, the
+    scope it needs and whether a repeat call is cached.
+
+    This is the contract the commander pins, so anything omitted here is a
+    change it cannot see.
+    """
     tools = [
         p.ToolInfo(
             name=t.name,

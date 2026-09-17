@@ -31,12 +31,17 @@ logger = get_logger(__name__)
 
 @dataclass(slots=True)
 class SagaStep:
+    """One step of a workflow as the caller declares it, before it becomes a
+    job row."""
+
     type: str
     payload: dict[str, Any] | None = None
     priority: int = 0
 
 
 class SagaService:
+    """Builds sagas. Everything after creation is the coordinator's job."""
+
     def __init__(
         self,
         saga_repo: SagaRepository,
@@ -54,6 +59,8 @@ class SagaService:
         name: str,
         steps: list[SagaStep],
     ) -> Saga:
+        """Write the saga and one job per step, each depending on the one
+        before it, so the dependency resolver runs them in order."""
         if not steps:
             raise RequestValidationError("Saga must have at least one step")
 

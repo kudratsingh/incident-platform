@@ -36,6 +36,9 @@ _EVENT_TO_STATUS: dict[str, str] = {
 
 
 class SseConsumer(BaseKafkaConsumer):
+    """Consumer group `sse-broadcaster` — republishes lifecycle events onto the
+    per-job Redis channel the browser's progress stream reads."""
+
     def __init__(self, redis: Redis) -> None:
         settings = get_settings()
         super().__init__(
@@ -57,6 +60,9 @@ class SseConsumer(BaseKafkaConsumer):
         value: dict[str, Any],
         **kafka_meta: Any,
     ) -> None:
+        """Translate one lifecycle event into the status the browser shows and
+        publish it, carrying the topic and offset so stale events can be
+        recognised."""
         if not isinstance(value, dict):
             logger.warning("skipping non-dict SSE event", extra={"topic": topic})
             return

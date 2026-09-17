@@ -74,6 +74,9 @@ def _is_transient(status_code: int) -> bool:
 
 
 class LlmTriageConsumer(BaseKafkaConsumer):
+    """Consumer group `llm-triage` — asks Claude to explain each dead-lettered
+    job and stores the answer."""
+
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         settings = get_settings()
         super().__init__(
@@ -89,6 +92,8 @@ class LlmTriageConsumer(BaseKafkaConsumer):
         value: dict[str, Any],
         **_kafka_meta: Any,
     ) -> None:
+        """Analyse one dead-letter event and write its triage row, plus the
+        coarse remediation category derived from it, in one transaction."""
         if not triage_service.is_enabled():
             # Disabled by config — skip silently. Tests and local dev without
             # an API key land here.

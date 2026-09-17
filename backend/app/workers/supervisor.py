@@ -105,6 +105,8 @@ WorkerFactory = Callable[[], Coroutine[Any, Any, None]]
 
 @dataclass
 class _WorkerHealth:
+    """What the supervisor currently believes about the worker loop."""
+
     state: str = NOT_STARTED
     last_alive: float | None = None
     # Deliberately a *separate* timestamp from `last_alive`. Sharing one would

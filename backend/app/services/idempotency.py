@@ -53,6 +53,8 @@ class IdempotencyKeyReusedError(AppError):
 
 @dataclass(frozen=True)
 class CacheHit:
+    """The answer a previous call already gave for this key."""
+
     response: dict[str, Any]
     stored_at: datetime
 
@@ -116,6 +118,9 @@ def _is_expired(record: IdempotencyRecord) -> bool:
 
 
 class IdempotencyService:
+    """Decides whether a Tier-1 call may run, or must return an earlier
+    answer."""
+
     def __init__(self, repo: IdempotencyRepository) -> None:
         self.repo = repo
 
@@ -127,6 +132,8 @@ class IdempotencyService:
         idempotency_key: str,
         arguments: dict[str, Any],
     ) -> CacheHit | None:
+        """Read a key without taking it: the stored answer, or None if there is
+        none. Refuses the same ways `acquire` does."""
         record = await self.repo.get_by_key(
             tenant_id=principal.tenant_id,
             principal_id=principal.id,

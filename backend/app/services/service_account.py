@@ -49,6 +49,9 @@ def looks_like_service_account_token(value: str) -> bool:
 
 
 class ServiceAccountService:
+    """Machine principals and their bearer tokens: create, mint, verify,
+    revoke. Every step leaves an audit row."""
+
     def __init__(
         self,
         sa_repo: ServiceAccountRepository,
@@ -71,6 +74,8 @@ class ServiceAccountService:
         scopes: list[str],
         created_by_user_id: uuid.UUID | None,
     ) -> ServiceAccount:
+        """Register a machine principal with a fixed set of scopes. The name is
+        unique within the tenant, and no token is minted here."""
         try:
             validate_scopes(scopes)
         except ValueError as exc:
@@ -236,6 +241,7 @@ class ServiceAccountService:
         token_id: uuid.UUID,
         revoked_by_user_id: uuid.UUID | None,
     ) -> ServiceAccountToken:
+        """Retire one of this account's tokens. Revoking twice is a no-op."""
         token = await self.token_repo.get_by_id(token_id)
         if token is None or token.service_account_id != service_account.id:
             raise NotFoundError(f"Token not found: {token_id}")

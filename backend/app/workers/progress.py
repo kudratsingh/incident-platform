@@ -83,6 +83,9 @@ TERMINAL_STATUSES = frozenset({"completed", "failed", "dead_letter", "cancelled"
 
 @dataclass
 class ProgressEvent:
+    """One progress update for a job, as it travels over Redis pub/sub and as
+    the retained snapshot is stored."""
+
     job_id: str
     status: str       # running | completed | failed | dead_letter | retrying | cancelled
     progress: int     # 0-100

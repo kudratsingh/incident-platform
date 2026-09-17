@@ -1,3 +1,5 @@
+"""The `users` table — human accounts, each belonging to exactly one tenant."""
+
 import uuid
 from typing import TYPE_CHECKING
 
