@@ -1,3 +1,6 @@
+"""Request middleware — the correlation ids, log context and latency metric
+every request carries, and the route label the metrics are grouped by."""
+
 import re
 import time
 import uuid

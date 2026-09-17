@@ -16,6 +16,9 @@ _ERROR_MESSAGE_MAX_CHARS = 900
 
 
 class OutboxRepository(BaseRepository[OutboxEvent]):
+    """The relay's whole interface to the queue: add a row, take the oldest
+    unpublished ones, and record how each attempt ended."""
+
     model = OutboxEvent
 
     async def add(
@@ -76,6 +79,8 @@ class OutboxRepository(BaseRepository[OutboxEvent]):
         return list(result.scalars().all())
 
     async def mark_published(self, ids: list[uuid.UUID]) -> None:
+        """Stamp these rows delivered, which is what takes them out of the
+        relay's window."""
         if not ids:
             return
         await self.session.execute(

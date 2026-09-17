@@ -1,3 +1,7 @@
+"""Password hashing and the JWTs behind login, refresh and the SSE stream
+token. Every token this file mints carries its own `type`, and decoding
+refuses a token of the wrong one."""
+
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -93,6 +97,8 @@ def create_stream_token(job_id: uuid.UUID, tenant_id: uuid.UUID) -> str:
 
 
 def decode_token(token: str, expected_type: str = "access") -> dict[str, Any]:
+    """Verify a token and return its claims, refusing one of the wrong kind —
+    a refresh token may not be spent as an access token."""
     settings = get_settings()
     try:
         payload: dict[str, Any] = jwt.decode(

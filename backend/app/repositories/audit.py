@@ -1,3 +1,5 @@
+"""Writes and reads for the audit log."""
+
 import uuid
 from collections.abc import Sequence
 from typing import Any
@@ -16,6 +18,9 @@ logger = get_logger(__name__)
 
 
 class AuditRepository(BaseRepository[AuditLog]):
+    """Appends audit rows for both human and machine principals, and reads
+    them back for the admin console and the agent's audit tool."""
+
     model = AuditLog
 
     async def log(

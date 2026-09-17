@@ -1,3 +1,6 @@
+"""The fixed vocabularies the whole platform shares: roles, job types, job and
+saga states, and the coarse DLQ category the agent routes on."""
+
 from enum import StrEnum
 
 

@@ -1,3 +1,9 @@
+"""The `audit_logs` table — who did what, and when.
+
+Append-only and written for humans and machine principals alike; the agent's
+own tool calls land here too, which is what makes a run reviewable afterwards.
+"""
+
 import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING, Any

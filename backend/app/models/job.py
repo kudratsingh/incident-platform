@@ -1,3 +1,9 @@
+"""The `jobs` table — one row per unit of work.
+
+Its `status` is the projection every other part of the platform reads: the
+queue, the DLQ tools, the read model and the SLOs all speak about this row.
+"""
+
 import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING, Any

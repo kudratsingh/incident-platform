@@ -1,3 +1,10 @@
+"""Every read and write against the `jobs` table.
+
+The status transitions here are the ones that matter: each terminal write also
+adds the outbox row that announces it, so a job cannot change state in Postgres
+without the rest of the platform hearing about it.
+"""
+
 import uuid
 from collections.abc import Collection, Sequence
 from datetime import UTC, datetime, timedelta
@@ -92,6 +99,8 @@ class JobRepository(BaseRepository[Job]):
     async def get_by_idempotency_key(
         self, key: str, tenant_id: uuid.UUID
     ) -> Job | None:
+        """The job an earlier submission with this key created, if any. Keys
+        are unique per tenant, so two tenants may reuse one freely."""
         result = await self.session.execute(
             select(Job).where(
                 Job.idempotency_key == key, Job.tenant_id == tenant_id
@@ -127,6 +136,11 @@ class JobRepository(BaseRepository[Job]):
         require_trace_id: bool = False,
         sort: JobSort = JobSort.CREATED_AT,
     ) -> tuple[list[Job], int]:
+        """One page of jobs and the true total behind it.
+
+        Every filter is applied in SQL, ahead of the limit, so a page is never
+        spent on rows that were going to be discarded.
+        """
         filters: list[Any] = [Job.tenant_id == tenant_id]
         if user_id is not None:
             filters.append(Job.user_id == user_id)
