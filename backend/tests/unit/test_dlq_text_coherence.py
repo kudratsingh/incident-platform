@@ -397,12 +397,12 @@ def test_create_stuck_dag_default_hint_is_still_covered() -> None:
     "hint", [None, RemediationHint.HUMAN_REQUIRED.value]
 )
 def test_poison_message_row_still_names_its_topic(hint: str | None) -> None:
-    """Whatever else moved, the row stays traceable to this hook and to
-    the topic it poisoned — that is how a human sweeping the DLQ joins the
-    row back to the Kafka half of the same invocation."""
+    """Name the topic and correction without disclosing the injecting hook."""
     text = _dlq_error_for_topic("job.submitted", hint)
     assert "job.submitted" in text
-    assert "poison_message" in text
+    assert "chaos" not in text.lower()
+    assert "poison_message" not in text
+    assert "producer must correct the payload" in text
 
 
 @pytest.mark.parametrize(
