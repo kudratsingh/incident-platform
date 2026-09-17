@@ -462,4 +462,4 @@ CI builds Docker images, pushes to ECR, and updates the ECS services on merge to
 
 ## License
 
-MIT
+No license is granted at this time. The code is published for reading and review only; all rights are reserved. You may not use, copy, modify or redistribute it without written permission from the author.
