@@ -111,11 +111,17 @@ _KNOWN_RESIDUAL_LEAKS = {
 class _RedisStub:
     """Enough Redis for the read surface, seeded the way a chaos run leaves it.
 
-    The `chaos:*` keys are here on purpose: `saturate_redis` and `bad_deploy`
-    leave exactly these behind, and a read tool that enumerated keys — none
-    does today — would hand the agent the lab. `get_cache_key_info` cannot
-    name them: `chaos:` is not in its readable-prefix allowlist, and the
-    refusal it returns for one only ever quotes the key the caller supplied.
+    The `chaos:*` keys are here on purpose: `saturate_redis`, `bad_deploy` and
+    `pause_control_loop` leave exactly these behind, and a read tool that
+    enumerated keys — none does today — would hand the agent the lab.
+    `get_cache_key_info` cannot name them: `chaos:` is not in its
+    readable-prefix allowlist, and the refusal it returns for one only ever
+    quotes the key the caller supplied.
+
+    `chaos:pause:outbox_relay` is what makes the sweep below the assertion
+    WO-R3-200 needs: the pause hook's whole effect is that key, and the world
+    a `jobs_not_progressing` scenario hands the agent has it set while the
+    agent reads every probe here.
     """
 
     def __init__(self) -> None:
@@ -124,6 +130,7 @@ class _RedisStub:
             f"cache:job:{{tenant}}:{_DLQ_JOB_ID}": "{}",
             "chaos:bad_deploy": "1",
             "chaos:sat:run-1": "x" * 32,
+            "chaos:pause:outbox_relay": "paused",
         }
 
     def seed_tenant_cache_key(self, tenant_id: uuid.UUID) -> str:

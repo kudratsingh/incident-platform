@@ -63,21 +63,28 @@ from app.core.logging import get_logger
 logger = get_logger(__name__)
 
 
+# The docstring below is deliberately ONE line, and written for a caller rather
+# than for a reader of this file. `pause_control_loop`'s `loop_name` field is
+# typed as this enum, so Pydantic copies the class docstring into
+# `$defs.ControlLoopName.description` in the tool's `inputSchema` — which is a
+# pinned contract the commander snapshots. The repo's rule about never putting a
+# class docstring on a Pydantic model whose schema reaches the wire applies to an
+# enum for exactly the same reason. Everything that belongs to a reader of this
+# module is in these comments and in the module docstring.
+#
+# Closed on purpose (see the module docstring). Every member names a loop
+# registered by `dispatcher.worker_loop` that reads `pause_key_for(<member>)` on
+# each iteration; `LOOP_FUNCTIONS` below maps each one to the coroutine that does
+# the reading, and the test parses `dispatcher.py` to prove the mapping.
+#
+# The three Kafka consumer groups an earlier draft of this enum carried —
+# `dependency_resolver`, `saga_coordinator`, `read_model` — are deliberately
+# absent. They are not loops, they are consumer groups, and
+# `kill_consumer('<group id>')` has stopped any consumer group since Wave 1. A
+# second mechanism for the same thing would mean two keys, two checks and two
+# ways for a teardown to miss one.
 class ControlLoopName(StrEnum):
-    """The background loops `pause_control_loop` may pause.
-
-    Closed on purpose (see the module docstring). Every member names a loop
-    registered by `dispatcher.worker_loop` that reads
-    `pause_key_for(<member>)` on each iteration; `LOOP_FUNCTIONS` below maps
-    each one to the coroutine that does the reading.
-
-    The three Kafka consumer groups an earlier draft of this enum carried —
-    `dependency_resolver`, `saga_coordinator`, `read_model` — are deliberately
-    absent. They are not loops, they are consumer groups, and
-    `kill_consumer('<group id>')` has stopped any consumer group since Wave 1.
-    A second mechanism for the same thing would mean two keys, two checks and
-    two ways for a teardown to miss one.
-    """
+    """One background loop inside the worker process."""
 
     OUTBOX_RELAY = "outbox_relay"
     DELAYED_RETRY_PROMOTE = "delayed_retry_promote"

@@ -455,3 +455,83 @@ def test_the_tool_declares_the_single_loop_blast_radius_and_the_chaos_scope() ->
         )
     finally:
         _restore_for_tests(snap)
+
+
+# ---------------------------------------------------------------------------
+# The contract delta, pinned
+# ---------------------------------------------------------------------------
+
+
+def test_the_enum_docstring_stays_short_enough_to_be_a_wire_description() -> None:
+    """`loop_name` is typed as `ControlLoopName`, so Pydantic copies this class's
+    docstring into `$defs.ControlLoopName.description` in the pinned
+    `inputSchema`.
+
+    The repo's rule is "no class docstring on a model whose schema reaches the
+    wire", and the reason is mechanical, not stylistic — it applies to an enum
+    used as a field type just as much. The first draft of this module had a
+    fourteen-line docstring here and shipped all of it into the tool contract.
+    A one-line docstring written for a caller is fine; prose for a reader of the
+    module belongs in a comment.
+    """
+    doc = ControlLoopName.__doc__ or ""
+    assert doc.strip() and "\n" not in doc.strip(), (
+        "ControlLoopName's docstring is multi-line and would ship into the "
+        "pinned tool schema — move the explanation into a comment above the class"
+    )
+
+
+def test_the_shape_of_the_new_tool_is_exactly_this() -> None:
+    """One new tool, and this is its whole surface.
+
+    The rebless note the coordinator writes needs a field list, and the delta is
+    easier to trust from a test than from a paragraph. Registration happens under
+    a patched chaos-enabled settings object because the unit tier runs with the
+    gate closed.
+    """
+    from app.mcp.registry import _restore_for_tests, _snapshot_for_tests, list_tools
+
+    snap = _snapshot_for_tests()
+    try:
+        _restore_for_tests({})
+        with patch(
+            "app.mcp.chaos.get_settings",
+            return_value=Settings(chaos_enabled=True, environment="test"),
+        ):
+            from app.mcp.tools.chaos import pause_control_loop
+
+            importlib.reload(pause_control_loop)
+        td = next(t for t in list_tools() if t.name == "pause_control_loop")
+
+        assert set(td.input_json_schema()["properties"]) == {
+            "loop_name",
+            "ttl_seconds",
+        }
+        assert set(td.output_json_schema()["properties"]) == {
+            "loop_name",
+            "pause_key",
+            "ttl_seconds",
+            "tick_interval_seconds",
+            "accepted",
+        }
+        # The closed set as the caller sees it, in one place.
+        assert td.input_json_schema()["$defs"]["ControlLoopName"]["enum"] == [
+            m.value for m in ControlLoopName
+        ]
+    finally:
+        _restore_for_tests(snap)
+
+
+def test_blast_radius_gained_exactly_one_member() -> None:
+    """`BlastRadius` was closed at four for the whole campaign, and the value is
+    in this tool's `[chaos: …]` description prefix — so the fifth member is a
+    contract delta in its own right."""
+    from app.mcp.chaos import BlastRadius
+
+    assert [m.value for m in BlastRadius] == [
+        "single_consumer",
+        "single_loop",
+        "single_service",
+        "shared_dependency",
+        "environment_wide",
+    ]

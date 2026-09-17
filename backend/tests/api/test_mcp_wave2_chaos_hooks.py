@@ -38,6 +38,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 class _RedisStub:
     def __init__(self) -> None:
         self._store: dict[str, bytes | str] = {}
+        #: Recorded `ex=` per key. Every chaos key is supposed to be
+        #: TTL-bounded (ADR 0008), and until this existed the tests could only
+        #: assert the number a tool *reported*, never the one it set.
+        self._ttls: dict[str, int | None] = {}
 
     async def get(self, key: str) -> bytes | str | None:
         return self._store.get(key)
@@ -46,6 +50,7 @@ class _RedisStub:
         self, key: str, value: bytes | str, ex: int | None = None
     ) -> bool:
         self._store[key] = value
+        self._ttls[key] = ex
         return True
 
     async def delete(self, *keys: str) -> int:
@@ -93,6 +98,7 @@ def _mcp_app_with_chaos_enabled(db_session: AsyncSession, redis_stub: _RedisStub
         snap = _snapshot_for_tests()
         _restore_for_tests({})
         importlib.reload(chaos_pkg.kill_consumer)  # type: ignore[attr-defined]
+        importlib.reload(chaos_pkg.pause_control_loop)  # type: ignore[attr-defined]
         importlib.reload(chaos_pkg.poison_message)  # type: ignore[attr-defined]
         importlib.reload(chaos_pkg.saturate_redis)  # type: ignore[attr-defined]
         importlib.reload(chaos_pkg.inject_latency)  # type: ignore[attr-defined]
@@ -1962,5 +1968,238 @@ async def test_seeded_dlq_row_text_agrees_with_its_hint(
         assert not coherence_violations(hint, row.error_message), (
             row.error_message
         )
+    finally:
+        teardown()
+
+
+# ---------------------------------------------------------------------------
+# pause_control_loop (WO-R3-200)
+# ---------------------------------------------------------------------------
+
+
+async def test_pause_control_loop_not_registered_when_chaos_disabled(
+    db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
+) -> None:
+    """Gate 1 of ADR 0008 at the surface: no CHAOS_ENABLED patch here, so the
+    default app must answer MCP_TOOL_NOT_FOUND and `tools/list` must not carry
+    the name — a read-scoped agent cannot learn the hook exists."""
+    from app.mcp.standalone import create_mcp_app
+
+    redis_stub = _RedisStub()
+    app = create_mcp_app()
+
+    async def _override_db():  # type: ignore[no-untyped-def]
+        yield db_session
+
+    async def _override_redis():  # type: ignore[no-untyped-def]
+        yield redis_stub
+
+    app.dependency_overrides[get_db] = _override_db
+    app.dependency_overrides[get_redis] = _override_redis
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app, raise_app_exceptions=False),
+        base_url="http://test",
+    ) as ac:
+        token = await _token(
+            db_session, default_tenant.id, [Scope.CHAOS_INVOKE.value]
+        )
+        listed = await ac.post(
+            "/mcp", json=_rpc("tools/list"), headers={"Authorization": f"Bearer {token}"}
+        )
+        body = await _call(
+            ac, token, "pause_control_loop", {"loop_name": "outbox_relay"}
+        )
+
+    names = {t["name"] for t in listed.json()["result"]["tools"]}
+    assert "pause_control_loop" not in names
+    assert body["error"]["code"] == protocol.MCP_TOOL_NOT_FOUND
+
+
+async def test_pause_control_loop_sets_the_key_with_a_ttl(
+    db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
+) -> None:
+    redis_stub = _RedisStub()
+    app, teardown = _mcp_app_with_chaos_enabled(db_session, redis_stub)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app, raise_app_exceptions=False),
+            base_url="http://test",
+        ) as ac:
+            token = await _token(
+                db_session, default_tenant.id, [Scope.CHAOS_INVOKE.value]
+            )
+            payload = _content(
+                await _call(
+                    ac,
+                    token,
+                    "pause_control_loop",
+                    {"loop_name": "outbox_relay", "ttl_seconds": 45},
+                )
+            )
+        assert payload["pause_key"] == "chaos:pause:outbox_relay"
+        assert payload["loop_name"] == "outbox_relay"
+        assert payload["accepted"] is True
+        assert payload["ttl_seconds"] == 45
+        # The relay turns once a second, so a 45s pause is comfortably
+        # observable — and the tool says so rather than leaving it to be
+        # inferred.
+        assert payload["tick_interval_seconds"] == 1.0
+        assert redis_stub._store["chaos:pause:outbox_relay"] == "paused"
+        # TTL-bounded and reversible without a second call (ADR 0008/0027).
+        assert redis_stub._ttls["chaos:pause:outbox_relay"] == 45
+    finally:
+        teardown()
+
+
+async def test_pause_control_loop_defaults_to_a_bounded_ttl(
+    db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
+) -> None:
+    """No `ttl_seconds` still means a TTL. A pause with no expiry would be the
+    one chaos effect a forgotten teardown could leave running."""
+    redis_stub = _RedisStub()
+    app, teardown = _mcp_app_with_chaos_enabled(db_session, redis_stub)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app, raise_app_exceptions=False),
+            base_url="http://test",
+        ) as ac:
+            token = await _token(
+                db_session, default_tenant.id, [Scope.CHAOS_INVOKE.value]
+            )
+            payload = _content(
+                await _call(
+                    ac, token, "pause_control_loop", {"loop_name": "dlq_replay_promote"}
+                )
+            )
+        assert payload["ttl_seconds"] == 300
+        assert redis_stub._ttls["chaos:pause:dlq_replay_promote"] == 300
+    finally:
+        teardown()
+
+
+@pytest.mark.parametrize(
+    "loop_name",
+    ["dependency_resolver", "saga_coordinator", "read_model", "worker-dispatcher", ""],
+)
+async def test_pause_control_loop_refuses_a_loop_outside_the_enum(
+    db_session: AsyncSession,
+    default_tenant,  # type: ignore[no-untyped-def]
+    loop_name: str,
+) -> None:
+    """Refused at parse time as invalid params — not accepted and matched
+    against nothing.
+
+    The three consumer-group names are in the list deliberately: an earlier
+    draft of the enum carried them (divergence H2), so a caller written against
+    that draft has to fail loudly rather than set a key no loop reads. The
+    right call for those is `kill_consumer`.
+    """
+    redis_stub = _RedisStub()
+    app, teardown = _mcp_app_with_chaos_enabled(db_session, redis_stub)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app, raise_app_exceptions=False),
+            base_url="http://test",
+        ) as ac:
+            token = await _token(
+                db_session, default_tenant.id, [Scope.CHAOS_INVOKE.value]
+            )
+            body = await _call(
+                ac, token, "pause_control_loop", {"loop_name": loop_name}
+            )
+        assert body["error"]["code"] == protocol.JSONRPC_INVALID_PARAMS
+        assert redis_stub._store == {}, "a refused call still wrote a key"
+    finally:
+        teardown()
+
+
+async def test_pause_control_loop_refuses_a_ttl_above_the_cap(
+    db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
+) -> None:
+    redis_stub = _RedisStub()
+    app, teardown = _mcp_app_with_chaos_enabled(db_session, redis_stub)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app, raise_app_exceptions=False),
+            base_url="http://test",
+        ) as ac:
+            token = await _token(
+                db_session, default_tenant.id, [Scope.CHAOS_INVOKE.value]
+            )
+            body = await _call(
+                ac,
+                token,
+                "pause_control_loop",
+                {"loop_name": "outbox_relay", "ttl_seconds": 86_400},
+            )
+        assert body["error"]["code"] == protocol.JSONRPC_INVALID_PARAMS
+        assert redis_stub._store == {}
+    finally:
+        teardown()
+
+
+async def test_pause_control_loop_missing_chaos_scope_is_forbidden(
+    db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
+) -> None:
+    """Gate 2: the agent principal's scopes are not enough, even on a stack
+    where the hook is registered."""
+    redis_stub = _RedisStub()
+    app, teardown = _mcp_app_with_chaos_enabled(db_session, redis_stub)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app, raise_app_exceptions=False),
+            base_url="http://test",
+        ) as ac:
+            token = await _token(
+                db_session,
+                default_tenant.id,
+                [Scope.TELEMETRY_READ.value, Scope.INCIDENTS_READ.value],
+            )
+            body = await _call(
+                ac, token, "pause_control_loop", {"loop_name": "outbox_relay"}
+            )
+        assert body["error"]["code"] == protocol.MCP_FORBIDDEN
+        assert redis_stub._store == {}
+    finally:
+        teardown()
+
+
+async def test_pause_control_loop_advertises_every_loop_it_can_pause(
+    db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
+) -> None:
+    """The schema the caller reads is the enum the loops implement.
+
+    `tools/list` is the only place a caller learns the closed set from, so the
+    two must not be able to drift: `test_pause_control_loop.py` ties the enum
+    to the loops, and this ties the wire to the enum.
+    """
+    from app.workers.control_loop_pause import ControlLoopName
+
+    redis_stub = _RedisStub()
+    app, teardown = _mcp_app_with_chaos_enabled(db_session, redis_stub)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app, raise_app_exceptions=False),
+            base_url="http://test",
+        ) as ac:
+            token = await _token(
+                db_session, default_tenant.id, [Scope.CHAOS_INVOKE.value]
+            )
+            listed = await ac.post(
+                "/mcp",
+                json=_rpc("tools/list"),
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        tool = next(
+            t
+            for t in listed.json()["result"]["tools"]
+            if t["name"] == "pause_control_loop"
+        )
+        assert tool["description"].startswith("[chaos: single_loop] ")
+        assert tool["required_scope"] == Scope.CHAOS_INVOKE.value
+        schema = json.dumps(tool["inputSchema"])
+        for member in ControlLoopName:
+            assert member.value in schema, member.value
     finally:
         teardown()
