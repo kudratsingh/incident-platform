@@ -1,5 +1,5 @@
 # ADR 0027 — One hook pauses a background loop, and the enum of loops is closed
-*Status: Accepted · 2026-09-17 · WO-R3-200 (plan v2.1 WP-4.1)*
+*Status: Accepted · 2026-09-17 · WO-R3-200 (plan v2.1 WP-4.1) · amended 2026-09-17 by WO-R3-213 (WP-7.1): pausing the resume sweep suspends a correctness backstop*
 
 ## Context
 
@@ -151,6 +151,93 @@ delta.
   its `[chaos: single_loop]` description, as it can for the other ten hooks.
   Unchanged by this ADR, and recorded again because the enum's member names are
   now on that surface too.
+
+## Amendment, 2026-09-17 — suspending a correctness backstop (WO-R3-213, plan v2.1 WP-7.1)
+
+The decision above added `resume_unblocked_waiting` to the enum and said Family C
+needs it. Building that family showed the member is not like the other ten, and
+the difference is worth a record rather than a comment.
+
+**The fault is composed of two mechanisms, and neither alone produces it.**
+Plan 01 §7.2 wants a child stuck `WAITING` with nothing dead-lettered and nothing
+paused, so the correct answer is to escalate rather than to replay
+(`create_stuck_dag`) or to un-pause (`pause_dag`). Two things promote such a
+child, and the world exists only while both are stopped:
+
+| Stopped | How | Mechanism |
+|---|---|---|
+| `dependency-resolver` consumer group | `kill_consumer('dependency-resolver')` | `chaos:kill:<group>`, checked in `BaseKafkaConsumer` per poll |
+| resume sweep | `pause_control_loop('resume_unblocked_waiting')` | `chaos:pause:<loop>`, checked in the loop per iteration |
+
+Two keys, two checks, two tools — deliberately, because they stop two different
+runtime kinds, which is the same reasoning that kept the consumer groups out of
+the enum in the first place (divergence H2). The lab sets both and the reset's one
+`chaos:*` scan clears both; `test_pause_control_loop.py` asserts that of the exact
+pair rather than of the pattern in general.
+
+**The recovery is asymmetric, and only one of the two TTLs matters.** The resolver
+reacts to `job.completed` and nothing else. In this world the parent's completion
+is already in the past, so the resolver returning promotes nothing — there is no
+event left to deliver. **The sweep's pause expiring is the only thing that heals
+the world**, which means the fault's duration is bounded by the pause TTL (capped
+at 3600 s), never by the kill TTL, and that a teardown which cleared only the kill
+key would leave a permanently stranded child behind. Stated here because the
+intuition runs the other way: the kill looks like the bigger act.
+
+**What makes the sweep different from the other ten members.** The other loops are
+relays, promoters and sweeps whose absence delays work. This one is a *correctness
+backstop*: [ADR 0022](0022-promotable-only-resume-sweep-and-dependency-cascade.md)
+and [ADR 0011](0011-dag-pause-enforcement.md) together make it the reason a DAG
+pause is temporary rather than terminal — the resolver has already consumed the
+parent's completion event by the time a pause lifts, so without the sweep a held
+child would stay `WAITING` forever. Pausing it deliberately suspends that
+guarantee for a bounded window.
+
+**Why that is safe in a lab.** The window is bounded by a TTL the caller cannot
+raise past an hour; `scripts/reset_eval_state.py` sweeps the key between
+scenarios; the hook registers only under `CHAOS_ENABLED=true` and the check
+short-circuits on that flag before any Redis call; and nothing is harmed that the
+expiry does not undo — the first unpaused iteration promotes the child and mints
+its `job.submitted`, with no operator action and no compensator. Unlike
+`lease_renewal` (above), this pause cannot leave a row in a state the TTL does not
+reverse.
+
+**Why it would not be safe in production.** Two reasons, and the second is the
+one that would hurt. A suspended backstop means every DAG pause that lifts inside
+the window, and every promotion event lost to a redelivery gap, strands its
+children until the flag expires. And it does so **silently**: a `WAITING` child
+raises no alert, dead-letters nothing, and appears in no queue depth — the
+cascade in `cascade_cancel_blocked_children` covers a parent that can never
+complete, not a promotion that never arrived. The observable symptom is work that
+does not happen, which is the hardest class of fault to notice and exactly why
+this world is worth evaluating an agent on.
+
+**Blast radius, stated more precisely than `single_loop` implies.** The member
+name is accurate about the process — the eight consumer groups and the other ten
+loops keep running. But the sweep is cross-tenant by design (it is a
+platform-level scheduler, not a request path), so pausing it holds promotions for
+**every** DAG in the environment for the duration, not only the scenario's chain.
+In a single-scenario lab that is the intent; it is a second reason the TTL is
+short and the reset sweeps the key.
+
+**Nothing agent-visible changed.** No tool was added, no description, schema or
+enum member moved: the world is read entirely through tools that already exist —
+`get_dag_state` (parent `completed`, child `waiting`, `paused` false with
+`paused_by` null, the child's `created_at` long past) and `list_dlq_messages`
+(empty). `tests/api/test_read_tools_never_name_the_lab.py` now arms both of this
+world's keys while it screens every read tool's response, because a scenario whose
+correct answer is to escalate is the one where a leak does most damage: there is
+nothing to fix, so a hint that something was done *to* the platform would be the
+only lead in the world.
+
+**What the agent still cannot read.** How long the sweep has been idle. WP-4.2 gave
+the outbox relay a per-pass heartbeat (`outbox:relay:last_tick`,
+[ADR 0028](0028-outbox-relay-heartbeat-and-delivery-reading.md)) and the same
+reading generalised to "last tick age per loop" would let a caller distinguish a
+child nothing has got to yet from one nothing is coming for, instead of inferring
+it from `created_at` against its own clock. This packet does not add it — the work
+order asks for no status read, and an agent-facing tool is a contract delta that
+belongs to a packet that asks for one. Recorded as a follow-up.
 
 ## Alternatives considered
 

@@ -38,6 +38,7 @@ from typing import Any
 import app.mcp.tools  # noqa: F401  — import for @tool registration side effects
 import pytest
 import pytest_asyncio
+from app.config import get_settings
 from app.core.outbox_heartbeat import RELAY_TICK_KEY
 from app.core.scopes import Scope
 from app.dependencies import get_db, get_redis
@@ -59,6 +60,8 @@ from app.services.operator_audit import (
     CHAOS_TOOL_INVOKED_ACTION,
 )
 from app.services.service_account import ServiceAccountService
+from app.workers.control_loop_pause import ControlLoopName, pause_key_for
+from app.workers.kafka_consumer import kill_key_for
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -124,6 +127,14 @@ class _RedisStub:
     a `jobs_not_progressing` scenario hands the agent has it set while the
     agent reads every probe here.
 
+    `chaos:pause:resume_unblocked_waiting` plus `chaos:kill:dependency-resolver`
+    are Family C's world (WO-R3-213), and they are here because that world is the
+    first that arms **two** keys from two different mechanisms at once. A scenario
+    whose correct answer is to escalate is the one where naming the lab does most
+    damage: there is nothing to fix, so a hint that something was done *to* the
+    platform is the only lead in the world. Both keys are set while every read
+    tool below is called.
+
     `outbox:relay:last_tick` is the other half of that world (WO-R3-201). It is
     the relay's own record of its last pass, and in a paused-relay world it is
     stale — several minutes old — because the pass that would refresh it is the
@@ -140,6 +151,10 @@ class _RedisStub:
             "chaos:bad_deploy": "1",
             "chaos:sat:run-1": "x" * 32,
             "chaos:pause:outbox_relay": "paused",
+            pause_key_for(ControlLoopName.RESUME_UNBLOCKED_WAITING): "paused",
+            kill_key_for(
+                get_settings().kafka_consumer_group_dependency
+            ): "killed",
             RELAY_TICK_KEY: (
                 datetime.now(UTC) - timedelta(seconds=390)
             ).isoformat(),

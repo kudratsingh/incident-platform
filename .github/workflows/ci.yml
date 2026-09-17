@@ -163,8 +163,12 @@ jobs:
           import sys
           import xml.etree.ElementTree as ET
 
-          # The eight files this job exists to run. A rename or deletion must
-          # be a deliberate edit here, not a silently shrinking test count.
+          # Every file this job exists to run. A rename, an addition or a
+          # deletion must be a deliberate edit here, not a silently shrinking
+          # test count — and `test_env_example.py::
+          # test_ci_census_covers_every_integration_module` fails if this set
+          # and `backend/tests/integration/` ever disagree, so the count is
+          # deliberately not written out in prose here.
           EXPECTED = {
               "test_rls_enforcement",
               "test_eval_reset_postgres",
@@ -175,6 +179,7 @@ jobs:
               "test_migration_role_pg",
               "test_outbox_dead_letter",
               "test_outbox_stall",
+              "test_resolver_stall",
           }
 
           try:
