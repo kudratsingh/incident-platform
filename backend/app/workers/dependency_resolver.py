@@ -39,6 +39,9 @@ logger = get_logger(__name__)
 
 
 class DependencyResolver(BaseKafkaConsumer):
+    """Consumer group `dependency-resolver` — promotes WAITING children once
+    their parents are done."""
+
     def __init__(
         self,
         session_factory: async_sessionmaker[AsyncSession],
@@ -62,6 +65,8 @@ class DependencyResolver(BaseKafkaConsumer):
         value: dict[str, Any],
         **_kafka_meta: Any,
     ) -> None:
+        """On a parent completing, move each child whose dependencies are all
+        met to PENDING and announce it — unless a pause holds the chain."""
         if not isinstance(value, dict):
             return
         parent_id_str = value.get("job_id")

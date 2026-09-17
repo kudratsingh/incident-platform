@@ -53,6 +53,9 @@ COMPENSATE_SUFFIX = ".compensate"
 
 
 class SagaCoordinator(BaseKafkaConsumer):
+    """Consumer group `saga-coordinator` — moves a saga through its own states
+    and runs the rollback when a step dies."""
+
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         settings = get_settings()
         super().__init__(
@@ -71,6 +74,8 @@ class SagaCoordinator(BaseKafkaConsumer):
         value: dict[str, Any],
         **_kafka_meta: Any,
     ) -> None:
+        """Route one step's event to the saga it belongs to: completion,
+        failure, or the settling of a rollback already under way."""
         if not isinstance(value, dict):
             return
         event = value.get("event")
@@ -120,6 +125,7 @@ class SagaCoordinator(BaseKafkaConsumer):
                 # compensation rows. The type check IS the idempotency guard.
 
     async def _handle_completion(self, session: AsyncSession, saga_id: uuid.UUID) -> None:
+        """Mark the saga COMPLETED once every one of its steps has."""
         saga_repo = SagaRepository(session)
         all_jobs = await saga_repo.jobs(saga_id)
         if not all_jobs:
@@ -146,6 +152,8 @@ class SagaCoordinator(BaseKafkaConsumer):
         failed_job_id: uuid.UUID,
         user_id: uuid.UUID,
     ) -> None:
+        """Start the rollback: cancel the steps still to come and queue one
+        `.compensate` job per step that already succeeded, newest first."""
         settings = get_settings()
         saga_repo = SagaRepository(session)
         job_repo = JobRepository(session)

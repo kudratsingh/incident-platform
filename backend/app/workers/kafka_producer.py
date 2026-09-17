@@ -165,6 +165,11 @@ async def publish_job_progress(
     message: str,
     retry_count: int = 0,
 ) -> None:
+    """Publish a progress update straight to Kafka.
+
+    The one lifecycle event that skips the outbox: progress is disposable, so
+    losing one to a broker blip costs nothing worth a transaction.
+    """
     settings = get_settings()
     await _publish(
         topic=settings.kafka_topic_job_progress,

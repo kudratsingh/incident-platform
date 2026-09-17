@@ -211,6 +211,10 @@ async def _move(
 
 
 class ReadModelProjector(BaseKafkaConsumer):
+    """Consumer group `read-model` — keeps the Redis job-status views in step
+    with the lifecycle topics, so the admin overview never aggregates the jobs
+    table."""
+
     def __init__(self, redis: Redis) -> None:
         settings = get_settings()
         super().__init__(
@@ -232,6 +236,8 @@ class ReadModelProjector(BaseKafkaConsumer):
         value: dict[str, Any],
         **_kafka_meta: Any,
     ) -> None:
+        """Move one job id into the status this event implies, ignoring a late
+        or repeated event that would drag a finished job backwards."""
         if not isinstance(value, dict):
             return
 
@@ -295,6 +301,7 @@ async def read_global_stats(redis: Redis, tenant_id: str) -> dict[str, int]:
 
 
 async def read_user_stats(redis: Redis, user_id: str) -> dict[str, int]:
+    """Status → count for one user, read straight from the projection."""
     out: dict[str, int] = {}
     for st in _TRACKED_STATUSES:
         out[st] = await _member_count(redis, _user_key(user_id, st))
@@ -321,6 +328,7 @@ def _score_for(moment: datetime | None) -> float:
 
 
 async def _scan_delete(redis: Redis, pattern: str) -> int:
+    """Delete every key matching `pattern`, in batches, and say how many."""
     deleted = 0
     cursor = 0
     while True:
@@ -366,6 +374,7 @@ async def _windowed_members(
 async def _status_counts(
     session: AsyncSession, scope_col: Any, tenant_id: uuid.UUID | None
 ) -> dict[tuple[str, str], int]:
+    """Exact (scope, status) → count from the jobs table, for the rebuild."""
     stmt = (
         select(scope_col, Job.status, func.count())
         .where(Job.status.in_(_TRACKED_STATUSES))

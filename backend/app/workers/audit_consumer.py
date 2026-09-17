@@ -38,6 +38,9 @@ _EVENT_TO_ACTION: dict[str, str] = {
 
 
 class AuditConsumer(BaseKafkaConsumer):
+    """Consumer group `audit-writer` — turns each lifecycle event into an
+    `event.*` audit row."""
+
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         settings = get_settings()
         super().__init__(
@@ -61,6 +64,8 @@ class AuditConsumer(BaseKafkaConsumer):
         partition: int = 0,
         offset: int = 0,
     ) -> None:
+        """Write one audit row for this event. A redelivery collides on the
+        Kafka coordinates and is skipped."""
         event_name = value.get("event") if isinstance(value, dict) else None
         if not event_name:
             logger.warning(

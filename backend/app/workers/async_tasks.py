@@ -42,6 +42,8 @@ async def process_bulk_api_sync(
     payload: dict[str, Any],
     publish: ProgressPublisher,
 ) -> dict[str, Any]:
+    """Call the payload's endpoints concurrently behind a circuit breaker,
+    reporting progress as each one lands, and return per-endpoint results."""
     requested_count: int = int(payload.get("endpoint_count", 5))
     endpoint_count: int = max(0, min(requested_count, MAX_ENDPOINT_COUNT))
     if endpoint_count != requested_count:

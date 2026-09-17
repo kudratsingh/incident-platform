@@ -24,6 +24,9 @@ logger = get_logger(__name__)
 
 
 class EventLogConsumer(BaseKafkaConsumer):
+    """Consumer group `event-log` — appends every lifecycle event to
+    `job_events`, the immutable history a job's timeline replays."""
+
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         settings = get_settings()
         super().__init__(
@@ -48,6 +51,8 @@ class EventLogConsumer(BaseKafkaConsumer):
         partition: int = 0,
         offset: int = 0,
     ) -> None:
+        """Append one row for this event. A redelivery collides on the Kafka
+        coordinates and is skipped."""
         event_name = value.get("event") if isinstance(value, dict) else None
         if not event_name:
             logger.warning(
