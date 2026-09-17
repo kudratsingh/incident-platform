@@ -170,8 +170,9 @@ _REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 # Every Redis key namespace the chaos framework writes into.
 #
 # One pattern, because every chaos key helper MUST live under `chaos:*`:
-# `kafka_consumer.kill_key_for()` yields `chaos:kill:{group}` and
-# `kafka_consumer.latency_key_for()` yields `chaos:latency:{group}`.
+# `kafka_consumer.kill_key_for()` yields `chaos:kill:{group}`,
+# `kafka_consumer.latency_key_for()` yields `chaos:latency:{group}` and
+# `control_loop_pause.pause_key_for()` yields `chaos:pause:{loop}`.
 # A new chaos hook adds no pattern here — it keeps its keys inside the
 # namespace, and `test_every_chaos_key_helper_lives_under_the_chaos_namespace`
 # fails if one ever escapes. (Two `kafka:consumer:*` entries used to sit
