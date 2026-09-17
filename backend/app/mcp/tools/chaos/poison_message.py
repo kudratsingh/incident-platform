@@ -211,12 +211,14 @@ def _dlq_error_for_topic(topic: str, hint: str | None) -> str:
     classification is not a symptom; see the asymmetric rule in
     `app.lab.dlq_failure_stories`).
 
-    The row keeps naming its topic and this hook so a human sweeping the
-    DLQ can trace it back, and so the Kafka half and the DLQ half of one
-    invocation can be joined by eye.
+    The row names its topic and the producer correction it needs, without
+    exposing the lab hook through agent-readable error text.
     """
     base = story(_STORY_KEY_FOR_HINT[hint]).error_message
-    return f"{base} (chaos poison_message on topic '{topic}')"
+    return (
+        f"{base} (topic '{topic}': rejected by schema validation; "
+        "producer must correct the payload)"
+    )
 
 
 class PoisonMessageInput(BaseModel):

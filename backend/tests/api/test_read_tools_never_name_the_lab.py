@@ -42,6 +42,7 @@ from app.core.scopes import Scope
 from app.dependencies import get_db, get_redis
 from app.mcp.registry import ToolDefinition, list_tools
 from app.mcp.standalone import create_mcp_app
+from app.mcp.tools.chaos.poison_message import _dlq_error_for_topic
 from app.models.alert import Alert
 from app.models.audit import PRINCIPAL_TYPE_SERVICE_ACCOUNT, AuditLog
 from app.models.enums import JobStatus, JobType
@@ -96,13 +97,6 @@ _KNOWN_RESIDUAL_LEAKS = {
         "`source LIKE 'chaos:%'`, so a renamed alert survives every reset "
         "and becomes a permanent distractor (WO-R2-131, reintroduced). The "
         "rename and the reset predicate have to move in one PR."
-    ),
-    "poison_message DLQ error text": (
-        "`poison_message` appends `(chaos poison_message on topic '…')` to "
-        "the error text of the DLQ row it writes, which `list_dlq_messages` "
-        "returns verbatim. Rewording it is a commander-side fixture and "
-        "grader rebless (the canned DLQ fixtures pin these strings), so it "
-        "is a coupled change, not a one-line edit here."
     ),
     "chaos-owner job owner": (
         "`create_bad_data_job` owns its job with a user whose email is "
@@ -171,8 +165,8 @@ async def chaos_world(  # type: ignore[no-untyped-def]
     """A world a chaos run has been through, built at the data level.
 
     The hooks themselves are not fired here — that needs a broker, a real
-    Redis and `CHAOS_ENABLED=true`, and two of the hooks would seed the
-    residual leaks listed above, which are not this PR's to close. What is
+    Redis and `CHAOS_ENABLED=true`, and bad_deploy would seed the
+    residual alert leak listed above, which is not this PR's to close. What is
     reproduced is every row shape the hooks leave behind that a read tool
     can reach: the `chaos.` audit stream with its `tool_name` + `arguments`
     payload (the leak being closed), a declared DLQ fixture job, a seeded
@@ -187,10 +181,13 @@ async def chaos_world(  # type: ignore[no-untyped-def]
         user_id=test_user.id,
         type=JobType.CSV_UPLOAD.value,
         status=JobStatus.DEAD_LETTER.value,
-        payload={"seeded_fixture": "wp15p-sweep"},
-        error_message=(
-            "ValueError: unparseable row 41: expected 6 columns, found 4"
-        ),
+        payload={
+            "seeded_fixture": True,
+            "chaos_fixture": "poison_message",
+            "fixture_name": "poison-message",
+            "topic": "job.submitted",
+        },
+        error_message=_dlq_error_for_topic("job.submitted", "human_required"),
         retry_count=3,
         remediation_hint="human_required",
         trace_id=_TRACE_ID,
@@ -451,7 +448,6 @@ def test_the_residual_leak_list_is_documented() -> None:
     """Each residual leak needs a reason, not just a name."""
     assert set(_KNOWN_RESIDUAL_LEAKS) == {
         "bad_deploy alert",
-        "poison_message DLQ error text",
         "chaos-owner job owner",
     }
     for name, reason in _KNOWN_RESIDUAL_LEAKS.items():
@@ -477,15 +473,4 @@ def test_bad_deploy_alert_source_still_leaks_pending_o8() -> None:
     assert _BANNED in str(source_default).lower(), (
         "bad_deploy's alert label no longer names the lab — if O-8 landed, "
         "add the alert to the seeded world and drop this tripwire"
-    )
-
-
-def test_poison_message_dlq_text_still_leaks() -> None:
-    """Tripwire for the second residual leak, same contract as above."""
-    from app.mcp.tools.chaos.poison_message import _dlq_error_for_topic
-
-    text = _dlq_error_for_topic("job.submitted", None)
-    assert _BANNED in text.lower(), (
-        "poison_message's DLQ error text no longer names the lab — seed a "
-        "poisoned row into the world above and drop this tripwire"
     )
