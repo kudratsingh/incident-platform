@@ -22,6 +22,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest_asyncio
+from app.core.outbox_heartbeat import RELAY_TICK_KEY
 from app.core.scopes import Scope
 from app.dependencies import get_db, get_redis
 from app.mcp import protocol
@@ -31,6 +32,7 @@ from app.models.audit import PRINCIPAL_TYPE_SERVICE_ACCOUNT, AuditLog
 from app.models.enums import JobStatus, JobType
 from app.models.job import Job
 from app.models.job_dependency import JobDependency
+from app.models.outbox import OutboxEvent
 from app.models.tenant import Tenant
 from app.repositories.audit import AuditRepository
 from app.repositories.service_account import (
@@ -1216,3 +1218,144 @@ async def test_get_trace_is_not_truncated_when_everything_fits(
     )
     assert payload["truncated"] is False
     assert payload["total_jobs"] == 1
+
+
+# ---------------------------------------------------------------------------
+# get_outbox_status (WO-R3-201) — end to end, through the JSON-RPC envelope
+# ---------------------------------------------------------------------------
+
+
+async def _outbox_row(
+    db_session: AsyncSession,
+    tenant_id: uuid.UUID,
+    *,
+    created_seconds_ago: float,
+    published_seconds_ago: float | None = None,
+) -> None:
+    now = datetime.now(UTC)
+    db_session.add(
+        OutboxEvent(
+            id=uuid.uuid4(),
+            tenant_id=tenant_id,
+            topic="job.submitted",
+            key=f"{tenant_id}:{uuid.uuid4()}",
+            payload={"event": "job.submitted"},
+            created_at=now - timedelta(seconds=created_seconds_ago),
+            published_at=(
+                None
+                if published_seconds_ago is None
+                else now - timedelta(seconds=published_seconds_ago)
+            ),
+        )
+    )
+    await db_session.flush()
+
+
+async def test_get_outbox_status_reads_healthy_on_a_drained_queue(
+    mcp_client, db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
+) -> None:
+    """A healthy outbox has to look healthy through the envelope too.
+
+    Everything delivered, a fresh relay pass on record: zero waiting, null
+    ages, a heartbeat age of a few seconds.
+    """
+    ac, redis_stub = mcp_client
+    await _outbox_row(
+        db_session, default_tenant.id, created_seconds_ago=8, published_seconds_ago=7
+    )
+    await redis_stub.set(
+        RELAY_TICK_KEY, (datetime.now(UTC) - timedelta(seconds=1)).isoformat()
+    )
+
+    token = await _token(
+        db_session, default_tenant.id, [Scope.TELEMETRY_READ.value]
+    )
+    payload = _content(await _call(ac, token, "get_outbox_status", {}))
+
+    assert payload["unpublished_count"] == 0
+    assert payload["oldest_unpublished_age_s"] is None
+    assert payload["newest_unpublished_age_s"] is None
+    assert payload["seconds_since_last_publish"] is not None
+    assert payload["relay_heartbeat_known"] is True
+    assert payload["relay_heartbeat_age_s"] < 60
+    assert payload["relay_heartbeat_unknown_reason"] is None
+    assert payload["relay_tick_interval_s"] == 1.0
+
+
+async def test_get_outbox_status_reads_stalled_on_an_aging_backlog(
+    mcp_client, db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
+) -> None:
+    """The Family B discriminator: a backlog aging past the relay's interval,
+    with a heartbeat that stopped moving."""
+    ac, redis_stub = mcp_client
+    await _outbox_row(db_session, default_tenant.id, created_seconds_ago=420)
+    await _outbox_row(db_session, default_tenant.id, created_seconds_ago=180)
+    await _outbox_row(db_session, default_tenant.id, created_seconds_ago=2)
+    await redis_stub.set(
+        RELAY_TICK_KEY, (datetime.now(UTC) - timedelta(seconds=400)).isoformat()
+    )
+
+    token = await _token(
+        db_session, default_tenant.id, [Scope.TELEMETRY_READ.value]
+    )
+    payload = _content(await _call(ac, token, "get_outbox_status", {}))
+
+    assert payload["unpublished_count"] == 3
+    assert payload["oldest_unpublished_age_s"] > 400
+    assert payload["newest_unpublished_age_s"] < 60
+    assert payload["last_publish_at"] is None
+    assert payload["relay_heartbeat_known"] is True
+    assert payload["relay_heartbeat_age_s"] > 300
+
+
+async def test_get_outbox_status_takes_no_arguments(
+    mcp_client, db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
+) -> None:
+    """`extra="forbid"`: a caller inventing a filter is told, not ignored.
+
+    The description promises no paging and no filtering; silently accepting a
+    `limit` would make that promise unverifiable from the caller's side.
+    """
+    ac, _ = mcp_client
+    token = await _token(
+        db_session, default_tenant.id, [Scope.TELEMETRY_READ.value]
+    )
+
+    body = await _call(ac, token, "get_outbox_status", {"limit": 10})
+
+    assert body["error"]["code"] == protocol.JSONRPC_INVALID_PARAMS
+
+
+async def test_get_outbox_status_requires_the_telemetry_read_scope(
+    mcp_client, db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
+) -> None:
+    ac, _ = mcp_client
+    token = await _token(
+        db_session, default_tenant.id, [Scope.INCIDENTS_READ.value]
+    )
+
+    body = await _call(ac, token, "get_outbox_status", {})
+
+    assert body["error"]["code"] == protocol.MCP_FORBIDDEN
+
+
+async def test_get_outbox_status_counts_only_the_callers_tenant(
+    mcp_client, db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
+) -> None:
+    """Two tenants, two backlogs, one reading each."""
+    ac, _ = mcp_client
+    other_id = uuid.uuid4()
+    db_session.add(
+        Tenant(id=other_id, slug=f"t-{other_id.hex[:8]}", name="other tenant")
+    )
+    await db_session.flush()
+    await _outbox_row(db_session, other_id, created_seconds_ago=900)
+    await _outbox_row(db_session, default_tenant.id, created_seconds_ago=5)
+
+    token = await _token(
+        db_session, default_tenant.id, [Scope.TELEMETRY_READ.value]
+    )
+    payload = _content(await _call(ac, token, "get_outbox_status", {}))
+
+    assert payload["unpublished_count"] == 1
+    assert payload["oldest_unpublished_age_s"] < 300

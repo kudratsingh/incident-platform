@@ -38,6 +38,7 @@ from typing import Any
 import app.mcp.tools  # noqa: F401  — import for @tool registration side effects
 import pytest
 import pytest_asyncio
+from app.core.outbox_heartbeat import RELAY_TICK_KEY
 from app.core.scopes import Scope
 from app.dependencies import get_db, get_redis
 from app.mcp.registry import ToolDefinition, list_tools
@@ -122,6 +123,14 @@ class _RedisStub:
     WO-R3-200 needs: the pause hook's whole effect is that key, and the world
     a `jobs_not_progressing` scenario hands the agent has it set while the
     agent reads every probe here.
+
+    `outbox:relay:last_tick` is the other half of that world (WO-R3-201). It is
+    the relay's own record of its last pass, and in a paused-relay world it is
+    stale — several minutes old — because the pass that would refresh it is the
+    pass that is not running. `get_outbox_status` therefore reads a real,
+    non-null heartbeat age here rather than the "unknown" branch, which is what
+    makes its response worth screening: the tool is being called against the
+    very world it exists to describe, and it still must not name the lab.
     """
 
     def __init__(self) -> None:
@@ -131,6 +140,9 @@ class _RedisStub:
             "chaos:bad_deploy": "1",
             "chaos:sat:run-1": "x" * 32,
             "chaos:pause:outbox_relay": "paused",
+            RELAY_TICK_KEY: (
+                datetime.now(UTC) - timedelta(seconds=390)
+            ).isoformat(),
         }
 
     def seed_tenant_cache_key(self, tenant_id: uuid.UUID) -> str:
@@ -329,6 +341,7 @@ _ARGUMENTS: dict[str, dict[str, Any]] = {
     "get_dag_state": {"job_id": str(_DLQ_JOB_ID)},
     "get_deploy_history": {},
     "get_incident": {"id": str(_ALERT_ID)},
+    "get_outbox_status": {},
     "get_postgres_health": {},
     "get_redis_health": {},
     "get_trace": {"trace_id": _TRACE_ID},
@@ -352,7 +365,7 @@ def test_every_read_tool_has_a_call_in_the_argument_table() -> None:
         f"read tools with no entry in _ARGUMENTS: {missing}. Add a sensible "
         "call for each so the response screen below covers it."
     )
-    assert len(_read_tools()) >= 13, "the read surface shrank — check why"
+    assert len(_read_tools()) >= 14, "the read surface shrank — check why"
 
 
 @pytest.mark.parametrize(

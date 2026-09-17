@@ -20,7 +20,8 @@ real server.
 What is stubbed, and why that does not weaken it: Kafka. The relay's publish
 call is replaced by a recorder, so "published" means "the relay decided to
 publish this row and marked it" — which is exactly the signal `get_outbox_status`
-(WP-4.2) will read and exactly what the pause has to stop. The lag half is read
+(WP-4.2) reads, through the same repository query, and exactly what the pause has
+to stop. The lag half is read
 from the Redis-cached value the metrics loop maintains
 (`kafka:consumer_lag:worker-dispatcher`), which is where every reader of lag on
 this platform reads it from — the API's backpressure check and the agent's
@@ -36,7 +37,6 @@ from __future__ import annotations
 import asyncio
 import subprocess
 import uuid
-from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
@@ -45,9 +45,9 @@ from app.config import Settings
 from app.models.base import Base
 from app.models.outbox import OutboxEvent
 from app.models.tenant import Tenant
+from app.repositories.outbox import OutboxRepository
 from app.workers import dispatcher
 from app.workers.control_loop_pause import ControlLoopName, pause_key_for
-from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 try:
@@ -177,24 +177,27 @@ async def _submit(factory: Any, tenant_id: uuid.UUID, count: int) -> None:
                 )
 
 
-async def _outbox_status(factory: Any) -> tuple[int, float | None]:
-    """`unpublished_count` and `oldest_unpublished_age_s` — the two numbers
-    WP-4.2's read tool will report, computed the same way here."""
+async def _outbox_status(
+    factory: Any, tenant_id: uuid.UUID
+) -> tuple[int, float | None]:
+    """`unpublished_count` and `oldest_unpublished_age_s`, from the real query.
+
+    WP-4.2 landed `get_outbox_status`, so this is no longer a re-implementation
+    of the numbers the tool will report — it is the query the tool runs, on the
+    real Postgres, against a world a stopped relay produced. That is the point
+    of reading it here rather than in the unit tier: `now()`, `created_at` and
+    the advisory-lock leader gate are all the server's, and SQLite has none of
+    them.
+    """
     async with factory() as session:
-        row = (
-            await session.execute(
-                select(
-                    func.count(OutboxEvent.id),
-                    func.min(OutboxEvent.created_at),
-                ).where(OutboxEvent.published_at.is_(None))
-            )
-        ).one()
-    count, oldest = int(row[0]), row[1]
-    if oldest is None:
-        return count, None
-    if oldest.tzinfo is None:
-        oldest = oldest.replace(tzinfo=UTC)
-    return count, (datetime.now(UTC) - oldest).total_seconds()
+        snapshot = await OutboxRepository(session).delivery_snapshot(
+            tenant_id=tenant_id
+        )
+    if snapshot.oldest_unpublished_at is None:
+        return snapshot.unpublished_count, None
+    return snapshot.unpublished_count, (
+        snapshot.measured_at - snapshot.oldest_unpublished_at
+    ).total_seconds()
 
 
 #: Shortened loop intervals for the window below, and how long the window is.
@@ -278,7 +281,7 @@ async def test_a_paused_relay_grows_the_outbox_while_dispatcher_lag_stays_flat(
     redis = _Redis()
 
     await _submit(session_factory, tenant_id, 4)
-    before_count, before_age = await _outbox_status(session_factory)
+    before_count, before_age = await _outbox_status(session_factory, tenant_id)
     assert before_count == 4
     assert before_age is not None
 
@@ -288,7 +291,7 @@ async def test_a_paused_relay_grows_the_outbox_while_dispatcher_lag_stays_flat(
 
     entries = await _run_ticks(session_factory, redis, _flat_lag_consumer())
 
-    after_count, after_age = await _outbox_status(session_factory)
+    after_count, after_age = await _outbox_status(session_factory, tenant_id)
 
     # Signal 1 — the outbox backlog grew and aged.
     assert after_count == 7, "the paused relay published rows anyway"
@@ -323,12 +326,12 @@ async def test_the_relay_drains_the_backlog_once_the_pause_expires(
     await redis.set(_PAUSE_KEY, "paused", ex=300)
 
     await _run_ticks(session_factory, redis, _flat_lag_consumer())
-    assert (await _outbox_status(session_factory))[0] == 5
+    assert (await _outbox_status(session_factory, tenant_id))[0] == 5
 
     await redis.delete(_PAUSE_KEY)  # what the TTL does, on its own clock
 
     await _run_ticks(session_factory, redis, _flat_lag_consumer())
-    assert (await _outbox_status(session_factory))[0] == 0, (
+    assert (await _outbox_status(session_factory, tenant_id))[0] == 0, (
         "the relay did not resume on its own after the flag went away"
     )
 
@@ -352,7 +355,7 @@ async def test_pausing_a_different_loop_leaves_the_relay_publishing(
 
     await _run_ticks(session_factory, redis, _flat_lag_consumer())
 
-    assert (await _outbox_status(session_factory))[0] == 0, (
+    assert (await _outbox_status(session_factory, tenant_id))[0] == 0, (
         "pausing another loop stopped the outbox relay"
     )
 
