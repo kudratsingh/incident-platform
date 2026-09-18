@@ -23,14 +23,9 @@ def hash_password(password: str) -> str:
 def verify_password(plain: str, hashed: str) -> bool:
     """True only when `plain` matches a well-formed bcrypt `hashed`.
 
-    Fails closed on any hash bcrypt cannot parse instead of raising.
-    Chaos-lab owner accounts are stored with the unusable sentinel
-    `!chaos-owner-no-login` (app/mcp/tools/chaos/create_bad_data_job.py);
-    `checkpw` raises ValueError('Invalid salt') on it, which escaped
-    `AuthService.login` as a 500 and turned the status code into an oracle
-    for "this address is a chaos account" (D-12). A hash that cannot be
-    parsed is simply a credential nothing can match, so the caller gets the
-    same 401 as any other bad password.
+    Fails closed on an unparseable hash instead of raising: the chaos-lab
+    sentinel `!chaos-owner-no-login` made `checkpw` raise, and the 500 was an
+    oracle for "this address is a chaos account" (D-12). Unparseable means 401.
     """
     try:
         return bcrypt.checkpw(plain.encode(), hashed.encode())
@@ -73,21 +68,15 @@ def create_refresh_token(data: dict[str, Any]) -> str:
     )
 
 
-# Native EventSource cannot set an Authorization header, so the SSE stream
-# authenticates with a token in the URL. That token must never be the primary
-# access JWT — URLs end up in access logs, proxies, and browser history.
-# Instead we mint a single-purpose token that only authorizes streaming ONE
-# job and dies after this many seconds. See ADR 0014.
+# EventSource cannot set headers, so the SSE stream takes a URL token — never
+# the access JWT. It authorizes ONE job, for this many seconds. ADR 0014.
 STREAM_TOKEN_TTL_SECONDS = 60
 
 
 def create_stream_token(job_id: uuid.UUID, tenant_id: uuid.UUID) -> str:
     """Mint a short-lived token authorizing the SSE stream for exactly one job.
 
-    The subject is the JOB id, not a user id: the stream route compares it to
-    its path parameter, so a token minted for job X can never open job Y's
-    stream. Callers must authorize the job (tenant scope + ownership) BEFORE
-    minting — the stream route trusts the token alone.
+    Subject is the JOB id. Authorize the job BEFORE minting: the route trusts only this.
     """
     return _make_token(
         {"sub": str(job_id), "tenant_id": str(tenant_id)},

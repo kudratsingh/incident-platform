@@ -1,24 +1,12 @@
 """
-Per-tenant rate limit + monthly quota check.
+Per-tenant rate limit + monthly quota check, both scoped to the authenticated
+tenant; 0 disables either cap.
 
-Two enforcement mechanisms, both scoped to the authenticated tenant:
-
-  * Rate limit: requests per minute, fixed window in Redis (it resets on
-    absolute boundaries rather than moving with the caller, so the real
-    bound is 2x the cap across a boundary instant — see
-    `app/utils/rate_limit.py`). The cap is `tenants.rate_limit_per_minute`;
-    0 disables.
-  * Monthly quota: total jobs the tenant created in the current UTC
-    calendar month. The cap is `tenants.quota_jobs_per_month`; 0 disables.
-    Checked against the number of jobs the request is about to create
-    (`job_count`), so a 50-step saga is weighed as 50 jobs rather than one.
-
-The quota is a per-request SQL count rather than a Redis counter:
-
-  * The set of tenants creating jobs in a given minute is small, so the
-    extra query is cheap (it hits the (tenant_id, created_at) index).
-  * It survives Redis restarts and stays consistent with the source of
-    truth, which matters more than micro-latency for the cap.
+Rate limit: `tenants.rate_limit_per_minute`, fixed window in Redis, so the real
+bound is 2x the cap across a boundary instant (`app/utils/rate_limit.py`). Quota:
+`tenants.quota_jobs_per_month` against jobs created this UTC month, weighed by
+`job_count` so a 50-step saga counts 50. The quota is a per-request SQL count on
+the (tenant_id, created_at) index, not a Redis counter, so it survives restarts.
 """
 
 import time
@@ -76,13 +64,8 @@ async def _check_monthly_quota(
 ) -> None:
     """Refuse the request if the `job_count` rows it creates cross the cap.
 
-    Checked as a batch rather than per row, and *before* the first INSERT:
-    `POST /sagas` creates one job per step, so a saga that ran this check as
-    a single job could overshoot the cap by N-1 rows, and one that ran it per
-    step would commit part of its chain before meeting the cap mid-loop.
-
-    `job_count=1` is exactly the `used >= cap` rule this replaced —
-    `used + 1 > cap` is the same predicate — so `POST /jobs` does not move.
+    As a batch and *before* the first INSERT, or a saga overshoots by N-1 rows or
+    commits half its chain. `job_count=1` is the old `used >= cap` predicate.
     """
     if tenant.quota_jobs_per_month <= 0:
         return
@@ -120,18 +103,10 @@ async def check_tenant_limits(
 ) -> None:
     """The per-tenant half of admission control, for every job-creating surface.
 
-    Reached through `utils/admission.check_job_admission`, which both
-    `POST /jobs` and `POST /sagas` call.
-
-    `job_count` is how many `jobs` rows this request will create — 1 for
-    `POST /jobs`, `len(steps)` for `POST /sagas`. It applies to the monthly
-    quota only, whose unit is jobs. The per-minute limit is deliberately left
-    at one increment per request: its column is `tenants.rate_limit_per_minute`
-    and its unit is requests, so multiplying it there would silently redefine
-    a configured value. Bounding volume is the quota's job, and it does it.
-
-    Raises RateLimitError (429) when the per-minute cap is hit,
-    QuotaExceededError (429, error_code=quota_exceeded) when the monthly cap is hit.
+    Reached through `utils/admission.check_job_admission`. `job_count` applies to
+    the monthly quota only; the per-minute limit stays one increment per request
+    because `tenants.rate_limit_per_minute` counts requests. Raises RateLimitError
+    (429) or QuotaExceededError (429, error_code=quota_exceeded).
     """
     tenant = (
         await session.execute(select(Tenant).where(Tenant.id == tenant_id))

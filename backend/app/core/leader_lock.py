@@ -1,29 +1,11 @@
 """Single-writer gate for background loops, on a Postgres advisory lock.
 
-`worker_loop` runs inside *every* API replica's lifespan (main.py:117), so
-the number of outbox relays running at any moment equals the number of
-replicas — two during every ECS rolling deploy, permanently more once
-Phase 8 turns on horizontal scaling. The relay's fetch is a plain SELECT,
-so each of them reads the same unpublished rows and publishes the whole
-backlog again. See ADR 0020 for why this gate, and not row locks or a
-lease column.
-
-The lock is *session*-level (`pg_try_advisory_lock`), not transaction
-level: a relay tick spans three transactions with Kafka round-trips in
-between (fetch / publish / mark), and `pg_advisory_xact_lock` would be
-released at the first commit — in the middle of the window it exists to
-protect. `app.core.migration_lock` makes the same call for the same
-reason, and the two keys are disjoint so the migration run and the relay
-never contend.
-
-THE trap this module exists to contain: session-level advisory locks are
-scoped to a *connection*, and the async engine hands out pooled ones. Take
-the lock on whatever connection `session.execute()` happened to check out
-and the next statement may run on a different connection — releasing a
-lock the process never held while the real one leaks until that pooled
-connection is recycled. So the gate checks out one `AsyncConnection`
-explicitly and holds that object for the whole critical section; acquire,
-the caller's work, and release all provably run on it.
+`worker_loop` runs in every API replica, so without this every replica's outbox
+relay republishes the same backlog (ADR 0020 — not row locks, not a lease column).
+`pg_try_advisory_lock` is *session*-level because a relay tick spans three
+transactions; the xact form would release at the first commit. THE trap: session
+locks are per *connection* and the engine pools them, so the gate checks out one
+`AsyncConnection` and runs acquire, the caller's work and release all on it.
 """
 
 from collections.abc import AsyncIterator
@@ -42,9 +24,7 @@ from sqlalchemy.sql.elements import TextClause
 
 logger = get_logger(__name__)
 
-#: ASCII "outbox" (6 bytes — comfortably inside the int64 the
-#: one-argument `pg_advisory_*` form takes). Every process that wants to
-#: be the single outbox writer must use this exact key.
+#: ASCII "outbox". Every single-outbox-writer process must use this key.
 OUTBOX_RELAY_LOCK_KEY: Final[int] = 0x6F7574626F78
 
 _TRY_ACQUIRE_SQL: Final[TextClause] = text("SELECT pg_try_advisory_lock(:key)")
@@ -56,14 +36,8 @@ def resolve_engine(
 ) -> AsyncEngine | None:
     """The `AsyncEngine` a session factory is bound to, or None.
 
-    The background loops are handed a session factory, never the engine,
-    and the gate needs the engine because it must check out a connection
-    of its own (a `Session` returns its connection to the pool at every
-    commit — see the module docstring). `async_sessionmaker` keeps the
-    bind in `.kw`; `AsyncSession.bind` is the documented equivalent and
-    is used as the fallback. Unit tests pin both paths so a SQLAlchemy
-    upgrade that moves them fails loudly instead of silently disabling
-    the gate.
+    The loops hold a factory, but the gate needs the engine to check out its own
+    connection. Bind comes from `.kw`, else `AsyncSession.bind`; tests pin both.
     """
     bind = getattr(session_factory, "kw", {}).get("bind")
     if isinstance(bind, AsyncEngine):
@@ -78,11 +52,8 @@ def resolve_engine(
 async def _release(conn: AsyncConnection, key: int) -> None:
     """Give the lock back, or throw the connection away trying.
 
-    A connection returned to the pool while it still holds the lock would
-    wedge every replica out of the relay until the pool happened to
-    recycle it. `invalidate()` closes the underlying DBAPI connection, and
-    Postgres drops every advisory lock a backend held when that backend
-    goes away — so discarding the connection is the safe failure mode.
+    A pooled connection still holding the lock wedges every replica out of
+    the relay; `invalidate()` drops it, and Postgres frees its locks.
     """
     try:
         await conn.execute(_RELEASE_SQL, {"key": key})
@@ -103,15 +74,9 @@ async def advisory_leader_lock(
 ) -> AsyncIterator[bool]:
     """Yield True to exactly one holder of `key` at a time.
 
-    Non-blocking: a caller that loses the race gets False immediately and
-    is expected to skip this tick rather than queue behind the winner —
-    the loops poll on an interval, so waiting would only pile ticks up.
-
-    Yields True unconditionally when there is no Postgres behind the
-    factory (the SQLite unit/API suites, where the process is alone
-    anyway). That keeps the gate invisible to those tiers; the real
-    mutual-exclusion proof is
-    `backend/tests/integration/test_outbox_relay_concurrency.py`.
+    Non-blocking: a loser gets False at once and skips this tick. Yields
+    True unconditionally with no Postgres behind the factory (SQLite suites);
+    the proof is `backend/tests/integration/test_outbox_relay_concurrency.py`.
     """
     engine = resolve_engine(session_factory)
     if engine is None:
@@ -128,16 +93,12 @@ async def advisory_leader_lock(
     try:
         result = await conn.execute(_TRY_ACQUIRE_SQL, {"key": key})
         acquired = bool(result.scalar())
-        # SQLAlchemy 2.0 autobegins on the first execute. Commit it: the
-        # lock is session-scoped and outlives transaction boundaries, and
-        # leaving the transaction open would park this connection in
-        # `idle in transaction` — holding a snapshot back from vacuum —
-        # for the whole tick.
+        # SQLAlchemy autobegins on first execute; commit it — an open
+        # transaction parks this connection `idle in transaction` all tick.
         await conn.commit()
 
         if not acquired:
-            # Deliberately no unlock: `pg_advisory_unlock` on a lock this
-            # session never took logs a Postgres warning and returns false.
+            # No unlock: `pg_advisory_unlock` on a lock never taken warns.
             yield False
             return
 

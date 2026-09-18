@@ -16,12 +16,8 @@ class AppError(Exception):
         super().__init__(message)
         self.message = message
         self.details = details
-        # Response headers the refusal itself carries — `Retry-After` on a
-        # capacity refusal is the one that matters today. The AppError handler
-        # in main.py passes these straight through to the JSONResponse; the
-        # error envelope (error_code / message / details / request_id) is
-        # unchanged, so a client that ignores headers sees exactly what it
-        # always saw.
+        # Headers the refusal itself carries — today only `Retry-After` on a
+        # capacity refusal. main.py passes them through; the envelope is unchanged.
         self.headers = headers
 
 
@@ -73,11 +69,8 @@ class BackpressureError(AppError):
 class StreamCapacityError(AppError):
     """This process is already running its maximum number of SSE streams.
 
-    Distinct from BackpressureError on purpose: backpressure is about the
-    worker being behind and applies to *submitting* work, this is about one
-    API process's concurrent-stream budget and applies to *watching* it. A
-    client that meets this should retry (the Retry-After header says when),
-    possibly against another replica — it should not stop submitting jobs.
+    BackpressureError bounds *submitting* work; this bounds *watching* it.
+    Retry (see Retry-After), maybe on another replica; keep submitting jobs.
     """
 
     status_code = 503

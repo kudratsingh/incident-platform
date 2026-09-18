@@ -88,11 +88,7 @@ def setup_logging(level: str = "INFO", log_file: str | None = None) -> None:
 
 
 def get_uvicorn_log_config(level: str = "INFO") -> dict[str, Any]:
-    """Return a uvicorn log_config dict that disables uvicorn's default handlers.
-
-    Pass this to uvicorn.run() or the --log-config flag so uvicorn does not
-    install its own ColorFormatter, letting our root JSONFormatter take over.
-    """
+    """A uvicorn log_config that disables its handlers so our JSONFormatter wins."""
     return {
         "version": 1,
         "disable_existing_loggers": False,

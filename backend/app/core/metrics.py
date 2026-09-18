@@ -1,57 +1,11 @@
 """
 CloudWatch custom metrics — bounded, aggregated, off the request thread.
 
-Only emits in production (ENVIRONMENT=production). In all other environments
-calls are no-ops so local dev and CI are unaffected and boto3 is never invoked.
-
-Namespace: IncidentPlatform
-
-Shape
------
-`emit_count` / `emit_gauge` do **no I/O**. They sanitise the dimensions and
-drop the datum into a bounded in-memory queue, then return. A single background
-task (`_emitter_loop`, started from the app lifespan) drains the queue every
-`FLUSH_INTERVAL_SECONDS`, folds the window into one `StatisticSet` per distinct
-(metric, unit, dimensions) triple, and makes **one** `put_metric_data` call in a
-thread executor.
-
-Why not one call per emit
-------------------------
-The previous shape ran a blocking boto3 `put_metric_data` on the default
-executor for every request, from a `create_task` whose handle was retained in a
-module-level set until it completed. Three costs, all per-request:
-
-  * a thread hop and an HTTPS round-trip to CloudWatch on the tail of every
-    response,
-  * a set that grew with in-flight emits and was bounded only by how fast
-    CloudWatch answered — a slow CloudWatch was a memory leak,
-  * `PutMetricData` throttling, which is driven by **call rate**, not by how
-    much data each call carries. One call per request is the worst possible
-    ratio; one call per flush window is the best.
-
-Aggregating into `StatisticSet` also means N requests against the same route in
-a window cost one datum instead of N, and CloudWatch still reconstructs
-Average / Sum / Min / Max / SampleCount from it.
-
-Overflow is a drop, not backpressure: metrics are the least important thing the
-process is doing, and blocking a request to record how fast the request was
-would be self-defeating. Drops are counted and logged.
-
-Cardinality
------------
-CloudWatch bills per distinct dimension *combination*, so an unbounded
-dimension value is an unbounded bill for data nobody reads. Two guards, in
-`_sanitise_dimensions`:
-
-  * an **allow-list** — a caller declares the finite set a dimension may take
-    (`register_dimension_values`). Anything else becomes `OTHER_VALUE`. The API
-    registers its templated route table at startup, which is exactly the set of
-    `Path` values that can legitimately occur.
-  * a **hard cap** — for any dimension nobody declared, the first
-    `MAX_DIMENSION_VALUES` distinct values pass and every later new value
-    becomes `OTHER_VALUE`. A future caller cannot reintroduce unbounded
-    cardinality by forgetting to declare an allow-list; the worst case is a
-    bounded set plus an `other` bucket.
+Namespace IncidentPlatform; no-op unless ENVIRONMENT=production. `emit_count` and
+`emit_gauge` do **no I/O** — they sanitise dimensions and queue the datum; `_emitter_loop`
+folds each window into one `StatisticSet` per (metric, unit, dimensions) for a single
+`put_metric_data` call, and overflow drops rather than blocking a request. Cardinality is
+bounded twice: an allow-list, then `MAX_DIMENSION_VALUES` distinct, then `OTHER_VALUE`.
 """
 
 import asyncio
@@ -125,11 +79,7 @@ def _is_production() -> bool:
 
 
 def register_dimension_values(name: str, values: set[str] | frozenset[str]) -> None:
-    """Declare the finite set of values a dimension is allowed to take.
-
-    Idempotent and additive: calling it twice unions the sets, so an app that
-    mounts extra routers after startup can register again.
-    """
+    """Declare the finite set of values a dimension may take; additive, so twice unions."""
     existing = _allowed_values.get(name, frozenset())
     _allowed_values[name] = existing | frozenset(values)
 
@@ -243,9 +193,7 @@ async def emit_gauge(
 def _aggregate(batch: list[_Datum]) -> list[dict[str, Any]]:
     """Fold a flush window into one StatisticSet per (metric, unit, dimensions).
 
-    CloudWatch reconstructs Average / Sum / Min / Max / SampleCount from the
-    StatisticSet, so nothing is lost relative to sending each sample — but a
-    thousand requests against one route become one datum.
+    CloudWatch still reconstructs Average/Sum/Min/Max/Count.
     """
     folded: dict[tuple[str, str, tuple[tuple[str, str], ...]], dict[str, float]] = {}
     for d in batch:
@@ -288,14 +236,9 @@ def _put(metric_data: list[dict[str, Any]]) -> None:
 async def _flush_once(queue: asyncio.Queue[_Datum]) -> int:
     """Drain everything currently queued and ship it. Returns samples sent.
 
-    The whole queue is drained, not a fixed slice of it: `MAX_DATUMS_PER_CALL`
-    bounds the datums in one **API call**, which is what CloudWatch limits, and
-    aggregation happens first — a window of N samples collapses to at most one
-    datum per distinct (metric, unit, dimensions), which the cardinality guards
-    already bound. Capping the *drain* instead would throttle the consumer to
-    N samples per window while the producer runs at request rate, so a
-    moderately busy service would sit permanently at the queue ceiling and drop.
-    The drain is still bounded — by `QUEUE_MAXSIZE`.
+    The whole queue drains, not a slice: `MAX_DATUMS_PER_CALL` bounds one API
+    call, and aggregation collapses the window first. Capping the drain would
+    throttle the consumer below the producer; `QUEUE_MAXSIZE` is the bound.
     """
     batch: list[_Datum] = []
     while True:
@@ -316,11 +259,7 @@ async def _flush_once(queue: asyncio.Queue[_Datum]) -> int:
 
 
 async def _emitter_loop(queue: asyncio.Queue[_Datum]) -> None:
-    """Flush the queue on a fixed interval until cancelled.
-
-    Errors are logged and swallowed: a metrics failure must never take down the
-    process, and the loop must survive to flush the next window.
-    """
+    """Flush the queue on a fixed interval until cancelled; errors are swallowed."""
     while True:
         try:
             await asyncio.sleep(FLUSH_INTERVAL_SECONDS)

@@ -1,22 +1,10 @@
 """The observability bootstrap every entrypoint has to run.
 
-There are two deployables from this image — `api` (`app.main`) and `mcp`
-(`app.mcp.standalone`) — and the second one never ran any of this. The
-result was an agent-facing surface that emitted unstructured logs with
-every INFO dropped (the root logger sat at WARNING with Python's default
-formatter) and exported zero spans, while `OTLP_ENDPOINT` was configured
-for it and the operator went looking for exactly that evidence when a
-live run misbehaved (WO-R2-60).
-
-So it lives here, once, and both entrypoints call it. A third entrypoint
-gets it by calling one function rather than by remembering four.
-
-**SQLAlchemy is instrumented elsewhere, on purpose.**
-`app.dependencies` instruments the engine at import time, because the
-instrumentation binds to the engine rather than to the process and every
-entrypoint imports that module to get a session. It is listed in
-`instrumented_libraries()` so a process can assert its own coverage
-rather than assume it.
+Both deployables (`app.main`, `app.mcp.standalone`) call it; the MCP process ran
+none of it and emitted unstructured logs with every INFO dropped and zero spans
+while `OTLP_ENDPOINT` was set (WO-R2-60). **SQLAlchemy is instrumented elsewhere**,
+in `app.dependencies`, because it binds to the engine rather than the process; it
+is listed in `instrumented_libraries()` so a process can assert its own coverage.
 """
 
 import logging
@@ -33,12 +21,9 @@ from opentelemetry.instrumentation.redis import RedisInstrumentor
 API_SERVICE_NAME = "incident-platform"
 MCP_SERVICE_NAME = "incident-platform-mcp"
 
-# Set once per process. Re-running `setup_tracing` is not merely wasteful:
-# OTel refuses to override an installed TracerProvider and logs about it,
-# and `setup_logging` replaces the root handlers, so a second pass in a
-# test session would quietly reconfigure logging under whatever else is
-# running. Reset it (see `tests/api/test_mcp_observability.py`) if you
-# need to prove the bootstrap runs.
+# Set once per process: OTel refuses to replace an installed TracerProvider,
+# and `setup_logging` swaps the root handlers (reset it in
+# `tests/api/test_mcp_observability.py`).
 _bootstrapped = False
 
 
@@ -47,9 +32,7 @@ def bootstrap_process_observability(
 ) -> None:
     """Structured logging, tracing, and the process-wide instrumentors.
 
-    Call at import time in the entrypoint module, before anything logs —
-    a line emitted before this runs gets Python's default formatter, and
-    at INFO it is not emitted at all.
+    Call at import time, before anything logs.
     """
     global _bootstrapped
     if _bootstrapped:
@@ -76,9 +59,7 @@ def bootstrap_process_observability(
 def instrument_app(app: FastAPI) -> None:
     """Server-span instrumentation for one ASGI app.
 
-    Separate from the process bootstrap because it is per-app and has to
-    run after every route is mounted — which is also why each entrypoint
-    calls it at the end of its factory rather than at import.
+    Per-app, so call it after every route is mounted.
     """
     FastAPIInstrumentor.instrument_app(app)
 
@@ -86,14 +67,8 @@ def instrument_app(app: FastAPI) -> None:
 def instrumented_libraries(app: FastAPI | None = None) -> dict[str, bool]:
     """Which auto-instrumentations are live in this process.
 
-    Reported rather than assumed: `test_mcp_observability.py` asserts the
-    MCP process has all three, which is the check that would have caught
-    WO-R2-60.
-
-    FastAPI is reported per-app because that is how it is instrumented —
-    `instrument_app` marks the app, it does not flip a process-wide flag
-    the way the Redis and SQLAlchemy instrumentors do. Pass the app to
-    get an answer about it.
+    Reported rather than assumed: `test_mcp_observability.py` asserts the MCP
+    process has all three (WO-R2-60). FastAPI is per-app — pass the app.
     """
     from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor
 

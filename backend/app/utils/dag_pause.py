@@ -1,20 +1,10 @@
-"""DAG pause flags — shared by the tool that sets them, the consumer
-that enforces them, and the tool that reports them.
+"""DAG pause flags — shared by the tool that sets them, the consumer that
+enforces them, and the tool that reports them.
 
-Lives in `app/utils/` rather than next to `pause_dag` because
-`app.workers` must not import from `app.mcp`. The MCP layer calls into
-the platform, never the other way around.
-
-The flag is a Redis key `dag:paused:<job_id>` with a TTL. A WAITING
-child is held back if *it* or any of its ancestors carries the flag,
-which is what makes `pause_dag(root)` pause a whole saga chain rather
-than just the root's direct children.
-
-**Fail-open on Redis errors.** If the pause lookup raises, the DAG
-promotes as if unpaused. Consistent with the platform's treatment of
-Redis as a performance/UX dependency and never a correctness one (see
-ADR 0005) — a Redis outage must not silently freeze every DAG in the
-system with no way to notice. The caller logs the fall-through.
+In `app/utils/` because `app.workers` must not import `app.mcp`. The flag is a
+Redis key `dag:paused:<job_id>` with a TTL, and a WAITING child is held back if it
+*or any ancestor* carries it. **Fail-open on Redis errors:** a failed lookup
+promotes as if unpaused, since an outage must not freeze every DAG (ADR 0005).
 """
 
 import uuid
@@ -24,9 +14,7 @@ from app.core.logging import get_logger
 
 logger = get_logger(__name__)
 
-# Ancestor walks are bounded so a pathological graph can't turn one
-# promotion into an unbounded Redis+DB crawl. Sagas are linear chains;
-# ad-hoc deps are shallow. 64 is far above anything real.
+# Bounded so a pathological graph cannot cause an unbounded crawl.
 _MAX_ANCESTOR_NODES = 64
 
 
@@ -40,10 +28,7 @@ async def collect_ancestors(
 ) -> list[uuid.UUID]:
     """Breadth-first walk up the dependency edges from `job_id`.
 
-    Returns the job plus every transitive parent, deduplicated and
-    capped at `_MAX_ANCESTOR_NODES`. Cycles are impossible by
-    construction (deps only reference already-existing jobs), but the
-    `seen` set makes the walk safe regardless.
+    The job plus every transitive parent, deduped and capped at `_MAX_ANCESTOR_NODES`.
     """
     seen: set[uuid.UUID] = set()
     order: list[uuid.UUID] = []
@@ -63,12 +48,7 @@ async def collect_ancestors(
 async def find_blocking_pause(
     redis: Any, dep_repo: Any, job_id: uuid.UUID
 ) -> uuid.UUID | None:
-    """Return the id of the job whose pause flag holds `job_id` back, or
-    None if nothing in its ancestry is paused.
-
-    One `MGET` over the whole ancestor set — the walk costs DB reads but
-    the pause lookup is a single Redis round-trip regardless of depth.
-    """
+    """The id of the job whose pause flag holds `job_id` back, else None (one `MGET`)."""
     try:
         nodes = await collect_ancestors(dep_repo, job_id)
         if not nodes:
@@ -89,9 +69,7 @@ async def find_blocking_pause(
 async def pause_state(redis: Any, job_id: uuid.UUID) -> tuple[bool, int | None]:
     """Direct pause flag for one job: `(paused, expires_in_seconds)`.
 
-    Only the job's own key — ancestor blocking is a separate question
-    answered by `find_blocking_pause`. TTL is reported as None when the
-    key is absent or carries no expiry.
+    Its own key only; TTL is None with no expiry.
     """
     try:
         key = pause_key_for(job_id)

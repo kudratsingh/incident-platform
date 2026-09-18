@@ -2,27 +2,12 @@
 Backpressure check — read the cached dispatcher consumer lag from Redis and
 raise BackpressureError (503) if it's above the configured threshold.
 
-The metrics loop in the worker updates the cache key every ~60s with the
-current group lag. The API never queries Kafka directly — that would add
-latency to every job submission. A missing/expired cache entry is treated
-as "lag unknown, accept the job."
-
-Fail-open, three ways
----------------------
-"Lag unknown" has three causes and they all land on the same answer — let
-the request through:
-
-  * the key is absent or expired (metrics loop hasn't run yet),
-  * the value is unparseable,
-  * **the read itself failed** (Redis unreachable).
-
-The third case used to be unhandled, which made this the only Redis touch
-on `POST /jobs` that failed *closed*: a Redis outage turned every job
-submission into a 500 while `rate_limit.py`, `quota.py` and `cache.py` all
-degraded quietly. That inverted the posture documented in docs/REDIS.md and
-in the ADR 0005 family — a backpressure signal is advisory, and losing the
-signal is not grounds for refusing work the durable path (Postgres + outbox)
-can still accept.
+The worker's metrics loop refreshes the key every ~60s; the API never queries
+Kafka directly. **Fail-open three ways** — absent/expired key, unparseable value,
+and a failed read (Redis unreachable) all accept the job. The third was once
+unhandled, making this the only Redis touch on `POST /jobs` that failed closed
+(docs/REDIS.md, ADR 0005): the signal is advisory, and losing it is no reason to
+refuse work.
 """
 
 from app.config import get_settings
@@ -32,9 +17,7 @@ from redis.asyncio import Redis
 
 logger = get_logger(__name__)
 
-# Keep in sync with workers/dispatcher.py:BACKPRESSURE_LAG_KEY — duplicated as
-# a constant here to avoid importing the dispatcher (and its heavy deps) from
-# the API request path.
+# Keep in sync with workers/dispatcher.py:BACKPRESSURE_LAG_KEY.
 BACKPRESSURE_LAG_KEY = "kafka:consumer_lag:worker-dispatcher"
 
 
@@ -48,8 +31,7 @@ async def check_backpressure(redis: Redis) -> None:
     try:
         raw = await redis.get(BACKPRESSURE_LAG_KEY)
     except Exception as exc:
-        # Redis unavailable — fail open, same as the rate limiter and the
-        # per-tenant quota check. No signal is not a reason to reject.
+        # Redis unavailable — fail open, like the rate limiter.
         logger.warning(
             "backpressure_check_failed",
             extra={"error_type": type(exc).__name__, "error": str(exc)[:200]},
