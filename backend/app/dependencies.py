@@ -1,8 +1,5 @@
-"""The shared FastAPI dependencies: the database session every request runs in,
-and the identity — human or machine — it runs as.
-
-Both auth paths end in the same place: context vars set for the logs and
-`app.tenant_id` set for Postgres row-level security.
+"""Per-request DB session and caller identity (human or machine). Both auth
+paths set `app.tenant_id` for Postgres row-level security.
 """
 
 import uuid
@@ -56,15 +53,9 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
     async with _async_session() as session:
         async with session.begin():
             yield session
-        # The commit has landed. Anything a service deferred because it
-        # must not be visible before then — cache invalidation, today —
-        # runs here (R2-23). On rollback the block above raises and this
-        # never runs, which is the behaviour we want: nothing committed,
-        # nothing to announce.
-        #
-        # This covers the API app and the MCP server, which shares this
-        # dependency. The worker loops own their own `session.begin()`
-        # blocks and call `run_post_commit` themselves.
+        # The commit has landed, so work a service deferred until then — cache
+        # invalidation, today — runs here (R2-23); on rollback it never runs.
+        # The worker loops own their `begin()` and call `run_post_commit`.
         await run_post_commit(session)
 
 
@@ -94,10 +85,8 @@ async def get_current_user(
     if not user.is_active:
         raise AuthenticationError("Account is disabled")
 
-    # Guard against tenant-claim drift: if the token's tenant_id doesn't match
-    # the user's actual tenant_id, refuse the request rather than silently
-    # picking one. Tokens minted before the multi-tenancy migration won't
-    # carry the claim — accept them only when they match the user's tenant.
+    # Refuse on tenant-claim drift rather than silently picking one. Tokens
+    # minted before multi-tenancy carry no claim; accept those.
     token_tenant_id = payload.get("tenant_id")
     if token_tenant_id is not None and token_tenant_id != str(user.tenant_id):
         raise AuthenticationError("Token tenant_id does not match user")
@@ -105,11 +94,9 @@ async def get_current_user(
     user_id_var.set(str(user.id))
     tenant_id_var.set(str(user.tenant_id))
 
-    # Postgres row-level security. The policies on tenant-scoped tables read
-    # `current_setting('app.tenant_id', true)` and gate every row by it.
-    # Setting it here means any query that escapes the repository helpers
-    # (raw SQL, a forgotten filter) still can't leak across tenants.
-    # Silent no-op on SQLite (tests) — `SET LOCAL` doesn't exist there.
+    # Postgres RLS: policies gate rows on
+    # `current_setting('app.tenant_id', true)`, so a forgotten filter cannot
+    # leak across tenants. No-op on SQLite.
     if db.bind is not None and db.bind.dialect.name == "postgresql":
         await db.execute(
             text("SELECT set_config('app.tenant_id', :tid, true)"),
@@ -125,21 +112,16 @@ get_redis = _get_redis
 def get_session_factory() -> async_sessionmaker[AsyncSession]:
     """Return the shared, tenant-scoped session factory.
 
-    Sessions from this factory carry no cross-tenant privilege: since
-    WO-R2-129 a statement that has not set `app.tenant_id` is refused by
-    the `tenant_isolation` policies. Request paths get their tenant from
-    `get_current_user` / `_apply_tenant_context`; the boot probes use it
-    for catalog reads that touch no tenant table. Code that legitimately
-    spans tenants asks for it explicitly — see
-    `app.core.tenant_scope.platform_session_factory` (ADR 0026).
+    Since WO-R2-129 a statement that has not set `app.tenant_id` is refused
+    by the `tenant_isolation` policies; code that legitimately spans tenants
+    asks for `app.core.tenant_scope.platform_session_factory` (ADR 0026).
     """
     return _async_session
 
 
 def get_engine() -> AsyncEngine:
-    """The one shared engine. Exposed so `platform_session_factory` can
-    build a cross-tenant factory over the *same* pool rather than opening
-    a second one (ADR 0015 rejected a second pool; ADR 0026 keeps that)."""
+    """The one shared engine; `platform_session_factory` reuses this pool
+    instead of opening a second (ADR 0015, 0026)."""
     return _engine
 
 
@@ -161,36 +143,23 @@ def require_role(*roles: UserRole) -> "type[User]":
 async def require_platform_admin(
     current_user: User = Depends(get_current_user),
 ) -> User:
-    """Dependency for endpoints that may cross tenant boundaries.
-
-    Platform admins additionally bypass the per-tenant RLS scope when they
-    pass `?tenant_id=` on the few endpoints that accept it. Ordinary
-    `role=admin` users remain scoped to their own tenant.
-    """
+    """Endpoints that may cross tenant boundaries: only a platform admin's
+    `?tenant_id=` is honoured — `role=admin` stays in its own tenant."""
     if not current_user.is_platform_admin:
         raise AuthorizationError("Platform admin role required")
     return current_user
 
 
-# ---------------------------------------------------------------------------
-# Machine-principal auth
-#
-# Machine principals (service accounts) speak to the platform with opaque
-# `sa_<random>` bearer tokens. The auth dependency below routes on the token
-# prefix: JWT → user path (existing), sa_ → service-account path (new).
-# Downstream code that doesn't care which kind of principal is calling
-# depends on `get_current_principal`; endpoints reserved for humans keep
-# depending on `get_current_user`.
-# ---------------------------------------------------------------------------
+# Machine-principal auth: service accounts carry opaque `sa_<random>` bearer
+# tokens, so `get_current_principal` routes on the token prefix. Human-only
+# endpoints keep depending on `get_current_user`.
 
 
 @dataclass(frozen=True)
 class Principal:
-    """Unified caller identity — either a human `User` or a `ServiceAccount`.
+    """Unified caller identity — a human `User` or a `ServiceAccount`.
 
-    Every request is one or the other. The scope check (`require_scope`)
-    reads `.scopes` and refuses human callers by construction; the tenant
-    context vars and RLS setting are populated the same way for both."""
+    `require_scope` reads `.scopes`; RLS and context vars are set for both."""
 
     kind: str  # "user" | "service_account"
     tenant_id: uuid.UUID
@@ -222,13 +191,10 @@ async def get_current_principal(
     token: str = Depends(_oauth2_scheme),
     db: AsyncSession = Depends(get_db),
 ) -> Principal:
-    """Unified auth entry point. Route on token prefix.
+    """Unified auth entry point, routing on the token prefix.
 
-    Endpoints scope-guarded with `require_scope` chain off this dependency
-    so both human and machine callers are recognized (the scope check then
-    refuses humans). Endpoints strictly for humans keep depending on
-    `get_current_user`, which continues to reject sa_ tokens by decoding
-    them as JWTs and failing."""
+    `require_scope` endpoints chain off this so machine and human callers are
+    both recognised; human-only endpoints keep `get_current_user`."""
     if looks_like_service_account_token(token):
         service = ServiceAccountService(
             ServiceAccountRepository(db),
@@ -254,9 +220,7 @@ async def get_current_principal(
 
 
 def require_scope(*required: Scope) -> "type[Principal]":
-    """Factory that returns a dependency requiring the caller's token carries
-    every listed scope. Refuses human callers — scopes are machine-only
-    (see ADR 0007)."""
+    """Requires every listed scope; refuses human callers (ADR 0007)."""
 
     required_strs = frozenset(s.value for s in required)
 
@@ -282,15 +246,10 @@ async def resolve_admin_tenant(
     db: AsyncSession,
     requested: uuid.UUID | None,
 ) -> uuid.UUID:
-    """Resolve the tenant_id an admin request should run against.
+    """The tenant_id an admin request runs against.
 
-    Platform admins may override via `?tenant_id=...`; for ordinary admins
-    and support users the override is silently ignored (we never want a
-    misconfigured client to escalate scope by accident).
-
-    When the effective tenant differs from the user's own, we also re-issue
-    `set_config('app.tenant_id', ...)` so the Postgres RLS policies let the
-    cross-tenant query through. No-op on SQLite.
+    Only a platform admin's `?tenant_id=` is honoured; a cross-tenant value
+    also re-issues `set_config('app.tenant_id', ...)` so RLS admits the query.
     """
     if requested is None or not current_user.is_platform_admin:
         return current_user.tenant_id
@@ -310,24 +269,8 @@ async def get_effective_tenant(
 ) -> uuid.UUID:
     """The tenant a read handler must scope itself to — as a dependency.
 
-    `resolve_admin_tenant` already computed this, but only where a handler
-    remembered to call it, and three read paths did not (WO-R2-50):
-    `GET /sagas/{id}` served any saga to any authenticated caller,
-    `GET /sagas` passed `user_id=None` for privileged callers with no tenant
-    filter at all, and `GET /admin/users/{id}/stats` answered any user UUID
-    out of Redis. Declaring the scope as a dependency rather than as three
-    remembered calls is the point: the next read endpoint inherits it by
-    typing `Depends(get_effective_tenant)`, and forgetting it is visible in
-    the signature rather than buried in a body.
-
-    The value is the caller's own tenant, except that a platform admin may
-    ask for another via `?tenant_id=` — the existing, deliberate override,
-    which also retargets `app.tenant_id` so RLS admits the query. Everyone
-    else's `?tenant_id=` is silently ignored, so exposing the parameter on
-    these endpoints grants nobody anything they did not already have.
-
-    RLS remains the backstop underneath this, not the substitute for it: it
-    is inert on SQLite, inert for a superuser connection, and — as the stats
-    path showed — absent entirely from a Redis read.
+    A dependency rather than three remembered `resolve_admin_tenant` calls,
+    because three read paths forgot it (WO-R2-50). The value is the caller's
+    own tenant, except a platform admin's `?tenant_id=`; RLS stays a backstop.
     """
     return await resolve_admin_tenant(current_user, db, tenant_id)

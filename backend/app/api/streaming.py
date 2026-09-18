@@ -1,39 +1,9 @@
 """
-Server-Sent Events endpoint for live job progress.
-
-POST /api/v1/jobs/{job_id}/stream-token  — mint a short-lived stream token
-GET  /api/v1/jobs/{job_id}/stream?token= — the SSE stream itself
-
-The client opens the stream once and receives text/event-stream events as the
-worker publishes progress.  The connection closes automatically when the job
-reaches a terminal state (completed / failed / dead_letter / cancelled) —
-including for a client that connects *after* the job finished: the stream
-opens with the retained progress snapshot (`job:progress:last:{job_id}`), and
-when no snapshot survives, a finished `jobs` row is turned into one synthetic
-terminal event.  A late subscriber is never left on a silent open connection.
-
-Auth transport (ADR 0014): native EventSource cannot set request headers, so
-the GET cannot carry the usual Authorization header.  The client first POSTs
-for a stream token (a normal fetch, normal header auth) — that endpoint
-authorizes the job (tenant scope + ownership) and mints a single-purpose
-token bound to this job_id.  The GET then validates that token from the query
-string; its identity comes entirely from the token.  A leaked stream URL is
-low-value: the token expires in STREAM_TOKEN_TTL_SECONDS and opens nothing
-but this one job's stream.
-
-Why SSE over WebSockets here:
-  - Job progress is unidirectional (server → client only).
-  - SSE reconnects automatically in the browser.
-  - No need for a full duplex channel.
-
-Connection budget (WO-R2-11): an open stream no longer owns a Redis
-connection.  Every stream in the process reads off one shared Pub/Sub
-connection (`workers/progress_broker.py`) drawn from a pool dedicated to
-streaming (`core/redis.py`), so viewers can no longer starve the rate limiter,
-`check_backpressure` and the worker loops that share the default pool.  The
-number of concurrent streams is capped explicitly instead — past the cap this
-endpoint answers 503 + `Retry-After` — and idle/maximum-duration timeouts stop
-a parked tab from holding a slot forever.
+Server-Sent Events endpoint for live job progress: `POST
+/jobs/{job_id}/stream-token` mints a job-bound token, `GET
+/jobs/{job_id}/stream?token=` streams it.  EventSource cannot set headers, so
+auth is a token in the query string (ADR 0014).  Every stream shares one
+Pub/Sub connection on a streaming-only Redis pool, capped (WO-R2-11).
 """
 
 import uuid
@@ -78,10 +48,8 @@ async def issue_stream_token(
     """
     Mint a short-lived, single-purpose token for this job's SSE stream.
 
-    This is where the stream's authorization happens: get_job raises 404 for
-    a cross-tenant job (existence is never confirmed) and 403 for a non-owner
-    without the admin/support role.  Only then is the token minted, with the
-    job id as its subject so it cannot be replayed against another job.
+    Where the stream is authorized: `get_job` 404s a cross-tenant job and 403s
+    a non-owner.  The token's subject is the job id, so it cannot be replayed.
     """
     svc = JobService(
         JobRepository(db),
@@ -101,8 +69,8 @@ async def issue_stream_token(
 def _terminal_event_from_row(job: Job) -> ProgressEvent:
     """The one event a caller gets when the job finished before they connected.
 
-    Built from the dataclass (never hand-rolled JSON) so it is indistinguishable
-    from a published event on the wire — the frontend types mirror this shape.
+    Built from the dataclass, never hand-rolled JSON, so it matches a
+    published event on the wire.
     """
     return ProgressEvent(
         job_id=str(job.id),
@@ -121,23 +89,9 @@ def _snapshot_is_stale(
 ) -> bool:
     """True when the retained snapshot says 'finished' and the row disagrees.
 
-    A DLQ replay is the way this happens: the job reaches `dead_letter`, the
-    snapshot records it, and then an operator replays the job. The replay's
-    `running` events deliberately do not overwrite a terminal snapshot
-    (`workers/progress.py`), so for the snapshot's remaining TTL it describes
-    a lifecycle the job has already left — and because `subscribe()` ends on
-    the first terminal event, a viewer of a job that is running right now got
-    one `dead_letter` event and a closed stream.
-
-    The tie-break is recency, not a preference for the row: the row is only
-    believed if it was written *after* the snapshot. That matters for the
-    ordinary race where a job finishes microseconds after this request read
-    its row — there the snapshot is the newer of the two, it is honoured, and
-    the client is correctly told the job is done instead of waiting out the
-    broker's idle timeout for events that have already been published.
-
-    Anything unparseable leaves the snapshot in charge, which is the
-    pre-WO-R2-57 behaviour.
+    A DLQ replay is how that happens: the replay's `running` events never
+    overwrite a terminal snapshot. The tie-break is recency — the row wins
+    only if it was written after the snapshot (WO-R2-57).
     """
     if snapshot is None or row_is_terminal or row_updated_at is None:
         return False
@@ -167,27 +121,9 @@ async def stream_job_progress(
     """
     Stream live progress events for a job via Server-Sent Events.
 
-    Events are JSON-encoded ProgressEvent objects:
-      { job_id, status, progress, message, retry_count, timestamp }
-
-    The stream closes when status is one of:
-    completed | failed | dead_letter | cancelled.
-
-    That promise now holds for late subscribers too.  Redis Pub/Sub is
-    at-most-once, so a client that connects after the terminal event — or that
-    reconnects across a Redis blip — used to sit on a silent open connection
-    forever.  Two things close it now: `subscribe` opens with the retained
-    `job:progress:last:{job_id}` snapshot and ends immediately if that snapshot
-    is terminal, and if the snapshot has been evicted (or was never written) a
-    finished `jobs` row short-circuits into a single synthetic terminal event.
-
-    Identity comes entirely from the ?token= stream token — deliberately NOT
-    get_current_user, which reads the Authorization header EventSource cannot
-    send.  The token was minted by issue_stream_token only after a tenant +
-    ownership check, and is bound to this job_id (admins and support staff
-    can mint for any same-tenant job; regular users only for their own).  The
-    row lookup below re-uses the tenant from that token and stays tenant-scoped
-    (`get_for_tenant`); it grants nothing the token did not already grant.
+    Closes on completed | failed | dead_letter | cancelled, late subscribers
+    included (the retained `job:progress:last:{job_id}` snapshot, else one
+    synthetic terminal event).  Identity is the ?token= token (ADR 0014).
     """
     if token is None:
         raise AuthenticationError("Missing stream token")
@@ -201,13 +137,9 @@ async def stream_job_progress(
     except ValueError as exc:
         raise AuthenticationError("Stream token carries no usable tenant") from exc
 
-    # Give the read below the same RLS backstop every other authenticated
-    # path has. This endpoint authenticates on the `?token=` stream token
-    # rather than `get_current_user`, so nothing had set `app.tenant_id`
-    # and the lookup ran unscoped — carried by the policy's bootstrap
-    # branch until WO-R2-129 removed it. The tenant comes from the signed
-    # token that was already checked against this job_id, so this narrows
-    # the query, it does not widen it.
+    # Give this read the RLS backstop every other authenticated path has —
+    # nothing had set `app.tenant_id` here (WO-R2-129). The tenant comes from
+    # the token already checked against this job_id, so it only narrows.
     await declare_tenant_scope(db, tenant_id)
 
     # Read the row here, not inside the generator: the get_db session is torn
@@ -219,10 +151,8 @@ async def stream_job_progress(
         else None
     )
 
-    # Reserve the stream slot BEFORE returning a response: a refusal has to be
-    # a normal 503 with Retry-After, not a stream that opens and then dies.
-    # This raises StreamCapacityError and never touches Redis, so a full
-    # process refuses cheaply instead of queueing against a finite pool.
+    # Reserve the slot BEFORE responding: a refusal must be a 503 with
+    # Retry-After, not a stream that opens and dies. Touches no Redis.
     slot = acquire_stream_slot()
 
     row_updated_at = job.updated_at if job is not None else None
@@ -235,13 +165,9 @@ async def stream_job_progress(
                 # would stay silent forever. Report the row and close.
                 yield {"data": finished_event.to_json(), "event": finished_event.status}
                 return
-            # The other disagreement: a terminal snapshot in front of a row
-            # that is not terminal, which is what a DLQ replay leaves behind
-            # (the snapshot's own guard refuses to let the replay's `running`
-            # events overwrite `dead_letter`). Handing that snapshot to the
-            # client closes the stream on its first event, for a job that is
-            # running right now. The row is durable state and it moved after
-            # the snapshot was written, so the row wins and we stream live.
+            # The other disagreement: a terminal snapshot in front of a
+            # non-terminal row, which a DLQ replay leaves behind. Serving it
+            # would close the stream on a running job, so the row wins.
             stale = _snapshot_is_stale(
                 snapshot,
                 row_is_terminal=finished_event is not None,
@@ -252,8 +178,6 @@ async def stream_job_progress(
         finally:
             slot.release()
 
-    # The background task is the belt to the generator's braces: if the client
-    # disappears between here and the first byte the generator is never driven,
-    # so its `finally` never runs and the slot would leak. `release()` is
-    # idempotent, so whichever fires first wins and the other is a no-op.
+    # Belt to the generator's braces: a client that vanishes before the first
+    # byte never drives it, so the slot would leak. `release()` is idempotent.
     return EventSourceResponse(_event_stream(), background=BackgroundTask(slot.release))

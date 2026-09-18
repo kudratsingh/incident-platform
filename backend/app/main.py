@@ -24,9 +24,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 _settings = get_settings()
-# Shared with `app.mcp.standalone` — see `app/core/observability.py`. The
-# MCP process ran none of this until WO-R2-60, which is why it is one
-# function now rather than four lines an entrypoint can half-copy.
+# Shared with `app.mcp.standalone`; the MCP process ran none of it until
+# WO-R2-60.
 bootstrap_process_observability(
     service_name=API_SERVICE_NAME, settings=_settings
 )
@@ -35,12 +34,8 @@ logger = get_logger(__name__)
 
 
 def _import_eval_seeder() -> tuple[Any, Any]:
-    """Resolve the eval seeder's entry points at call time.
-
-    `scripts/` is bind-mounted (dev) or baked (image) at /app and picked
-    up as an implicit namespace package (no __init__.py). Split out of
-    the boot path so tests can substitute the (seed, write_pins_json)
-    pair without faking a package tree."""
+    """Resolve the eval seeder's entry points at call time — `scripts/` is an
+    implicit namespace package at /app, and tests substitute the pair."""
     import sys as _sys
 
     if "/app" not in _sys.path:
@@ -54,20 +49,9 @@ def _import_eval_seeder() -> tuple[Any, Any]:
 
 
 async def _boot_seed_eval_fixtures() -> None:
-    """SEED_EVAL_FIXTURES=true boot path, with its two failure domains
-    kept unconflatable in the log:
-
-      * "eval fixture seed failed"       — the fixtures did NOT land.
-      * "eval fixture pins write failed" — the fixtures DID land; only
-        the pin manifest is missing.
-
-    They used to share one try/except, so the EACCES from the pins write
-    (whose old default lived under the root-owned /app) was reported as
-    a seed failure while 5 alerts, 9 jobs and 6 deploy markers sat
-    committed in the database — anyone reading the log concluded the
-    fixtures were absent when they were present. Neither failure blocks
-    boot: worst case the tools serve an unseeded (or unpinned) world,
-    which every tool already handles defensively."""
+    """SEED_EVAL_FIXTURES=true boot path. Two failure domains stay separate in
+    the log: "eval fixture seed failed" (nothing landed) vs "eval fixture pins
+    write failed" (fixtures landed, manifest did not). Neither blocks boot."""
     try:
         seed, write_pins_json = _import_eval_seeder()
         await seed()
@@ -111,82 +95,55 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     from app.workers.dispatcher import worker_loop
     from app.workers.kafka_producer import start_producer, stop_producer
 
-    # Schema is materialised by `alembic upgrade head`, run from
-    # scripts/entrypoint.sh in prod and from the docker-compose
-    # `command:` in dev. A previous version of this lifespan also called
-    # `Base.metadata.create_all` here as a "dev convenience," which
-    # created a Frankenstein state on first boot: create_all built every
-    # current table but the alembic_version row still pointed at the
-    # initial revision, so the next alembic run would find tables already
-    # existing and refuse to advance. Removed.
+    # Schema comes from `alembic upgrade head` (entrypoint.sh in prod, the
+    # compose `command:` in dev). A `create_all` here once left
+    # alembic_version behind the tables it had built — removed.
 
-    # Fail fast if the DB is behind the code's alembic head. The v0.4.1
-    # postmortem: `docker compose restart` didn't rerun the migrate
-    # one-shot, so `jobs.remediation_hint` was missing and every DLQ
-    # tool 500'd for hours before an operator spotted it in the logs.
-    # A loud boot failure is strictly better than the silent run.
+    # Fail fast if the DB is behind the code's alembic head — the v0.4.1
+    # postmortem: a missing `jobs.remediation_hint` 500'd every DLQ tool
+    # for hours.
     _session_factory = get_session_factory()
     await assert_migrations_current(_session_factory)
 
-    # Fail fast (in production) if this connection would silently bypass
-    # row-level security — superuser, or table owner without FORCE. The
-    # runtime is supposed to be the non-owner incident_app role (ADR
-    # 0015); outside production the probe only logs, so local superuser
-    # compose stacks keep booting.
+    # Fail fast in production if this connection would bypass row-level
+    # security: the runtime is the non-owner incident_app role (ADR 0015).
+    # Elsewhere it only logs.
     await assert_rls_posture(_session_factory, settings)
 
-    # Live-eval fixtures — opt-in via SEED_EVAL_FIXTURES=true. Runs the
-    # same script the operator would invoke via `make seed-eval-fixtures`,
-    # inline in the lifespan so the agent's `docker compose up` produces
-    # a stack with realistic data without a separate step. Idempotent —
-    # every ID is `uuid5`-derived, so re-boots are safe. Runs after
-    # migrations (which the compose command executes first) so the
-    # deploy_markers / alerts / etc. tables exist.
+    # Live-eval fixtures — opt-in via SEED_EVAL_FIXTURES=true. Same script as
+    # `make seed-eval-fixtures`, run inline after migrations. Idempotent
+    # (uuid5 ids), so re-boots are safe.
     if settings.seed_eval_fixtures:
         await _boot_seed_eval_fixtures()
 
-    # Kafka producer — if the broker is unreachable we log and continue so the
-    # API still boots. The producer stays unset, and the publish paths lazily
-    # retry the start (throttled to one attempt per 5s), so the outbox relay's
-    # next tick after the broker returns restarts it: a boot-time broker outage
-    # self-heals without a redeploy.
+    # An unreachable broker logs and does not block boot: the publish paths
+    # lazily retry the start, so a boot-time outage self-heals without a
+    # redeploy.
     try:
         await start_producer()
     except Exception as exc:
         logger.error("kafka producer failed to start", extra={"error": str(exc)})
 
-    # Background CloudWatch flush task. Every emit_gauge/emit_count call in
-    # this process (request middleware, worker metrics loop) queues into it
-    # rather than making its own PutMetricData call. No-op outside production.
+    # Background CloudWatch flush; every emit_gauge/emit_count queues into
+    # it. No-op outside production.
     await metrics.start_metrics_emitter()
 
     redis = get_redis_client()
-    # Platform (cross-tenant) scope, declared once for every consumer and
-    # background loop below (ADR 0026). The loops are mixed-tenant by
-    # design — the outbox relay publishes for all tenants, the dispatcher
-    # polls pending jobs across them — and since WO-R2-129 the
-    # `tenant_isolation` policies refuse a statement that names no tenant
-    # instead of admitting it. Attaching the declaration to the factory
-    # they are handed covers all ~30 `async with session_factory()` sites
-    # without each one remembering; `_session_factory` above stays
-    # strictly scoped and is what the boot probes keep using.
+    # Platform (cross-tenant) scope for every consumer and background loop
+    # below (ADR 0026) — they are mixed-tenant by design, and
+    # `tenant_isolation` refuses a statement that names no tenant. The boot
+    # probes keep the strictly scoped `_session_factory` above.
     session_factory = platform_session_factory(get_engine())
 
-    # Supervised, not fire-and-forget. This one task hosts every consumer and
-    # every background loop — there is no separate worker deployable yet — so
-    # an unwatched `create_task` here means a process that answers HTTP while
-    # dispatching nothing, with `/api/v1/health` still green. The supervisor
-    # restarts it with capped backoff and publishes the liveness the deep
-    # health check below reads (`app/workers/supervisor.py`, ADR 0009).
+    # Supervised, not fire-and-forget: this one task hosts every consumer and
+    # loop, so an unwatched `create_task` means a process that serves HTTP and
+    # dispatches nothing (`app/workers/supervisor.py`, ADR 0009).
     worker_supervisor.start(lambda: worker_loop(session_factory, redis))
 
     yield
 
-    # `stop()` cancels the worker, waits for its in-flight drain, and never
-    # raises. It has to never raise: the previous `await worker_task` re-raised
-    # whatever the worker had stored, which aborted the lifespan right here and
-    # left the Kafka producer and both Redis pools open on every shutdown that
-    # followed a worker crash.
+    # `stop()` never raises: the previous `await worker_task` re-raised and
+    # left the producer and both Redis pools open after a worker crash.
     await worker_supervisor.stop()
 
     try:
@@ -194,9 +151,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     except Exception as exc:
         logger.error("kafka producer failed to stop", extra={"error": str(exc)})
 
-    # Last flush before the loop closes, so the final window is not discarded.
-    # Guarded for the same reason as the worker await: everything below it —
-    # the broker reset and both pool closes — depends on getting past here.
+    # Last flush before the loop closes, guarded because everything below
+    # depends on getting past here.
     try:
         await metrics.stop_metrics_emitter()
     except Exception as exc:
@@ -253,20 +209,10 @@ def create_app() -> FastAPI:
 
     @app.exception_handler(Exception)
     async def unhandled_error_handler(request: Request, exc: Exception) -> JSONResponse:
-        """Catch-all so an escaped non-AppError still answers in the documented
-        envelope (`error_code` / `message` / `details` / `request_id`) instead of
-        Starlette's bare `text/plain` "Internal Server Error".
-
-        The error shape a client is most likely to meet during an incident was
-        the one shape it could not parse, and the response carried no
-        correlation ID — so the 500 a user reported could not be tied back to a
-        log line. Starlette re-raises after this handler runs, so uvicorn still
-        logs the traceback and the error still reaches OTel; only the bytes on
-        the wire change.
-
-        `request_id_var` is read off the header rather than the contextvar:
-        `RequestContextMiddleware` is a `BaseHTTPMiddleware`, so its contextvar
-        assignments happen in a child task that this handler does not inherit.
+        """Catch-all so an escaped non-AppError answers in the documented
+        envelope, not Starlette's `text/plain` 500. `request_id` comes off the
+        header: `RequestContextMiddleware` sets its contextvars in a child task
+        this handler does not inherit.
         """
         request_id = request.headers.get("X-Request-ID") or request_id_var.get("")
         logger.exception(
@@ -316,14 +262,9 @@ def create_app() -> FastAPI:
     async def healthz() -> dict[str, str]:
         """Process liveness. No I/O, no dependencies, never 503.
 
-        This is what the **ALB target group** probes (`infra/alb.tf`), and the
-        question it answers is the only one a target group should ask: can
-        this task serve HTTP? Pointing the target group at the deep check
-        instead meant a single Redis outage failed every target at once and
-        turned a degraded-but-serving API into a total one (WO-R2-65) — every
-        Redis-dependent path in this application already fails open, so the
-        API keeps answering while Redis is away, and there is nothing for a
-        load balancer to route around when *all* targets share the outage.
+        What the **ALB target group** probes (`infra/alb.tf`). Pointing it at
+        the deep check made one Redis outage fail every target at once, though
+        every Redis path here fails open (WO-R2-65).
         """
         return {"status": "ok"}
 
@@ -331,22 +272,9 @@ def create_app() -> FastAPI:
     async def healthz_worker() -> JSONResponse:
         """Task liveness, including the in-process worker. No external I/O.
 
-        This is what the **ECS container check** probes (`infra/ecs.tf`), and
-        it is the probe with restart authority. It exists to keep two
-        different questions apart, which one endpoint could not (WO-R2-65
-        composing with ADR 0009's amendment):
-
-          * "Should this task be replaced?" — yes for a worker that died and
-            could not be restarted in-process, because a replacement task
-            fixes it. That is ADR 0009's requirement and it still holds here.
-          * "Is a dependency down?" — never a reason to replace a task.
-            Postgres and Redis are shared, so a task recycled over them comes
-            back to the same outage, having destroyed whatever in-flight work
-            it was holding. The deep check answers this one, for operators
-            and dashboards, and nothing with restart authority reads it.
-
-        `worker_status()` is synchronous and I/O-free, so this endpoint cannot
-        block on a dependency and therefore cannot fail for one.
+        What the **ECS container check** probes (`infra/ecs.tf`), and the only
+        probe with restart authority: a worker that died is worth replacing a
+        task for, a shared dependency being down is not (WO-R2-65, ADR 0009).
         """
         worker = worker_supervisor.worker_status()
         return JSONResponse(
@@ -362,40 +290,9 @@ def create_app() -> FastAPI:
     async def health() -> JSONResponse:
         """Deep readiness check, for operators and dashboards.
 
-        Verifies DB connectivity, Redis connectivity **and worker liveness**.
-        Returns 200 if all three are healthy, 503 otherwise.
-
-        **Nothing with restart or routing authority probes this endpoint**
-        (WO-R2-65). It used to be both the ALB target-group check and the ECS
-        container check, which made a Redis outage — a dependency every
-        caller of it already fails open on — deregister every backend target
-        and recycle every task mid-job. The two probes now ask the narrower
-        questions they are each entitled to act on: `/healthz` for "can this
-        task serve HTTP" and `/healthz/worker` for "is this task worth
-        keeping". This endpoint keeps the whole truth for the human reading
-        it during an incident.
-
-        The worker check changes what a green answer here means. It used to
-        mean "this process can reach its dependencies"; it now means "…and it
-        is processing jobs". That distinction was the whole failure: the
-        worker task runs inside this process (there is no separate worker
-        deployable), so a worker that died at boot left every probe green
-        while the backlog built with nothing draining it — and `ConsumerLag`,
-        the metric both backlog alarms read, is emitted by a loop inside the
-        dead worker and is deliberately not emitted when lag is unknown. A
-        dead worker makes it go *absent*, and both alarms read missing data as
-        `notBreaching`.
-
-        The worker half of that judgement is still acted on, by
-        `/healthz/worker` and the ECS container check that probes it every
-        30s with a 3-failure threshold. A worker that recovers does so well
-        inside that window (the restart ladder caps at 30s); one that cannot
-        gets the task recycled, which is the correct outcome — and now it is
-        the *only* condition on that path, so the recycle happens for the
-        reason ADR 0009 intended and not for a Redis blip.
-
-        The worker probe is in-process and I/O-free, so it adds nothing to the
-        endpoint's latency.
+        DB, Redis and worker liveness; 200 when all three are healthy. Nothing
+        with restart or routing authority probes this (WO-R2-65) — `/healthz`
+        and `/healthz/worker` ask the narrower questions they may act on.
         """
         from app.core.redis import get_redis_client
         from app.dependencies import _engine
@@ -426,10 +323,8 @@ def create_app() -> FastAPI:
             content={
                 "status": "ok" if healthy else "degraded",
                 **checks,
-                # State, restart count and the last error, so the operator who
-                # curls this during an incident learns whether the worker is
-                # dead, flapping or merely slow to heartbeat — without it,
-                # `"worker": "error"` sends them to the logs for the next step.
+                # State, restart count and last error, so an operator learns
+                # whether the worker is dead, flapping or slow to heartbeat.
                 "worker_detail": worker.detail,
             },
         )

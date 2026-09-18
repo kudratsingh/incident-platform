@@ -21,10 +21,8 @@ async def list_audit_logs(
     current_user: User = Depends(_require_support_or_admin),
     db: AsyncSession = Depends(get_db),
 ) -> PaginatedResponse[AuditLogResponse]:
-    # Tenant scope is applied in the application layer (F1-02): support and
-    # tenant admins always read their own tenant; platform admins may target
-    # another tenant with ?tenant_id= (resolve_admin_tenant ignores the
-    # override for everyone else).
+    # Tenant scope is applied in the app layer (F1-02); `?tenant_id=` is
+    # honoured only for platform admins.
     effective_tenant = await resolve_admin_tenant(current_user, db, tenant_id)
     repo = AuditRepository(db)
     logs, total = await repo.list_logs(
