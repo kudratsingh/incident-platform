@@ -787,6 +787,11 @@ async def _rebaseline_timestamps(session: AsyncSession) -> int:
             cast("int", job_spec["run_seconds"]),
         )
     for dag_spec in _dag_specs():
+        # The two children drain to completed after first boot. Reset never
+        # restores their waiting status (ADR 0029), so re-anchoring their
+        # NULL lifecycle from the seed spec would make completed rows incoherent.
+        if dag_spec["run_seconds"] is None:
+            continue
         job_targets[stable(cast("str", dag_spec["name"]))] = _lifecycle(
             now,
             cast("timedelta", dag_spec["created_offset"]),
