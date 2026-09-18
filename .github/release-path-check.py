@@ -1,25 +1,9 @@
 #!/usr/bin/env python3
 """Behavioural guard for release.yml's release-vs-dispatch decision (WO-R2-31).
 
-Runs in the `workflows` (Workflow lint) CI job, and locally with:
-
-    python3 .github/release-path-check.py
-
-Why this and not a static assertion: the property that matters is not "the
-string GITHUB_EVENT_NAME appears somewhere", it is "a workflow_dispatch run
-started from a tag ref does not move :latest and does not republish the tag".
-That is a statement about what the script *does*, so this extracts the real
-`Compute tags` body out of the workflow and executes it under both event
-names, asserting on the tags it computes.
-
-`docker manifest inspect` is stubbed on PATH, so the GHCR collision refusal
-is exercised deterministically with no registry, no network and no daemon.
-
-The bug this locks down: the discriminator used to be `GITHUB_REF_TYPE ==
-"tag"`. A `workflow_dispatch` can be launched from any ref including a `v*`
-tag, so REF_TYPE reads "tag" for both surfaces — a manual smoke-test build
-from a tag took the full release path, moved `:latest`, skipped the
-version-format check and the collision refusal, and ignored the version input.
+Runs in the `workflows` CI job, or locally as `python3 .github/release-path-check.py`.
+It extracts the real `Compute tags` body and runs it under both event names, `docker
+manifest inspect` stubbed. The bug: `GITHUB_REF_TYPE == "tag"` matched a dispatch too.
 """
 
 from __future__ import annotations
@@ -38,9 +22,7 @@ WORKFLOW = REPO / ".github/workflows/release.yml"
 OWNER = "kudratsingh"
 IMAGE = f"ghcr.io/{OWNER}/incident-platform"
 
-# `${{ }}` expressions the extracted script is allowed to contain, and the
-# value each takes in this harness. Anything else aborts rather than being
-# silently mangled — if someone adds a new interpolation, this says so.
+# `${{ }}` expressions the script may contain, and their value here; anything else aborts.
 KNOWN_EXPRESSIONS = {"${{ github.repository_owner }}": OWNER}
 
 
@@ -216,9 +198,7 @@ def main() -> int:
     check("refuses to publish it", rc != 0)
     check("says why", "bad tag format" in log, log)
 
-    # ---- structural: the belt-and-braces :latest guard exists ----------
-    # Unreachable while the branches above are correct, so it cannot be
-    # exercised behaviourally; assert it is present so it is not dropped.
+    # ---- structural: the :latest guard exists but is unreachable -------
     print("\nstructure:")
     check(
         "an explicit non-push :latest refusal is present",
