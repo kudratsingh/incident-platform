@@ -15,23 +15,10 @@ from pydantic import (
     model_validator,
 )
 
-# ---------------------------------------------------------------------------
-# Per-type payload bounds
-#
-# The payload is user-controlled and its knobs translate directly into work in
-# the worker process — which is the SAME process that serves the API and hosts
-# every consumer loop. endpoint_count=10**7 eagerly creates 10**7 asyncio tasks
-# and OOM-kills that process; page_count/row_count peg the 4-worker process
-# pool long enough to push the Kafka dispatcher past max_poll_interval_ms and
-# get the whole consumer group kicked.
-#
-# extra="allow" is required, not incidental: payloads legitimately carry
-# __traceparent (injected in JobService.create_job) plus arbitrary
-# caller-defined keys. Only the knobs the processors actually read are bounded.
-#
-# These caps are deliberately conservative and defensive — the Phase 14 "real"
-# processors will want their own, likely lower, resource-derived limits.
-# ---------------------------------------------------------------------------
+# Per-type payload bounds: the payload is user-controlled and its knobs become work in
+# the worker process that also serves the API, so an unbounded one OOMs or stalls it.
+# extra="allow" is required — payloads carry __traceparent plus caller-defined keys, and
+# only the knobs the processors actually read are bounded.
 
 _PAYLOAD_BOUNDS = ConfigDict(extra="allow")
 
@@ -42,25 +29,11 @@ class BulkApiSyncPayload(BaseModel):
     endpoint_count: int = Field(default=5, ge=0, le=100)
 
 
-# Largest number of chunks a csv_upload may be split into (WO-R2-07).
-#
-# `row_count` and `chunk_size` were bounded separately and their *relationship*
-# was not, which is the gap: `process_csv_upload` iterates
-# `range(0, row_count, chunk_size)`, so the work is the chunk COUNT —
-# `ceil(row_count / chunk_size)` — at ~0.08s of blocking read each across a
-# 4-thread pool. `{row_count: 1_000_000, chunk_size: 1}` passed both field
-# bounds and bought a million chunks: hours of execution from a payload that
-# costs nothing to submit, and ten of them sit comfortably inside the rate
-# limit.
-#
-# Note it is the quotient, not the product. Bounding `row_count * chunk_size`
-# would have been exactly backwards — it is smallest for the pathological
-# shape (10**6) and largest for the cheapest legitimate one (10**11).
-#
-# 10_000 is the documented maximum `row_count` at the default `chunk_size`, so
-# every shape that was reasonable before still validates, and the worst
-# accepted job is ~200s — comfortably inside `job_execution_timeout_seconds`,
-# which is the backstop for the processors whose cost this cannot predict.
+# Largest number of chunks a csv_upload may be split into (WO-R2-07). The work is the
+# chunk COUNT — `ceil(row_count / chunk_size)` — so bounding the two fields separately
+# let `{row_count: 1_000_000, chunk_size: 1}` buy hours of execution. Bound the
+# quotient, not the product. 10_000 is the documented max `row_count` at the default
+# `chunk_size`, so the worst accepted job stays inside `job_execution_timeout_seconds`.
 MAX_CSV_CHUNKS = 10_000
 
 
@@ -107,23 +80,9 @@ _PAYLOAD_MODELS: dict[str, type[BaseModel]] = {
 def _bound_payload_size(payload: dict[str, Any]) -> None:
     """Reject a payload too large to ever survive the trip to Kafka.
 
-    `extra="allow"` bounds the knobs the processors read and nothing else,
-    so an arbitrary key of arbitrary length passes every other check here.
-    That payload is copied verbatim into the `job.submitted` outbox row
-    (`_job_submitted_payload`), and a record above the broker's
-    `message.max.bytes` (1 MiB by default) is refused identically on every
-    retry — a poison row, created through the ordinary submission API, by
-    an ordinary user, with no privileges and no malice required.
-
-    The relay now dead-letters such a row instead of retrying it forever
-    (ADR 0001's 2026 Q3 addendum), but that is the backstop. This is the
-    trigger, and refusing 250 KB at the door with a 422 is a far better
-    outcome for the caller than accepting the job and silently never
-    emitting its events.
-
-    Measured on the serialised form, since bytes on the wire are what the
-    broker counts. The envelope fields around the payload are small and
-    fixed; the default cap leaves them three quarters of a MiB of room.
+    `extra="allow"` bounds only the knobs the processors read, so one arbitrary key can push
+    the outbox row past the broker's `message.max.bytes` — a poison row any user can create.
+    Measured on the serialised form, since bytes on the wire are what the broker counts.
     """
     size = len(json.dumps(payload, default=str).encode())
     limit = get_settings().max_job_payload_bytes
@@ -136,18 +95,8 @@ def _bound_payload_size(payload: dict[str, Any]) -> None:
 def validate_processor_payload(job_type: str, payload: dict[str, Any] | None) -> None:
     """Raise ValueError if `payload` exceeds the bounds for `job_type`.
 
-    Shared by every creation surface: POST /jobs (JobCreate) and POST /sagas
-    (SagaStepRequest), which does NOT go through JobCreate. Bounding only one
-    of them leaves the other as a trivial bypass.
-
-    Job types with no bound model — saga compensation types like
-    `csv_upload.compensate`, or anything not in JobType — are a no-op for
-    the per-type knobs, but NOT for the size check: that one runs first and
-    applies to every type, because "no bound model" is otherwise a bypass.
-
-    Raises ValueError rather than re-raising the pydantic ValidationError so
-    that a caller-side @model_validator turns it into the standard flat 422
-    envelope instead of a doubly-nested error body.
+    Shared by POST /jobs and POST /sagas — bounding one leaves the other a bypass; a type
+    with no bound model still gets the size check. ValueError keeps the flat 422 envelope.
     """
     if payload is None:
         return
@@ -196,9 +145,7 @@ class JobResponse(BaseModel):
     # Total runs this job may have — the original plus its retries. 3 means
     # three runs and two retries (WO-R2-172).
     max_attempts: int
-    # Attribution for a DLQ row (F2-16). REST-only on purpose: the MCP tool
-    # output models are contract-frozen, and the admin UI is the only
-    # consumer that needs it.
+    # DLQ attribution (F2-16). REST-only — the MCP output models are frozen.
     dead_lettered_by: str | None = None
     priority: int
     trace_id: str | None
@@ -214,31 +161,18 @@ class JobResponse(BaseModel):
             "capped total runs. Kept for one release so clients can "
             "migrate; removed after that."
         ),
-        # The marker goes in the schema, not in `deprecated=`, which would
-        # raise a Python DeprecationWarning on every serialization. The
-        # deprecated caller is an HTTP client reading OpenAPI, and warning
-        # this process about the client's field choice is noise it cannot
-        # act on.
+        # In the schema, not `deprecated=`: that would warn this process
+        # about a field choice only the HTTP client can act on.
         json_schema_extra={"deprecated": True},
     )
     @property
     def max_retries(self) -> int:
-        """The old name for `max_attempts`, still on the wire (WO-R2-172).
-
-        Computed rather than stored so there is exactly one number: a
-        second real field could be given a different value by a careless
-        constructor, and the whole point of the rename is that these two
-        names were never two things.
-        """
+        """The old name for `max_attempts` (WO-R2-172); computed so there is exactly one number."""
         return self.max_attempts
 
 
 class StreamTokenResponse(BaseModel):
-    """A short-lived, single-purpose token for GET /jobs/{id}/stream?token=…
-
-    Minted by POST /jobs/{id}/stream-token after the caller was authorized
-    for the job. Expires in STREAM_TOKEN_TTL_SECONDS (see ADR 0014).
-    """
+    """Short-lived job-bound token for GET /jobs/{id}/stream?token=… (ADR 0014)."""
 
     token: str
 

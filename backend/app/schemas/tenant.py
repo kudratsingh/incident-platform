@@ -9,23 +9,7 @@ INT32_MAX = 2**31 - 1
 
 
 class TenantLimitsUpdate(BaseModel):
-    """Partial update of a tenant's rate limit and monthly job quota.
-
-    Both fields are optional; only the ones present in the body are
-    applied, which is why the handler reads `model_fields_set` rather
-    than the model's defaults.
-
-    `StrictInt` rather than `int` is the load-bearing part. This endpoint
-    used to take an untyped `dict` and validate with
-    `isinstance(value, int)` — and in Python `isinstance(True, int)` is
-    `True`, because `bool` subclasses `int`. A JSON `true` therefore
-    passed the guard and was written as a rate limit of **1**, throttling
-    a whole tenant to one request a minute with a 200 OK in reply
-    (WO-R2-61). Pydantic's lax mode has the same hole (it coerces `True`
-    to `1`); strict mode is what closes it, and it also refuses the
-    numeric strings and floats the old check happened to reject by
-    accident rather than by design.
-    """
+    """Partial update of a tenant's rate limit and quota; `StrictInt` refuses bool (WO-R2-61)."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -45,14 +29,9 @@ class TenantLimitsUpdate(BaseModel):
     @field_validator("rate_limit_per_minute", "quota_jobs_per_month")
     @classmethod
     def _null_does_not_clear_a_limit(cls, value: int | None) -> int | None:
-        """Reject an explicit `null`, while leaving an omitted field alone.
+        """Reject an explicit `null`; an omitted field never reaches a field validator.
 
-        A field validator does not run for a field the caller omitted, so
-        reaching this with `None` means the body really did carry
-        `"rate_limit_per_minute": null`. Both columns are NOT NULL, so
-        that is a client bug; answering 200 and changing nothing would
-        hide it. The `| None` in the annotation is the absent-field
-        sentinel only.
+        Both columns are NOT NULL, so `null` is a client bug — 200-and-do-nothing hides it.
         """
         if value is None:
             raise ValueError(
