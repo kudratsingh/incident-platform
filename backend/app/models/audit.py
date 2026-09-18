@@ -25,31 +25,21 @@ if TYPE_CHECKING:
     from app.models.job import Job
     from app.models.user import User
 
-# Principal type discriminator on audit_logs.principal_type. Kept as string
-# literals rather than an enum so the DB constraint stays lax — new principal
-# shapes (Wave-3 approval bots, etc.) can be added without a schema change.
+# Discriminator on audit_logs.principal_type; a string so a new shape needs no DDL.
 PRINCIPAL_TYPE_USER = "user"
 PRINCIPAL_TYPE_SERVICE_ACCOUNT = "service_account"
 
-#: Width of `audit_logs.request_id`. Named because it is a *correctness*
-#: bound, not a formatting one: an over-long value makes the row fail to
-#: insert, and every audit writer on the MCP path is savepoint-wrapped and
-#: silent on failure, so a value this column cannot hold suppresses the
-#: audit record for an action that ran (R2-51). `AuditRepository.log`
-#: enforces it as a last resort; `app.core.middleware` refuses to mint one
-#: this long in the first place.
+#: Width of `audit_logs.request_id`, a *correctness* bound: MCP audit writers are
+#: silent, so a too-wide value deletes the record of an action that ran (R2-51).
+#: `AuditRepository.log` truncates; the middleware refuses to mint one.
 REQUEST_ID_MAX_LENGTH = 255
 
 
 class AuditLog(Base):
     """Immutable append-only record of every significant action in the system.
 
-    Two principal shapes write here: humans (`principal_type='user'`,
-    `principal_id` = users.id, `user_id` also set for backward compat with
-    the FK-based path) and service accounts (`principal_type='service_account'`,
-    `principal_id` = service_accounts.id, `user_id` null). Consumers filter
-    on principal_type when they want to isolate operator activity from agent
-    activity.
+    Humans (`principal_type='user'`, `user_id` also set) and service accounts
+    (`principal_id` = service_accounts.id, `user_id` null) write here.
     """
 
     __tablename__ = "audit_logs"
@@ -63,9 +53,7 @@ class AuditLog(Base):
         nullable=False,
         index=True,
     )
-    # Kept for backward compat with existing queries; new machine-principal
-    # rows leave it null. See `principal_type` + `principal_id` for the
-    # canonical actor identity going forward.
+    # Backward compat only; `principal_type` + `principal_id` are canonical.
     user_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("users.id", ondelete="SET NULL"),
@@ -76,9 +64,8 @@ class AuditLog(Base):
         String(32), nullable=False, default=PRINCIPAL_TYPE_USER,
         server_default=PRINCIPAL_TYPE_USER,
     )
-    # Plain UUID column, not an FK — points at users.id or service_accounts.id
-    # depending on principal_type. Kept unconstrained so a deleted principal
-    # doesn't cascade or block audit reads (the row is a historical record).
+    # Plain UUID, not an FK — users.id or service_accounts.id;
+    # a deleted principal must not cascade (ADR 0007).
     principal_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), nullable=True
     )
@@ -98,12 +85,8 @@ class AuditLog(Base):
     )
     ip_address: Mapped[str | None] = mapped_column(String(50), nullable=True)
     extra_data: Mapped[dict[str, Any] | None] = mapped_column(PortableJSON, nullable=True)
-    # Kafka coordinates — set ONLY by the AuditConsumer for event.* rows so
-    # redelivery dedups on the unique constraint below. Nullable is
-    # load-bearing: inline transactional audit writers (API routes, worker
-    # _run_job, saga coordinator) have no Kafka coords and leave all three
-    # NULL; both Postgres and SQLite treat NULLs as distinct under UNIQUE,
-    # so inline rows never collide.
+    # Kafka coordinates — set ONLY by the AuditConsumer, so redelivery dedups on the
+    # constraint below. Inline writers leave all three NULL, and NULLs are distinct.
     kafka_topic: Mapped[str | None] = mapped_column(String(128), nullable=True)
     kafka_partition: Mapped[int | None] = mapped_column(Integer, nullable=True)
     kafka_offset: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
@@ -119,9 +102,7 @@ class AuditLog(Base):
     )
 
     __table_args__ = (
-        # Kafka redelivery → second event.* write fails this constraint, the
-        # AuditConsumer treats the IntegrityError as "already recorded" and
-        # commits the offset. Mirrors uq_job_events_kafka_coord.
+        # Redelivery fails this constraint; mirrors uq_job_events_kafka_coord.
         UniqueConstraint(
             "kafka_topic", "kafka_partition", "kafka_offset", name="uq_audit_logs_kafka_coord"
         ),

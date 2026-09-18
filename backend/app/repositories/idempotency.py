@@ -45,22 +45,8 @@ class IdempotencyRepository(BaseRepository[IdempotencyRecord]):
     ) -> uuid.UUID | None:
         """Reserve the key with a response-less row, atomically.
 
-        `INSERT ... ON CONFLICT DO NOTHING RETURNING id`: returns the new
-        row's id when this caller won the key, and `None` when someone
-        else already holds it. One statement, so there is no window
-        between deciding the key is free and taking it — which is the
-        whole point. The lookup-then-insert shape this replaces left both
-        of two concurrent callers believing they had the key.
-
-        On Postgres a conflicting *uncommitted* row makes this statement
-        wait on the holder's transaction rather than returning
-        immediately, so the loser resumes once the winner has committed
-        its response and reads it back. That blocking is the
-        serialisation, not a side effect to design around.
-
-        Dialect-specific by necessity: `ON CONFLICT` is not in core
-        SQLAlchemy. Both engines we run on support it with the same
-        semantics for this use.
+        `ON CONFLICT DO NOTHING RETURNING id` — the new id if this caller won the key,
+        `None` otherwise. On Postgres an uncommitted conflict blocks — the serialisation.
         """
         values: dict[str, Any] = {
             "id": uuid.uuid4(),
@@ -72,10 +58,7 @@ class IdempotencyRepository(BaseRepository[IdempotencyRecord]):
             "response_json": None,
             "expires_at": expires_at,
         }
-        # Conflict target given as the constraint's columns rather than
-        # its name: both dialects accept `index_elements`, only Postgres
-        # accepts `constraint=`. These are exactly the columns of
-        # `uq_idempotency_scope`.
+        # Exactly the columns of `uq_idempotency_scope`; only Postgres takes `constraint=`.
         conflict_columns = ["tenant_id", "principal_id", "idempotency_key"]
         if self.session.get_bind().dialect.name == "postgresql":
             stmt: Any = pg_insert(IdempotencyRecord)
@@ -96,12 +79,8 @@ class IdempotencyRepository(BaseRepository[IdempotencyRecord]):
         response_json: dict[str, Any],
         expires_at: datetime | None,
     ) -> None:
-        """Attach the response to a claim this caller owns.
-
-        An UPDATE by primary key on a row we inserted ourselves, so it
-        cannot collide — which is what removes the "action took effect,
-        cache write lost the race" window entirely rather than repairing
-        it afterwards."""
+        """Attach the response to a claim this caller owns — an UPDATE by primary key on
+        our own row, so it cannot collide."""
         await self.session.execute(
             update(IdempotencyRecord)
             .where(IdempotencyRecord.id == record_id)
@@ -118,13 +97,8 @@ class IdempotencyRepository(BaseRepository[IdempotencyRecord]):
         await self.session.flush()
 
     async def delete_expired(self, *, now: datetime | None = None) -> int:
-        """DELETE every record whose `expires_at` is in the past. Used
-        by the reaper loop — ADR 0010's "no reaper" clause pointed at
-        this method as the follow-up when write rate justifies it.
-        Records with `expires_at IS NULL` (no TTL — shouldn't happen
-        post-v0.4.5 but kept nullable for schema flexibility) are
-        never reaped.
-
+        """DELETE every record whose `expires_at` has passed, for the reaper loop
+        (ADR 0010's "no reaper" follow-up). `expires_at IS NULL` is never reaped.
         Returns the row count deleted."""
         cutoff = now or datetime.now(UTC)
         result = await self.session.execute(
@@ -133,7 +107,5 @@ class IdempotencyRepository(BaseRepository[IdempotencyRecord]):
                 IdempotencyRecord.expires_at < cutoff,
             )
         )
-        # SQLAlchemy async DML returns a CursorResult (has rowcount) but
-        # the annotated return type is Result. Runtime is correct;
-        # mypy needs the nudge.
+        # Async DML returns CursorResult, not the declared Result.
         return int(result.rowcount or 0)  # type: ignore[attr-defined]

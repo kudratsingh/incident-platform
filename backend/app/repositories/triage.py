@@ -31,10 +31,7 @@ class TriageRepository(BaseRepository[JobTriage]):
     ) -> JobTriage:
         """Insert a new triage, or update the existing one for this job.
 
-        Re-triaging the same job (e.g. after Replay → DLQ again) replaces the
-        prior analysis rather than accumulating rows. job_id has a UNIQUE
-        constraint, so a race between two consumers either succeeds once and
-        no-ops once, or both end up at the latest write — both are acceptable.
+        The UNIQUE on job_id makes a race between two consumers land on one row.
         """
         existing = await self.get_by_job_id(job_id)
         if existing is not None:

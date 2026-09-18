@@ -1,11 +1,8 @@
 """
 LLM-driven triage analysis for dead-lettered jobs.
 
-One row per terminally-failed job: the LLM consumer classifies the failure
-root cause, summarises what happened, suggests a fix, and tells us whether
-a retry is likely to succeed. Admins see this on the DLQ tab so they can
-decide between Replay vs Resolve without having to read the raw stack
-trace themselves.
+One row per terminally-failed job: root cause, summary, suggested fix, retryability.
+Shown on the admin DLQ tab.
 """
 
 import uuid

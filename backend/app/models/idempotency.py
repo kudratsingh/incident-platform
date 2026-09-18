@@ -1,11 +1,6 @@
 """
-Idempotency records for machine-principal actions.
-
-Rows are keyed by (tenant, principal, key). Same tenant+principal+key
-with matching `arguments_hash` returns the cached `response_json`;
-mismatched hash refuses the request. This is standard idempotency-key
-semantics (Stripe-shape); the lifecycle, including the claim-before-
-execute ordering, is ADR 0010.
+Idempotency records for machine-principal actions, keyed by (tenant, principal,
+key). A mismatched `arguments_hash` refuses. Lifecycle is ADR 0010.
 """
 
 import uuid
@@ -38,19 +33,15 @@ class IdempotencyRecord(Base):
         nullable=False,
         index=True,
     )
-    # Plain UUID (no FK) — points at either users.id or
-    # service_accounts.id depending on principal_type. Matches the
-    # `audit_logs.principal_id` convention.
+    # Plain UUID (no FK), as `audit_logs.principal_id` (ADR 0007).
     principal_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), nullable=False
     )
     tool_name: Mapped[str] = mapped_column(String(128), nullable=False)
     idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False)
     arguments_hash: Mapped[str] = mapped_column(String(64), nullable=False)
-    # NULL means "claimed, not yet answered": the row was inserted to
-    # reserve the key before the action ran, and the response is attached
-    # when it returns (R2-27). Both commit together, so a NULL is
-    # normally invisible to other callers — see IdempotencyService.
+    # NULL means "claimed, not yet answered": the key is reserved before the action
+    # runs (R2-27), and both commit together.
     response_json: Mapped[dict[str, Any] | None] = mapped_column(
         PortableJSON, nullable=True
     )

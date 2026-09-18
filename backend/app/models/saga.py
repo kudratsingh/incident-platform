@@ -1,11 +1,8 @@
 """
 Saga — a multi-step distributed workflow whose steps are jobs.
 
-Each step is an ordinary Job with `saga_id` set. The chain is wired up via
-the job dependency DAG (each step depends on the previous), so the
-generic DependencyResolver handles step-to-step transitions. SagaCoordinator
-watches the lifecycle and updates the saga's own status, including
-publishing compensation events when a step fails.
+Each step is a Job with `saga_id` set, chained through the dependency DAG.
+SagaCoordinator owns the saga's status and compensation.
 """
 
 import uuid

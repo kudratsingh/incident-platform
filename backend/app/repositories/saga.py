@@ -8,21 +8,11 @@ from app.models.saga import Saga
 from app.repositories.base import BaseRepository
 from sqlalchemy import select
 
-# The order a saga's steps are meant to be read in: the declaration order
-# recorded at creation, then — for rows that carry no index — the stable
-# `(created_at, id)` fallback.
-#
-# One expression, used by every query that returns saga steps, because the
-# two of them disagreeing is precisely the bug this constant exists to
-# prevent. `saga_step_index` must lead: `created_at` is
-# `transaction_timestamp()`, so the steps of one saga are a total tie under
-# it, and appending a uuid tiebreaker to a tie does not produce declaration
-# order — it produces a *stable random* order, which for a rendered step
-# list is worse than the accident it replaced.
-#
-# NULLS LAST is what keeps the `.compensate` rows (index NULL by design)
-# below the steps they undo, and it is also the correct place for a legacy
-# saga's unindexed rows.
+# The order a saga's steps are read in: declaration order, then `(created_at, id)`
+# for rows with no index. One expression, used by every query returning steps,
+# because two of them disagreeing is the bug it prevents: `created_at` is
+# `transaction_timestamp()`, so one saga's steps tie under it and a uuid tiebreaker
+# gives stable *random* order. NULLS LAST keeps `.compensate` rows below their steps.
 _STEP_ORDER = (
     Job.saga_step_index.asc().nulls_last(),
     Job.created_at.asc(),
@@ -41,11 +31,8 @@ class SagaRepository(BaseRepository[Saga]):
     ) -> Saga | None:
         """Tenant-scoped (and optionally owner-scoped) get_by_id.
 
-        Returns None when the saga belongs to another tenant, or — when
-        `user_id` is given — to another user: never raises, never leaks the
-        row. Same shape and same reason as `JobRepository.get_for_tenant`.
-        Ownership follows `list_for_user`: a saga is a user's if any of its
-        jobs are.
+        None for another tenant's or another user's saga; a saga is a user's if any
+        of its jobs are.
         """
         stmt = select(Saga).where(Saga.id == saga_id, Saga.tenant_id == tenant_id)
         if user_id is not None:
@@ -60,10 +47,7 @@ class SagaRepository(BaseRepository[Saga]):
     async def jobs(self, saga_id: uuid.UUID) -> list[Job]:
         """All jobs belonging to a saga, in declaration order.
 
-        This is the list the API returns as a saga's `steps` and the detail
-        view renders, so the order is part of the contract: step 1 first.
-        `_STEP_ORDER` is what makes that true — see the note there for why a
-        bare `(created_at, id)` sort does not.
+        The API returns this as a saga's `steps`, so `_STEP_ORDER` is contract.
         """
         stmt = select(Job).where(Job.saga_id == saga_id).order_by(*_STEP_ORDER)
         result = await self.session.execute(stmt)
@@ -72,12 +56,8 @@ class SagaRepository(BaseRepository[Saga]):
     async def completed_steps(self, saga_id: uuid.UUID) -> list[Job]:
         """Completed steps of a saga in declaration order.
 
-        The compensation order is this list reversed, so the ordering is
-        load-bearing: it is what makes "undo the most recent success first"
-        true rather than merely likely. `saga_step_index` is the recorded
-        declaration order (WO-R2-58); `(created_at, id)` is the fallback for
-        rows written before that column existed — arbitrary between tied
-        steps, as it always was, but at least stable across reads.
+        Compensation is this list reversed, so the order is load-bearing: it is what
+        makes "undo the most recent success first" true (`saga_step_index`, WO-R2-58).
         """
         stmt = (
             select(Job)
@@ -102,14 +82,10 @@ class SagaRepository(BaseRepository[Saga]):
         offset: int = 0,
         limit: int = 20,
     ) -> tuple[list[Saga], int]:
-        """List sagas in one tenant. user_id=None means 'every saga in that
-        tenant' (the admin/support view).
+        """List sagas in one tenant; `user_id=None` means every saga in it.
 
-        `tenant_id` is required, not optional-with-a-default: the caller that
-        wanted "all sagas" passed `user_id=None` and got every tenant's,
-        with Postgres RLS the only thing between the response and a
-        cross-tenant read (WO-R2-50). A privileged caller is privileged
-        inside their tenant, not across the platform.
+        `tenant_id` is required, not optional: a privileged caller is privileged inside
+        their tenant, not across the platform (WO-R2-50).
         """
         from sqlalchemy import func
 
@@ -118,9 +94,7 @@ class SagaRepository(BaseRepository[Saga]):
             select(func.count()).select_from(Saga).where(Saga.tenant_id == tenant_id)
         )
         if user_id is not None:
-            # A saga "belongs to" a user if any of its jobs are theirs. Jobs are
-            # always created by one user for the saga's lifetime, so a subquery
-            # over jobs.user_id == user_id is sufficient.
+            # A saga "belongs to" a user if any of its jobs are theirs.
             sub = select(Job.saga_id).where(Job.user_id == user_id).distinct()
             base = base.where(Saga.id.in_(sub))
             count_stmt = count_stmt.where(Saga.id.in_(sub))

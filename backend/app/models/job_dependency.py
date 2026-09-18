@@ -1,13 +1,8 @@
 """
 job_dependencies — many-to-many self-join on jobs.
 
-A row (job_id, depends_on_job_id) means `job_id` cannot be dispatched until
-`depends_on_job_id` reaches COMPLETED. The DependencyResolver consumer
-watches job.completed events and unblocks waiting children.
-
-Cycles are not possible at insert time because dependencies must reference
-existing jobs and a new job has no children yet; the DAG only ever points
-backward in time.
+A row (job_id, depends_on_job_id) blocks `job_id` until the parent is COMPLETED;
+the DependencyResolver unblocks it. The DAG only ever points backward in time.
 """
 
 import uuid

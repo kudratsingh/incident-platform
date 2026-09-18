@@ -1,15 +1,9 @@
 """
-Periodic incident summaries.
+Periodic incident summaries — one row per (tenant, window) the digest worker has
+summarized, listed newest-first in the admin UI.
 
-One row per (tenant, window) that the digest worker has summarized. The
-worker queries the event log + jobs table for the window, hands a small
-aggregate to Claude, and persists the narrative + structured highlights
-here. The admin UI lists these in reverse-chronological order.
-
-Why a separate table rather than recomputing each request: the digest
-is expensive to generate (LLM call, multi-second latency, real cost)
-and exactly the same answer is asked for repeatedly by every admin
-viewing the tab. Persisting once + serving many is the right trade.
+A table rather than a recompute because the digest costs an LLM call and the same
+answer is asked for repeatedly.
 """
 
 import uuid
@@ -43,9 +37,7 @@ class IncidentDigest(Base):
     )
 
     summary: Mapped[str] = mapped_column(Text, nullable=False)
-    # The LLM's structured highlights — top concerns, recommended actions,
-    # and the raw stats we fed in. Stored as one JSONB blob so we can
-    # evolve the shape without migrations.
+    # Structured highlights, one JSONB blob so the shape can evolve migration-free.
     highlights: Mapped[dict[str, Any] | None] = mapped_column(
         PortableJSON, nullable=True
     )
