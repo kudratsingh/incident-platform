@@ -1,29 +1,8 @@
 """Exactly-once publish under two concurrent relay ticks on one Postgres.
 
-This is the assertion the unit tier structurally cannot express. The
-unit/API suites run on in-memory SQLite, which has no
-`pg_try_advisory_lock` (and no notion of a second session contending for
-one), so there the leader gate is a documented no-op and every unit test
-has to *inject* leadership rather than compete for it. Whether two real
-processes can both win the gate — and whether the lock survives the
-relay's three transaction boundaries on a pooled async connection — is
-only answerable against a real server.
-
-Two tests, and the second is the control that makes the first mean
-something:
-
-  1. `test_two_concurrent_relays_publish_each_row_exactly_once` — ten
-     unpublished rows, two relay ticks racing on one database. The two
-     publish sets must be disjoint and their union must be all ten.
-  2. `test_without_the_gate_both_relays_publish_the_whole_backlog` — the
-     same race with the gate bypassed, which is exactly what HEAD did
-     before this change: both relays publish all ten, twenty publishes
-     total. This pins the defect as real rather than theoretical, and
-     would fail if some unrelated mechanism (row locks, timing) were
-     quietly doing the deduplication instead of the gate.
-
-Skipped automatically when Docker / testcontainers isn't available so the
-rest of the suite still runs.
+SQLite has no `pg_try_advisory_lock`, so the unit tier can only inject leadership. Two
+relays race ten rows; the publish sets must be disjoint and cover all ten. The second
+test bypasses the gate, so no unrelated mechanism can be doing the deduplication.
 """
 
 import asyncio
@@ -80,11 +59,9 @@ def pg() -> Any:
 
 @pytest.fixture
 async def session_factory(pg: Any) -> Any:
-    """A factory over a real Postgres, with the outbox schema created.
+    """A factory over a real Postgres with the outbox schema created.
 
-    A pool with room for several connections on purpose: the gate checks
-    out one of its own for the lock while the tick's sessions use others,
-    which is the arrangement the connection-scoping trap lives in.
+    Several pool connections: the gate holds its own for the lock.
     """
     engine = create_async_engine(pg.get_connection_url(), pool_size=5, max_overflow=5)
     async with engine.begin() as conn:
@@ -182,8 +159,7 @@ async def test_two_concurrent_relays_publish_each_row_exactly_once(
 async def test_without_the_gate_both_relays_publish_the_whole_backlog(
     session_factory: Any,
 ) -> None:
-    """The defect, reproduced: this is HEAD's behavior on every rolling
-    deploy. Keep it — it is what proves the gate is load-bearing."""
+    """The defect reproduced — it proves the gate is load-bearing."""
     await _seed(session_factory)
 
     sink = await _race(session_factory, gated=False)
@@ -195,8 +171,7 @@ async def test_without_the_gate_both_relays_publish_the_whole_backlog(
 async def test_the_gate_lets_the_next_tick_in_after_the_first_releases(
     session_factory: Any,
 ) -> None:
-    """Leadership is per tick, not sticky: the lock is released at the end
-    of every tick so a surviving replica can take over after a deploy."""
+    """Leadership is per tick, so a replica can take over."""
     async with advisory_leader_lock(session_factory, OUTBOX_RELAY_LOCK_KEY) as first:
         assert first is True
         async with advisory_leader_lock(

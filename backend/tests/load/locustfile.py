@@ -1,31 +1,8 @@
-"""
-Locust load test suite for the Incident Platform API.
+"""Locust load suite for the Incident Platform API.
 
-Simulates three user archetypes that reflect real traffic patterns:
-
-  RegularUser   — logs in, submits jobs, polls status (bulk of traffic)
-  AdminUser     — browses all jobs, replays failures (low frequency, wider reads)
-  ReadHeavy     — hammers GET /jobs/{id} to exercise the Redis cache path
-
-Run locally against a live stack (docker-compose up):
-
-    locust -f backend/tests/load/locustfile.py \
-        --host http://localhost:8000 \
-        --users 50 --spawn-rate 5 --run-time 60s --headless
-
-Or open the web UI (omit --headless) and drive it interactively.
-
-`--host` is the origin only. Every path below is built from `ROUTES`
-under `API_PREFIX` (`/api/v1`), which is where all routers are mounted;
-backend/tests/api/test_locustfile_paths.py sends each one at the real app
-so the suite cannot go back to 404ing every request unnoticed.
-
-Environment variables (optional overrides):
-    LOAD_USER_EMAIL    default: loadtest@example.com
-    LOAD_USER_PASSWORD default: LoadTest123!
-    LOAD_ADMIN_EMAIL   default: loadtest-admin@example.com
-    LOAD_ADMIN_PASSWORD default: LoadTest123!
-    LOAD_API_PREFIX    default: /api/v1
+Three archetypes: RegularUser (bulk traffic), AdminUser (wider reads), ReadHeavy (the
+Redis cache path). Run: `locust -f backend/tests/load/locustfile.py --host <origin>
+--users 50 --spawn-rate 5 --run-time 60s --headless`. LOAD_* env vars override creds.
 """
 
 from __future__ import annotations
@@ -38,34 +15,23 @@ import uuid
 
 from locust import HttpUser, between, task
 
-# Make `app` importable no matter where locust is launched from: backend/ is
-# two parents up from tests/load/, so the __file__-relative insert keeps
-# `locust -f backend/tests/load/locustfile.py` working from any cwd.
+# Make `app` importable from any cwd: backend/ is two parents up from tests/load/.
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 
 from app.models.enums import JobType  # noqa: E402
 
-# ---------------------------------------------------------------------------
 # Shared helpers
-# ---------------------------------------------------------------------------
 
 _DEFAULT_PAYLOAD = {"filename": "data.csv", "rows": 100}
-# Derived from the enum so the load suite cannot drift from the API contract
-# (a hardcoded copy once 422'd on three of the four types). Pinned by
-# backend/tests/unit/test_locustfile_job_types.py.
+# From the enum so it cannot drift; pinned by unit/test_locustfile_job_types.py.
 _JOB_TYPES = [t.value for t in JobType]
 
-# Every router is mounted under `Settings.api_v1_prefix`. Without this the
-# documented `--host http://localhost:8000` sends every simulated request to
-# a path that does not exist, so a "successful" run measures nothing but the
-# 404 handler. Overridable for a stack mounted somewhere else.
+# Routers mount under `Settings.api_v1_prefix`; without it every request 404s
+# and the run measures nothing but the 404 handler.
 API_PREFIX = os.getenv("LOAD_API_PREFIX", "/api/v1")
 
-# The route templates this suite exercises, as name -> (method, path). The
-# tasks build their URLs from here and nowhere else, and
-# backend/tests/unit/test_locustfile_paths.py resolves every entry against
-# the real FastAPI route table — so a dropped prefix, a renamed route or a
-# remounted router fails a test instead of silently 404ing the whole run.
+# Route templates as name -> (method, path); tasks build URLs from here only.
+# test_locustfile_paths.py resolves each against the real FastAPI route table.
 ROUTES: dict[str, tuple[str, str]] = {
     "login": ("POST", "/auth/login"),
     "create_job": ("POST", "/jobs"),
@@ -83,8 +49,7 @@ def url(route: str, **params: object) -> str:
 
 
 def label(route: str, suffix: str = "") -> str:
-    """The Locust stat label: the un-substituted template, so every id
-    collapses into one row instead of one row per job."""
+    """Un-substituted template, so all ids collapse to one row."""
     text = API_PREFIX + ROUTES[route][1]
     return f"{text} {suffix}".strip()
 
@@ -105,9 +70,7 @@ def _login(client, email: str, password: str) -> str | None:
         return None
 
 
-# ---------------------------------------------------------------------------
 # User archetypes
-# ---------------------------------------------------------------------------
 
 
 class RegularUser(HttpUser):
@@ -236,11 +199,7 @@ class AdminUser(HttpUser):
 
 
 class ReadHeavyUser(HttpUser):
-    """
-    Hammers the same job IDs repeatedly to exercise the Redis cache.
-    Represents monitoring dashboards or polling clients that re-fetch
-    the same resources many times per second.
-    """
+    """Hammers the same job IDs to exercise the Redis cache — a polling dashboard."""
 
     wait_time = between(0.1, 0.5)
     weight = 2  # 20 % of simulated users

@@ -1,35 +1,8 @@
 """The Family B contrast, on a real Postgres: the outbox grows, the lag does not.
 
-`kill_consumer('worker-dispatcher')` and `pause_control_loop('outbox_relay')`
-produce the same top-level symptom — jobs accepted, nothing executing — and the
-opposite evidence. A killed consumer leaves the backlog in Kafka, so consumer
-lag climbs. A paused relay leaves the backlog in Postgres, so `outbox_events`
-rows accumulate unpublished and age, while `worker-dispatcher` lag stays flat
-because nothing is reaching Kafka to fall behind on. That contrast is the whole
-reason the family is built first (plan 01 §7.1), and it is only a contrast if
-**both** signals are asserted — a test that watched the outbox alone would pass
-just as happily on a world where everything had stopped.
-
-Why this tier. The relay tick is three transaction boundaries behind a Postgres
-advisory-lock leader gate (ADR 0020), and "rows stayed unpublished and got
-older" is a claim about `published_at`, `created_at` and a real clock. SQLite
-has no advisory lock, so the unit tier has to inject leadership rather than take
-it, and `NOW()` there is not the server's. Both halves of the assertion need the
-real server.
-
-What is stubbed, and why that does not weaken it: Kafka. The relay's publish
-call is replaced by a recorder, so "published" means "the relay decided to
-publish this row and marked it" — which is exactly the signal `get_outbox_status`
-(WP-4.2) reads, through the same repository query, and exactly what the pause has
-to stop. The lag half is read
-from the Redis-cached value the metrics loop maintains
-(`kafka:consumer_lag:worker-dispatcher`), which is where every reader of lag on
-this platform reads it from — the API's backpressure check and the agent's
-`get_consumer_lag` both do. Standing up Redpanda to observe a number nobody
-reads from the broker would test the harness.
-
-Skipped automatically when Docker / testcontainers is unavailable, like every
-other file in this tier.
+`kill_consumer('worker-dispatcher')` and `pause_control_loop('outbox_relay')` look the same
+from above: Kafka backlog with climbing lag, versus unpublished `outbox_events` rows with
+flat lag. Both are asserted, or it is not a contrast. Needs the leader gate (ADR 0020).
 """
 
 from __future__ import annotations
@@ -76,9 +49,7 @@ pytestmark = pytest.mark.skipif(
 _PAUSE_KEY = pause_key_for(ControlLoopName.OUTBOX_RELAY)
 _LAG_KEY = dispatcher.BACKPRESSURE_LAG_KEY
 
-#: Flat, and deliberately non-zero: a scenario's world has traffic in it, and
-#: "lag stayed at the number it was" is the assertion. Zero would leave the test
-#: unable to tell a flat reading from an absent one.
+#: Deliberately non-zero: zero could not be told apart from an absent reading.
 _FLAT_LAG = 7
 
 
@@ -109,9 +80,7 @@ async def session_factory(pg: Any) -> Any:
 class _Redis:
     """The two keys this world needs, with a `set`/`get`/`delete` surface.
 
-    A stub rather than a real Redis container: the pause check is one GET of one
-    key, and the lag cache is one SET of one key. A second container would add a
-    minute to the tier to prove that redis-py can round-trip a string.
+    A stub, not a container: one GET for the pause and one SET for the lag.
     """
 
     def __init__(self) -> None:
@@ -180,15 +149,8 @@ async def _submit(factory: Any, tenant_id: uuid.UUID, count: int) -> None:
 async def _outbox_status(
     factory: Any, tenant_id: uuid.UUID
 ) -> tuple[int, float | None]:
-    """`unpublished_count` and `oldest_unpublished_age_s`, from the real query.
-
-    WP-4.2 landed `get_outbox_status`, so this is no longer a re-implementation
-    of the numbers the tool will report — it is the query the tool runs, on the
-    real Postgres, against a world a stopped relay produced. That is the point
-    of reading it here rather than in the unit tier: `now()`, `created_at` and
-    the advisory-lock leader gate are all the server's, and SQLite has none of
-    them.
-    """
+    """`unpublished_count` and `oldest_unpublished_age_s`, from the query
+    `get_outbox_status` runs (WP-4.2), on the server whose clock it reads."""
     async with factory() as session:
         snapshot = await OutboxRepository(session).delivery_snapshot(
             tenant_id=tenant_id
@@ -200,26 +162,16 @@ async def _outbox_status(
     ).total_seconds()
 
 
-#: Shortened loop intervals for the window below, and how long the window is.
-#: The real loops sleep 1 s (relay) and 60 s (metrics) between passes, which no
-#: test should wait for. Patching the two module constants keeps the loop bodies
-#: — and their own `asyncio.sleep` calls — completely untouched.
+#: Shortened loop intervals (the real ones are 1 s and 60 s) and the window length.
+#: Patching the constants leaves the loop bodies alone.
 _FAST_INTERVAL = 0.02
 _WINDOW_SECONDS = 0.4
 
 
 async def _run_ticks(factory: Any, redis: _Redis, consumer: Any) -> list[bool]:
-    """Let the real loops run for a short window, then cancel them.
-
-    Deliberately NOT a patched `asyncio.sleep`: the relay holds a live asyncpg
-    connection through its tick, and replacing the event loop's sleep for
-    everything in that window would put a `CancelledError` wherever the driver
-    happened to await next. Cancelling the task is how `worker_loop` stops these
-    loops in production, so it is also the faithful way to stop them here.
-
-    `CHAOS_ENABLED=true` is patched in for the whole window — that is gate 1, and
-    without it the pause check never reaches Redis at all.
-    """
+    """Let the real loops run for a short window, then cancel them. Cancellation,
+    not a patched `asyncio.sleep`, because the relay holds a live asyncpg
+    connection; `CHAOS_ENABLED=true` is gate 1 for the pause check."""
     entries: list[bool] = []
 
     async def _publish_raw(*, topic: str, key: str, payload: dict[str, Any]) -> None:
@@ -254,13 +206,8 @@ async def _run_ticks(factory: Any, redis: _Redis, consumer: Any) -> list[bool]:
 
 
 def _flat_lag_consumer() -> Any:
-    """A dispatcher consumer whose lag does not move.
-
-    This is not a convenience — it is the world. The relay is not publishing, so
-    nothing new arrives on `job.submitted`, so the group's lag is whatever it
-    already was. A consumer that reported a climbing lag here would be modelling
-    the *other* fault.
-    """
+    """A dispatcher consumer whose lag does not move — the world a stopped relay
+    leaves, where a climbing lag would be modelling the other fault."""
     consumer = AsyncMock()
     consumer.consumer_lag = AsyncMock(return_value=_FLAT_LAG)
     consumer.in_flight = set()
@@ -270,13 +217,8 @@ def _flat_lag_consumer() -> Any:
 async def test_a_paused_relay_grows_the_outbox_while_dispatcher_lag_stays_flat(
     session_factory: Any,
 ) -> None:
-    """The contrast, asserted on both signals.
-
-    Sequence: submit, pause, submit again, run several relay ticks and a couple
-    of metrics passes. Afterwards every row must still be unpublished, the
-    oldest must have aged, and the cached `worker-dispatcher` lag must be the
-    flat value — not missing, not climbing.
-    """
+    """The contrast on both signals: after the ticks every row is still
+    unpublished, the oldest has aged, and the cached lag is flat and present."""
     tenant_id = await _make_tenant(session_factory)
     redis = _Redis()
 
@@ -311,14 +253,8 @@ async def test_a_paused_relay_grows_the_outbox_while_dispatcher_lag_stays_flat(
 async def test_the_relay_drains_the_backlog_once_the_pause_expires(
     session_factory: Any,
 ) -> None:
-    """TTL restores normal publishing with no manual step.
-
-    The key is deleted rather than waited out — Redis expiry and an explicit
-    delete are indistinguishable to the check, which is a GET, and waiting out a
-    real TTL would put a minimum sleep in the tier for no extra coverage. What
-    this proves is the half that matters: nothing calls a compensator, and the
-    first tick that finds the key gone drains everything.
-    """
+    """TTL restores publishing with no manual step. The key is deleted instead of
+    waited out; to a GET the two are the same, and nothing calls a compensator."""
     tenant_id = await _make_tenant(session_factory)
     redis = _Redis()
 
@@ -339,12 +275,8 @@ async def test_the_relay_drains_the_backlog_once_the_pause_expires(
 async def test_pausing_a_different_loop_leaves_the_relay_publishing(
     session_factory: Any,
 ) -> None:
-    """`single_loop` is a blast-radius claim, so it gets an assertion.
-
-    A key for one member must not stop another member's loop — the failure mode
-    a shared key or a prefix match would produce, and one that would quietly
-    widen every scenario's fault.
-    """
+    """`single_loop` is a blast-radius claim: one member's key must not stop
+    another's loop, as a shared key or prefix match would."""
     tenant_id = await _make_tenant(session_factory)
     redis = _Redis()
 

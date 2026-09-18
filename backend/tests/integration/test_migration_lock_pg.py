@@ -1,28 +1,8 @@
-"""End-to-end proof that alembic serializes on a real Postgres advisory lock.
+"""End-to-end proof that alembic serializes on a real Postgres advisory lock (F2-04).
 
-The unit tests pin the helper's contract; this module proves the thing the
-work order actually cares about (F2-04) against a live server: a second
-`alembic upgrade head` cannot run while another holds the lock, which is
-what stops two ECS backend tasks from racing on `pg_type` at scale-out.
-
-Two assertions:
-
-  1. The lock is real and mutually exclusive — a second session's
-     `pg_advisory_lock` on the same key blocks until the first releases.
-  2. env.py actually takes it — with the lock held from this test's own
-     session, a subprocess `alembic upgrade head` (the exact command
-     scripts/entrypoint.sh runs) makes no progress; released, it completes
-     and the schema lands at head. This is the assertion that fails at
-     HEAD, where env.py takes no lock and the subprocess sails straight
-     through while the lock is held.
-
-The subprocess goes through the async path (postgresql+asyncpg URL, which
-is what the container and production both use); env.py routes both the
-async and sync paths through the same do_run_migrations, so one lock call
-covers both.
-
-Skipped automatically when Docker / testcontainers isn't available so the
-rest of the suite still runs.
+Two assertions: the lock is mutually exclusive across sessions, and env.py actually
+takes it — a subprocess `alembic upgrade head` makes no progress while this test holds
+it, then completes and lands the schema at head. Skipped without Docker/testcontainers.
 """
 
 import os
@@ -49,9 +29,7 @@ pytestmark = pytest.mark.skipif(
     reason="set RUN_MIGRATION_LOCK_TEST=1 and install Docker + testcontainers[postgres] to run",
 )
 
-# How long we let the blocked party sit before calling it "blocked". Long
-# enough that a non-blocking implementation would certainly have finished,
-# short enough not to drag the suite.
+# How long the blocked party sits before we call it "blocked" rather than slow.
 BLOCK_PROBE_SECONDS = 5.0
 
 
@@ -87,9 +65,7 @@ async def test_second_session_blocks_until_the_first_releases(dsn: str) -> None:
         done, _ = await asyncio.wait({pending}, timeout=2.0)
         assert not done, "second session acquired the lock while the first held it"
 
-        # The lock survives a commit on the holder's session — this is what
-        # makes it usable across alembic's internal transaction boundaries
-        # (an xact-scoped lock would have been dropped right here).
+        # Survives a commit: an xact-scoped lock would have dropped right here.
         async with holder.transaction():
             await holder.execute("SELECT 1")
         done, _ = await asyncio.wait({pending}, timeout=2.0)
@@ -105,11 +81,7 @@ async def test_second_session_blocks_until_the_first_releases(dsn: str) -> None:
 
 
 async def test_alembic_upgrade_blocks_while_the_lock_is_held(pg: Any, dsn: str) -> None:
-    """`alembic upgrade head` waits on the lock, then completes and commits.
-
-    Fails at HEAD: without the lock in env.py the subprocess runs to
-    completion while this test still holds the lock.
-    """
+    """`alembic upgrade head` waits on the lock, then completes and commits."""
     import asyncpg
 
     async_url = pg.get_connection_url()
@@ -156,9 +128,7 @@ async def test_alembic_upgrade_blocks_while_the_lock_is_held(pg: Any, dsn: str) 
                 proc.kill()
                 proc.communicate(timeout=30)
 
-        # The migration really committed (the lock must not leave alembic
-        # looking at an "external" transaction, which would silently make
-        # begin_transaction a no-op and roll everything back on close).
+        # Really committed: an "external" transaction would null begin_transaction.
         assert await holder.fetchval("SELECT to_regclass('alembic_version') IS NOT NULL")
         assert await holder.fetchval("SELECT count(*) FROM alembic_version") == 1
         assert await holder.fetchval("SELECT to_regclass('jobs') IS NOT NULL")

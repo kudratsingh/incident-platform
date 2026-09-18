@@ -1,20 +1,8 @@
 """The documented ways to run migrations, against a real Postgres (WO-R2-67).
 
-Two findings, one root cause: neither documented path could apply a
-migration. `make migrate` exec'd alembic inside the `app` container, which
-connects as the non-owner `incident_app` role and cannot CREATE; and the
-README's `cd backend && alembic upgrade head` cannot work at all, because
-alembic.ini lives only at the repo root and the CLI does not search parent
-directories.
-
-The first test here is the one that matters most, and not for the reason it
-looks like: it asserts migrations actually *create tables*. While fixing the
-role check, the preflight was first written as a bare `connection.execute()`,
-which autobegins a transaction — and `MigrationContext` downgrades
-`begin_transaction()` to a null context when it finds a transaction it did
-not open, so all eleven revisions applied, reported success, and rolled back
-on close. Every existing migration test still passed. A test that runs
-migrations and then counts tables is the only one that could see it.
+Neither worked: `make migrate` ran alembic as the non-owner `incident_app` role, and the
+README's `cd backend && alembic upgrade head` cannot find alembic.ini. The first test
+counts tables, because a run that reports success and rolls back on close passes the rest.
 """
 
 from __future__ import annotations
@@ -91,8 +79,7 @@ async def _table_count(dsn: str) -> int:
 async def test_owner_migration_from_the_repo_root_creates_the_schema(
     pg: Any,
 ) -> None:
-    """The blessed path: run from the repo root, as the owner, and the
-    tables are actually there afterwards."""
+    """The owner, from the repo root; tables really land."""
     dsn = _owner_dsn(pg)
 
     result = _run_alembic(dsn, cwd=REPO_ROOT)
@@ -118,16 +105,13 @@ async def test_rerunning_is_a_no_op(pg: Any) -> None:
 async def test_a_non_owner_role_is_refused_with_a_useful_message(
     pg: Any,
 ) -> None:
-    """What `make migrate` did before this order: connect as the runtime
-    role and discover the problem partway through a CREATE TABLE."""
+    """What `make migrate` did: runtime role, fails mid-CREATE."""
     import asyncpg  # type: ignore[import-untyped]
 
     owner = _owner_dsn(pg)
     conn = await asyncpg.connect(owner.replace("postgresql+asyncpg://", "postgresql://"))
     try:
-        # Create-if-absent rather than DROP/CREATE: the migrations grant
-        # privileges to this role, so by the time this test runs it may
-        # already exist and own dependent objects.
+        # Create-if-absent: the role may already own dependent objects.
         await conn.execute(
             "DO $$ BEGIN "
             "IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'incident_app') "
@@ -156,9 +140,7 @@ async def test_a_non_owner_role_is_refused_with_a_useful_message(
 
 
 def test_the_readme_command_runs_from_the_repo_root_only() -> None:
-    """`cd backend && alembic upgrade head` cannot work — alembic.ini is at
-    the repo root and the CLI does not search upwards. No database needed:
-    it fails before it would connect."""
+    """alembic.ini is at the repo root and the CLI does not search up."""
     assert (REPO_ROOT / "alembic.ini").exists()
     assert not (REPO_ROOT / "backend" / "alembic.ini").exists()
 

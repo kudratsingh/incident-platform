@@ -1,28 +1,8 @@
-"""The outbox→relay→Kafka round-trip, and what happens to a row that can never make it.
+"""The outbox→relay→Kafka round-trip, and the row that can never make it (WO-R2-05).
 
-ADR 0001's Verification section has cited an integration test named
-`test_outbox_relay` since Phase 7. It never existed, so the pattern the ADR
-is *about* — write outbox row, relay publishes, consumer reads it — had no
-end-to-end proof anywhere in the repo. `test_relay_round_trip_reaches_a_real_consumer`
-below is that proof, and the ADR now cites it by its real name.
-
-The other three tests are the defect that absence hid (WO-R2-05). The relay
-incremented an `attempts` counter that nothing read: no cap, no failed
-state, no error column. A row that could never publish was therefore retried
-every tick forever — and because `fetch_unpublished` returns a *fixed*
-oldest-`OUTBOX_RELAY_BATCH` window, each such row permanently occupied one
-of exactly 100 slots. That is not gradual degradation. It is a cliff: at 100
-poison rows the window is full of them and no other event is ever fetched
-again, for any tenant, with no error rate to see it by.
-
-Both halves need a real server to mean anything:
-
-  * Real Postgres, because the fix is partly a SQL predicate (`attempts <
-    cap`) and partly a write (`published_at`/`failed_at`/`error_message`)
-    against a real column set. SQLite would prove neither.
-  * Real Redpanda, because "cannot publish" has to be genuine. The oversize
-    row here is refused by the actual Kafka client for the actual reason a
-    production row would be — not by a mock we told to raise.
+ADR 0001 cited a `test_outbox_relay` that never existed; the round-trip test here is it.
+`attempts` was incremented and never read, so each poison row held one of the 100 fixed
+`fetch_unpublished` slots — at 100, nothing else is fetched. Real broker, real Postgres.
 """
 
 import asyncio
@@ -70,15 +50,11 @@ pytestmark = pytest.mark.skipif(
     reason="needs Docker + testcontainers[postgres]",
 )
 
-#: Low enough to drive a row through the cap in a handful of ticks. The
-#: production default is ~900 (about fifteen minutes of continuous failure)
-#: precisely so a broker outage does not quarantine a healthy backlog; a
-#: test that had to tick 900 times would be asserting about patience.
+#: Low enough to reach the cap in a few ticks; production is ~900, so a broker
+#: outage does not quarantine a healthy backlog.
 TEST_MAX_ATTEMPTS = 3
 
-#: Comfortably over aiokafka's 1 MiB `max_request_size`. The client refuses
-#: this before it reaches the broker, identically on every retry — which is
-#: exactly what makes it poison rather than a transient failure.
+#: Over aiokafka's 1 MiB max_request_size, so it is refused identically every retry.
 _OVERSIZE_BYTES = 1_500_000
 
 TOPIC = "job.submitted"
@@ -125,12 +101,8 @@ async def redpanda() -> AsyncGenerator[str, None]:
 async def relay(
     pg: Any, redpanda: str, monkeypatch: pytest.MonkeyPatch
 ) -> AsyncGenerator[Any, None]:
-    """A session factory over real Postgres, with the real producer pointed at
-    real Redpanda and the attempt cap lowered.
-
-    Yields the factory. The producer is a module-level singleton, so it is
-    started and stopped here rather than leaking into the next test.
-    """
+    """Factory over real Postgres, real producer on Redpanda, cap lowered; the
+    producer is a module singleton, so it stops here."""
     monkeypatch.setenv("KAFKA_BOOTSTRAP_SERVERS", redpanda)
     monkeypatch.setenv("OUTBOX_MAX_ATTEMPTS", str(TEST_MAX_ATTEMPTS))
     monkeypatch.setenv("CHAOS_ENABLED", "false")
@@ -182,12 +154,8 @@ def _valid_payload(tenant_id: uuid.UUID) -> dict[str, Any]:
 
 
 def _oversize_payload(tenant_id: uuid.UUID) -> dict[str, Any]:
-    """Schema-valid but far too large for the broker to accept.
-
-    Deliberately not schema-invalid: that path dead-letters on the first
-    attempt and would never exercise the cap. This row is well-formed and
-    still impossible, which is the case the counter was supposed to catch.
-    """
+    """Schema-valid but too large for the broker: schema-invalid would
+    dead-letter on the first attempt and never reach the cap."""
     payload = _valid_payload(tenant_id)
     payload["payload"] = {"blob": "x" * _OVERSIZE_BYTES}
     return payload
@@ -226,10 +194,7 @@ async def _fetch_window(factory: Any) -> list[uuid.UUID]:
 
 
 async def test_relay_round_trip_reaches_a_real_consumer(relay: Any) -> None:
-    """Write an outbox row → relay tick → a consumer reads it off Kafka.
-
-    The test ADR 0001 has cited since Phase 7 and never had.
-    """
+    """Outbox row → relay tick → consumer, the test ADR 0001 lacked."""
     tenant_id = await _seed_tenant(relay)
     payload = _valid_payload(tenant_id)
     row_id = await _add_row(relay, tenant_id, payload)
@@ -258,12 +223,8 @@ async def test_relay_round_trip_reaches_a_real_consumer(relay: Any) -> None:
 
 
 async def test_an_unpublishable_row_is_dead_lettered_at_the_cap(relay: Any) -> None:
-    """The row that used to be retried forever.
-
-    Before the cap existed this loop ran unbounded: every tick incremented
-    `attempts`, nothing ever read it, and the row stayed in the fetch window
-    for the lifetime of the deployment.
-    """
+    """The row that used to be retried forever: `attempts` rose, nothing
+    read it, and it never left the fetch window."""
     tenant_id = await _seed_tenant(relay)
     row_id = await _add_row(relay, tenant_id, _oversize_payload(tenant_id))
 
@@ -299,12 +260,8 @@ async def test_an_unpublishable_row_is_dead_lettered_at_the_cap(relay: Any) -> N
 async def test_a_healthy_row_behind_a_full_window_of_poison_still_publishes(
     relay: Any,
 ) -> None:
-    """The cliff, reproduced at its exact edge.
-
-    `OUTBOX_RELAY_BATCH` poison rows, all older than one healthy row. Without
-    a dead-letter exit the window is 100/100 poison on every tick and the
-    healthy row is never even fetched — not slowly, not eventually, never.
-    """
+    """The cliff at its edge: OUTBOX_RELAY_BATCH poison rows older than a
+    healthy row that is then never fetched at all."""
     tenant_id = await _seed_tenant(relay)
 
     # Schema-invalid rather than oversize: same permanent unpublishability,
@@ -334,11 +291,8 @@ async def test_a_healthy_row_behind_a_full_window_of_poison_still_publishes(
 async def test_unpublished_stats_sees_a_stall_that_queue_depth_cannot(
     relay: Any,
 ) -> None:
-    """The gauge behind the stall alarm, measured against real rows.
-
-    QueueDepth reads the Redis delayed set and stays green through a total
-    outbox stall, so these two numbers are the only warning anyone gets.
-    """
+    """The stall alarm's gauge: QueueDepth reads Redis and stays green
+    through a total outbox stall."""
     tenant_id = await _seed_tenant(relay)
 
     async with relay() as session:

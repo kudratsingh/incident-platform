@@ -1,25 +1,8 @@
 """The transaction envelope against a real Postgres (WO-R2-06).
 
-Why this cannot live in the SQLite tier: Postgres aborts the *entire*
-transaction on a constraint violation. Every statement after the failed
-INSERT — including the audit write that is the whole point of the path —
-is refused with `current transaction is aborted`, and the eventual COMMIT
-silently degrades to a ROLLBACK, so a handler that merely catches the
-`IntegrityError` still loses the audit row without seeing an error.
-SQLite is far more forgiving and will happily let the caught-and-continue
-version pass. Only a SAVEPOINT gets the transaction back to a committable
-state, and only a real server can demonstrate that.
-
-Two facts pinned here, both against the live `uq_idempotency_scope`
-constraint and the real `agent.tool_invoked` rows `evals/guards.py`
-grades on:
-
-  1. An idempotency `store()` collision returns a JSON-RPC envelope and
-     the success audit row for the action that executed is *committed*.
-  2. A crashed tool's own writes are rolled back while its
-     `outcome=error` audit row is committed.
-
-Skipped automatically when Docker / testcontainers isn't available.
+Postgres aborts the whole transaction on a constraint violation, so the audit write after a
+failed INSERT is refused and COMMIT degrades to ROLLBACK — only a SAVEPOINT recovers, where
+SQLite lets the caught-and-continue version pass. Pinned against `uq_idempotency_scope`.
 """
 
 from __future__ import annotations
@@ -106,8 +89,7 @@ def pg() -> Any:
 
 @pytest_asyncio.fixture
 async def factory(pg: Any) -> Any:
-    """Fresh engine per test — asyncpg connections are bound to the loop
-    that opened them, and pytest-asyncio gives each test its own."""
+    """Fresh engine per test: asyncpg is bound to its loop."""
     engine = create_async_engine(pg.get_connection_url())
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -243,15 +225,8 @@ async def test_crashed_tool_rolls_back_its_writes_but_not_its_audit_row(
     assert rows[0].extra_data["outcome"] == "error"
 
 
-# ---------------------------------------------------------------------------
-# R2-27 — the claim is atomic, so a retried tool call cannot 500 after
-# taking effect.
-#
-# Also Postgres-only, for a second reason on top of the one at the top of
-# this file: SQLite's in-memory engine serialises everything onto one
-# connection, so "two concurrent requests" cannot exist there at all. The
-# race these pin is the whole finding.
-# ---------------------------------------------------------------------------
+# R2-27 — the claim is atomic, so a retried tool call cannot 500 after taking effect.
+# Postgres-only again: SQLite serialises onto one connection, so the race cannot exist.
 
 CONCURRENT_TOOL_NAME = "pg_claim_probe"
 
@@ -267,8 +242,7 @@ class _SlowOut(BaseModel):
 
 @pytest.fixture
 def claim_probe_tool() -> Any:
-    """A Tier-1-shaped action that is slow enough to hold its claim while
-    a second caller arrives, and that counts its own executions."""
+    """Holds its claim while a second caller arrives; counts executions."""
     snapshot = _snapshot_for_tests()
     state: dict[str, Any] = {
         "executions": 0,
@@ -297,19 +271,9 @@ def claim_probe_tool() -> Any:
 async def test_concurrent_same_key_calls_execute_once_and_replay(
     factory: Any, claim_probe_tool: Any
 ) -> None:
-    """Two `tools/call` requests with the same Idempotency-Key: one
-    execution, one cached replay, and no 500 for either.
-
-    Before the claim, the lookup and the claiming INSERT sat in the same
-    READ COMMITTED transaction with nothing between them, so both callers
-    missed the cache and both ran the action. The loser then hit
-    `uq_idempotency_scope` on the way out — after its side effect had
-    already landed.
-
-    The reservation row closes the window rather than repairing it: the
-    second caller's `ON CONFLICT DO NOTHING` finds the first caller's
-    uncommitted row and waits on it, then reads the committed response
-    and replays it."""
+    """Same Idempotency-Key twice: one execution, one cached replay, no 500. The
+    second caller's `ON CONFLICT DO NOTHING` blocks on the first's uncommitted
+    reservation row, so it cannot miss the cache and run the action too."""
     state = claim_probe_tool
     principal = await _seed(factory)
     args = {"idempotency_key": "pg-concurrent-1"}
@@ -379,14 +343,8 @@ def crashing_claim_tool() -> Any:
 async def test_a_failed_tool_releases_its_claim_for_a_later_retry(
     factory: Any, crashing_claim_tool: Any
 ) -> None:
-    """A claim taken before execution must not outlive a failed call.
-
-    The envelope deliberately commits the request transaction on a tool
-    error, so that the `outcome=error` audit row survives (#154) — which
-    means a reservation row would commit right along with it and wedge
-    the key for its whole TTL. A retry has to be able to re-execute, so
-    the claim is released on every path that does not record a
-    response."""
+    """A claim must not outlive a failed call: the envelope commits on a tool error
+    to keep the `outcome=error` row (#154), so the claim is released explicitly."""
     principal = await _seed(factory)
 
     response = await _call(

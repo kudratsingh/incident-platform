@@ -1,19 +1,8 @@
-"""
-End-to-end Kafka integration test.
+"""End-to-end Kafka integration test over Redpanda (Testcontainers).
 
-Spins up Redpanda (Kafka API-compatible) via Testcontainers, then produces
-a job.submitted message and asserts:
-  1. The producer's schema validation accepts a valid payload.
-  2. The consumer reads back the same payload.
-  3. An invalid payload is rejected at produce time (schema validation).
-  4. A handler failure triggers seek-back redelivery: the failed message is
-     re-consumed on a later poll and the group's committed offset ends past
-     both messages of the batch (BaseKafkaConsumer at-least-once contract).
-
-Skipped automatically if Docker isn't reachable, so CI without Docker still
-runs the unit/api suites.
-
-Run only this file:  pytest backend/tests/integration/test_kafka_e2e.py -v
+Asserts schema validation on both ends (valid job.submitted accepted, invalid rejected)
+and that a handler failure seeks back and redelivers, the group's committed offset
+ending past the whole batch — BaseKafkaConsumer's at-least-once contract. Needs Docker.
 """
 
 from __future__ import annotations
@@ -62,9 +51,7 @@ pytestmark = pytest.mark.skipif(
 
 
 def _find_free_port() -> int:
-    """Find a free TCP port to advertise Redpanda on. Kafka clients need the
-    advertised address to match what they connect to, so we pin a known port
-    before starting the container rather than letting Docker assign one."""
+    """A free port pinned before start: the advertised address must match."""
     import socket
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("", 0))
@@ -197,21 +184,13 @@ class _FlakyConsumer(BaseKafkaConsumer):
 async def test_handler_failure_seeks_back_and_redelivers(
     redpanda: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Live redelivery round-trip (E1-01): the handler fails the first
-    delivery of message 2 in a 2-message batch. The consumer must commit
-    only past message 1, seek back, redeliver message 2 on a later poll,
-    and end with the group's committed offset at 2 — not silently commit
-    past the failure."""
+    """Live redelivery (E1-01): message 2 of 2 fails, so only 1 is committed
+    and 2 is redelivered on a later poll."""
     topic = f"test.redelivery.{uuid.uuid4().hex[:8]}"
     group = f"test-redelivery-{uuid.uuid4().hex[:8]}"
 
-    # An ephemeral topic with no schema file. `validate()` used to no-op for
-    # unregistered topics; since WO-R2-62 it raises, and `_process_one` would
-    # treat both records as poison pills and commit past them — the exact
-    # behaviour this test asserts must NOT happen, so it would pass for the
-    # wrong reason if it were left unregistered rather than failing. What is
-    # under test is redelivery, so register the topic permissively and let the
-    # scripted handler failure be the only failure in play.
+    # Ephemeral topic with no schema file: since WO-R2-62 `validate()` raises, so both
+    # records would be poison pills and the test would pass for the wrong reason.
     monkeypatch.setitem(
         schema_registry._VALIDATORS, topic, Draft202012Validator({"type": "object"})
     )
