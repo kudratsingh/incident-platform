@@ -1,45 +1,17 @@
 """
-Seed the platform with realistic data for the incident-commander
-agent's live eval suite.
+Seed the platform with realistic data for the incident-commander agent's live eval suite.
 
-Populates:
-  1. Redis lag values for 8 Kafka consumer groups
-  2. `deploy_markers` — 6 recent deploys, one annotated for the
-     deploy-correlation scenario
-  3. `alerts` — mix of active + resolved across kafka / dlq / api / db
-     sources (guarantees the alert-storm scenario sees total >= 3
-     active)
-  4. Dead-letter jobs — 3 realistic DLQ entries with populated
-     `job_triages` rows
-  5. Failed jobs with traces — jobs sharing trace_ids that
-     `search_traces` / `get_trace` can drill into, plus audit rows
-     that share the request_id so `get_trace` returns a real graph
-  6. A DAG rooted at a stable seed job_id — three-node parent →
-     seed → child so `get_dag_state` returns nodes+edges
+Populates: Redis lag for 8 consumer groups; `deploy_markers` (6 deploys, one annotated for the
+deploy-correlation scenario); `alerts` (active + resolved across kafka/dlq/api/db, so the
+alert-storm scenario sees >= 3 active); 4 dead-letter jobs with `job_triages` rows; failed jobs
+sharing trace_ids plus audit rows sharing the request_id so `get_trace` returns a graph; and a
+three-node DAG (parent → seed → child) for `get_dag_state`.
 
-Runs are **idempotent**: every ID is derived from `uuid5(NAMESPACE, name)`
-so a re-run finds every row already present and does nothing. This
-means the agent's `make eval-live` can be run repeatedly without
-churn.
+Idempotent: every id is `uuid5(NAMESPACE, name)`, so a re-run finds every row present. The script
+prints each pinned id under `EVAL FIXTURE PINS`.
 
-At the end the script prints every pinned ID under `EVAL FIXTURE
-PINS` — copy-paste that into scenario definitions when you want to
-hardcode-probe a specific one.
-
-Usage (with the compose stack running):
-
-    make seed-eval-fixtures
-    # or:
-    docker compose exec app python scripts/seed_eval_fixtures.py
-
-Env vars (optional):
-
-    DATABASE_URL     postgres+asyncpg://...   (defaults to compose value)
-    REDIS_URL        redis://redis:6379/0     (defaults to compose value)
-    SEED_TENANT_SLUG default: default
-    EVAL_PINS_PATH   where `write_pins_json` lands the pin manifest
-                     (default: <tempdir>/eval-fixtures-pins.json — see
-                     `default_pins_path`)
+Usage: `make seed-eval-fixtures`. Env vars (optional): `DATABASE_URL`, `REDIS_URL`,
+`SEED_TENANT_SLUG`, `EVAL_PINS_PATH` (where `write_pins_json` lands the manifest).
 """
 
 from __future__ import annotations
@@ -53,9 +25,7 @@ from typing import Any, cast
 
 # Allow running from project root without installing the package.
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "backend"))
-# ...and this script's own directory, so the sibling `eval_safety`
-# helper resolves however this module was imported (flat by the tests,
-# or as `scripts.seed_eval_fixtures` by reset_eval_state).
+# ...and this dir, so the sibling `eval_safety` resolves either import path.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import eval_safety  # type: ignore[import-not-found]  # noqa: E402
@@ -93,11 +63,7 @@ from sqlalchemy.ext.asyncio import (  # noqa: E402
 )
 
 # ---------------------------------------------------------------------------
-# Deterministic ID space
-#
-# uuid5 with a fixed namespace + human-readable name means every run
-# generates the same UUID for the same fixture. Scenarios can pin
-# specific IDs by pasting them from the report the script prints.
+# Deterministic ID space — uuid5(namespace, name), so scenarios can pin ids.
 # ---------------------------------------------------------------------------
 
 _NAMESPACE = uuid.UUID("aaaaaaaa-e7a1-4000-8000-000000000000")
@@ -120,32 +86,18 @@ _TENANT_SLUG = os.getenv("SEED_TENANT_SLUG", "default")
 
 
 class SeedError(RuntimeError):
-    """A seed precondition the caller can act on.
+    """A seed precondition. `Exception`, not `SystemExit`, so the API boot guard
+    catches it (WO-R2-69)."""
 
-    Deliberately an `Exception` rather than `SystemExit`: this module is
-    imported by the API's boot path, which catches `Exception` to log and
-    degrade. See `_ensure_tenant` (WO-R2-69).
-    """
-
-# Kept in one place so a typo doesn't drift the tool + the seed apart.
-# Mirror of app.mcp.tools.consumer_lag._CONSUMER_LAG_KEY_PREFIX.
+# Mirror of app.mcp.tools.consumer_lag._CONSUMER_LAG_KEY_PREFIX, kept here so it can't drift.
 _LAG_KEY_PREFIX = "kafka:consumer_lag:"
-# Written WITHOUT expiry, like every other fixture in this script
-# (R2-17). These used to carry a 24h TTL on the theory that "fresh runs
-# re-seed anyway" — but the stack outlives the run. After a day of
-# uptime without a re-seed the keys simply vanished, and the six live
-# scenarios that assert a non-null lag for these groups started failing
-# as agent errors rather than as an unmet precondition: one wasted paid
-# run per occurrence. Durability is the reset's job, not a TTL's.
+# Written WITHOUT expiry, like every other fixture here (R2-17): a 24h TTL let the keys vanish
+# after a day of uptime, failing six scenarios as agent errors. Durability is the reset's job.
 
-# The `remediate_stale_cache_success` eval scenario expects this Redis
-# key to exist with recognisably-stale contents, then invalidates it via
-# `invalidate_cache_key` and observes the delete. Without the seed the
-# scenario can't run live — that gap was FIX_PLAN #19. Reset re-populates
-# it so consecutive scenarios each start from the stale-cache condition.
+# `remediate_stale_cache_success` expects this key to hold recognisably-stale contents, then
+# invalidates it via `invalidate_cache_key` and watches the delete (FIX_PLAN #19).
 _HOT_SET_KEY = "cache:jobs:worker-dispatcher:hot_set"
-# Value is a JSON array of stable job IDs; anyone inspecting it sees
-# obviously-fake "hot" state rather than mistaking it for real cache.
+# A JSON array of stable job IDs — obviously fake "hot" state.
 _HOT_SET_TTL_SECONDS = 24 * 3600
 
 # ---------------------------------------------------------------------------
@@ -160,33 +112,17 @@ _CONSUMER_LAGS: dict[str, int] = {
     "payments-consumer": 30_000,
     "shipping-consumer": 100_000,
     "healthy-consumer": 0,
-    # worker-dispatcher is already populated by the metrics loop when
-    # the worker is running — don't overwrite it here.
+    # worker-dispatcher is owned by the metrics loop — don't overwrite it.
 }
 
 
-# How long a seeded job waited to be dispatched, and the lifecycle columns
-# that follow from it (WO-R2-69).
-#
-# `update_status` stamps `started_at` on the PENDING→RUNNING write and
-# `completed_at` on every terminal write, so a `completed`/`failed`/
-# `dead_letter` row the platform produced *always* has both. Seeded rows had
-# neither, which made them incoherent in two directions at once:
-#
-#   * The dispatch-latency SLO counts a dispatched job with `started_at IS
-#     NULL` as a dispatch miss — that is what NULL means there. Seven fixture
-#     rows therefore sat permanently in the denominator as failures, and every
-#     reset re-anchored them into the rolling 24h window so they never aged
-#     out. On a lab stack with little other traffic that is most of the
-#     denominator, i.e. a seeded fast-burn alert about nothing.
-#   * `list_jobs(sort=DEAD_LETTERED_AT)` orders on
-#     `coalesce(completed_at, created_at)` (WO-R2-53), so for exactly the
-#     fixture set the DLQ scenarios are graded against, the "when did it die"
-#     sort silently degraded to "when was it submitted".
-#
-# 4 seconds is deliberately well inside the objective's 30-second threshold:
-# the fixtures should be ordinary healthy dispatches, so that a scenario that
-# *induces* latency is measuring its own effect and not the seed's.
+# How long a seeded job waited to be dispatched, and the lifecycle columns that follow (WO-R2-69).
+# `update_status` stamps `started_at` on PENDING→RUNNING and `completed_at` on every terminal
+# write; seeded rows had neither. The dispatch-latency SLO reads `started_at IS NULL` on a
+# dispatched job as a miss, so seven fixture rows sat permanently in the denominator — most of it
+# on a quiet lab stack. And `list_jobs(sort=DEAD_LETTERED_AT)` orders on
+# `coalesce(completed_at, created_at)` (WO-R2-53), so for the graded fixture set "when did it die"
+# degraded to "when was it submitted". 4 s is well inside the 30-second objective.
 _DISPATCH_LATENCY_SECONDS = 4
 
 
@@ -195,10 +131,8 @@ def _lifecycle(
 ) -> tuple[datetime, datetime | None, datetime | None]:
     """(created_at, started_at, completed_at) for one seeded job.
 
-    One derivation, used by both the seed and the re-baseline, so a reset
-    cannot produce a row shape the seed would never have written. Jobs that
-    were never dispatched (`run_seconds is None` — the WAITING half of the DAG)
-    keep NULL for both, which is what never-dispatched means.
+    Shared by the seed and the re-baseline. `run_seconds is None` keeps both NULL — never
+    dispatched.
     """
     created_at = now - created_offset
     if run_seconds is None:
@@ -210,12 +144,8 @@ def _lifecycle(
 def _dag_specs() -> list[dict[str, object]]:
     """The three-node DAG: parent (completed) → seed (waiting) → child.
 
-    Given explicit offsets so the parent's own lifecycle is orderable. The
-    re-baseline used to pin all three at exactly `now`, which — once the
-    parent had a real `started_at` — would have meant a job that started
-    before it was created, and a negative dispatch latency in every tool that
-    subtracts the two.
-    """
+    Explicit offsets so the parent is orderable: pinning all three at `now` gave it a
+    start before its own creation."""
     return [
         {
             "name": "dag-parent-job",
@@ -241,15 +171,9 @@ def _dag_specs() -> list[dict[str, object]]:
 def _deploy_rows() -> list[dict[str, object]]:
     """The seeded deploy history. Always `tenant_id=None` (WO-R2-69).
 
-    A deploy marker is platform-wide by construction: the column is nullable
-    precisely so it can say "this is not a tenant's row", the RLS policy is
-    written around `tenant_id IS NULL`, and every other producer of these rows
-    passes None. The seeder alone stamped them with a concrete tenant, which
-    made the fixture history invisible to the policy's platform-wide branch
-    and visible to exactly one tenant — so `get_deploy_history`, which the
-    correlation scenarios read, agreed with the contract on an empty database
-    and disagreed with it on a seeded one. There is no parameter to get this
-    wrong with any more.
+    A deploy marker is platform-wide by construction — the RLS policy is written around
+    `tenant_id IS NULL` and every other producer passes None. Stamping a concrete tenant made
+    the history invisible to `get_deploy_history`, which the correlation scenarios read.
     """
     now = datetime.now(UTC)
     return [
@@ -376,10 +300,8 @@ def _alert_rows(tenant_id: uuid.UUID) -> list[dict[str, object]]:
 def _triage_from(story: DlqFailureStory) -> dict[str, object]:
     """The `job_triages` row that goes with a story.
 
-    `list_dlq_messages` returns the triage block inline with the entry,
-    so it is as agent-visible as the error text and is held to the same
-    coherence rule (WO-R2-146). It lives in the table beside the error
-    string precisely so the two can never be updated apart."""
+    `list_dlq_messages` returns it inline, so it is as agent-visible as the error text
+    (WO-R2-146)."""
     assert story.triage is not None, f"{story.key} has no triage row"
     return {
         "root_cause_category": story.triage.root_cause_category,
@@ -391,37 +313,19 @@ def _triage_from(story: DlqFailureStory) -> dict[str, object]:
 
 
 def _dlq_specs() -> list[dict[str, object]]:
-    """Each spec becomes one Job + one JobTriage row. Each maps to one
-    of the three `remediation_hint` categories the agent branches on:
+    """Each spec becomes one Job + one JobTriage row, one per `remediation_hint` category
+    the agent branches on:
 
       * upstream timeout  → replay_safe        (blip, replay as-is)
       * SMTP / rate limit → wait_and_replay    (dep refusing, retry later)
       * csv bad-data      → human_required     (persistent bug, escalate)
 
-    Job types use the platform's real enum values but error strings
-    name the intended service (send_email, process_payment) so the
-    agent's LLM reads a realistic string.
-
-    Every error string and triage row comes from
-    `app.lab.dlq_failure_stories`, and `story_key` names which one. Ids,
-    job types, retry counts and order are unchanged — this pack is
-    pinned by scenario YAML and by canned commander fixtures, so only
-    the texts move.
-
-    Two of the four texts changed with WO-R2-146:
-
-      * `dlq-job-schema-violation` was `replay_safe` carrying a
-        SchemaValidationError. A missing required field is permanent, so
-        the row told the agent not to do the one thing its hint asked
-        for. Its id keeps the old name — the *fixture* is still "the
-        replay-safe one" — while its story is now an upstream timeout.
-      * `dlq-job-process-payment` was `wait_and_replay` carrying a bare
-        30s timeout, which reads as "retry now" rather than "retry
-        later". It is now the rate-limited case, where the text says why
-        waiting is the point.
-
-    The other two were already coherent and are untouched, which is why
-    they are pinned by `story()` rather than by `story_for(hint)`.
+    Error strings and triage rows come from `app.lab.dlq_failure_stories`, named by
+    `story_key`; the ids, job types, retry counts and order are pinned by scenario YAML and
+    canned fixtures. WO-R2-146 moved two: the id
+    `dlq-job-schema-violation` still means "the replay-safe one" but its story is an upstream
+    timeout, and `dlq-job-process-payment` is the rate-limited case rather than a bare 30s
+    timeout reading as "retry now".
     """
     return [
         {
@@ -504,18 +408,10 @@ def _failed_trace_specs() -> list[dict[str, object]]:
 async def _ensure_tenant(session: AsyncSession, slug: str) -> Tenant:
     """The tenant every fixture hangs off. Raises `SeedError` when absent.
 
-    A normal exception, not `SystemExit` (WO-R2-69). `SystemExit` derives
-    from `BaseException`, so the API's boot-time seed guard — an
-    `except Exception` around `await seed()` whose entire purpose is to log
-    the failure and let the app start anyway — could not catch it. A missing
-    `SEED_TENANT_SLUG`, which is a configuration typo on a lab stack, instead
-    unwound through the lifespan and killed the process on every boot: a
-    crash-loop whose log line said nothing about tenants, for a fixture set
-    the platform is designed to run without.
-
-    The CLI still exits non-zero with this message — `main()` catches it and
-    reports it — so the operator-facing behaviour is unchanged. What changes
-    is that an embedded caller now gets an exception it is allowed to handle.
+    A normal exception, not `SystemExit` (WO-R2-69): `SystemExit` derives from
+    `BaseException`, so the API's boot-time `except Exception` seed guard could not catch it
+    and a missing `SEED_TENANT_SLUG` crash-looped the process. `main()` still turns this into
+    a non-zero exit, so the CLI behaviour is unchanged.
     """
     tenant = (
         await session.execute(select(Tenant).where(Tenant.slug == slug))
@@ -552,12 +448,9 @@ async def _ensure_seed_user(
 
 
 async def _seed_consumer_lag(redis: aioredis.Redis) -> None:
-    """Write the synthetic consumer-lag fixtures durably.
+    """Write the consumer-lag fixtures durably; no TTL (`_LAG_KEY_PREFIX`).
 
-    No TTL — see `_LAG_KEY_PREFIX`. `worker-dispatcher` is deliberately
-    absent from `_CONSUMER_LAGS`: the metrics loop owns that key with a
-    90s TTL, and a durable fixture written over it would pin a stale lag
-    the loop could no longer correct."""
+    `worker-dispatcher` is absent from `_CONSUMER_LAGS`: the loop owns it."""
     for group, lag in _CONSUMER_LAGS.items():
         await redis.set(f"{_LAG_KEY_PREFIX}{group}", str(lag))
 
@@ -568,10 +461,8 @@ async def _seed_hot_set(redis: aioredis.Redis) -> None:
     inspecting Redis doesn't confuse it with production cache."""
     import json as _json
 
-    # Derived from `_dlq_specs()` (first three, keeping the
-    # schema-violation job first) so every member references a job the
-    # seed actually creates. Hardcoded stable() names drifted once when
-    # specs were renamed, leaving phantom UUIDs in the cache (D-14).
+    # From `_dlq_specs()`, so every member names a real seeded job;
+    # hardcoded names drifted once, leaving phantom UUIDs (D-14).
     payload = _json.dumps(
         [str(spec["job_id"]) for spec in _dlq_specs()[:3]]
     )
@@ -581,27 +472,13 @@ async def _seed_hot_set(redis: aioredis.Redis) -> None:
 async def _reset_dlq_state(session: AsyncSession) -> int:
     """Re-baseline stable() DLQ jobs to their advertised state.
 
-    Live eval scenarios mutate these rows (status → RUNNING/REPLAYED,
-    retry_count reset to 0 on replay, remediation_hint occasionally
-    cleared). Without this reset, the second run of a scenario sees a
-    row in the wrong state and mis-grades — that was FIX_PLAN #7. Only
-    touches the stable() IDs from `_dlq_specs()`; leaves any non-fixture
-    jobs alone.
+    Live scenarios mutate these rows (status, retry_count on replay, hint), so the second run
+    of a scenario otherwise mis-grades (FIX_PLAN #7). Only `_dlq_specs()` stable() ids are
+    touched. `error_message` is one of the four restored columns — a replay overwrites it, and
+    WO-R2-146 changed these texts, so a stale one puts the old contradiction in front of the
+    agent. The `job_triages` row is restored with it.
 
-    Four columns are restored, `error_message` among them — said out
-    loud because WO-R2-146 changed what these texts say, and a row that
-    kept a stale text across runs would put the *old* contradiction back
-    in front of the agent on a stack seeded before the change. A replay
-    overwrites the text with the live processor's own error, so this is
-    not a theoretical path. `tests/unit/test_eval_reset.py` pins it.
-
-    The fixture's `job_triages` row is restored alongside it — see
-    `_reset_triage_state` for why a stale triage block is the same defect
-    one field lower.
-
-    Returns the number of fixtures reset (0 = already baseline). A
-    fixture counts once whether its job row, its triage row, or both had
-    drifted."""
+    Returns the number of fixtures reset (job row, triage row or both counts once)."""
     now = datetime.now(UTC)
     reset_count = 0
     for spec in _dlq_specs():
@@ -638,16 +515,9 @@ async def _reset_triage_state(
 ) -> bool:
     """Re-baseline one fixture's `job_triages` row. True if it changed.
 
-    `_seed_dlq` inserts a triage row only when none exists, so on a stack
-    that was seeded before a text change the job row gets re-baselined by
-    the caller while its triage block keeps the old wording forever. That
-    matters because `list_dlq_messages` returns the triage inline: a row
-    whose error text now reads as a transient timeout, above a triage
-    that still says "schema rejected it three times", puts WO-R2-146's
-    contradiction straight back in front of the agent one field lower.
-
-    Restores content only. `id`, `job_id` and `model_used` identify the
-    row and are what it is looked up by."""
+    `_seed_dlq` inserts one only when none exists, so a stack seeded before a text change
+    keeps the old wording forever — and `list_dlq_messages` returns the triage inline, so
+    WO-R2-146's contradiction comes back one field lower. Content only."""
     triage_id = spec["triage_id"]
     existing = (
         await session.execute(
@@ -671,12 +541,8 @@ async def _reset_triage_state(
     return True
 
 
-# How much wall-clock drift a fixture timestamp may accumulate before a
-# reset re-anchors it. Non-zero so back-to-back resets stay no-ops (the
-# idempotency reset_eval_state documents), and far below the tightest
-# freshness window an eval asserts on: `since_hours=1` minus the largest
-# job offset (45 min) still leaves several minutes of headroom, and real
-# staleness is measured in hours-to-days.
+# Drift a fixture timestamp may accumulate before a reset re-anchors it. Non-zero so
+# back-to-back resets stay no-ops, and far below the tightest eval window (`since_hours=1`).
 _REBASELINE_TOLERANCE = timedelta(seconds=60)
 
 
@@ -699,46 +565,20 @@ def _drifted(actual: datetime | None, target: datetime | None) -> bool:
 
 
 async def _rebaseline_timestamps(session: AsyncSession) -> int:
-    """Re-anchor every time-anchored fixture column to its spec offset
-    from *now*, so a reset leaves the seeded world exactly as fresh as
-    it was at first boot (BUILD_PLAN 2.5 — time re-baselining).
+    """Re-anchor every time-anchored fixture column to its spec offset from *now*, so a reset
+    leaves the seeded world as fresh as it was at first boot (BUILD_PLAN 2.5).
 
-    The seeder computes offsets at seed time and check-then-insert never
-    updates them, so two days into a stack's life
-    `search_traces(since_hours=1)` found nothing and every age-sensitive
-    scenario graded against an apparently healthy system. Shift, don't
-    flatten: each row keeps its own spec offset, so the stories the
-    offsets encode (staging soak before the prod deploy, the v0.4.2
-    hotfix hours before the billing failures) keep their relative
-    spacing.
+    The seeder computes offsets at seed time and check-then-insert never updates them, so two
+    days in, `search_traces(since_hours=1)` found nothing and every age-sensitive scenario
+    graded an apparently healthy system. Shift, not flatten: each row keeps its own offset.
 
-    Scope — every seeded fixture field an eval can time-assert on:
-
-      * `jobs` (DLQ + failed-trace specs): the whole lifecycle —
-        `created_at` / `updated_at` / `started_at` / `completed_at` —
-        derived together by `_lifecycle` from each spec's
-        `created_offset` and `run_seconds`. `created_at` is what
-        `search_traces(since_hours=...)` filters on and
-        `list_dlq_messages` returns; `completed_at` is what the
-        `DEAD_LETTERED_AT` sort orders on and what the dispatch-latency
-        SLO measures against `started_at`.
-      * `jobs` (DAG trio): the same four columns from `_dag_specs`. The
-        parent is `completed` and so carries a start and an end; the two
-        `waiting` nodes carry neither, because they have not been
-        dispatched. This loop used to pin all three at `now`, which is
-        what gave the parent a start earlier than its own creation.
-      * `alerts`: `fired_at` / `resolved_at` from `_alert_rows` —
-        `list_active_alerts` returns `fired_at`.
-      * `deploy_markers`: `deployed_at` from `_deploy_rows` —
-        `get_deploy_history` returns `deployed_at`.
-
-    Deliberately excluded: `audit_logs` (ground truth — no reset codepath
-    may touch it, ADR 0012 amendment) and `job_triages` (no timestamp
-    appears in any tool output). Only stable() IDs are addressed, so
-    organic rows created by live traffic are structurally unreachable.
-
-    Rows already within `_REBASELINE_TOLERANCE` of target are skipped.
-    Returns the number of rows shifted."""
+    Scope is every seeded field an eval can time-assert on: the whole `jobs` lifecycle
+    (`created_at`/`updated_at`/`started_at`/`completed_at`, derived together by `_lifecycle`
+    for the DLQ, failed-trace and DAG specs), `alerts.fired_at`/`resolved_at`, and
+    `deploy_markers.deployed_at`. Excluded on purpose: `audit_logs` (ground truth, ADR 0012
+    amendment) and `job_triages` (no timestamp reaches a tool output). Only stable() ids are
+    addressed. Rows already within `_REBASELINE_TOLERANCE` of target are skipped; returns the
+    number shifted."""
     now = datetime.now(UTC)
     shifted = 0
 
@@ -771,14 +611,9 @@ async def _rebaseline_timestamps(session: AsyncSession) -> int:
             alert.resolved_at = resolved_target
             shifted += 1
 
-    # The whole lifecycle, not just created_at (WO-R2-69). Re-anchoring
-    # `created_at` alone left `started_at`/`completed_at` at whatever
-    # wall-clock the previous run stamped, which produced rows that started
-    # before they were created — the DAG parent, pinned at `now` by this
-    # very loop while its start stayed in the past, was guaranteed to — and
-    # a negative dispatch latency in every tool that subtracts the two.
-    # Deriving all three from the spec makes the reset restore a shape the
-    # seed would have written, rather than a shifted half of one.
+    # The whole lifecycle, not just created_at (WO-R2-69): re-anchoring `created_at` alone
+    # left `started_at`/`completed_at` where the previous run stamped them, so rows started
+    # before they were created and dispatch latency came out negative.
     job_targets: dict[uuid.UUID, tuple[datetime, datetime | None, datetime | None]] = {}
     for job_spec in (*_dlq_specs(), *_failed_trace_specs()):
         job_targets[cast("uuid.UUID", job_spec["job_id"])] = _lifecycle(
@@ -823,13 +658,9 @@ async def _rebaseline_timestamps(session: AsyncSession) -> int:
 
 
 async def _seed_deploys(session: AsyncSession) -> None:
-    """Insert the deploy history, and repair any row a previous seed
-    tenant-stamped.
+    """Insert the deploy history, and repair any row a previous seed tenant-stamped.
 
-    The repair matters because this seeder is check-then-insert: a stack
-    seeded before WO-R2-69 already holds these six ids with a concrete
-    `tenant_id`, and re-seeding would skip straight past them forever. The
-    rows are addressed by stable id, so this can only touch fixtures.
+    Check-then-insert would skip pre-WO-R2-69 rows forever. Stable ids only.
     """
     for spec in _deploy_rows():
         existing = (
@@ -899,8 +730,7 @@ async def _seed_dlq(session: AsyncSession, tenant: Tenant, user: User) -> None:
         ).scalar_one_or_none()
         if existing_t is not None:
             continue
-        # `spec["triage"]` is typed as `object` in the container dict;
-        # cast to a concrete mapping so mypy on py3.12 can index it.
+        # Cast to a concrete mapping so mypy can index it.
         t = cast("dict[str, Any]", spec["triage"])
         session.add(
             JobTriage(
@@ -951,8 +781,7 @@ async def _seed_failed_traces(
                 completed_at=completed_at,
             )
         )
-        # One audit row sharing the trace_id (via request_id) so
-        # `get_trace(trace_id)` returns a graph, not just the job.
+        # One audit row sharing the trace_id via request_id, so `get_trace` returns a graph.
         audit_id = stable(f"failed-trace-audit-{spec['job_id']}")
         existing_a = (
             await session.execute(
@@ -1084,32 +913,17 @@ async def seed(
     reset: bool = False,
     allow_target_mismatch: bool = False,
 ) -> dict[str, int]:
-    """Programmatic entry point — usable from tests and the app
-    lifespan's `SEED_EVAL_FIXTURES=true` path. No stdout output.
+    """Programmatic entry point, and the lifespan's `SEED_EVAL_FIXTURES=true` path. No stdout.
 
-    Gated on the target, like every other script that writes to a
-    database here (WO-R2-19): refuses when `ENVIRONMENT=production`, and
-    refuses when `database_url`/`redis_url` are not the ones `settings`
-    names, unless `allow_target_mismatch=True`. This seeder writes a
-    user with a known password and overwrites job rows by stable id, so
-    "which database" is exactly as load-bearing a question here as it is
-    for the reset.
+    Gated on the target like every writing script here (WO-R2-19): refuses on
+    `ENVIRONMENT=production`, and on a `database_url`/`redis_url` that is not the one
+    `settings` names unless `allow_target_mismatch=True`.
 
-    `reset=True` re-baselines mutable fixture state that scenarios
-    drift over the course of a live eval run (FIX_PLAN #7):
-      * stable() DLQ jobs get status/retry_count/hint/error_message
-        restored to their spec.
-      * every time-anchored fixture column is re-anchored to its
-        now-relative seed offset (`_rebaseline_timestamps`, BUILD_PLAN
-        2.5) so age-sensitive scenarios see a fresh world after reset.
-      * Kafka consumer-lag keys re-written (a scenario that consumed
-        or drove up lag has its cached value replaced).
-      * `cache:jobs:worker-dispatcher:hot_set` re-populated (FIX_PLAN
-        #19 — required for `remediate_stale_cache_success`).
-
-    Returns a small summary dict
-    {'dlq_reset': N, 'timestamps_rebaselined': N} for the caller to
-    log / include in a reset-protocol audit trail."""
+    `reset=True` re-baselines the mutable state a live run drifts (FIX_PLAN #7): DLQ job
+    status/retry_count/hint/error_message, every time-anchored column
+    (`_rebaseline_timestamps`, BUILD_PLAN 2.5), the consumer-lag keys, and
+    `cache:jobs:worker-dispatcher:hot_set` (FIX_PLAN #19). Returns
+    `{'dlq_reset': N, 'timestamps_rebaselined': N}`."""
     eval_safety.assert_safe_target(
         script="seed_eval_fixtures.py",
         database_url=database_url,
@@ -1118,11 +932,8 @@ async def seed(
     )
 
     engine = create_async_engine(database_url, echo=False)
-    # Platform (cross-tenant) scope: this script touches many tenants'
-    # rows and sets no `app.tenant_id`. Since WO-R2-129 that is refused
-    # rather than silently admitted, and it runs as `incident_app`
-    # (docker-compose `app` service) — a non-owner role with no
-    # BYPASSRLS — so the declaration is what keeps it working. ADR 0026.
+    # Platform (cross-tenant) scope: this script sets no `app.tenant_id`, which ADR 0026
+    # refuses, and runs as the non-owner `incident_app` role with no BYPASSRLS.
     factory = platform_session_factory(engine)
     redis = aioredis.from_url(redis_url, decode_responses=True)
     dlq_reset = 0
@@ -1140,8 +951,7 @@ async def seed(
                 await _seed_dag(session, tenant, user)
                 if reset:
                     dlq_reset = await _reset_dlq_state(session)
-                    # After the DLQ restore, which stamps updated_at=now
-                    # on drifted rows — the re-anchor has the last word.
+                    # After the DLQ restore stamps updated_at=now — the re-anchor wins.
                     timestamps_rebaselined = await _rebaseline_timestamps(
                         session
                     )
@@ -1209,18 +1019,9 @@ _PINS_BASENAME = "eval-fixtures-pins.json"
 def default_pins_path() -> str:
     """Where the pin manifest lands when the caller doesn't say.
 
-    Resolution order:
-
-      1. `EVAL_PINS_PATH` — full destination path, for operators (or the
-         commander's compose) to point at a mount of their choosing.
-      2. `<tempdir>/eval-fixtures-pins.json` — `tempfile.gettempdir()`,
-         i.e. `/tmp/eval-fixtures-pins.json` in the shipped image, the
-         one location writable under any runtime user.
-
-    The previous default, `/app/eval-fixtures-pins.json`, was unwritable
-    in every released image: the Dockerfile COPYs `/app` as root and runs
-    as the non-root `appuser`, so the boot-time write died with EACCES —
-    on a manifest the old log line then reported as a *seed* failure.
+    `EVAL_PINS_PATH` if set, else `<tempfile.gettempdir()>/eval-fixtures-pins.json`. The old
+    `/app/eval-fixtures-pins.json` default was unwritable in every released image (COPYed as
+    root, run as `appuser`), and the EACCES was logged as a *seed* failure.
     """
     import tempfile
 
@@ -1230,14 +1031,10 @@ def default_pins_path() -> str:
 
 
 def write_pins_json(path: str | None = None) -> str:
-    """Write the pin manifest to `path` (default `default_pins_path()`).
-    Returns the path written so the caller can log or print it.
+    """Write the pin manifest to `path` (default `default_pins_path()`); returns the path.
 
-    Raises `OSError` when the destination is genuinely unwritable — the
-    caller decides how loud to be. Both callers (the api lifespan and
-    `main()` below) treat that as "pin manifest missing", explicitly
-    distinct from a seed failure: the fixtures are already committed by
-    the time this runs."""
+    Raises `OSError` if unwritable; callers read that as "manifest missing", not a seed
+    failure."""
     import json
     import pathlib
 
@@ -1293,10 +1090,8 @@ async def main() -> None:
             reset=args.reset, allow_target_mismatch=args.allow_target_mismatch
         )
     except SeedError as exc:
-        # The CLI contract is unchanged — message on stderr, exit 1. Only the
-        # exception type changed, so that the API's boot guard can catch it
-        # (WO-R2-69); turning it back into an exit code belongs here, at the
-        # one call site that is actually a command line.
+        # CLI contract unchanged — stderr, exit 1. Only the exception type moved,
+        # so the API's boot guard can catch it (WO-R2-69).
         print(f"error: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc
     try:

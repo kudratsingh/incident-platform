@@ -1,31 +1,14 @@
 """
-Create the two load-test accounts expected by locustfile.py.
+Create the two load-test accounts locustfile.py expects, with the stack running:
+`python scripts/seed_load_test_users.py`.
 
-Usage (with the stack running):
-    python scripts/seed_load_test_users.py
+Optional env vars (defaults match locustfile.py): `DATABASE_URL`, `LOAD_USER_EMAIL`,
+`LOAD_USER_PASSWORD`, `LOAD_ADMIN_EMAIL`, `LOAD_ADMIN_PASSWORD`.
 
-Env vars (all optional — match the defaults in locustfile.py):
-    DATABASE_URL          postgres+asyncpg://...  (defaults to docker-compose value)
-    LOAD_USER_EMAIL       default: loadtest@example.com
-    LOAD_USER_PASSWORD    default: LoadTest123!
-    LOAD_ADMIN_EMAIL      default: loadtest-admin@example.com
-    LOAD_ADMIN_PASSWORD   default: LoadTest123!
-
-## Guardrail
-
-This script creates a `role=admin` account whose default password is
-published in this file, in `locustfile.py`, and in the git history of
-both. Until WO-R2-19 it had no gate of any kind: it wrote that account
-into whatever `DATABASE_URL` happened to be set, from any environment,
-with no confirmation and no indication of which host it had just
-written to.
-
-It now refuses unless the target is the configured one and
-`ENVIRONMENT` is not `production` — the same `eval_safety` gate its
-sibling `reset_eval_state.py` uses, and for the same reason: the DSN
-chooses the victim, the ENVIRONMENT label only describes the shell.
-Pass `--i-know-what-im-doing` for a deliberate cross-stack seed. The
-target host is printed before anything is written.
+One account is `role=admin` with a repo-published default password, so this goes through the
+`eval_safety` gate (WO-R2-19): it refuses on `ENVIRONMENT=production` or a `DATABASE_URL` other
+than the configured one, prints the target first, and takes `--i-know-what-im-doing` for a
+deliberate cross-stack seed.
 """
 
 from __future__ import annotations
@@ -35,8 +18,7 @@ import asyncio
 import os
 import sys
 
-# Allow running from project root without installing the package, and
-# put this script's own dir on the path so `eval_safety` resolves.
+# backend/ and this dir on sys.path: `app` and `eval_safety`.
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "backend"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -100,8 +82,7 @@ async def main() -> None:
         database_url=_DB_URL,
         allow_target_mismatch=args.allow_target_mismatch,
     )
-    # An operator about to mint an admin account should be able to see
-    # where it is going without reading their own shell history.
+    # So an operator can see where the admin account is going.
     print(eval_safety.describe_target(_DB_URL))
 
     engine = create_async_engine(_DB_URL, echo=False)
@@ -124,11 +105,8 @@ async def _upsert_users(session: AsyncSession) -> None:
             print(f"  already exists: {spec['email']}")
             continue
         user = User(
-            # Phase 12 made users.tenant_id NOT NULL; this script predates
-            # it and inserted NULL, so every run died on a
-            # NotNullViolationError. Seeded into the default tenant to
-            # match every other bootstrap path (`DEFAULT_TENANT_ID` is the
-            # mixed-hex UUID chosen for SQLite compatibility).
+            # users.tenant_id is NOT NULL since Phase 12; seeded into
+            # DEFAULT_TENANT_ID like every other bootstrap path.
             tenant_id=DEFAULT_TENANT_ID,
             email=spec["email"],
             hashed_password=hash_password(spec["password"]),
