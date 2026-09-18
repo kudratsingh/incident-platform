@@ -1,15 +1,6 @@
-"""
-Failure-mode tests — what happens when things go wrong.
-
-Covers:
-- Redis unavailable during job creation
-- Redis unavailable during rate limit check (fail-open behaviour)
-- Database error during job creation
-- Malformed / missing request payloads
-- Rate limit enforcement (429)
-- Auth edge cases (expired token, tampered token, missing header)
-- Job replay on non-failed job
-- Accessing another user's job
+"""Failure-mode tests: Redis down during job creation and during the rate-limit check, a database
+error on create, malformed payloads, 429 enforcement, auth edge cases, replaying a non-failed job,
+and reaching another user's job.
 """
 
 from collections.abc import AsyncGenerator
@@ -24,25 +15,17 @@ from app.utils.backpressure import BACKPRESSURE_LAG_KEY
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
-# ---------------------------------------------------------------------------
-# Redis failure during job creation
-# ---------------------------------------------------------------------------
+# Redis failure during job creation.
 #
-# Assertion rule for everything in this section: a fail-open path must be
-# pinned to the success status it is supposed to produce (201), never to
-# `!= <the-rejection-code>`. A 500 also satisfies `!= 429`, so the negative
-# form certifies fail-open while a fail-closed crash walks straight through
-# it — which is exactly what happened to the backpressure check.
+# Assertion rule for this section: a fail-open path is pinned to the success status it must produce
+# (201), never to `!= <the rejection code>`. A 500 satisfies `!= 429` too, which is exactly what
+# happened to the backpressure check.
 
 
 class _RedisDown:
-    """A Redis stand-in whose every command raises, simulating a full outage.
-
-    Deliberately not an ``AsyncMock`` with one method patched: the claim
-    under test is "Redis is *down*", and a stub that answers some commands
-    would let a fail-closed path pass by taking a branch that never touched
-    the dead server.
-    """
+    """A Redis stand-in whose every command raises. Deliberately not an AsyncMock with one method
+    patched: a stub that answers some commands lets a fail-closed path pass on a branch that never
+    touched the dead server."""
 
     def __getattr__(self, name: str) -> Any:
         async def _raise(*_args: Any, **_kwargs: Any) -> Any:
@@ -64,10 +47,7 @@ class _RedisLagging(AsyncMock):
 async def _client_with_redis(
     db_session: AsyncSession, redis_obj: Any
 ) -> AsyncGenerator[AsyncClient, None]:
-    """Build a test client whose `get_redis` dependency yields `redis_obj`.
-
-    Mirrors the shared `client` fixture; only the Redis stand-in differs.
-    """
+    """Mirrors the shared `client` fixture; only the Redis stand-in differs."""
     app = create_app()
 
     async def _override_db() -> AsyncGenerator[AsyncSession, None]:
@@ -107,19 +87,10 @@ async def redis_lagging_client(  # type: ignore[no-untyped-def]
 async def test_job_create_still_works_when_redis_is_down(
     redis_down_client: AsyncClient, auth_headers: dict[str, str]
 ) -> None:
-    """Redis fully down must not block job creation.
-
-    The durable path is Postgres: `POST /jobs` writes the `jobs` row and the
-    `outbox_events` row in one transaction, and the relay publishes to Kafka
-    later. Every Redis touch on this path (per-client rate limit, backpressure
-    lag cache, per-tenant rate limit) is advisory, so an outage degrades to
-    "no signal, accept the job" — see docs/REDIS.md, "What breaks when Redis
-    goes down".
-
-    This test used to be an empty `pass` that merely described the invariant
-    in a docstring. It reported green for the entire period during which
-    `check_backpressure` did an unguarded GET and 500'd the whole endpoint.
-    """
+    """Redis fully down must not block job creation: the durable path is Postgres, and every Redis
+    touch here is advisory (docs/REDIS.md). This test used to be an empty `pass` that described the
+    invariant in a docstring, and reported green for the whole period `check_backpressure` 500'd the
+    endpoint on an unguarded GET."""
     resp = await redis_down_client.post(
         "/api/v1/jobs",
         json={"type": "csv_upload"},
@@ -132,12 +103,7 @@ async def test_job_create_still_works_when_redis_is_down(
 async def test_backpressure_fails_open_when_redis_get_raises(
     redis_down_client: AsyncClient, auth_headers: dict[str, str]
 ) -> None:
-    """Narrow version of the test above, aimed at the backpressure GET only.
-
-    The other two Redis touches on the path are stubbed out so a regression
-    can only be attributed to `check_backpressure`. 201 — not "not 503", and
-    not "not 429".
-    """
+    """Narrow version aimed at the backpressure GET alone: 201, not "not 503" and not "not 429"."""
     with (
         patch("app.utils.rate_limit._check"),
         patch("app.utils.quota._check_tenant_rate"),
@@ -153,12 +119,8 @@ async def test_backpressure_fails_open_when_redis_get_raises(
 async def test_backpressure_still_rejects_when_redis_reports_high_lag(
     redis_lagging_client: AsyncClient, auth_headers: dict[str, str]
 ) -> None:
-    """Failing open on *errors* must not turn into failing open on *signal*.
-
-    A reachable Redis reporting lag above the threshold still produces the
-    503. Without this, the fail-open tests above would be satisfied just as
-    well by deleting the check altogether.
-    """
+    """Failing open on errors must not become failing open on signal: a reachable Redis reporting
+    lag above the threshold still produces the 503."""
     resp = await redis_lagging_client.post(
         "/api/v1/jobs",
         json={"type": "csv_upload"},
@@ -168,21 +130,14 @@ async def test_backpressure_still_rejects_when_redis_reports_high_lag(
     assert resp.json()["error_code"] == "backpressure"
 
 
-# ---------------------------------------------------------------------------
 # Redis failure during rate limit check — fail-open
-# ---------------------------------------------------------------------------
 
 
 async def test_redis_down_on_rate_limit_fails_open(
     client: AsyncClient, auth_headers: dict[str, str]
 ) -> None:
-    """If Redis is down for the rate limiter the request should still go through
-    (fail-open) rather than blocking all traffic with a 500.
-
-    Asserts 201, not `!= 429`: the fail-closed outcome this test exists to
-    rule out is a 500, which satisfies `!= 429` just as happily as the
-    success it is meant to prove.
-    """
+    """Fail-open for the rate limiter, asserted as 201 rather than `!= 429` — a 500 satisfies `!=
+    429` just as happily as the success this is meant to prove."""
     with patch(
         "app.utils.rate_limit._check",
         side_effect=ConnectionError("Redis unavailable"),
@@ -195,9 +150,7 @@ async def test_redis_down_on_rate_limit_fails_open(
     assert resp.status_code == 201, resp.text
 
 
-# ---------------------------------------------------------------------------
 # Database error during job creation
-# ---------------------------------------------------------------------------
 
 
 async def test_db_error_on_job_create_returns_500(
@@ -218,14 +171,9 @@ async def test_db_error_on_job_create_returns_500(
 async def test_unhandled_error_returns_the_standard_error_envelope(
     client: AsyncClient, auth_headers: dict[str, str]
 ) -> None:
-    """An escaped non-AppError still answers in the documented shape.
-
-    CLAUDE.md promises `error_code` / `message` / `details` / `request_id` on
-    every error response. Without a catch-all handler, anything that isn't an
-    `AppError` fell through to Starlette's bare `Internal Server Error`
-    text/plain body — the one error shape a client is most likely to hit
-    during an incident was the one shape it could not parse.
-    """
+    """An escaped non-AppError still answers in the documented shape. Without a catch-all handler
+    anything that is not an `AppError` fell through to Starlette's text/plain body — the one error
+    shape a client is most likely to hit during an incident was the one it could not parse."""
     with patch(
         "app.repositories.job.JobRepository.create",
         side_effect=Exception("DB connection lost"),
@@ -243,9 +191,7 @@ async def test_unhandled_error_returns_the_standard_error_envelope(
     assert "DB connection lost" not in resp.text
 
 
-# ---------------------------------------------------------------------------
 # Malformed payloads
-# ---------------------------------------------------------------------------
 
 
 async def test_missing_job_type_returns_422(
@@ -294,9 +240,7 @@ async def test_empty_body_on_login_returns_422(client: AsyncClient) -> None:
     assert resp.status_code == 422
 
 
-# ---------------------------------------------------------------------------
 # Rate limit enforcement
-# ---------------------------------------------------------------------------
 
 
 async def test_rate_limit_returns_429(
@@ -318,9 +262,7 @@ async def test_rate_limit_returns_429(
     assert resp.json()["error_code"] == "rate_limit_exceeded"
 
 
-# ---------------------------------------------------------------------------
 # Auth edge cases
-# ---------------------------------------------------------------------------
 
 
 async def test_missing_auth_header_returns_401(client: AsyncClient) -> None:
@@ -365,9 +307,7 @@ async def test_login_unknown_email_returns_401(client: AsyncClient) -> None:
     assert resp.status_code == 401
 
 
-# ---------------------------------------------------------------------------
 # Job access control
-# ---------------------------------------------------------------------------
 
 
 async def test_replay_non_failed_job_returns_400(
@@ -413,27 +353,18 @@ async def test_get_nonexistent_job_returns_404(
     assert resp.json()["error_code"] == "not_found"
 
 
-# ---------------------------------------------------------------------------
-# The same Redis posture on POST /sagas (WO-R2-12)
+# The same Redis posture on POST /sagas (WO-R2-12).
 #
-# `POST /sagas` creates N job rows and used to run none of the three
-# preconditions `POST /jobs` runs. Adding them has to add the *whole* posture,
-# not just the rejection half: a check that rejects on signal but 500s on a
-# Redis outage would make the saga endpoint strictly worse than the bypass it
-# replaced. These mirror the `POST /jobs` tests above, assertion rule and all
-# (a fail-open path is pinned to 201, never to "!= 503").
-# ---------------------------------------------------------------------------
+# It creates N job rows and used to run none of the three preconditions `POST /jobs` runs. Adding
+# them has to add the whole posture: a check that rejects on signal but 500s on a Redis outage would
+# be strictly worse than the bypass it replaced. Assertion rule as above.
 
 
 async def test_saga_create_still_works_when_redis_is_down(
     redis_down_client: AsyncClient, auth_headers: dict[str, str]
 ) -> None:
-    """Redis fully down must not block saga creation either.
-
-    The durable path is identical to `POST /jobs`: Postgres rows plus an
-    outbox row in one transaction. Every Redis touch the new admission guard
-    adds is advisory, so an outage degrades to "no signal, accept the work".
-    """
+    """Saga creation has the identical durable path: Postgres rows plus an outbox row in one
+    transaction, and every Redis touch the admission guard adds is advisory."""
     resp = await redis_down_client.post(
         "/api/v1/sagas",
         json={"name": "redis-is-down", "steps": [{"type": "csv_upload"}]},
@@ -447,13 +378,8 @@ async def test_saga_create_still_works_when_redis_is_down(
 async def test_saga_backpressure_fails_open_when_redis_get_raises(
     redis_down_client: AsyncClient, auth_headers: dict[str, str]
 ) -> None:
-    """Narrow version, aimed at the backpressure GET the saga path now makes.
-
-    The other Redis touches are stubbed out so a regression can only be
-    attributed to `check_backpressure` — the shared helper from PR #150,
-    reused rather than reimplemented, which is what makes this pass without
-    the saga path needing its own fail-open logic.
-    """
+    """Narrow version for the backpressure GET the saga path now makes, through the shared helper
+    from PR #150 rather than a reimplementation."""
     with (
         patch("app.utils.rate_limit._check"),
         patch("app.utils.quota._check_tenant_rate"),
@@ -470,12 +396,8 @@ async def test_saga_backpressure_fails_open_when_redis_get_raises(
 async def test_saga_create_is_refused_when_redis_reports_high_lag(
     redis_lagging_client: AsyncClient, auth_headers: dict[str, str]
 ) -> None:
-    """THE backpressure half of WO-R2-12: sagas are refused when jobs are.
-
-    Pre-fix this returned 201 while `POST /jobs` returned 503 against the very
-    same Redis — the backpressure signal applied to one job-creating surface
-    and not the other.
-    """
+    """The backpressure half of WO-R2-12: pre-fix this returned 201 while `POST /jobs` returned 503
+    against the very same Redis."""
     resp = await redis_lagging_client.post(
         "/api/v1/sagas",
         json={"name": "too-much-lag", "steps": [{"type": "csv_upload"}]},
@@ -504,13 +426,9 @@ class _RedisCountingKeys(AsyncMock):
 async def test_jobs_and_sagas_share_one_job_creation_rate_bucket(
     db_session: AsyncSession, default_tenant: Any, auth_headers: dict[str, str]
 ) -> None:
-    """Both job-creating endpoints draw on the SAME per-IP budget.
-
-    A separate bucket would leave the bypass half-open: a caller refused by
-    `POST /jobs` could carry on creating job rows through `POST /sagas` at the
-    full rate. Asserted on the key the limiter touches rather than by sending
-    31 requests, so the test does not depend on a wall-clock window.
-    """
+    """Both job-creating endpoints draw on the SAME per-IP budget; a separate bucket would let a
+    caller refused by `POST /jobs` carry on through `POST /sagas`. Asserted on the limiter's key
+    rather than by sending 31 requests against a wall-clock window."""
     redis = _RedisCountingKeys()
     async with _client_with_redis(db_session, redis) as ac:
         await ac.post("/api/v1/jobs", json={"type": "csv_upload"}, headers=auth_headers)

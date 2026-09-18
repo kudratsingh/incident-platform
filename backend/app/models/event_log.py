@@ -1,12 +1,8 @@
 """
-job_events — immutable append-only log of lifecycle events, written by the
-EventLogConsumer from the Kafka topics. This is the event-sourcing store:
-given a job_id, the full state history can be reconstructed by replaying
-its events in offset order.
+job_events — immutable lifecycle log the EventLogConsumer writes from Kafka;
+replaying a job's events in offset order rebuilds its state.
 
-Idempotency: a UNIQUE constraint on (kafka_topic, kafka_partition,
-kafka_offset) makes Kafka redelivery a no-op (the second write fails the
-constraint and the consumer treats it as success).
+UNIQUE (kafka_topic, kafka_partition, kafka_offset) makes redelivery a no-op.
 """
 
 import uuid
@@ -60,9 +56,7 @@ class JobEvent(Base):
         UniqueConstraint(
             "kafka_topic", "kafka_partition", "kafka_offset", name="uq_job_events_kafka_coord"
         ),
-        # Hot path: timeline endpoint orders by recorded_at (offset order within
-        # a single partition is preserved by recorded_at because the consumer
-        # processes serially per partition).
+        # Hot path: the timeline orders by recorded_at, which is per-partition offset.
         Index("ix_job_events_job_recorded", "job_id", "recorded_at"),
     )
 

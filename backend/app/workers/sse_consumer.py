@@ -1,11 +1,6 @@
 """
-SSE broadcaster consumer — bridges Kafka lifecycle events into the per-job
-Redis pub/sub channel that the SSE endpoint already subscribes to.
-
-This decouples the dispatcher from SSE clients entirely: the dispatcher
-publishes to Kafka and walks away; this consumer fans out to any number of
-SSE-connected browsers via Redis pub/sub. Different consumer instance =
-different subscriber group = independent processing, no coordination needed.
+SSE broadcaster consumer — bridges Kafka lifecycle events into the per-job Redis pub/sub channel
+the SSE endpoint subscribes to, so the dispatcher publishes to Kafka and walks away.
 """
 
 from typing import Any
@@ -18,16 +13,8 @@ from redis.asyncio import Redis
 
 logger = get_logger(__name__)
 
-# Map Kafka event names to the SSE status string clients see.
-# `job.failed` is split based on the `dead_lettered` flag at runtime:
-#   - dead_lettered=True  → "dead_letter" (terminal)
-#   - dead_lettered=False → "retrying"    (transient — will be re-dispatched)
-#
-# `cancelled` is terminal and was already in `progress.TERMINAL_STATUSES`, so
-# the stream-closing half of this has been in place all along, waiting for a
-# producer that did not exist (WO-R2-113). Until then the only thing that ever
-# closed a cancelled job's stream was the DB short-circuit in `api/streaming.py`
-# on reconnect — a client already connected simply waited.
+# Kafka event name → the SSE status clients see. `job.failed` splits on `dead_lettered`: True is
+# terminal "dead_letter", False transient "retrying". `cancelled` got a producer at WO-R2-113.
 _EVENT_TO_STATUS: dict[str, str] = {
     "job.progress": "running",
     "job.completed": "completed",
@@ -97,12 +84,8 @@ class SseConsumer(BaseKafkaConsumer):
         )
         retry_count = int(value.get("retry_count", 0))
 
-        # Provenance for the snapshot's ordering guard (WO-R2-57). Every event
-        # for a job carries the same Kafka key (`{tenant}:{user}`) and so
-        # shares a partition, which makes the offset within one topic the
-        # producer's own order — and makes a redelivered offset recognisable
-        # as the replay it is. Offsets from *different* topics are
-        # incomparable, hence the topic travelling with the offset.
+        # Provenance for the snapshot's ordering guard (WO-R2-57): within one topic the offset is
+        # the producer's order, and offsets across topics are incomparable — hence the topic too.
         offset = kafka_meta.get("offset")
         await publish_progress(
             self.redis,

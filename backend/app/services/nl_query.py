@@ -1,22 +1,10 @@
 """
 Natural-language admin queries.
 
-Lets an admin type a sentence ("CSV uploads that failed in the last hour
-with retry_count >= 2") and get back a constrained filter spec that maps
-directly to existing list endpoints — no raw SQL ever leaves the model.
-
-Safety
-------
-The model can ONLY fill in fields on `JobFilterSpec`. Every field is an
-enum, a small typed value, or a bounded integer. Pydantic rejects
-anything else. That means even a prompt-injected user input can't smuggle
-unsafe data into the query — the worst case is a benign filter spec that
-returns zero rows.
-
-Pattern matches `triage.py` and `retry_policy.py`:
-  * messages.parse() with a Pydantic schema
-  * claude-opus-4-7 with adaptive thinking
-  * frozen system prompt with cache_control: ephemeral
+Turns a sentence ("CSV uploads that failed in the last hour with retry_count >= 2") into a
+constrained filter spec for the existing list endpoints — no raw SQL ever leaves the model.
+The model can ONLY fill `JobFilterSpec` fields, all enums or bounded values, so even a
+prompt-injected input can at worst produce a benign spec. Same pattern as `triage.py`.
 """
 
 import asyncio
@@ -35,9 +23,7 @@ logger = get_logger(__name__)
 
 
 class JobFilterSpec(BaseModel):
-    """The constrained shape Claude returns. Every field is optional —
-    if the user's question doesn't constrain something, the model leaves
-    it null and the API treats it as "no filter."""
+    """The constrained shape Claude returns; a null field means no filter."""
 
     status: JobStatus | None = Field(
         default=None,
@@ -139,10 +125,7 @@ def is_enabled() -> bool:
 async def parse_question(question: str) -> tuple[JobFilterSpec, dict[str, int], str]:
     """Call Claude and return (filter_spec, usage, model_id).
 
-    Raises NLQueryDisabledError when the feature is off, anthropic / network
-    exceptions on real API failures, and asyncio.TimeoutError when the call
-    exceeds `llm_nl_query_timeout_seconds` (ADR 0005). The admin route turns
-    all three into the documented 503 `nl_query_unavailable`.
+    Disabled/timeout/API errors all become the 503 `nl_query_unavailable` (ADR 0005).
     """
     settings = get_settings()
     if not settings.llm_nl_query_enabled:

@@ -1,13 +1,8 @@
 """
 `get_incident` / `list_incidents` — read the alert stream.
 
-Incidents in this platform are `alerts` rows (see Wave 1 PR B). The
-naming split follows the vocabulary the agent thinks in: "list the
-current incidents", "give me details on incident X". The paired
-`list_active_alerts` tool is a strict subset (unresolved only, no id
-lookup); these are the general-purpose read surface.
-
-Both scoped to caller's tenant. Both `incidents:read`.
+Incidents are `alerts` rows. `list_active_alerts` is a strict subset (unresolved
+only, no id lookup). Both tenant-scoped, both `incidents:read`.
 """
 
 import uuid

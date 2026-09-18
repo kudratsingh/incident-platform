@@ -1,12 +1,6 @@
 """
-asyncio-based job processors.
-
-Used for: bulk_api_sync — high-concurrency I/O where we want many in-flight
-operations at once without blocking the event loop.
-
-Design: fire off N coroutines with asyncio.gather / as_completed, report
-progress as each one resolves.  asyncio.sleep() simulates the actual network
-latency of real API calls.
+asyncio job processors (bulk_api_sync) — N coroutines via `as_completed`, with `asyncio.sleep()`
+standing in for network latency.
 """
 
 import asyncio
@@ -22,12 +16,8 @@ from opentelemetry.trace import SpanKind
 logger = get_logger(__name__)
 tracer = get_tracer(__name__)
 
-# Hard ceiling on eagerly-created tasks. POST /jobs and POST /sagas already
-# reject anything above this (schemas.job.BulkApiSyncPayload), but replays
-# republish the *stored* payload without revalidating, so rows written before
-# the bound existed still land here. This clamp is load-bearing, not
-# belt-and-braces: the worker shares its process with the API and every
-# consumer loop, so an unbounded fan-out OOM-kills all of them at once.
+# Hard ceiling on eagerly-created tasks: replays republish a stored payload without revalidating,
+# and the worker shares its process with the API, so an unbounded fan-out OOM-kills everything.
 MAX_ENDPOINT_COUNT = 100
 
 # One breaker per logical external service, shared across all jobs in this process.

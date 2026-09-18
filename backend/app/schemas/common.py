@@ -4,13 +4,8 @@ from pydantic import BaseModel, Field
 
 T = TypeVar("T")
 
-#: Ceiling on any `page_size` query parameter.
-#:
-#: A `page_size` reaches Postgres as the LIMIT, so an unbounded one is a
-#: single-request memory exhaustion — the caller names how many rows the
-#: API materialises. Named here rather than repeated per endpoint so the
-#: listing surfaces cannot drift apart (WO-R2-61); `PaginationParams`
-#: below and the hand-rolled `Query(...)` declarations both read it.
+#: Ceiling on any `page_size` — it reaches Postgres as the LIMIT, so an unbounded
+#: one is memory exhaustion. Shared so listing surfaces cannot drift (WO-R2-61).
 MAX_PAGE_SIZE = 100
 
 

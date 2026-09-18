@@ -1,16 +1,8 @@
 """
 `list_active_alerts` — poll-based read of unresolved alerts.
 
-The paired push channel is the HMAC-signed webhook fired from
-`AlertService.create_alert` (see `app/services/alerts.py`). Agents
-that can't accept inbound webhooks (or want a catch-up path after a
-missed delivery) poll this tool.
-
-Scoped to the caller's tenant via the existing `Principal.tenant_id`
-context. Postgres RLS additionally enforces it at the DB layer — this
-tool is defense-in-depth on top of that.
-
-Requires `incidents:read`.
+The paired push channel is the webhook from `AlertService.create_alert`; this is the
+catch-up path. Tenant-scoped, RLS as defence in depth. Requires `incidents:read`.
 """
 
 from datetime import datetime

@@ -6,9 +6,8 @@ from app.models.job import Job
 from app.repositories.base import BaseRepository
 from sqlalchemy import and_, func, select
 
-# The statuses a digest calls "failed". One tuple, used by both the
-# failed-by-type counts and the error samples, so the narrative the LLM is
-# given and the numbers printed beside it cannot describe different job sets.
+# The statuses a digest calls "failed" — one tuple for counts and samples,
+# so both describe one job set.
 _FAILED_STATUSES = ("failed", "dead_letter")
 
 
@@ -42,22 +41,8 @@ class DigestRepository(BaseRepository[IncidentDigest]):
     ) -> tuple[dict[str, int], dict[str, int], list[str]]:
         """Returns (by_status_counts, failed_by_type_counts, error_samples).
 
-        The aggregates feed the digest LLM call. `error_samples` is the
-        list of error_message strings for failed+dlq jobs in the window
-        — the service fingerprints them itself before sending to the LLM.
-
-        The status filter on the samples is load-bearing (WO-R2-63).
-        `error_message` is not cleared when a retry succeeds, so a job that
-        failed once and then completed still carries the text of the attempt
-        that failed. Selecting on `error_message IS NOT NULL` alone therefore
-        fed the digest every *transient* failure the retry policy had already
-        absorbed, mixed in with the ones that actually ended badly — the two
-        are indistinguishable once they are a list of strings, and the LLM
-        was asked to characterise "what went wrong in this window" from a
-        sample set whose majority had gone right on the next attempt. The
-        counts either side of it were always status-filtered; only the
-        narrative input was not, so the digest's prose disagreed with its
-        own numbers.
+        The status filter on the samples is load-bearing (WO-R2-63): `error_message`
+        survives a successful retry, so the prose would disagree with the counts.
         """
         in_window = and_(
             Job.tenant_id == tenant_id,

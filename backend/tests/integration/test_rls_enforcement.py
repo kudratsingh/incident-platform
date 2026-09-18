@@ -1,56 +1,9 @@
 """Postgres row-level security enforcement test.
 
-Boots a real Postgres in a container, runs the full Alembic migration
-chain (including both RLS migrations), then proves:
-
-  1. With `app.tenant_id` set to tenant A, queries see only A's rows.
-  2. With it set to B, only B's rows are visible.
-  3. With it unset, *nothing* is visible and nothing can be written — the
-     bootstrap escape hatch is gone (WO-R2-129 / ADR 0026). Cross-tenant
-     work declares itself with `app.tenant_scope = 'platform'` instead of
-     being admitted for having set nothing.
-  4. Posture: every tenant table has RLS both ENABLEd and FORCEd. FORCE
-     is what makes the policies bind the table *owner* — production
-     connects as the RDS master, which owns every table and is otherwise
-     exempt (F1-01).
-  5. Tenant tables created after the first RLS migration (alerts as the
-     probe) are isolated too (F1-05).
-  6. deploy_markers rows with tenant_id NULL (platform-wide deploys)
-     stay visible from a tenant-scoped session — the policy variant that
-     keeps get_deploy_history working under service-account contexts.
-  7. audit_logs is immutable at the DB layer: UPDATE/DELETE as the
-     runtime role raise insufficient_privilege — a loud error, because
-     migration b8e4a1c92f35 revokes those grants from incident_app
-     (F1-07). INSERT with a matching tenant still succeeds.
-  8. Deleting a job still nulls audit_logs.job_id via the FK's ON DELETE
-     SET NULL: referential actions execute with the referencing table
-     owner's privileges and bypass RLS, so neither the grant revoke nor
-     the restrictive deny policies break scripts/reset_eval_state.py.
-  9. The migration-vs-runtime split is real: CREATE TABLE / ALTER TABLE
-     as incident_app raise insufficient_privilege, while the grants do
-     cover alembic_version (assert_migrations_current reads it at boot).
- 10. The boot posture probe (app.core.rls_check.assert_rls_posture)
-     passes on a live incident_app engine and raises on a superuser
-     engine under production settings.
- 11. An audit INSERT for a FOREIGN tenant is refused by the WITH CHECK
-     and accepted once `app.tenant_id` is retargeted at that tenant —
-     the constraint the operator-audit writes in app/api/admin.py are
-     built around (F1-08).
-
-Since WO-P2-03 the non-superuser sessions here connect as the actual
-production runtime role: `incident_app`, created by the migration chain
-itself and given its password by `python -m app.core.db_bootstrap`
-(exactly what scripts/entrypoint.sh and the compose migrate one-shot
-run) — not a hand-rolled test role.
-
-The third assertion used to read the other way — "unset sees all rows" —
-and warned that tightening the policy would force the author to migrate
-workers + relays. That is exactly what WO-R2-129 did: the loops now run
-on `tenant_scope.platform_session_factory`, which declares the scope once
-per transaction, and `alembic/env.py` declares it for migration runs.
-
-Skipped automatically when Docker / testcontainers isn't available so the
-rest of the suite still runs.
+Boots a real Postgres, runs the whole Alembic chain, then proves per-tenant visibility; an
+unscoped session refused, not admitted (WO-R2-129 / ADR 0026, where cross-tenant work
+declares `app.tenant_scope = 'platform'`); ENABLE + FORCE everywhere (F1-01, F1-05); the
+`deploy_markers` NULL variant; `audit_logs` immutability (F1-07); F1-08; the boot probe.
 """
 
 import os
@@ -78,16 +31,12 @@ pytestmark = pytest.mark.skipif(
     reason="set RUN_RLS_TEST=1 and install Docker + testcontainers[postgres] to run",
 )
 
-# Every tenant-scoped table under RLS, from the same derivation the boot
-# probe uses (WO-R2-26) rather than a third hand-maintained copy: the ORM
-# metadata, minus the `users` bootstrap exemption. A new tenant-scoped
-# table joins this list, the unit coverage gate and the runtime probe at
-# once, the moment its model exists.
+# Every tenant-scoped table under RLS, from the derivation the boot probe uses
+# (WO-R2-26): the ORM metadata minus the `users` bootstrap exemption.
 ALL_TENANT_RLS_TABLES = sorted(tenant_scoped_tables())
 
-# The strict `tenant_isolation` predicate as shipped by e2a9c4f70b31 (ADR
-# 0026). Kept here so a test that has to drop and rebuild a policy restores
-# the real one rather than an approximation of it.
+# The strict `tenant_isolation` predicate as shipped by e2a9c4f70b31 (ADR 0026), so a
+# test that rebuilds a policy restores the real one.
 _STRICT_MATCH = (
     "current_setting('app.tenant_scope', true) = 'platform'"
     " OR tenant_id = nullif(current_setting('app.tenant_id', true), '')::uuid"
@@ -103,19 +52,9 @@ def pg() -> Any:
 
 
 def _alembic(database_url: str, *args: str) -> None:
-    """Run an alembic command against the container.
-
-    Uses the current interpreter and an absolute -c path so the call
-    works regardless of cwd and PATH; env.py routes on the URL's dialect
-    (postgresql+asyncpg here, so the async engine path).
-
-    ALEMBIC_DATABASE_URL is popped, not just overridden: `env.py::_get_url`
-    prefers it over DATABASE_URL (ADR 0015's two-URL scheme), so an
-    inherited value from the developer's shell or a CI job env would
-    silently redirect this fixture's destructive `upgrade / downgrade -1 /
-    upgrade` cycle at whatever database that variable names instead of the
-    throwaway container.
-    """
+    """Run an alembic command against the container. ALEMBIC_DATABASE_URL is popped,
+    not overridden: `env.py::_get_url` prefers it (ADR 0015), so an inherited value
+    would point this fixture's destructive upgrade/downgrade cycle elsewhere."""
     env = os.environ.copy()
     env["DATABASE_URL"] = database_url
     env.pop("ALEMBIC_DATABASE_URL", None)
@@ -127,9 +66,7 @@ def _alembic(database_url: str, *args: str) -> None:
 
 
 def _run_db_bootstrap(database_url: str, password: str) -> None:
-    """Invoke the real boot-time password sync, exactly as the entrypoint
-    and the compose migrate one-shot do: `python -m app.core.db_bootstrap`
-    with the owner URL and INCIDENT_APP_DB_PASSWORD in the environment."""
+    """The real boot-time password sync, via `python -m app.core.db_bootstrap`."""
     env = os.environ.copy()
     env["ALEMBIC_DATABASE_URL"] = database_url
     env.pop("DATABASE_URL", None)
@@ -152,18 +89,9 @@ class RlsDb:
 
 @pytest.fixture(scope="module")
 def rls_db(pg: Any) -> RlsDb:
-    """Migrated database with the production `incident_app` role, set up
-    once per module.
-
-    The migration chain itself creates `incident_app` (b8e4a1c92f35) and
-    `python -m app.core.db_bootstrap` gives it a password — the same two
-    steps scripts/entrypoint.sh runs at every boot — so the non-superuser
-    sessions in this module exercise the exact role production connects
-    as after the phase-2 flip. A `downgrade -1` / re-`upgrade head`
-    round-trip proves the role migration reverses cleanly. The superuser
-    DSN is for fixtures/verification only — superusers bypass RLS even
-    under FORCE.
-    """
+    """Migrated database with the production `incident_app` role, once per module:
+    b8e4a1c92f35 creates it, db_bootstrap gives it a password, and the round-trip
+    proves that migration reverses. The superuser DSN is for fixtures only."""
     host = pg.get_container_host_ip()
     port = pg.get_exposed_port(5432)
     superuser_dsn = f"postgresql://{pg.username}:{pg.password}@{host}:{port}/{pg.dbname}"
@@ -201,11 +129,8 @@ async def _create_tenant(sup: Any, slug: str) -> uuid.UUID:
 
 
 async def test_rls_isolates_tenants(rls_db: RlsDb) -> None:
-    """Two tenants insert jobs. With app.tenant_id set, each sees only its own.
-
-    Connects as the production non-owner role (incident_app) so the
-    policy applies exactly as it does after the phase-2 flip.
-    """
+    """Two tenants insert jobs; each scoped session sees only its own, as the
+    non-owner `incident_app`."""
     import asyncpg
 
     sup = await asyncpg.connect(rls_db.superuser_dsn)
@@ -268,12 +193,8 @@ async def test_rls_isolates_tenants(rls_db: RlsDb) -> None:
 
 
 async def test_rls_enabled_and_forced_on_all_tenant_tables(rls_db: RlsDb) -> None:
-    """Every tenant table must have RLS ENABLEd *and* FORCEd (F1-01).
-
-    Without FORCE the table owner is exempt — and production connects as
-    the RDS master, which owns every table — so ENABLE alone leaves RLS
-    inert exactly where it matters.
-    """
+    """RLS ENABLEd and FORCEd everywhere (F1-01): without FORCE the owner is
+    exempt, and production is the RDS master."""
     import asyncpg
 
     sup = await asyncpg.connect(rls_db.superuser_dsn)
@@ -330,15 +251,8 @@ async def test_alerts_isolated_between_tenants(rls_db: RlsDb) -> None:
 
 
 async def test_deploy_markers_null_tenant_rows_visible_in_tenant_scope(rls_db: RlsDb) -> None:
-    """deploy_markers keeps platform-wide (tenant_id NULL) rows visible.
-
-    Deploys are platform-wide today (tenant_id is nullable by design), and
-    get_deploy_history runs under a service-account tenant context. The
-    standard tenant_isolation shape would hide every NULL row and silently
-    degrade that MCP tool to its env-var fallback — hence the policy
-    variant with `OR tenant_id IS NULL`. Tenant-scoped rows of *other*
-    tenants must still be hidden.
-    """
+    """`deploy_markers` keeps NULL-tenant rows visible, or `get_deploy_history`
+    degrades to its env-var fallback. Other tenants' rows stay hidden."""
     import asyncpg
 
     sup = await asyncpg.connect(rls_db.superuser_dsn)
@@ -373,15 +287,8 @@ async def test_deploy_markers_null_tenant_rows_visible_in_tenant_scope(rls_db: R
 
 
 async def test_audit_logs_update_delete_raise_insufficient_privilege(rls_db: RlsDb) -> None:
-    """audit_logs tampering is a loud error for the runtime role (F1-07).
-
-    Migration b8e4a1c92f35 revokes UPDATE/DELETE on audit_logs from
-    incident_app, so tampering fails at the grant layer with
-    insufficient_privilege — an error, no longer the silent 'UPDATE 0'
-    no-op that the restrictive deny policies alone produced for a
-    DML-granted role (that pre-P2-03 assertion lived in this test; the
-    deny policies still back-stop any owner-connected session).
-    """
+    """audit_logs tampering is a loud error (F1-07): b8e4a1c92f35 revokes
+    UPDATE/DELETE, so it fails at the grant layer, not as a silent `UPDATE 0`."""
     import asyncpg
 
     sup = await asyncpg.connect(rls_db.superuser_dsn)
@@ -422,11 +329,7 @@ async def test_audit_logs_update_delete_raise_insufficient_privilege(rls_db: Rls
 
 
 async def test_audit_insert_with_matching_tenant_succeeds(rls_db: RlsDb) -> None:
-    """Append stays open: the runtime role can still INSERT audit rows.
-
-    The revoke covers UPDATE/DELETE only — audit_logs is append-only,
-    not read-only, for incident_app.
-    """
+    """Append stays open: the revoke is UPDATE/DELETE only."""
     import asyncpg
 
     sup = await asyncpg.connect(rls_db.superuser_dsn)
@@ -451,16 +354,9 @@ async def test_audit_insert_with_matching_tenant_succeeds(rls_db: RlsDb) -> None
 async def test_foreign_tenant_audit_insert_needs_retargeted_setting(
     rls_db: RlsDb,
 ) -> None:
-    """The WITH CHECK that shapes the operator-audit writes in admin.py.
-
-    `POST /admin/tenants` and `PATCH /admin/tenants/{id}` write an audit
-    row belonging to the tenant being acted on, while the request's
-    `app.tenant_id` is the platform admin's OWN tenant. That INSERT is
-    refused (F1-08), which is why `app/api/admin.py::_set_rls_tenant`
-    retargets the setting at the subject tenant for the write — the same
-    `set_config` move `resolve_admin_tenant` makes for cross-tenant reads,
-    with no policy relaxed. Both halves are asserted here.
-    """
+    """The WITH CHECK behind admin.py's operator-audit writes: an audit row for the
+    subject tenant is refused while `app.tenant_id` is the admin's own (F1-08), which
+    is why `_set_rls_tenant` retargets the setting instead of relaxing a policy."""
     import asyncpg
 
     sup = await asyncpg.connect(rls_db.superuser_dsn)
@@ -499,13 +395,8 @@ async def test_foreign_tenant_audit_insert_needs_retargeted_setting(
 
 
 async def test_ddl_denied_for_incident_app(rls_db: RlsDb) -> None:
-    """The migration-vs-runtime split is real: no DDL for incident_app.
-
-    CREATE TABLE needs CREATE on the schema (only USAGE is granted);
-    ALTER TABLE needs table ownership (the migration role owns
-    everything). Both must fail with insufficient_privilege — DDL,
-    TRUNCATE and DROP POLICY power stays off the network-facing process.
-    """
+    """No DDL for incident_app: CREATE needs schema CREATE (only USAGE is granted)
+    and ALTER needs ownership, so DROP POLICY power stays off the facing process."""
     import asyncpg
 
     app = await asyncpg.connect(rls_db.app_dsn)
@@ -519,8 +410,7 @@ async def test_ddl_denied_for_incident_app(rls_db: RlsDb) -> None:
 
 
 async def test_incident_app_can_read_alembic_version(rls_db: RlsDb) -> None:
-    """GRANT ... ON ALL TABLES includes alembic_version — required: both
-    lifespans run assert_migrations_current as incident_app at boot."""
+    """alembic_version must be readable: both lifespans check it at boot."""
     import asyncpg
 
     app = await asyncpg.connect(rls_db.app_dsn)
@@ -532,14 +422,8 @@ async def test_incident_app_can_read_alembic_version(rls_db: RlsDb) -> None:
 
 
 async def test_rls_posture_probe_against_live_engines(rls_db: RlsDb) -> None:
-    """assert_rls_posture on real engines: the probe SQL itself.
-
-    As incident_app (non-superuser, non-owner) the posture is healthy —
-    no raise even under production settings. As the container superuser
-    RLS is bypassed wholesale, so production settings must raise. This is
-    the boot-time negative probe F1-01 asked for: it would have flagged
-    the original prod posture (owner, unforced) on the first deploy.
-    """
+    """assert_rls_posture on real engines: healthy as incident_app, raising as the
+    superuser under production settings — the negative probe F1-01 asked for."""
     from app.config import Settings
     from app.core.rls_check import assert_rls_posture
     from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -564,15 +448,9 @@ async def test_rls_posture_probe_against_live_engines(rls_db: RlsDb) -> None:
 
 
 async def test_job_delete_still_nulls_audit_fk_via_ri_bypass(rls_db: RlsDb) -> None:
-    """Deleting a job must still SET NULL audit_logs.job_id.
-
-    Referential actions execute with the *referencing table owner's*
-    privileges and bypass row security, so neither the UPDATE revoke on
-    audit_logs nor the restrictive deny policies block the FK's ON
-    DELETE SET NULL — this is what keeps scripts/reset_eval_state.py
-    (which deletes jobs and users) working as incident_app. Do not "fix"
-    a failing cascade by re-granting UPDATE.
-    """
+    """Deleting a job must still SET NULL audit_logs.job_id: referential actions run
+    with the referencing owner's privileges and bypass row security. Do not "fix" a
+    failure here by re-granting UPDATE."""
     import asyncpg
 
     sup = await asyncpg.connect(rls_db.superuser_dsn)
@@ -620,9 +498,7 @@ async def test_job_delete_still_nulls_audit_fk_via_ri_bypass(rls_db: RlsDb) -> N
         await sup.close()
 
 
-# ---------------------------------------------------------------------------
 # R2-26 — the boot probe must catch RLS being OFF, not just unFORCEd
-# ---------------------------------------------------------------------------
 
 
 async def _probe_as_app(rls_db: RlsDb, environment: str) -> None:
@@ -646,17 +522,9 @@ async def _probe_as_app(rls_db: RlsDb, environment: str) -> None:
 async def test_probe_catches_rls_switched_off_on_one_table(
     rls_db: RlsDb, caplog: Any
 ) -> None:
-    """A table with row-level security switched off entirely used to pass
-    as 'rls posture ok'.
-
-    The probe never selected `pg_class.relrowsecurity`, so it could only
-    see the *owner exemption* (FORCE off). For the non-owner production
-    role its inert calculation short-circuited to False no matter what,
-    which means the one runtime tripwire on the security boundary was
-    blind to the most direct way of disabling it. `DISABLE ROW LEVEL
-    SECURITY` on any tenant table and every query against it is
-    unconstrained.
-    """
+    """A table with RLS switched off entirely used to pass as ok: the probe never
+    selected `pg_class.relrowsecurity`, so it saw only the owner exemption and was
+    blind to the most direct way of disabling the boundary."""
     import asyncpg
 
     sup = await asyncpg.connect(rls_db.superuser_dsn)
@@ -685,12 +553,8 @@ async def test_probe_catches_rls_switched_off_on_one_table(
 async def test_probe_catches_a_dropped_tenant_isolation_policy(
     rls_db: RlsDb,
 ) -> None:
-    """RLS ENABLEd + FORCEd with no policy is not a safe posture — it is
-    a different one. Postgres denies by default when no policy matches,
-    so a dropped `tenant_isolation` does not leak rows; it silently
-    breaks the table instead, and either way the posture the probe
-    claims to verify is gone. It must not report ok.
-    """
+    """ENABLEd + FORCEd with no policy is a different posture, not a safe one, and
+    the probe must not report ok."""
     import asyncpg
 
     sup = await asyncpg.connect(rls_db.superuser_dsn)
@@ -700,13 +564,8 @@ async def test_probe_catches_a_dropped_tenant_isolation_policy(
         with pytest.raises(RuntimeError, match="row-level security"):
             await _probe_as_app(rls_db, "production")
     finally:
-        # Restore the policy the migration actually creates, WITH CHECK and
-        # all. The previous restore here rebuilt a USING-only policy with a
-        # bare `::uuid` cast — so every test ordered after this one ran
-        # against a `sagas` whose writes were unconstrained and whose reads
-        # raised on an empty-string GUC, rather than against the shipped
-        # policy. Nothing looked until
-        # `test_unscoped_writes_are_refused_on_every_tenant_table` did.
+        # Restore the policy the migration creates, WITH CHECK and all: a USING-only
+        # rebuild left every later test running against an unconstrained `sagas`.
         await sup.execute(
             "CREATE POLICY tenant_isolation ON sagas"
             "  USING (" + _STRICT_MATCH + ")"
@@ -720,28 +579,9 @@ async def test_probe_catches_a_dropped_tenant_isolation_policy(
 async def test_a_cleared_tenant_setting_is_refused_not_admitted(
     rls_db: RlsDb,
 ) -> None:
-    """WO-R2-129 — the inversion of the WO-R2-127 finding.
-
-    `app.tenant_id` is set with `set_config(..., true)` — **transaction-local**.
-    The admin digest route reads the window, ends that transaction so the
-    Anthropic round-trip holds no connection, and then INSERTs the result in a
-    new one. The setting does not carry over.
-
-    This test used to assert that the unscoped INSERT *succeeded* — because
-    every `tenant_isolation` policy opened with
-
-        current_setting('app.tenant_id', true) IS NULL OR ... = '' OR ...
-
-    the ADR 0003 bootstrap hatch, which made an unset setting fail **open**:
-    the policy was satisfied unconditionally, the statement ran with no tenant
-    isolation whatsoever, and nothing errored or logged. Its own assertion
-    message said that if this ever started raising, the branch had changed and
-    the finding needed rewriting rather than deleting. It has, and this is the
-    rewrite.
-
-    The bootstrap branch is gone (ADR 0026). An unscoped statement is now
-    refused on both halves: the write trips WITH CHECK, and the read returns
-    nothing rather than every tenant's rows.
+    """WO-R2-129, the inversion of WO-R2-127: `app.tenant_id` is transaction-local, so
+    the digest route's write phase is unscoped. The ADR 0003 bootstrap hatch made that
+    fail open; with it gone the write trips WITH CHECK and the read returns nothing.
     """
     import asyncpg
 
@@ -827,14 +667,8 @@ async def test_a_cleared_tenant_setting_is_refused_not_admitted(
 async def test_unscoped_writes_are_refused_on_every_tenant_table(
     rls_db: RlsDb,
 ) -> None:
-    """The finding was never specific to digests (WO-R2-129).
-
-    The bootstrap branch was in the policy text of all eleven tables, so
-    the fail-open default was wave-wide. Rather than trust that the
-    migration looped correctly, ask the server what predicate each policy
-    actually ended up with: no `tenant_isolation` policy may still admit
-    a session on the grounds that it set nothing.
-    """
+    """Never specific to digests (WO-R2-129): the bootstrap branch was in all eleven
+    policies, so ask the server what each one ended up with."""
     import asyncpg
 
     sup = await asyncpg.connect(rls_db.superuser_dsn)
@@ -867,13 +701,8 @@ async def test_unscoped_writes_are_refused_on_every_tenant_table(
 async def test_platform_scope_is_what_lets_the_worker_loops_work(
     rls_db: RlsDb,
 ) -> None:
-    """The declared-scope half of the design.
-
-    Without it the loops would be broken rather than secured: the outbox
-    relay, dispatcher and reapers are mixed-tenant by construction. The
-    declaration is transaction-local, so it cannot leak onto the next
-    request that checks the same pooled connection out.
-    """
+    """The declared-scope half: the loops are mixed-tenant by construction, and the
+    declaration is transaction-local so it cannot leak onto the next request."""
     import asyncpg
 
     sup = await asyncpg.connect(rls_db.superuser_dsn)
@@ -913,17 +742,9 @@ async def test_platform_scope_is_what_lets_the_worker_loops_work(
 async def test_service_accounts_preauth_read_survives_but_writes_do_not(
     rls_db: RlsDb,
 ) -> None:
-    """The one genuine non-`users` bootstrap consumer (ADR 0026).
-
-    `get_current_principal` -> `verify_token` reads `service_accounts`
-    two statements before `_apply_tenant_context` can issue `set_config`
-    — it is fetching the row that says which tenant this is. So the
-    unscoped SELECT has to keep working, or no machine principal could
-    ever authenticate and the whole MCP surface would go dark.
-
-    It is restored for `FOR SELECT` only: an unscoped session can still
-    resolve a token, and still cannot write.
-    """
+    """The one genuine non-`users` bootstrap consumer (ADR 0026): `verify_token` reads
+    `service_accounts` before `_apply_tenant_context` can name the tenant, so the
+    unscoped SELECT has to work — but it is restored `FOR SELECT` only."""
     import asyncpg
 
     sup = await asyncpg.connect(rls_db.superuser_dsn)
@@ -980,14 +801,8 @@ async def test_service_accounts_preauth_read_survives_but_writes_do_not(
 async def test_unscoped_deploy_marker_write_is_limited_to_platform_rows(
     rls_db: RlsDb,
 ) -> None:
-    """`deploy_markers` keeps `OR tenant_id IS NULL` — deliberate, ADR 0015.
-
-    Deploys are platform-wide, `tenant_id` is nullable by design, and
-    hiding NULL rows from tenant-scoped sessions would silently degrade
-    `get_deploy_history` to its env-var fallback. What WO-R2-129 changes
-    is the reach of an unscoped session: it may still write a NULL-tenant
-    marker, but it can no longer forge one belonging to a named tenant.
-    """
+    """`deploy_markers` keeps `OR tenant_id IS NULL` (ADR 0015); what WO-R2-129
+    changes is reach — an unscoped session can no longer forge a named tenant's."""
     import asyncpg
 
     sup = await asyncpg.connect(rls_db.superuser_dsn)
@@ -1023,17 +838,9 @@ async def test_unscoped_deploy_marker_write_is_limited_to_platform_rows(
 async def test_the_real_platform_session_factory_declares_the_scope(
     rls_db: RlsDb,
 ) -> None:
-    """Exercise `platform_session_factory` itself, not a hand-written GUC.
-
-    Everything else in this file speaks raw asyncpg, and the unit/API
-    suite runs on SQLite where the `after_begin` hook is a deliberate
-    no-op — so neither tier would notice if the factory stopped emitting
-    `set_config` on Postgres. That is the one component the worker loops
-    actually depend on: if it silently stopped working, the outbox relay
-    would fetch zero rows and all Kafka delivery would stop.
-
-    So: build both factories over a real engine and show the difference
-    is the factory, not the caller.
+    """Exercise `platform_session_factory` itself, not a hand-written GUC: everywhere
+    else speaks raw asyncpg and SQLite makes the `after_begin` hook a no-op, so no
+    tier would notice it stop emitting `set_config` and the relay fetching zero rows.
     """
     import asyncpg
     from app.core.tenant_scope import platform_session_factory

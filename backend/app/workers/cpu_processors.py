@@ -1,19 +1,9 @@
 """
-CPU-bound job processors using a ProcessPoolExecutor.
+CPU-bound job processors (doc_analysis, report_gen) on a ProcessPoolExecutor, which escapes the
+GIL where a thread would not. Progress is only reportable *between* submissions.
 
-Used for: doc_analysis, report_gen — work that is genuinely CPU-intensive
-(text extraction, aggregation, PDF rendering).  Running this on the event
-loop or even in a thread would peg a single CPU core and starve the GIL.
-A separate process gets its own GIL and its own CPU core.
-
-IMPORTANT: Functions submitted to ProcessPoolExecutor must be:
-  - Defined at module level (picklable)
-  - Purely synchronous — no asyncio, no SQLAlchemy, no Redis
-  - Self-contained — they receive plain dicts, return plain dicts
-
-Progress can only be reported *between* process submissions, not from
-inside the subprocess.  For fine-grained progress, split work into
-multiple smaller process submissions.
+IMPORTANT: anything submitted must be module-level (picklable) and purely synchronous — no
+asyncio, no SQLAlchemy, no Redis; plain dicts in, plain dicts out.
 """
 
 import multiprocessing
@@ -32,52 +22,22 @@ logger = get_logger(__name__)
 # We cap at 4 to avoid overwhelming the host in constrained environments.
 _MAX_POOL_WORKERS = 4
 
-# The pool is created lazily rather than at import time, for two reasons:
-#
-#  1. Start method. On Linux + CPython, multiprocessing defaults to fork. A
-#     pool built at import time forks whatever the process looks like *then*;
-#     by the time a CPU job runs, thread_adapters' csv-worker ThreadPoolExecutor
-#     and the Kafka/Redis clients are live, and forking a thread-laden process
-#     risks children that deadlock on a lock held by a thread that does not
-#     exist in the child. We pin an explicit spawn context instead, which costs
-#     ~0.5-1s of child startup on the first CPU job and nothing after.
-#     (macOS already defaults to spawn, which is why tests never saw this.)
-#
-#  2. Recovery. If a child is killed — OOM killer, ECS task pressure — the pool
-#     enters a permanently broken state and every subsequent submit raises
-#     BrokenProcessPool. With a module-level singleton that state survived until
-#     the task was restarted, so one dead child failed every later CPU job.
-#     _reset_pool() drops the broken pool so the next attempt rebuilds it.
+# Lazy, not import-time: forking a thread-laden process risks children deadlocked on a lock no
+# thread in the child holds, so a spawn context is pinned (~0.5-1s on the first CPU job); and one
+# killed child breaks the pool permanently, so `_reset_pool()` drops it instead.
 _process_pool: ProcessPoolExecutor | None = None
 
-# Guards the (pool, generation) pair. A threading lock rather than an
-# asyncio one because these two functions are plain sync calls, reachable
-# from any thread and from more than one event loop in tests; it is held
-# only around bookkeeping, never around a shutdown or a submit.
+# Guards the (pool, generation) pair. A threading lock, held only around bookkeeping.
 _pool_lock = threading.Lock()
 
-# Monotonic id of the *current* pool, handed out with it and quoted back
-# when a caller asks for a reset.
-#
-# Without it, `_reset_pool` dropped whatever pool happened to be current.
-# A dead child breaks the pool for every job at once, so several jobs
-# fail together and each one calls the reset: the first drops the broken
-# pool, an unrelated job rebuilds and submits, and the second reset then
-# tore down that healthy replacement — with `cancel_futures=True`, taking
-# live work with it, and leaving the next job to rebuild again. Comparing
-# generations makes a reset apply only to the pool its caller actually
-# observed as broken, so concurrent resets collapse into one rebuild
-# (WO-R2-64).
+# Monotonic id of the *current* pool, quoted back on a reset. Without it, a second job's reset tore
+# down the healthy replacement the first had rebuilt, with its live work (WO-R2-64).
 _pool_generation = 0
 
 
 def _get_pool() -> tuple[ProcessPoolExecutor, int]:
-    """Return the process pool and its generation, creating it on first use.
-
-    The generation travels with the pool deliberately: a caller cannot
-    ask for a correct reset without saying *which* pool it saw fail, and
-    returning them together is what stops the two reads drifting apart.
-    """
+    """Return the process pool and its generation, creating it on first use. They travel together
+    so a reset must name the pool its caller saw fail."""
     global _process_pool, _pool_generation
     with _pool_lock:
         if _process_pool is None:
@@ -92,12 +52,8 @@ def _get_pool() -> tuple[ProcessPoolExecutor, int]:
 def _reset_pool(generation: int | None = None) -> None:
     """Discard the pool `generation` identified, so the next call rebuilds.
 
-    Pass the generation returned alongside the pool that just failed. If
-    the current pool is a later one, someone has already handled this
-    breakage and rebuilt — the reset is a no-op rather than a teardown of
-    a healthy pool. `generation=None` means "drop whatever is current"
-    and is for teardown callers (tests, shutdown) that are not reacting
-    to a specific failure.
+    A later current generation means someone already rebuilt, so this is a no-op; `None` drops
+    whatever is current.
     """
     global _process_pool
     with _pool_lock:
@@ -134,12 +90,7 @@ MAX_GROUP_COUNT = 1000
 
 
 def _analyze_document(payload: dict[str, Any]) -> dict[str, Any]:
-    """
-    Simulates CPU-intensive document analysis (text extraction, NLP).
-
-    Real version: pdfplumber / pytesseract / spaCy — all CPU-bound and
-    Python-GIL-limited.  Running in a subprocess bypasses the GIL entirely.
-    """
+    """Simulates CPU-intensive document analysis; the real version is pdfplumber / spaCy."""
     # Clamped here, in the pure function, because it runs in the child and so
     # covers every caller — including replays, which republish a stored payload
     # without going back through request validation.
@@ -165,11 +116,7 @@ def _analyze_document(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _generate_report(payload: dict[str, Any]) -> dict[str, Any]:
-    """
-    Simulates CPU-intensive report generation (data aggregation, chart rendering).
-
-    Real version: pandas aggregations + matplotlib/reportlab — CPU-bound.
-    """
+    """Simulates CPU-intensive report generation; really pandas + matplotlib."""
     # Same reasoning as _analyze_document. group_count needs a floor of 1, not
     # 0: it is the divisor in the aggregation below, and group_count=0 silently
     # produced a report with zero groups (the comprehension body never ran).
@@ -198,12 +145,7 @@ async def process_doc_analysis(
     payload: dict[str, Any],
     publish: ProgressPublisher,
 ) -> dict[str, Any]:
-    """
-    Why a process pool here: pdfplumber/spaCy are CPU-bound and GIL-bound.
-    A thread would not help — only a separate process escapes the GIL.
-    We lose the ability to report granular progress from inside the process,
-    so we bracket with before/after publishes.
-    """
+    """Run doc analysis on the process pool, bracketed by before/after progress publishes."""
     import asyncio
     loop = asyncio.get_running_loop()
 
@@ -214,14 +156,8 @@ async def process_doc_analysis(
             pool, _analyze_document, payload
         )
     except BrokenProcessPool:
-        # A child died (OOM kill, host pressure). The pool is permanently
-        # broken; drop it and re-raise so _run_job's normal retry path picks
-        # this up — the next attempt builds a fresh pool instead of failing
-        # every CPU job from here until the task restarts.
-        #
-        # Scoped to the generation we submitted against: a sibling job
-        # failing on the same dead pool may already have rebuilt it, and
-        # tearing that replacement down would cancel its in-flight work.
+        # A child died, so the pool is permanently broken: drop it and re-raise into `_run_job`'s
+        # retry path, scoped to our generation so a sibling's rebuilt pool survives.
         logger.warning("cpu_processors.pool_broken", extra={"processor": "doc_analysis"})
         _reset_pool(generation)
         raise

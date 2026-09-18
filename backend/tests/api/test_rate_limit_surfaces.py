@@ -1,21 +1,12 @@
 """Per-principal and per-identity rate limiting (WO-R2-30).
 
-Three surfaces that made a paid or pool-consuming call per request with
-no limiter of any kind, while `CLAUDE.md` and `docs/REDIS.md` asserted
-the control existed:
+Three surfaces made a paid or pool-consuming call per request with no limiter of any kind, while
+`CLAUDE.md` and `docs/REDIS.md` asserted the control existed: `POST /mcp` (a tool-call storm
+saturates the MCP process's 5 + 10 connection pool), `POST /admin/query` (~$0.006 an Anthropic call)
+and `POST /admin/digests/generate` (~$0.018).
 
-  * `POST /mcp` — no rate limiting at all, despite CLAUDE.md's "every
-    MCP request ... is rate-limited per principal" since the server
-    shipped. A tool-call storm saturates the MCP process's DB pool
-    (SQLAlchemy defaults: 5 + 10 overflow = 15 connections).
-  * `POST /admin/query` — one Anthropic call per request (~$0.006).
-  * `POST /admin/digests/generate` — one Anthropic call per request
-    (~$0.018).
-
-Plus the window-semantics test: the shared limiter is a **fixed**
-window that three docstrings and two docs called *sliding*. The
-boundary test below pins the behaviour that actually exists so the
-`2 * limit` bound is a checked claim rather than a comment.
+Plus the window semantics: the shared limiter is a FIXED window that three docstrings and two docs
+called sliding, so the boundary test pins `2 * limit` as a checked claim.
 """
 
 from __future__ import annotations
@@ -45,13 +36,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 
 class _CountingRedis:
-    """Redis double that actually counts, so a limiter can trip.
-
-    The MCP suite's existing `_RedisStub` implements only `get`, which
-    means an `incr` against it raises `AttributeError` and the limiter
-    *fails open* — the tests would pass whether or not the limiter was
-    wired up at all. Counting for real is the whole point here.
-    """
+    """A Redis double that actually counts, so a limiter can trip: the MCP suite's `_RedisStub`
+    implements only `get`, so an `incr` raises `AttributeError` and the limiter fails open."""
 
     def __init__(self) -> None:
         self.counters: dict[str, int] = {}
@@ -86,9 +72,7 @@ def tight_limits(monkeypatch: pytest.MonkeyPatch):  # type: ignore[no-untyped-de
     get_settings.cache_clear()
 
 
-# ---------------------------------------------------------------------------
 # MCP surface — per principal
-# ---------------------------------------------------------------------------
 
 
 async def _mint_token(
@@ -163,9 +147,8 @@ async def test_mcp_refuses_one_principal_past_its_ceiling(
     body = resp.json()
     assert resp.status_code == 429
     assert body["error"]["code"] == protocol.MCP_RATE_LIMITED
-    # Still a well-formed JSON-RPC envelope — an MCP client that cannot
-    # parse the response reads it as a transport failure and retries,
-    # which is the opposite of backing off.
+    # Still a well-formed JSON-RPC envelope: a client that cannot parse the response reads a
+    # transport failure and retries, which is the opposite of backing off.
     assert body["jsonrpc"] == "2.0"
 
 
@@ -174,10 +157,8 @@ async def test_mcp_limit_is_per_principal_not_global(
     db_session: AsyncSession,
     default_tenant,
 ) -> None:
-    """A second principal is unaffected by the first exhausting its
-    allowance. This is the property the *name* of the control promises,
-    and the one an IP-keyed limiter would not deliver: both principals
-    reach the MCP process from the same address."""
+    """A second principal is unaffected by the first exhausting its allowance — the property the
+    name promises, and one an IP-keyed limiter would not deliver."""
     ac, redis = mcp_rl_client
     limit = get_settings().mcp_rate_limit_per_principal
 
@@ -223,9 +204,7 @@ async def test_mcp_fails_open_when_redis_is_down(
 async def test_mcp_unauthenticated_initialize_is_not_rate_limited(
     mcp_rl_client,  # type: ignore[no-untyped-def]
 ) -> None:
-    """`initialize` is deliberately allowed unauthenticated, so there is
-    no principal to key on. It must not consume — or be refused by — a
-    per-principal bucket."""
+    """`initialize` is deliberately unauthenticated: no principal to key on, so no bucket."""
     ac, redis = mcp_rl_client
     for _ in range(get_settings().mcp_rate_limit_per_principal + 3):
         resp = await ac.post("/mcp", json=_rpc("initialize"))
@@ -238,10 +217,8 @@ async def test_mcp_malformed_request_does_not_consume_allowance(
     db_session: AsyncSession,
     default_tenant,
 ) -> None:
-    """Parse errors are charged to nobody: the request never reached a
-    tool, and letting bad framing drain a good caller's bucket would
-    make the limiter a denial-of-service vector against its own
-    principal."""
+    """Parse errors are charged to nobody, or bad framing becomes a denial of service against the
+    principal the limiter protects."""
     ac, redis = mcp_rl_client
     token = await _mint_token(db_session, default_tenant, [Scope.TELEMETRY_READ.value])
     headers = {"Authorization": f"Bearer {token}"}
@@ -256,9 +233,7 @@ async def test_mcp_malformed_request_does_not_consume_allowance(
     assert "result" in ok.json()
 
 
-# ---------------------------------------------------------------------------
 # Paid admin endpoints
-# ---------------------------------------------------------------------------
 
 
 async def test_nl_query_refuses_past_its_ceiling(
@@ -348,11 +323,9 @@ async def test_digest_generate_refuses_past_its_ceiling(
     client._transport.app.dependency_overrides[get_redis] = _override_redis  # type: ignore[attr-defined]
 
     limit = get_settings().admin_digest_rate_limit
-    # `collect_window_stats` is the route's first call since WO-R2-127 split
-    # it into read / call / write; returning None is an empty window, which
-    # short-circuits before `generate_digest` — so no paid call is made and
-    # the limiter is still what decides the 429. Patching the old composed
-    # `run_digest_for_tenant` here would intercept nothing at all.
+    # `collect_window_stats` is the route's first call since WO-R2-127 split it into read / call /
+    # write; None is an empty window, which short-circuits before `generate_digest`, so no paid call
+    # is made and the limiter still decides the 429.
     read = AsyncMock(return_value=None)
     with patch("app.services.incident_digest.collect_window_stats", new=read):
         for n in range(limit):
@@ -365,11 +338,9 @@ async def test_digest_generate_refuses_past_its_ceiling(
             "/api/v1/admin/digests/generate", json={}, headers=admin_headers
         )
 
-    # The stub has to have been the thing that answered, or this test would
-    # pass just as well with the patch pointing at a function the route no
-    # longer calls: the real read also returns None on an empty window, so
-    # the status codes alone cannot tell the two apart. The refused call is
-    # rejected before the read, hence `limit` and not `limit + 1`.
+    # The stub has to have been what answered: the real read also returns None on an empty window,
+    # so the status codes alone cannot tell the two apart. The refused call is rejected before the
+    # read, hence `limit`.
     assert read.await_count == limit
 
     assert resp.status_code == 429
@@ -395,11 +366,9 @@ async def test_paid_endpoints_have_independent_buckets(
 
     client._transport.app.dependency_overrides[get_redis] = _override_redis  # type: ignore[attr-defined]
 
-    # `collect_window_stats` is the route's first call since WO-R2-127 split
-    # it into read / call / write; returning None is an empty window, which
-    # short-circuits before `generate_digest` — so no paid call is made and
-    # the limiter is still what decides the 429. Patching the old composed
-    # `run_digest_for_tenant` here would intercept nothing at all.
+    # `collect_window_stats` is the route's first call since WO-R2-127 split it into read / call /
+    # write; None is an empty window, which short-circuits before `generate_digest`, so no paid call
+    # is made and the limiter still decides the 429.
     with patch(
         "app.services.incident_digest.collect_window_stats",
         new=AsyncMock(return_value=None),
@@ -421,29 +390,19 @@ async def test_paid_endpoints_have_independent_buckets(
     assert resp.status_code == 200
 
 
-# ---------------------------------------------------------------------------
 # Window semantics — the claim the docs used to make
-# ---------------------------------------------------------------------------
 
 
 async def test_fixed_window_admits_2x_across_a_boundary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The limiter is a **fixed** window, and this is what that costs.
+    """The limiter is a FIXED window, and this is what that costs.
 
-    `int(time.time()) // window` buckets on absolute boundaries, so a
-    caller who spends its whole allowance just before the boundary gets
-    a fresh one immediately after: `2 * limit` requests inside a moment,
-    while never breaking the rule as implemented.
-
-    Three docstrings, `docs/REDIS.md` and `docs/ARCHITECTURE.md` all
-    called this *sliding*, which promises a bound the code has never
-    enforced (WO-R2-30). The behaviour is pinned here rather than
-    changed: `2 * limit` is a real bound, and every ceiling in this
-    change is sized against the doubled figure. A future switch to a
-    sorted-set sliding window should flip this test to assert the
-    refusal — that it has to be edited at all is the point.
-    """
+    `int(time.time()) // window` buckets on absolute boundaries, so a caller that spends its whole
+    allowance just before one gets a fresh allowance immediately after: `2 * limit` inside a moment,
+    without ever breaking the rule as implemented. Three docstrings and two docs called it sliding
+    (WO-R2-30). Pinned rather than changed — every ceiling is sized against the doubled figure, and
+    a switch to a sorted-set window has to edit this test."""
     redis = _CountingRedis()
     clock = {"now": 599.0}  # window 59 of a 10s window
     monkeypatch.setattr("app.utils.rate_limit.time.time", lambda: clock["now"])

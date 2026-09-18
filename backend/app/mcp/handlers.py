@@ -1,21 +1,8 @@
 """
-Dispatch layer — parse JSON-RPC, route to method, enforce scope on
-tools/call, wrap every call in `record_tool_invocation` for the audit
-trail. This is the layer that turns a bare-metal MCP request into a
-scope-checked, audited service-layer call.
-
-Error mapping to JSON-RPC codes:
-  - `ValidationError` (Pydantic)        → JSONRPC_INVALID_PARAMS
-  - `AuthenticationError` (AppError)    → MCP_UNAUTHORIZED
-  - `AuthorizationError` (AppError)     → MCP_FORBIDDEN
-  - unknown tool                        → MCP_TOOL_NOT_FOUND
-  - other `AppError`                    → MCP_TOOL_ERROR
-  - anything else                       → JSONRPC_INTERNAL_ERROR
-
-Every one of those is a JSON-RPC envelope: `tools/call` is wrapped end to
-end, so no exception — including one raised after the tool has already
-run — can reach the transport as a bare 500. See ADR 0010's 2026-08-30
-addendum for what the transaction looks like underneath.
+Dispatch layer — parse JSON-RPC, route to the method, enforce scope on
+`tools/call`, audit every call via `record_tool_invocation`. Every failure comes
+back as a JSON-RPC envelope, never a bare 500 (ADR 0010's 2026-08-30 addendum has
+the transaction underneath).
 """
 
 import time
@@ -51,50 +38,25 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 logger = get_logger(__name__)
 
-# Cached Tier-1 responses outlive any plausible retry window at 24h but
-# stop pinning the platform to a response forever — a leftover record with
-# no TTL is why repeat operator restores replayed stale results.
+# 24h — outlives any plausible retry window without pinning a response forever.
 _IDEMPOTENCY_TTL = timedelta(hours=24)
 
 SERVER_NAME = "incident-platform-mcp"
 SERVER_VERSION = "0.1.0"
-# The MCP spec is still versioned per calendar release. We echo the client's
-# requested version if we support it; otherwise pin to the version we test
-# against.
+# Pinned to the version we test against; the spec is versioned per release.
 SUPPORTED_PROTOCOL_VERSION = "2025-03-26"
 
 
 class AuditWriteFailedError(Exception):
-    """The audit row for this tool call could not be written.
-
-    Raised — never returned — so the request transaction unwinds. See
-    `_audit` for why that is the outcome we want.
-    """
+    """The audit row could not be written; raised so the request rolls back."""
 
 
 async def _audit(audit_repo: AuditRepository, **kwargs: Any) -> None:
     """Write the tool-invocation audit row, or fail the whole request.
 
-    `record_tool_invocation` is savepoint-wrapped and never raises, which
-    is what lets it run on paths that are already returning an error. The
-    cost of that shape was silence: if the row could not be written, the
-    call still returned 200 and the request transaction still committed,
-    so a Tier-1 action took effect with no record that it ever ran. A
-    caller-controlled `X-Request-ID` longer than `audit_logs.request_id`
-    was enough to trigger it on demand (R2-51).
-
-    Raising here converts that into the honest outcome. The exception
-    leaves `handle_tools_call` deliberately unconverted, so `get_db`'s
-    `session.begin()` block rolls the request back — the tool's own DB
-    writes go with it — and the standalone app's catch-all handler
-    returns a JSON-RPC internal error. An action whose audit row cannot
-    be written does not get to commit quietly.
-
-    Non-DB side effects (a Redis `DEL`, say) have already happened and
-    cannot be unwound; the client sees an error for a call that partly
-    landed, which is exactly what an unauditable action *is*. Retrying
-    under the same idempotency key is safe: the claim is released on
-    every path that does not complete.
+    `record_tool_invocation` never raises, so a dropped row used to leave a Tier-1
+    action committed with nothing recording it (R2-51); raising rolls it back. Redis
+    side effects cannot be unwound, but retrying under the same key is safe.
     """
     if not await record_tool_invocation(audit_repo, **kwargs):
         raise AuditWriteFailedError(str(kwargs.get("tool_name")))
@@ -146,22 +108,15 @@ def handle_initialize(
 
 
 def handle_tools_list(request_id: str | int | None) -> p.JsonRpcResponse:
-    """Advertise every registered tool: its description, both schemas, the
-    scope it needs and whether a repeat call is cached.
-
-    This is the contract the commander pins, so anything omitted here is a
-    change it cannot see.
-    """
+    """Advertise every registered tool. The commander pins this, so an omission
+    here is a change it cannot see."""
     tools = [
         p.ToolInfo(
             name=t.name,
             description=t.description,
             inputSchema=t.input_json_schema(),
             outputSchema=t.output_json_schema(),
-            # `.value` rather than the Scope member: model_dump() has to
-            # produce a bare JSON string, not an enum repr, or the
-            # commander's snapshot diffs on the serialization instead of
-            # on the scope.
+            # `.value`, not the Scope member: model_dump() must emit a bare string.
             required_scope=(
                 t.required_scope.value if t.required_scope is not None else None
             ),
@@ -185,38 +140,19 @@ async def handle_tools_call(
 ) -> p.JsonRpcResponse:
     """Transaction envelope around a single tool call.
 
-    Nothing gets out of here except a `JsonRpcResponse` — with one
-    deliberate exception, `AuditWriteFailedError`, which has to escape in
-    order to roll the request back rather than commit an action nothing
-    recorded. The standalone app converts it to an envelope. The work is in
-    `_run_tool_call`; this wrapper exists so that *every* step of it —
-    argument validation, execution, the audit write, the idempotency
-    store — is covered by one handler. It used to be that the
-    post-execution block sat past the end of the last `except`, so an
-    exception there (an idempotency-key collision, most plausibly)
-    unwound straight out of `dispatch` into Starlette. `get_db` saw the
-    exception on the way through and rolled the request transaction
-    back, taking the success audit row for an action that had already
-    run with it, and the client got a plain-text 500 it could only read
-    as a transport failure — so it retried, and the Tier-1 side effect
-    happened a second time with no audit row for either attempt.
+    Nothing escapes except `AuditWriteFailedError`, which must, so the request rolls
+    back rather than committing an action nothing recorded. The work is in
+    `_run_tool_call`; this wrapper covers every step of it under one handler.
     """
     try:
         return await _run_tool_call(request_id, params, ctx=ctx)
     except AuditWriteFailedError:
-        # The one exception this envelope does not convert. Returning a
-        # response here would commit the request transaction, which is
-        # the behaviour being fixed: the audit row is missing, so the
-        # work must not stand. Letting it out rolls the transaction back
-        # in `get_db` and the standalone app's catch-all turns it into a
-        # JSON-RPC internal error — still an envelope, still parseable,
-        # but 500 rather than a 200 that claims a clean run.
+        # The one exception this envelope does not convert: returning a response
+        # would commit a transaction whose audit row is missing (`get_db` rolls back).
         logger.exception("mcp tools/call not audited; failing the request")
         raise
     except Exception:
-        # Deliberately last-resort. Every *expected* failure is handled
-        # inside with an audit row attached; reaching here means an
-        # unhandled one, and the response still has to be an envelope.
+        # Last resort — expected failures are handled inside, with an audit row.
         logger.exception("mcp tools/call failed outside every handled path")
         return _error(
             request_id, p.JSONRPC_INTERNAL_ERROR, "internal server error"
@@ -229,10 +165,8 @@ async def _run_tool_call(
     *,
     ctx: ToolContext,
 ) -> p.JsonRpcResponse:
-    """Dispatch a tool by name. This is where scope enforcement lives —
-    the tool handler itself never sees the check. Every branch writes an
-    audit row via `record_tool_invocation` so operators can filter by
-    outcome on the Audit tab."""
+    """Dispatch a tool by name. Scope is enforced here, not in the handler, and
+    every branch writes an audit row."""
     audit_repo = AuditRepository(ctx.db)
     start = time.perf_counter()
 
@@ -271,9 +205,7 @@ async def _run_tool_call(
     # audit stream (see ADR 0008). Compute once so every branch gets it.
     is_chaos = tool_def.is_chaos
 
-    # Scope check. Machine-only surface — humans presenting a JWT are
-    # rejected upstream by the auth dependency, but a machine principal
-    # missing the specific scope hits this branch.
+    # Scope check — humans are rejected upstream by the auth dependency.
     if tool_def.required_scope is not None:
         if tool_def.required_scope.value not in ctx.principal.scopes:
             await _audit(
@@ -323,10 +255,8 @@ async def _run_tool_call(
         tool_def.required_scope.value if tool_def.required_scope else None
     )
 
-    # Idempotency check (Tier 1 actions only). A repeat call with the
-    # same (tenant, principal, key) + matching arguments returns the
-    # cached response without invoking the handler. Same key +
-    # different args refuses with IdempotencyKeyReusedError (409).
+    # Idempotency (Tier 1 only): same key + same args replays the cached
+    # response; same key + different args is a 409.
     idempotency_key: str | None = None
     idempotency_service: IdempotencyService | None = None
     claim: Claim | None = None
@@ -351,14 +281,9 @@ async def _run_tool_call(
                 p.JSONRPC_INVALID_PARAMS,
                 "idempotency_key is required for this tool",
             )
-        # Claim the key BEFORE executing, in one atomic INSERT ... ON
-        # CONFLICT DO NOTHING. The lookup this replaces sat in the same
-        # READ COMMITTED transaction as the insert that claimed the key,
-        # with the whole action in between: two concurrent calls on one
-        # key both missed the cache, both ran the action, and the loser
-        # then died on the unique constraint with its side effect already
-        # landed. Winning the insert is now what authorises execution, so
-        # the second caller never gets that far.
+        # Claim the key BEFORE executing, in one atomic INSERT ... ON CONFLICT DO
+        # NOTHING. The lookup this replaces let two concurrent calls on one key both
+        # run the action; winning the insert is now what authorises execution.
         try:
             acquired = await idempotency_service.acquire(
                 principal=ctx.principal,
@@ -409,14 +334,9 @@ async def _run_tool_call(
             return _ok(request_id, result.model_dump())
         claim = acquired
 
-    # SAVEPOINT around the handler. A tool that fails for any reason
-    # rolls back its own partial writes and nothing else: the request
-    # transaction stays open and usable, which is what lets the audit
-    # row below actually be written. The flush is inside the savepoint
-    # on purpose — a deferred DB error (constraint violation, FK drift —
-    # the class that sank #70) has to surface while there is still a
-    # savepoint to roll back to, not at the outer commit where the
-    # response has already been decided.
+    # SAVEPOINT around the handler: a failing tool rolls back its own writes, so
+    # the audit row below is still writable. The flush is inside it so a deferred
+    # DB error (the class that sank #70) surfaces while a savepoint still exists.
     executed = False
     try:
         async with ctx.db.begin_nested():
@@ -476,14 +396,9 @@ async def _run_tool_call(
     except Exception as exc:
         latency_ms = (time.perf_counter() - start) * 1000
         logger.exception("mcp tool crashed", extra={"tool": tool_def.name})
-        # The savepoint above already discarded whatever the tool staged
-        # before it died (#5), so the client's "internal tool error" and
-        # the database now agree. This used to be `await ctx.db.rollback()`,
-        # which closed the transaction `get_db` opened as a context
-        # manager: SQLAlchemy then refused every later statement with
-        # "Can't operate on closed transaction inside context manager",
-        # so the audit write below — savepoint-wrapped and silent on
-        # failure (#6) — was dropped to the log on every crashed call.
+        # The savepoint already discarded whatever the tool staged (#5), so the
+        # client's error and the database agree. Not a bare `ctx.db.rollback()` —
+        # that closes `get_db`'s transaction and drops the audit write below (#6).
         await _audit(
             audit_repo,
             principal=ctx.principal,
@@ -500,16 +415,9 @@ async def _run_tool_call(
             request_id, p.JSONRPC_INTERNAL_ERROR, "internal tool error"
         )
     finally:
-        # Release the claim on every path that will not go on to record a
-        # response. The envelope deliberately commits the request
-        # transaction even when the tool failed, so that the
-        # `outcome=error` audit row survives (#154) — which means a claim
-        # left behind commits with it and wedges the key for its whole
-        # 24h TTL, turning one failed call into a permanently unusable
-        # key. A retry has to be able to re-execute.
-        #
-        # `executed` is set at the end of the try body, so the success
-        # path reaches `complete` below instead of releasing here.
+        # Release the claim on any path that will not record a response: the
+        # envelope commits even when the tool failed (#154), so a claim left behind
+        # wedges the key for its whole 24h TTL. `executed` marks the success path.
         if claim is not None and idempotency_service is not None and not executed:
             await _release_claim(
                 ctx=ctx,
@@ -531,11 +439,8 @@ async def _run_tool_call(
         is_chaos=is_chaos,
     )
 
-    # Attach the response to the claim we already hold, so a repeat call
-    # with the same key returns this result verbatim. An UPDATE by id on
-    # a row this call inserted, so unlike the insert-after-execution it
-    # replaces, it cannot lose a race for the key — there is no race left
-    # to lose.
+    # Attach the response to the claim we hold so a repeat call replays it:
+    # an UPDATE by id on a row this call inserted, so no race to lose.
     if idempotency_service is not None and claim is not None:
         await _complete_claim(
             ctx=ctx,
@@ -545,10 +450,8 @@ async def _run_tool_call(
             output=output,
         )
 
-    # Emit the tool result as a single text content block whose body is
-    # the JSON-serialized output model. Structured content is the norm
-    # for our tools; the MCP `text` content type is a lowest-common
-    # denominator that every client can parse.
+    # One text content block holding the JSON-serialized output model — `text`
+    # is what every MCP client can parse.
     result = p.ToolCallResult(
         content=[p.ToolCallContent(text=output.model_dump_json())]
     )
@@ -565,20 +468,9 @@ async def _complete_claim(
 ) -> None:
     """Attach this call's response to the claim it already holds.
 
-    An UPDATE by primary key on a row this call inserted, so the
-    duplicate-key error that used to land here — a concurrent caller, or
-    an expired-but-unreaped record still occupying the unique index —
-    cannot happen: both are settled before the action runs now.
-
-    Still savepoint-wrapped, for the same reason #154 wrapped the insert.
-    The transaction at this point already holds the audit row for a
-    Tier-1 action that really did execute; that row is the agent's safety
-    grade (`evals/guards.py` reads `agent.tool_invoked`), so it outranks
-    the cache write. If the update somehow fails, Postgres would poison
-    the transaction and take the audit row down with it unless there is a
-    savepoint to roll back to. The response goes uncached and a retry
-    re-executes — the honest outcome, and strictly better than losing the
-    evidence that the first attempt ran.
+    Savepoint-wrapped for the same reason #154 wrapped the insert: the audit row for
+    an action that really ran outranks the cache write, so an uncached response and
+    a re-executing retry is the honest outcome.
     """
     try:
         async with ctx.db.begin_nested():
@@ -603,12 +495,8 @@ async def _release_claim(
 ) -> None:
     """Drop an unfinished claim so a retry can re-execute.
 
-    Savepoint-wrapped and never raising: this runs in a `finally` on
-    paths that are already returning an error response, and the audit row
-    for that error still has to be committable afterwards. A release that
-    cannot be written leaves the key claimed until its TTL — logged
-    loudly, because that is the one state where a retry gets
-    `idempotency_key_in_flight` for a call nobody is running.
+    Savepoint-wrapped and never raising: the error's own audit row still has to be
+    committable. A failed release leaves the key claimed until its TTL, so log loudly.
     """
     try:
         async with ctx.db.begin_nested():
@@ -621,10 +509,7 @@ async def _release_claim(
 
 
 def _extract_idempotency_key(arguments: dict[str, Any]) -> str | None:
-    """Idempotent tools declare `idempotency_key: str` in their input
-    model. We read the value out of raw arguments (pre-Pydantic parse)
-    so the check can run before/after model validation without
-    ambiguity."""
+    """Read `idempotency_key` out of raw arguments, before Pydantic parses them."""
     value = arguments.get("idempotency_key")
     if isinstance(value, str) and value:
         return value
@@ -632,9 +517,7 @@ def _extract_idempotency_key(arguments: dict[str, Any]) -> str | None:
 
 
 def _serialize_cached_response(response: dict[str, Any]) -> str:
-    """Re-serialize a cached response to the same wire shape a fresh
-    execution would produce. `default=str` mirrors what
-    `model_dump_json()` does for datetimes."""
+    """Re-serialize a cached response to the wire shape a fresh run produces."""
     import json as _json
 
     return _json.dumps(response, default=str)
@@ -654,11 +537,9 @@ async def dispatch(
 ) -> p.JsonRpcResponse:
     """Route a parsed JSON-RPC request to the right handler.
 
-    `principal_or_error` is either a `Principal` (auth succeeded) or an
-    `AppError` (auth failed). We only fail the request out for auth-
-    requiring methods; `initialize` is allowed unauthenticated so the
-    agent can complete the handshake before minting its scoped token
-    if it ever wants to."""
+    `initialize` is allowed unauthenticated; every other method needs a
+    `Principal` in `principal_or_error`.
+    """
 
     method = request.method
 

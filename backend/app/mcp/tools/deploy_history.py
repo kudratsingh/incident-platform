@@ -1,22 +1,10 @@
 """
 `get_deploy_history` — what's deployed on this environment.
 
-Preferred source: the `deploy_markers` table (populated by the release
-pipeline in the future, and by `scripts/seed_eval_fixtures.py` today).
-Returns the most recent N rows, newest first, optionally scoped to
-one environment.
-
-Fallback: if `deploy_markers` is empty **or the query itself errors
-(missing table, connection issue, etc.)** the tool returns a single
-synthetic "current" entry read from env vars (`APP_VERSION`,
-`APP_REVISION`, `BACKEND_IMAGE_TAG`).
-
-The DB error path is what makes this tool safe to expose during
-staged rollouts — earlier versions crashed with HTTP 500 when
-`deploy_markers` didn't exist yet (typical on a stack running an
-older image against a fresher DB, or before migrations settled).
-
-Requires `telemetry:read`.
+Prefers the `deploy_markers` table, newest first. Falls back to one synthetic entry
+from `APP_VERSION` / `APP_REVISION` / `BACKEND_IMAGE_TAG` when the table is empty or
+the query errors — which is what makes it safe on a staged rollout where
+`deploy_markers` may not exist yet. Requires `telemetry:read`.
 """
 
 import os
@@ -103,22 +91,16 @@ async def get_deploy_history(
 
     settings = get_settings()
 
-    # Try the DB path first. Any error — missing table (staged rollout,
-    # migration not yet applied), transient connection issue, transaction
-    # already in a failed state — falls through to the env-based synthetic
-    # entry rather than surfacing HTTP 500 to the agent. Logged as a
-    # warning so operators know they're on the fallback path.
+    # DB path first. Any error — missing table on a staged rollout, a connection
+    # issue — falls through to the env synthetic rather than a 500.
     from app.models.deploy_marker import DeployMarker
 
     rows: list[DeployMarker] = []
     total = 0
     db_error_note: str | None = None
-    # SAVEPOINT, not a bare `try`. The failure this fallback exists for —
-    # `deploy_markers` absent on a staged rollout — aborts the whole
-    # Postgres transaction, so before R2-59 the fallback returned happily
-    # and the envelope's audit write for this very call was then dropped
-    # on the floor. Rolling back to the savepoint keeps the session usable
-    # for everything that runs after the tool returns.
+    # SAVEPOINT, not a bare `try`: an absent `deploy_markers` aborts the whole
+    # Postgres transaction, so before R2-59 the fallback returned happily and this
+    # call's own audit write was dropped.
     async with degrade_on_db_error(ctx.db, what="deploy_markers") as probe:
         repo = DeployMarkerRepository(ctx.db)
         rows, total = await repo.list_recent(
@@ -144,9 +126,7 @@ async def get_deploy_history(
             source="deploy_markers",
         )
 
-    # Empty table (or DB error) → env-based single-entry synthetic.
-    # Behaviour matches the pre-table version of this tool so unseeded
-    # envs (fresh clones, CI) still get *something* useful.
+    # Empty table or DB error → env-based synthetic, so unseeded envs get something.
     app_version = os.getenv("APP_VERSION")
     image_tag = os.getenv("BACKEND_IMAGE_TAG")
     revision = os.getenv("APP_REVISION")

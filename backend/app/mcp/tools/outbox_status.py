@@ -1,47 +1,11 @@
 """
 `get_outbox_status` — how the transactional outbox is delivering right now.
 
-Every job state change is committed to Postgres together with a row in
-`outbox_events`; a background relay polls those rows once a second and
-publishes them to Kafka, stamping each one delivered (ADR 0001, ADR 0020). So
-the queue between "the database committed it" and "Kafka has it" is a table,
-and a relay that stops leaves that table growing while every existing dashboard
-reads green — `QueueDepth` measures the Redis delayed set, which a relay stall
-does not touch.
-
-Why this tool exists (WO-R3-201, plan 01 §7.1). Two faults look identical from
-the top — jobs accepted, nothing executing — and have opposite evidence:
-
-  * a consumer that stopped leaves the backlog in Kafka, so `get_consumer_lag`
-    climbs and the outbox stays empty;
-  * a relay that stopped leaves the backlog in Postgres, so this reading grows
-    and consumer lag stays flat, because nothing is reaching Kafka to fall
-    behind on.
-
-Without this tool the second fault is invisible: the agent can see the symptom
-and none of the discriminating evidence. Nothing here says *why* the relay is
-not running, and that is deliberate — a relay that was stopped on purpose must
-read exactly like one whose process died (ADR 0012, plan 01:106).
-
-Three properties the description below is written to hold, each paid for
-elsewhere in this campaign:
-
-  * **A healthy outbox reads healthy.** An empty queue is a zero count with
-    null ages, not a crash and not a suspicious null. And the one healthy
-    reading that looks alarming — an old `last_publish_at` on a platform with
-    no traffic — is named in the description rather than left to be
-    misdiagnosed.
-  * **Unknown is null with the reason, never a fabricated zero** (WO-R2-17's
-    lesson, applied to the relay heartbeat: a `0` age would read as a relay
-    that had just ticked).
-  * **One call carries the trend**, because the caller cannot let time pass
-    (WO-R3-254). Here the trend is in the reading itself: `oldest` and `newest`
-    unpublished ages bracket the backlog, so "arriving and not leaving" is
-    visible without a second call. Unlike the cached lag metric, this query is
-    live, so a second call a few seconds later really is new evidence.
-
-Requires `telemetry:read` — the same scope as `get_consumer_lag`, so one token
-sees both halves of the contrast or neither.
+Every job state change commits with a row in `outbox_events` that a background relay
+publishes to Kafka (ADR 0001, 0020, 0028). A stopped consumer climbs
+`get_consumer_lag` and leaves the outbox empty; a stopped relay does the opposite,
+and this tool is the only read that shows it (WO-R3-201). Nothing says *why* — a
+deliberate stop must read like a dead process (ADR 0012). Needs `telemetry:read`.
 """
 
 from datetime import datetime
@@ -52,22 +16,15 @@ from app.mcp.registry import ToolContext, tool
 from app.repositories.outbox import OutboxRepository
 from pydantic import BaseModel, ConfigDict, Field
 
-# The relay's poll interval, mirrored from `dispatcher.OUTBOX_RELAY_INTERVAL`
-# rather than imported: the MCP server runs as its own process and does not
-# import the worker package (same reason `consumer_lag.py` mirrors the lag
-# sample key). `tests/unit/test_outbox_status.py` imports both sides and fails
-# if one moves — a mirror without a tripwire is a lie waiting to happen.
-#
-# It is on the wire because an age means nothing without it: 3 seconds since
-# the last pass is normal, 300 is a stopped relay, and only this number says
-# where the line is.
+# Mirrored from `dispatcher.OUTBOX_RELAY_INTERVAL`, not imported: the MCP process
+# must not import the worker package (`tests/unit/test_outbox_status.py` fails if
+# one side moves). On the wire because an age means nothing without it: 3 s is
+# normal, 300 is a stopped relay.
 RELAY_TICK_INTERVAL_SECONDS = 1.0
 
 
 class GetOutboxStatusInput(BaseModel):
-    # No fields, and `extra="forbid"` on purpose: the description promises no
-    # filtering and no paging, and silently accepting a `limit` would make that
-    # promise unverifiable from the caller's side.
+    # No fields and `extra="forbid"`: the description promises no filtering or paging.
     model_config = ConfigDict(extra="forbid")
 
 
@@ -169,10 +126,8 @@ class GetOutboxStatusOutput(BaseModel):
 def _age_seconds(measured_at: datetime, at: datetime | None) -> float | None:
     """Seconds between a timestamp and the moment the reading was taken.
 
-    Clamped at 0 rather than allowed to go negative. Negative ages come from
-    clock skew between the worker and the database, and a caller can do nothing
-    useful with a minus sign; the field description says this is what a 0 can
-    also mean, so the clamp is disclosed rather than hidden.
+    Clamped at 0: a negative age is worker/database clock skew, and the field
+    description says so.
     """
     if at is None:
         return None
@@ -266,9 +221,7 @@ async def get_outbox_status(
     snapshot = await OutboxRepository(ctx.db).delivery_snapshot(
         tenant_id=ctx.principal.tenant_id
     )
-    # Read after the queue, and never fatal: a heartbeat the platform cannot
-    # produce is reported as unknown, while the counts — which come from the
-    # database and are the load-bearing half of the reading — still stand.
+    # Never fatal: a missing heartbeat reads unknown, the counts still stand.
     tick_at, unknown_reason = await read_relay_tick(ctx.redis)
 
     return GetOutboxStatusOutput(

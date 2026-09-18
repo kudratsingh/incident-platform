@@ -1,27 +1,11 @@
 """
 `get_trace` / `search_traces` — read the platform's trace history.
 
-Traces are the correlation IDs carried on every job and every audit
-row. `get_trace(trace_id)` pulls the job(s) + audit entries sharing
-one trace so the agent has full context. `search_traces` runs a
-constrained scan of recent jobs matching common filters and returns
-matching trace IDs — cheap enough to run against the jobs index.
-
-Both scoped to the caller's tenant. Both require `incidents:read`.
-
-`get_trace`'s audit half applies the same stream withholding
-`list_audit_events` does (`app.services.operator_audit.
-hidden_audit_action_prefixes`): a principal without `chaos:invoke` sees
-neither the lab's rows nor their count here, because a trace is another
-route into the same table and one chaos invocation's `request_id` is
-precisely the trace an investigating agent would follow.
-
-Both are bounded, and both say so (WO-R2-53). The agent cannot read this
-docstring — the tool *description* is the whole interface — so a window
-that behaves differently from what the description claims is a functional
-defect. `get_trace` reports `truncated` plus the true totals rather than
-promising completeness it cannot deliver; `search_traces` applies its
-NULL-trace filter in SQL so untraced rows cannot eat the result budget.
+`get_trace` pulls the jobs and audit rows sharing one trace; `search_traces` scans
+recent jobs and returns their trace ids. Both tenant-scoped, both `incidents:read`,
+and the audit half withholds the same streams `list_audit_events` does. Both are
+bounded and say so (WO-R2-53): `get_trace` reports `truncated` plus the true totals,
+`search_traces` filters NULL traces in SQL so untraced rows cannot eat the budget.
 """
 
 from datetime import datetime, timedelta
@@ -38,13 +22,9 @@ from pydantic import BaseModel, ConfigDict, Field
 # get_trace
 # ---------------------------------------------------------------------------
 
-# Result caps. Deliberate — a trace on a busy tenant can carry thousands of
-# audit rows and an MCP response is read into a context window — but they used
-# to be silent, under a description that promised "every artifact carrying a
-# given trace_id" (WO-R2-53). A cap the caller cannot see is a cap that makes
-# the caller wrong: an agent that reads 50 of 4000 jobs and concludes anything
-# about the trace has been misled by the tool, not by the data. They are named
-# here so the description, the output and the query cannot drift apart.
+# Result caps, deliberate — a busy tenant's trace can carry thousands of audit rows.
+# They used to be silent under a description promising completeness (WO-R2-53), and a
+# cap the caller cannot see makes the caller wrong. Named here so nothing drifts.
 MAX_TRACE_JOBS = 50
 MAX_TRACE_AUDIT_ROWS = 200
 
@@ -133,27 +113,17 @@ async def get_trace(inp: GetTraceInput, ctx: ToolContext) -> GetTraceOutput:
     total_audit: int | None = None
     if inp.include_audit:
         audit_repo = AuditRepository(ctx.db)
-        # Pull the audit rows carrying this request_id. AuditRepository
-        # doesn't have a trace_id column — it stores the request_id which
-        # is the same value in our middleware.
-        #
-        # Both predicates run in SQL: filtering request_id in Python over a
-        # recent window made the lookup decay as audit_logs grew (every MCP
-        # call appends a row), and the tenant filter is the actual isolation
-        # here — audit_logs is in the RLS list but RLS is inert in the real
-        # deployment. limit stays as a bound on the now-filtered query.
+        # `audit_logs` has no trace_id column; `request_id` is that value.
+        # Both predicates run in SQL: Python filtering decayed as the table grew,
+        # and the tenant filter is the real isolation.
         rows, total_audit = await audit_repo.list_logs(
             offset=0,
             limit=MAX_TRACE_AUDIT_ROWS,
             request_id=inp.trace_id,
             tenant_id=ctx.principal.tenant_id,
-            # Same withholding as `list_audit_events`, for the same
-            # reason and from the same rule — a trace is just another way
-            # to ask `audit_logs` a question, and one chaos invocation's
-            # request_id is exactly the trace an investigating agent
-            # follows. Excluded rows are out of `total_audit_events` too,
-            # so `truncated` stays a statement about what was capped
-            # rather than about what was hidden.
+            # Same withholding as `list_audit_events` — a chaos invocation's
+            # request_id is the trace an agent follows, and excluded rows leave
+            # `total_audit_events` too.
             exclude_action_prefixes=hidden_audit_action_prefixes(ctx.principal),
         )
         for row in rows:
@@ -258,18 +228,14 @@ async def search_traces(
         status=inp.status,
         job_type=inp.job_type,
         created_after=created_after,
-        # The NULL-trace filter belongs in SQL, ahead of the LIMIT. Dropping
-        # those rows in Python afterwards spent the budget on jobs that were
-        # about to be discarded, so on a table dominated by untraced jobs the
-        # tool reported "no traces" for traces that existed (WO-R2-53).
+        # NULL-trace filter in SQL, ahead of the LIMIT: in Python it spent the
+        # budget and answered "no traces" for existing ones (WO-R2-53).
         require_trace_id=True,
     )
 
     matches = [
         TraceMatch(
-            # Non-null by construction now — `require_trace_id` excludes both
-            # NULL and empty. The fallback keeps the type checker happy
-            # without pretending the column is non-nullable.
+            # Non-null by construction; the fallback is for the type checker.
             trace_id=j.trace_id or "",
             job_id=str(j.id),
             job_type=j.type,

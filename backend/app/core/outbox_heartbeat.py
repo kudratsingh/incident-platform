@@ -1,41 +1,13 @@
 """When the outbox relay last completed a pass, recorded where another process
 can read it.
 
-The relay is a loop inside the worker process (`_outbox_relay_loop`). From
-outside that process its work is visible only through what it has already
-delivered — which is enough while events are flowing and useless when the queue
-is empty. An idle relay and a stopped relay both publish nothing, so "nothing
-was delivered recently" cannot tell them apart, and that ambiguity is exactly
-what a caller investigating a queue that is not moving has to resolve. One key,
-written by the relay on every pass it completes, separates the two. It is also
-the only way a reader in the MCP process can observe the loop at all: the two
-run in different processes from the same image (ADR 0006), so nothing
-in-memory crosses between them.
-
-Three deliberate choices, each of which the obvious alternative gets wrong:
-
-  * **Written by the work, not by the loop around it.** The stamp goes inside
-    `_outbox_relay_tick`, after the fetch that proves the queue was reachable.
-    Written higher up — before the leader gate or before the per-iteration skip
-    check — it would mean "the coroutine is alive", and a loop that spins
-    without doing its pass is precisely the state this signal exists to expose.
-  * **Derived from the pass, not from a gauge.** `_emit_outbox_gauges` runs at
-    most once a minute, so a heartbeat read off it would have a 60-second
-    resolution and could not distinguish a relay that stopped 5 seconds ago
-    from one running normally. The relay polls every second, so a per-pass
-    stamp gives the reading a one-second resolution instead.
-  * **Not under `chaos:*`.** This is a platform signal with a platform writer.
-    The reset script's `chaos:*` sweep must not clear it, and the name of the
-    key that records *that* a relay is not running must not hint at *why*
-    (ADR 0012).
-
-Failure posture differs by direction, on purpose. The **write** fails open,
-matching `control_loop_pause.loop_is_paused`: the relay exists to deliver
-events, and a diagnostic write must never cost a tick. The **read** fails
-*known*: an absent or unparseable record is reported as unknown together with
-the reason, never as an age. A fabricated `0` would read as a relay that had
-ticked at the instant the caller asked, which is the one answer this signal
-must never give.
+An idle relay and a stopped relay both publish nothing, so delivery alone cannot
+tell them apart, and the MCP reader is in another process (ADR 0006). So the stamp
+goes inside `_outbox_relay_tick` — not around the loop, which would only mean the
+coroutine is alive — once per one-second pass rather than off the once-a-minute
+gauge, and outside `chaos:*` so the reset sweep cannot clear it (ADR 0012). The
+write fails open (a diagnostic must never cost a tick); the read fails *known*, so
+an absent record is reported as unknown with a reason and never as an age.
 """
 
 from datetime import UTC, datetime
@@ -49,16 +21,11 @@ logger = get_logger(__name__)
 #: listed in `docs/REDIS.md`'s key catalog alongside every other key.
 RELAY_TICK_KEY = "outbox:relay:last_tick"
 
-#: Generous on purpose. This value is evidence about a loop that may have been
-#: stopped for a long time, and an expired key downgrades a real age to
-#: "unknown" — honest, but weaker evidence than a number. A day covers any
-#: stall worth investigating, and one ~32-byte key refreshed once a second
-#: costs nothing.
+#: Generous on purpose: an expired key downgrades a real age to "unknown",
+#: and a day covers any stall worth investigating.
 RELAY_TICK_TTL_SECONDS = 86_400
 
-#: Why a tick time is unknown, in the words the caller is handed. Constants
-#: rather than inline strings so the set is closed, pinned by a test, and
-#: cannot drift between the reader and the tool that reports it.
+#: Why a tick time is unknown, in the caller's words. Closed set, pinned by a test.
 TICK_UNKNOWN_NO_RECORD = (
     "no completed relay pass is on record: either none has run since this "
     "platform started, or the last one is older than the platform keeps"
@@ -74,12 +41,7 @@ TICK_UNKNOWN_UNREACHABLE = (
 
 
 def _client() -> Any:
-    """A Redis handle, imported at call time.
-
-    Deferred for the same reason `loop_is_paused` defers it: a unit path that
-    exercises a loop must not have to stand up a Redis client, and the worker
-    package is imported in contexts where the pool has not been built.
-    """
+    """A Redis handle, imported at call time — like `loop_is_paused`, to avoid a live pool."""
     from app.core.redis import get_redis_client
 
     return get_redis_client()
@@ -90,17 +52,14 @@ async def record_relay_tick(
 ) -> None:
     """Stamp "the relay completed a pass", with the time it happened.
 
-    Best-effort by design — see the module docstring on the split failure
-    posture. `redis` and `now` are injectable so a test can drive both sides of
-    the key without a live client or a real clock.
+    Best-effort by design; `redis` and `now` are injectable.
     """
     stamp = (now or datetime.now(UTC)).isoformat()
     try:
         client = redis if redis is not None else _client()
         await client.set(RELAY_TICK_KEY, stamp, ex=RELAY_TICK_TTL_SECONDS)
     except Exception as exc:
-        # Warning, not error: the relay did its job, and the loop must not
-        # treat a lost diagnostic as a failed pass.
+        # Warning: a lost diagnostic is not a failed pass.
         logger.warning(
             "outbox relay pass not recorded", extra={"error": str(exc)}
         )
@@ -109,13 +68,8 @@ async def record_relay_tick(
 async def read_relay_tick(redis: Any) -> tuple[datetime | None, str | None]:
     """`(time of the last completed relay pass, reason it is unknown)`.
 
-    Exactly one side is populated: a time with no reason, or a reason with no
-    time. That shape is what lets the caller-facing tool report "unknown, and
-    here is which kind of unknown" without ever inventing an age.
-
-    A stamp with no offset can only come from a writer that dropped it; the
-    platform's clock is UTC everywhere, so it is read as UTC rather than an
-    otherwise good record being discarded.
+    Exactly one side is populated, so the tool can report which kind of unknown
+    it has without inventing an age. A stamp with no offset is read as UTC.
     """
     try:
         raw = await redis.get(RELAY_TICK_KEY)

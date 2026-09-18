@@ -1,150 +1,27 @@
-"""
-`create_stuck_dag` — manufacture a dependency chain that is genuinely
-stuck and stays stuck until remediated.
+"""`create_stuck_dag` — manufacture a dependency chain that is genuinely stuck.
 
-The `remediate_runaway_saga_success` scenario needs a DAG that is not
-making progress at probe time. The boot-seeded three-node DAG cannot
-provide one: its parent is `completed`, so the resolver (or the resume
-sweep) promotes the whole chain within seconds of boot and the fault
-evaporates before the agent ever probes it. This hook builds the chain
-the scenario actually describes:
+Three shapes (WO-R3-274, ADR 0029). Default `root_status="dead_letter"`:
+upstream completed → root dead-lettered → N descendants `waiting`, stuck by the
+platform's own rules (a child promotes only at `unmet_count == 0`, `dead_letter`
+is terminal, and no `saga_id` means nothing cancels it). `root_status="completed"`
+strands the chain with no dead-letter row to replay, and does NOT hold alone: it
+needs `kill_consumer('dependency-resolver')` AND
+`pause_control_loop('resume_unblocked_waiting')`, and only the pause's TTL heals
+it (WO-R3-213, ADR 0027's 2026-09-17 amendment). Adding `failed_step=K`
+dead-letters descendant K under a live root, and that shape holds alone.
 
-    upstream (completed) → root (dead_letter) → N descendants (waiting)
+Rows are inserted, not transitioned, so #165's CANCELLED cascade (ADR 0022 §3)
+never fires: read the result as a declared instance of the pre-#165 stuck mode,
+not live behaviour. `replay_dlq_by_ids` on the root unsticks it, `pause_dag` only
+stabilizes (commander ADR 0026). The dead-lettered row's text derives from the
+declared `remediation_hint` through `app.lab.dlq_failure_stories` (WO-R2-146);
+`child_age_seconds` backdates the whole chain, parents included.
 
-## Three chain shapes, one hook (WO-R3-274, ADR 0029)
-
-`root_status` picks between two, and `failed_step` splits the second.
-The default is the chain above, byte for byte:
-
-  * `root_status="dead_letter"` (default) — the chain above. Stuck by
-    the platform's own rules; see the next section.
-  * `root_status="completed"` — upstream completed → root **completed**
-    → step-1..N `waiting`, and **no dead-letter row anywhere**. Plan 01
-    §7.2's `resolver_stall` world: the discriminator is an absence, so
-    the correct answer is to escalate rather than to replay something.
-  * `root_status="completed"` + `failed_step=K` — the same, except
-    descendant K is `dead_letter` and the K-1 descendants ahead of it are
-    `completed`, because a job cannot have been dispatched before its own
-    parent finished. Plan 01 §7.2's `downstream_child_failed`: the root
-    is fine and something further down is not.
-
-**The completed-root shapes are not self-sustaining, and the description
-says so.** With the root `completed`, step-1 has no unmet parent, so both
-promoters will drain it: the `dependency-resolver` consumer group on the
-next `job.completed` redelivery, and `_resume_unblocked_waiting_loop`
-within ~10 s regardless. Stranding that child takes both stalls —
-`kill_consumer('dependency-resolver')` and
-`pause_control_loop('resume_unblocked_waiting')` — which is the finding
-of WO-R3-213 and the 2026-09-17 amendment to ADR 0027. This hook writes
-the rows; those two hooks keep them. Advertising a "stuck" chain that
-quietly drains would be the fourth description rule's exact failure
-(CLAUDE.md: never advertise a safety property the tool cannot deliver),
-so the description names both companions. The `failed_step` shape is the
-exception and needs neither: no `waiting` row in it has a `completed`
-parent (K-1 of them are themselves `completed`, and everything behind K
-waits on a `dead_letter`, which is terminal), so it is stuck the same way
-the default chain is.
-
-Why the default chain is stuck by the platform's own rules, not by
-simulation:
-
-  * `DependencyResolver` promotes a WAITING child only when
-    `unmet_count == 0` — every parent `completed`
-    (`app/workers/dependency_resolver.py`). The resume sweep applies
-    the same gate.
-  * `dead_letter` is terminal. Nothing retries it — the delayed-retry
-    loop and the LLM retry policy act before dead-letter, the stale
-    sweeps act on PENDING/RUNNING — so the root never emits the
-    `job.completed` the descendants are waiting for.
-  * The chain carries no `saga_id`, so the saga coordinator never
-    cancels the descendants.
-
-That last point used to read "plain-DAG descendants of a dead-lettered
-parent stay `waiting` indefinitely — the platform's real stuck mode".
-Since #165 that is true only of *directly-inserted* rows, which is what
-this hook writes. `JobRepository.update_status` now cascades CANCELLED
-to non-saga WAITING descendants when a parent *transitions* into
-DEAD_LETTER or CANCELLED — ADR 0022 §3,
-`docs/ADR/0022-promotable-only-resume-sweep-and-dependency-cascade.md`
-— so a chain that reached this shape by transition would drain
-itself. This hook inserts the terminal status rather than transitioning
-into it, so the cascade never fires on it — a genuine property of where
-that chokepoint sits, not luck. The manufactured state is therefore
-still stuck by the platform's rules, but it is a state the platform no
-longer *produces* on its own; treat it as a declared instance of the
-pre-#165 stuck mode rather than as a sample of live behaviour.
-
-Compensating actions (ADR 0008 amendment — named on both sides):
-
-  * `replay_dlq_by_ids` on `root_job_id` genuinely unsticks the chain:
-    replay resets the root to `pending`, the dispatcher completes it,
-    and the resolver promotes each descendant in turn. Round-trip test:
-    `test_create_stuck_dag_round_trip_with_replay_dlq_by_ids` in
-    `tests/api/test_mcp_chaos_stuck_dag.py`.
-  * `pause_dag(root_job_id)` stabilizes without fixing: `get_dag_state`
-    reads `paused=true` while descendants hold in `waiting`, and the
-    pause self-cleans on TTL — so the chain is stuck again the moment it
-    lapses, and while it holds the platform refuses the replay above.
-    The scenario grades the replay, not the pause (commander ADR 0026 —
-    a stabilizer is not a resolution). This bullet used to call the
-    pause "the stabilization the scenario grades", which stopped being
-    true when that scenario was redesigned around the replay.
-
-The dead-lettered row's `error_message` is derived from the
-`remediation_hint` the call declares, through
-`app.lab.dlq_failure_stories`. The two have to agree: the agent reads
-that row before deciding whether a replay is safe, and a `replay_safe`
-root whose text named a permanent schema violation is what made it
-escalate on a scenario graded for a replay (WO-R2-146). "That row" is
-the root under the default, descendant `failed_step` when one is asked
-for, and **nothing at all** under a bare `root_status="completed"` — a
-chain with no dead-letter row has nothing to carry a hint, so both
-fields go unused rather than being stamped somewhere they would read as
-a fault the world does not contain.
-  * Every row is tagged `payload.seeded_fixture = true`, so the reset
-    sweep (`scripts/reset_eval_state.py::_delete_seeded_dlq_fixtures`)
-    DELETEs the whole chain — edges CASCADE with the jobs (ADR 0012
-    rule 2 disposal). A demo stack can never be left permanently
-    wedged: replay drains the chain, and reset deletes it.
-
-IDs derive from `uuid5(namespace, f"{tenant_id}:{chain_name}:{role}")`
-— same deterministic-pinning convention as
-`scripts/seed_eval_fixtures.py`, distinct namespace — so a scenario can
-pin the root id in YAML before the hook ever runs, given the tenant it
-will run as. The tenant id is in the key deliberately: the idempotency
-probe below runs on the RLS-scoped MCP session, so a chain another
-tenant manufactured under the same `chain_name` would be *invisible* to
-it and the hook would fall through to an INSERT that collides on the
-primary key — a 500 where the contract promises a 409. Widening the
-probe past RLS to see that row would be the wrong repair; making the id
-space per-tenant means the collision cannot be represented at all, and
-two tenants can drill the same `chain_name` concurrently.
-
-Re-invoking with the same `chain_name` while the chain is intact is
-idempotent; once any row has drifted (someone remediated it) — or the
-stored chain is *longer* than the one now being asked for — the hook
-refuses rather than rewriting history or under-reporting it. Pick a
-fresh `chain_name` or reset the environment. Note what that means across
-shapes: the ids do not depend on `root_status`, so asking for a
-*different* shape under a `chain_name` that already exists is drift, not
-a repeat, and is refused with `stuck_chain_name_in_use` — the statuses
-do not match. That is the intended reading; rewriting a chain's shape
-under its own name would silently change the world a scenario already
-pinned.
-
-`child_age_seconds` backdates `created_at`/`updated_at` on **every** row
-in the chain, not only the descendants. Plan 01 §7.2 reads "child
-created_at age large" and the platform's own proof used 47 minutes
-(`tests/integration/test_resolver_stall.py`), which is what the field is
-named for — but moving only the descendants would make them older than
-the parents they depend on, a graph the platform cannot produce. Dispatch
-timestamps (`started_at` / `completed_at`) are left NULL on every row,
-exactly as they already were, so the backdate is one column pair and not
-a second lifecycle to keep coherent.
-
-Chaos-only surface: gated behind `CHAOS_ENABLED=true` + `chaos:invoke`
-scope + `environment_wide` blast radius label. See ADR 0008 gating.
-Writes directly to `jobs` / `job_dependencies`; doesn't touch Kafka.
+Ids are `uuid5(ns, f"{tenant_id}:{chain_name}:{role}")` — pinnable, per-tenant,
+and independent of the shape, so re-invoking a `chain_name` in another shape is
+drift (`stuck_chain_name_in_use`). Rows carry `payload.seeded_fixture = true`, so
+the reset DELETEs the chain and edges CASCADE (ADR 0012 rule 2). ADR 0008 gated;
+writes `jobs` / `job_dependencies`, never Kafka.
 """
 
 import uuid
@@ -158,12 +35,9 @@ from app.lab.dlq_failure_stories import default_error_for
 from app.mcp.chaos import BlastRadius, chaos_tool
 from app.mcp.registry import ToolContext
 
-# Deliberately reuses seed_dlq_messages' marker, owner fallback, and hint
-# validation so the two declared-fixture hooks stay in lockstep — same
-# disposal rule, same chaos-owner cleanup, same hint vocabulary (see that
-# module's docstring). The canned error strings are shared too, but they
-# now come from `app.lab.dlq_failure_stories` rather than from a dict in
-# that module.
+# Reuses seed_dlq_messages' marker, owner fallback and hint validation so the
+# declared-fixture hooks stay in lockstep; error strings now come from
+# `app.lab.dlq_failure_stories`.
 from app.mcp.tools.chaos.seed_dlq_messages import (
     SEEDED_FIXTURE_MARKER,
     _fixture_owner,
@@ -178,27 +52,18 @@ from sqlalchemy import select
 
 logger = get_logger(__name__)
 
-# uuid5 namespace for chain ids. Fixed and documented so a scenario can
-# precompute the ids it pins:
-# root = uuid5(ns, f"{tenant_id}:{chain_name}:root").
-# Distinct from the eval seed's namespace so a chain can never collide
-# with a boot-seeded fixture id.
+# uuid5 namespace for chain ids: root = uuid5(ns,
+# f"{tenant_id}:{chain_name}:root"). Distinct from the eval seed's.
 _NAMESPACE = uuid.UUID("cccccccc-57ac-4000-8000-000000000000")
 
-# Upper bound on `waiting_steps`, and therefore on the chain's whole id
-# space. One constant because the integrity probe has to enumerate every
-# id this hook could *ever* have written for a chain_name — not just the
-# ones the current call wants — to notice descendants left by a longer
-# earlier call. Raising the field bound without raising this one would
-# blind the probe to the new tail.
+# Upper bound on `waiting_steps`, and so on the chain's whole id space: the
+# integrity probe enumerates every id this hook could ever have written for a
+# chain_name, to notice descendants left by a longer earlier call.
 _MAX_WAITING_STEPS = 10
 
-# Upper bound on `child_age_seconds` — one day. Bounded for the same reason
-# every other lab dial here is: an unbounded backdate puts a fixture outside
-# `search_traces(since_hours=...)`'s widest window (168 h) and outside any age
-# an operator would believe of a chain on a stack that is usually hours old.
-# A day is comfortably more than the 47 minutes the platform's own stranded-
-# child proof uses.
+# Upper bound on `child_age_seconds` — one day. An unbounded backdate would put
+# a fixture outside `search_traces(since_hours=...)`'s widest window (168 h) and
+# outside any age an operator would believe.
 _MAX_CHILD_AGE_SECONDS = 86_400
 
 
@@ -315,18 +180,11 @@ class CreateStuckDagInput(BaseModel):
         """Two inputs that are not independent, refused before any write.
 
         A dead-lettered root *and* a dead-lettered descendant is two faults in
-        one chain and no world the plan asks for; and a `failed_step` past the
-        end of the chain would silently address a descendant this call is not
-        creating. Both are argument errors (JSON-RPC invalid params), not
+        one chain, and a `failed_step` past the end would address a row this
+        call is not creating. Both are JSON-RPC invalid params, not
         `stuck_chain_name_in_use` — nothing about the environment is wrong.
-
-        `PydanticCustomError`, not a bare `ValueError`, for the reason
-        `saturate_redis._bound_total_footprint` gives: the MCP handler returns
-        `exc.errors()` as the invalid-params payload and json-encodes it, and
-        pydantic puts the raised *exception object* in `ctx` for a plain
-        `ValueError` — which is not serializable, so the refusal would leave as
-        a 500 instead of the invalid params it is. A custom error's ctx is the
-        dict passed here.
+        `PydanticCustomError` for the reason
+        `saturate_redis._bound_total_footprint` gives.
         """
         if self.failed_step is None:
             return self
@@ -461,10 +319,8 @@ async def create_stuck_dag(
         sid for sid in step_ids if expected[sid] == JobStatus.WAITING.value
     ]
 
-    # Probe the chain's *whole* id space, not just the rows this call
-    # wants, so a longer chain left by an earlier call is visible as
-    # extra descendants instead of being silently omitted from the
-    # response (R2-55). Still a primary-key IN over at most 12 ids.
+    # Probe the whole id space, not just this call's rows, so a longer chain
+    # from an earlier call shows up as extra descendants (R2-55).
     existing = (
         (
             await ctx.db.execute(
@@ -492,16 +348,12 @@ async def create_stuck_dag(
         )
 
     user = await _fixture_owner(ctx, tenant_id)
-    # Derived from the hint this call declares, never fixed: the row the
-    # agent reads has to describe a failure the declared hint's action
-    # would actually fix. A chain seeded `replay_safe` whose root said
-    # SchemaValidationError is what made the agent escalate, correctly,
-    # on a scenario graded for a replay (WO-R2-146).
+    # Derived from the declared hint: a `replay_safe` chain whose root said
+    # SchemaValidationError made the agent escalate, correctly (WO-R2-146).
     error_message = inp.error_message or default_error_for(hint)
 
-    # `created_at`/`updated_at` are only passed when a backdate was asked
-    # for, so the default call writes exactly the rows it always wrote and
-    # lets the server default stamp them.
+    # Passed only for a backdate; otherwise the server default stamps
+    # them.
     timestamps: dict[str, datetime] = {}
     if inp.child_age_seconds:
         backdated = datetime.now(UTC) - timedelta(seconds=inp.child_age_seconds)
@@ -569,11 +421,8 @@ async def create_stuck_dag(
 def _step_status(position: int, failed_step: int | None) -> str:
     """Status for descendant `position` (1-based) given the failed step.
 
-    With no `failed_step` every descendant is `waiting`. With one, the chain
-    reads as a run that got as far as N and stopped there: the descendants
-    ahead of it must be `completed`, because the platform cannot dispatch a
-    job whose parent has not finished, and the ones behind it are `waiting`
-    on a row that will never complete.
+    Rows ahead of the failed one are `completed`, because nothing dispatches
+    before its parent finishes; the rest stay `waiting`.
     """
     if failed_step is None or position > failed_step:
         return JobStatus.WAITING.value
@@ -590,20 +439,12 @@ def _assert_intact(
 ) -> None:
     """Idempotent repeat vs. drifted chain.
 
-    A repeat call that finds exactly the manufactured rows present, in
-    the caller's tenant, with exactly the manufactured statuses is a
-    no-op. Anything else — a partial chain, a chain someone has already
-    remediated (root replayed, descendants promoted), a chain that is
-    *longer* than the one asked for, or a chain built under this
-    `chain_name` in a *different shape* (the ids do not depend on
-    `root_status` or `failed_step`, so a shape change reads here as a
-    status mismatch, which is exactly right) — is refused: re-manufacturing would
-    mean rewriting rows that are now history, and returning `intact`
-    would mean under-reporting the chain the caller then reasons about.
-    The caller picks a fresh `chain_name` or resets the environment.
-
-    `existing` must cover the chain's whole id space, not just
-    `expected`; that is what makes the extra-descendant arm reachable.
+    Exactly the manufactured rows, in the caller's tenant, with exactly the
+    manufactured statuses is a no-op. Anything else — partial, already
+    remediated, longer than asked for, or the same `chain_name` in a different
+    shape (ids ignore `root_status`, so a shape change reads as a status
+    mismatch) — is refused. `existing` must cover the whole id space, which is
+    what makes the extra-descendant arm reachable.
     """
     by_id = {j.id: j for j in existing}
     drift: list[str] = []
@@ -612,10 +453,8 @@ def _assert_intact(
         if row is None:
             drift.append(f"{job_id}: missing")
         elif row.tenant_id != tenant_id:
-            # Unreachable while ids are tenant-derived; kept because it
-            # is the invariant the derivation exists to guarantee, and a
-            # non-RLS session (a script, a superuser) is the one caller
-            # that could still see a foreign row here.
+            # Unreachable while ids are tenant-derived; only a non-RLS
+            # session could see a foreign row here.
             drift.append(f"{job_id}: owned by another tenant")
         elif row.status != status:
             drift.append(f"{job_id}: {row.status!r} != {status!r}")

@@ -1,16 +1,8 @@
 """
-Alerts — outbound signals about platform state that agents (or humans)
-should know about.
+Alerts — durable outbound signals about platform state.
 
-Every alert is a durable row in this table. Consumers reach them one
-of two ways:
-  - Push: an HMAC-signed webhook fires on create, if
-    `Settings.alert_webhook_url` is configured.
-  - Poll: the `list_active_alerts` MCP tool reads unresolved rows.
-
-Alerts don't have a state machine — just `fired_at` and `resolved_at`.
-Coarse severity (`info` / `warning` / `critical`) plus a free-form
-`source` string keep this useful without over-modeling.
+Reached by an HMAC-signed webhook on create (`Settings.alert_webhook_url`) or by the
+`list_active_alerts` MCP tool. No state machine, just `fired_at` / `resolved_at`.
 """
 
 import uuid
@@ -25,17 +17,9 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 if TYPE_CHECKING:
     from app.models.tenant import Tenant
 
-# The operator vocabulary a producer may assert. `low` was added by
-# WO-R2-124 (user decision, 2026-08-30 — see ADR 0025): it is a real band
-# below `info` that the incident commander's triage already classifies as
-# noise, and without it two of that classifier's three noise branches were
-# unreachable by any alert this platform could send.
-#
-# Deliberately four values and not more. `medium`/`high` were declined —
-# they map onto `warning`/`critical` and adding them would widen the
-# vocabulary to fit fixtures rather than reality. `unknown` was declined
-# too: it is a *receiver's* default for a malformed payload, not something
-# a producer should be able to assert. ADR 0025 records both refusals.
+# The vocabulary a producer may assert. `low` was added by WO-R2-124 so the
+# commander's noise branches are reachable from a real alert. Deliberately four
+# values: `medium`/`high` and `unknown` were declined (ADR 0025).
 SEVERITY_LOW = "low"
 SEVERITY_INFO = "info"
 SEVERITY_WARNING = "warning"
@@ -59,9 +43,7 @@ class Alert(Base):
         index=True,
     )
     severity: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
-    # Human-authored source string — `slo:job_completion`, `dlq:threshold`,
-    # `chaos:manual`. Kept freeform because the set of alert producers
-    # grows over time; a strict enum would hurt more than help.
+    # Freeform source string — `slo:job_completion`, `dlq:threshold`.
     source: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     title: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[str | None] = mapped_column(String(2048), nullable=True)
@@ -77,17 +59,10 @@ class Alert(Base):
         PortableJSON, nullable=True
     )
     request_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    # De-duplication identity for producers that fire repeatedly on one
-    # sustained condition (WO-R2-29). NULL for producers that don't need it —
-    # a human firing a chaos tool means it every time — and NULLs do not
-    # collide under the unique constraint below, on Postgres or SQLite.
-    #
-    # The uniqueness is what makes de-duplication safe rather than merely
-    # likely: `worker_loop` runs in every API replica, so a check-then-insert
-    # would let two replicas both find nothing and both alert. Here the second
-    # one gets an IntegrityError and stops. Producers therefore put the window
-    # *into* the key (see `services/slo._fast_burn_dedup_key`) instead of
-    # keeping it in a query.
+    # De-duplication identity for producers that fire on one sustained condition
+    # (WO-R2-29); NULL when not needed, and NULLs do not collide below. The constraint
+    # is what makes it safe: `worker_loop` runs in every replica, so a check-then-insert
+    # would let both alert — hence the window lives in `_fast_burn_dedup_key`.
     dedup_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
     tenant: Mapped["Tenant"] = relationship("Tenant", lazy="noload")

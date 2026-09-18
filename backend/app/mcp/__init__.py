@@ -1,17 +1,8 @@
 """
-MCP server — machine-principal front door for the platform.
+MCP server — machine-principal front door for the platform (ADR 0006).
 
-Deployed as a standalone process from the same image (see
-`docs/ADR/0006-mcp-server-standalone-process.md`). Handlers call the
-service layer directly; import-linter enforces `app.mcp → app.services`
-as one-directional, and that nothing outside `app.mcp` imports it
-(contracts in `[tool.importlinter]`, pyproject.toml).
-
-Public shape:
-  - `standalone.app` — FastAPI ASGI app with a single POST /mcp endpoint
-  - `registry.tool` — decorator for tool implementations
-  - `protocol.*` — JSON-RPC 2.0 + MCP method types
-
+A standalone process from the same image. Import-linter keeps
+`app.mcp → app.services` one-directional (`[tool.importlinter]`, pyproject.toml).
 Import `app.mcp.tools` (side-effect) to register every shipped tool.
 """
 

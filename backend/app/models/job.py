@@ -23,14 +23,8 @@ if TYPE_CHECKING:
 def _default_max_attempts(_ctx: Any = None) -> int:
     """Run ceiling for a row that does not name one, from `MAX_JOB_ATTEMPTS`.
 
-    A callable rather than a constant so SQLAlchemy resolves it per
-    INSERT: the setting is read at flush time, which is what lets an
-    operator change the ceiling by restarting with a new environment
-    instead of by editing three literals (WO-R2-76).
-
-    The import is deferred to keep `app.models` free of an import-time
-    dependency on `app.config` — models are the one layer nothing else
-    may have to import config *through*.
+    A callable so SQLAlchemy resolves the setting per INSERT (WO-R2-76); the import
+    is deferred to keep `app.models` free of an import-time `app.config` dependency.
     """
     from app.config import get_settings
 
@@ -59,74 +53,38 @@ class Job(TimestampMixin, Base):
     status: Mapped[str] = mapped_column(
         String(50), default=JobStatus.PENDING, nullable=False, index=True
     )
-    # Caller-supplied key for idempotent creation — same key → same job returned.
-    # Uniqueness is scoped per-tenant (composite constraint below) so different
-    # tenants can reuse the same key without colliding.
+    # Caller-supplied idempotency key; uniqueness is per-tenant (constraint below).
     idempotency_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
     payload: Mapped[dict[str, Any] | None] = mapped_column(PortableJSON, nullable=True)
     result: Mapped[dict[str, Any] | None] = mapped_column(PortableJSON, nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     retry_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    # How many times this job may RUN in total — the original run plus its
-    # retries. The dispatcher retries while `retry_count < max_attempts`, so
-    # 3 means three runs and two retries. It was called `max_retries` until
-    # WO-R2-172, which read as one run more than the platform has ever given;
-    # the arithmetic is unchanged, only the name.
-    #
-    # Resolved per INSERT from `MAX_JOB_ATTEMPTS` rather than frozen at a
-    # literal 3, so the documented knob governs rows written outside
-    # `JobService` too — the chaos hooks, the eval seeds, saga steps
-    # (WO-R2-76). See `_default_max_attempts` for why it is a callable.
+    # How many times this job may RUN in total — original run plus retries, so 3 means
+    # three runs and two retries (`max_retries` until WO-R2-172). Resolved per INSERT
+    # from `MAX_JOB_ATTEMPTS`, so the knob governs rows outside `JobService` (WO-R2-76).
     max_attempts: Mapped[int] = mapped_column(
         Integer, default=_default_max_attempts, nullable=False
     )
-    # Coarse categorization the agent uses to decide DLQ remediation:
-    #   `replay_safe`      — transient / poison; replay after fix
-    #   `wait_and_replay`  — external dep down; retry after recovery
-    #   `human_required`   — persistent bug; do NOT replay
-    # Set by the LLM triage service (Phase 10) when `LLM_TRIAGE_ENABLED`
-    # is on — it is off by default, so on a stock deployment the only
-    # writers are the seed script, the chaos hooks and `mark_dlq_permanent`
-    # (R2-24). Nullable — only DLQ entries carry a value today, and NULL
-    # reads as "not categorised", not as "safe to replay".
-    # Cleared on replay (R2-23): the value describes one dead-letter
-    # episode, not the job.
-    # Kept as a plain string (no CHECK constraint) so new categories can
-    # be added without a schema change.
+    # Coarse DLQ category the agent routes on: `replay_safe` / `wait_and_replay` /
+    # `human_required`. Writers are LLM triage (off by default), the seed script, the
+    # chaos hooks and `mark_dlq_permanent` (R2-24). NULL means "not categorised", not
+    # "safe to replay"; cleared on replay (R2-23). Plain string so new values need no DDL.
     remediation_hint: Mapped[str | None] = mapped_column(String(32), nullable=True)
-    # Which mechanism forced this job into the DLQ, when it was NOT the
-    # default one. Today's sole value is `llm_retry_policy` — the LLM-guided
-    # retry policy returning `dead_letter_now` while retries remained.
-    # NULL = the default mechanism (retries exhausted, no registered
-    # processor, or the dispatcher's safety net), so a NULL row renders
-    # unbadged rather than being attributed to a policy that never ran.
-    # A different axis from remediation_hint, which says what to do NEXT.
+    # Which mechanism forced this job into the DLQ, when not the default one.
+    # Only value today is `llm_retry_policy`; NULL = the default mechanism, so a NULL
+    # row renders unbadged. A different axis from remediation_hint (what to do NEXT).
     dead_lettered_by: Mapped[str | None] = mapped_column(String(32), nullable=True)
     # When an operator last fenced this row with `mark_dlq_permanent`, and who
-    # (WO-R2-158). `remediation_hint` alone cannot answer either question: the
-    # value `human_required` is identical whether triage classified the row or
-    # a person fenced it, so a fence was unobservable on the row and an
-    # idempotent re-fence used to write nothing at all — not the row, not even
-    # an audit row. These two columns are what makes a fence a visible action.
-    # `fenced_at` is re-stamped on EVERY mark, including a mark on a row that
-    # was already `human_required`, because re-fencing is still an operator
-    # act. It is the platform's own clock at the moment of the call (aware
-    # UTC), and a different clock from `completed_at`/`dead_lettered_at` (when
-    # the job died) and `created_at` (when it was submitted) — the three can
-    # be days apart. Both are episode-scoped exactly as `remediation_hint` and
-    # `dead_lettered_by` are, so `JobService.replay_job` clears all four: a
-    # fence timestamp surviving next to a NULL hint would be the same
-    # incoherence these columns exist to remove (R2-23).
+    # (WO-R2-158) — `remediation_hint` alone cannot say, so a fence was unobservable.
+    # Re-stamped on EVERY mark, including a re-fence, in aware UTC: a different clock
+    # from `completed_at` and `created_at`. Episode-scoped, so `replay_job` clears it
+    # along with the hint (R2-23).
     fenced_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
-    # The principal that raised the fence, as `"{principal_type}:{principal_id}"`
-    # — e.g. `service_account:0f9a…`. Self-describing rather than a bare UUID
-    # because the same id space is `users.id` or `service_accounts.id`
-    # depending on the type, and a column that cannot say which is the shape
-    # ADR 0007 rejected for `audit_logs`. No FK, same as `audit_logs.principal_id`:
-    # the fence record must survive the principal being deleted. NULL means
-    # nobody has fenced this row.
+    # The principal that raised the fence, as `"{principal_type}:{principal_id}"` —
+    # self-describing because the id space is users.id or service_accounts.id
+    # (ADR 0007). No FK: the record must survive the principal. NULL = never fenced.
     fenced_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # Higher number = higher priority in the queue
     priority: Mapped[int] = mapped_column(Integer, default=0, nullable=False, index=True)
@@ -138,20 +96,14 @@ class Job(TimestampMixin, Base):
     completed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
-    # When the stale-PENDING backstop last re-published this job (WO-R2-28).
-    # The backstop's own de-duplication marker: it stamps this inside the same
-    # transaction as the outbox insert and then refuses to re-publish a job it
-    # already re-published inside the cutoff window. Kept separate from
-    # `updated_at` on purpose — that one is the staleness signal ("time since
-    # last progress") and is rendered to operators, so a sweep write must not
-    # be able to masquerade as progress or reset the visible age.
+    # When the stale-PENDING backstop last re-published this job (WO-R2-28) — its own
+    # de-duplication marker, stamped in the same transaction as the outbox insert.
+    # Separate from `updated_at`, which operators read as time since last progress.
     requeued_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
-    # When the worker executing this job last checked in (WO-R2-28). Renewed
-    # by `_renew_running_leases_loop` while the job is this process's, read by
-    # the stale-RUNNING sweep in every replica. NULL means nobody has checked
-    # in — which is what a crash orphan looks like, so NULL reads as stale.
+    # When the worker running this job last checked in (WO-R2-28); read by the
+    # stale-RUNNING sweep in every replica, and NULL reads as stale.
     heartbeat_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
@@ -161,17 +113,9 @@ class Job(TimestampMixin, Base):
         nullable=True,
         index=True,
     )
-    # Position of this step in its saga's declaration order, 0-based, written
-    # once at creation (WO-R2-58). It exists because `created_at` cannot carry
-    # this: `func.now()` is Postgres `transaction_timestamp()`, so every step
-    # of a saga — all inserted by one request — shares an identical value and
-    # `ORDER BY created_at` over them is a total tie. Compensation rolls back
-    # in reverse of this column, and "undo the most recent success first" is a
-    # correctness property, not a display preference.
-    #
-    # NULL for everything that is not a declared step: ordinary jobs, and the
-    # `.compensate` rows the coordinator mints (they are ordered by the steps
-    # they undo, not by a position of their own).
+    # Position of this step in its saga's declaration order, 0-based (WO-R2-58).
+    # `created_at` cannot carry it — `transaction_timestamp()` ties every step of one
+    # request — and compensation rolls back in reverse of it. NULL for non-step rows.
     saga_step_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     user: Mapped["User"] = relationship("User", back_populates="jobs", lazy="noload")

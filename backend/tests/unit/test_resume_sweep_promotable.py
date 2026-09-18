@@ -1,11 +1,8 @@
 """Resume sweep starvation and the dependency cascade (R2-09).
 
-Real rows on a real (SQLite in-memory) engine rather than the mock-heavy
-`test_dispatcher.py` style: the fix is a `NOT EXISTS` subquery, an ORDER BY
-and a keyset cursor, and a mocked session proves nothing about any of them.
-
-The engine is module-local so committed rows never leak into the shared
-session-scoped `sqlite_engine` other suites roll back against.
+Real rows on a module-local SQLite engine: the fix is a `NOT EXISTS` subquery, an ORDER BY and a
+keyset cursor, so a mocked session proves nothing, and committed rows never leak into the shared
+`sqlite_engine`.
 """
 
 import uuid
@@ -35,20 +32,15 @@ from sqlalchemy.ext.asyncio import (
 )
 from sqlalchemy.pool import StaticPool
 
-# Mixed hex on purpose, same reason `DEFAULT_TENANT_ID` is: an all-digit UUID
-# hex round-trips through SQLite's NUMERIC affinity as a float and blows up
-# the UUID result processor.
+# Mixed hex like `DEFAULT_TENANT_ID`: all-digit hex round-trips through SQLite as a float.
 _USER_ID = uuid.UUID("c4b5a697-8d9e-4f01-9a2b-3c4d5e6f7a8b")
 
 _EPOCH = datetime(2026, 1, 1, tzinfo=UTC)
 
 
 class _StubRedis:
-    """Only the surface `find_blocking_pause` touches.
-
-    `paused` holds the job ids whose DAG-pause flag is set; everything else
-    reads back as an absent key.
-    """
+    """Only the surface `find_blocking_pause` touches: `paused` holds the job ids whose DAG-pause
+    flag is set, everything else reads as absent."""
 
     def __init__(self, paused: set[uuid.UUID] | None = None) -> None:
         self.paused = {str(j) for j in (paused or set())}
@@ -133,15 +125,9 @@ async def _seed_blocked_wall(
 ) -> None:
     """`count` WAITING children whose parent is DEAD_LETTER — the stuck set.
 
-    Inserted directly rather than by dead-lettering a parent through
-    `update_status`, because that path now cascades them to CANCELLED. Direct
-    inserts are how this state actually accumulated in production (and how
-    the `create_stuck_dag` chaos hook manufactures it), so this is the real
-    backlog shape, not a synthetic one.
-
-    Created oldest-first so an unordered `LIMIT 200` — which on SQLite scans
-    in insertion order — sees the wall before anything seeded after it.
-    """
+    Inserted directly rather than by dead-lettering a parent, because that path now cascades them to
+    CANCELLED, and direct inserts are how this state really accumulated (and how `create_stuck_dag`
+    manufactures it). Oldest first, so an unordered `LIMIT 200` sees the wall."""
     async with factory() as session:
         async with session.begin():
             for i in range(count):
@@ -164,15 +150,10 @@ async def _seed_blocked_wall(
 async def test_healthy_child_promoted_from_behind_a_wall_of_stuck_rows(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """THE assertion for R2-09.
-
-    250 permanently-blocked WAITING rows (dead-lettered parents, nothing can
-    ever promote them) plus one healthy child whose parent completed and whose
-    pause has lifted. Red before the fix: the sweep selected `WAITING LIMIT
-    200` with no ORDER BY and no eligibility predicate, so the healthy child
-    was simply never in the page — the 200 slots were spent on rows that were
-    then discarded by the per-row `unmet_count` check, every pass, forever.
-    """
+    """THE assertion for R2-09: 250 permanently-blocked WAITING rows plus one healthy child whose
+    parent completed and whose pause has lifted. Red before the fix — `WAITING LIMIT 200` with no
+    ORDER BY and no eligibility predicate spent all 200 slots on rows the per-row check then
+    discarded, every pass, forever."""
     await _seed_blocked_wall(session_factory, 250)
 
     async with session_factory() as session:
@@ -201,12 +182,8 @@ async def test_healthy_child_promoted_from_behind_a_wall_of_stuck_rows(
 async def test_stuck_rows_are_not_candidates_at_all(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """The predicate excludes them rather than fetching-then-discarding.
-
-    A pass over a pure wall of blocked rows must select nothing, which is
-    what makes the LIMIT spend its budget only on promotable work. The
-    returned cursor is None because the page was short.
-    """
+    """The predicate excludes them rather than fetching-then-discarding, which is what makes the
+    LIMIT spend its budget only on promotable work."""
     await _seed_blocked_wall(session_factory, 250)
 
     cursor = await _resume_unblocked_waiting_once(session_factory, _StubRedis())
@@ -224,14 +201,9 @@ async def test_stuck_rows_are_not_candidates_at_all(
 async def test_cursor_rotates_past_a_full_page_of_paused_children(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """The second line of defence, for what the SQL predicate cannot see.
-
-    A DAG pause lives in Redis, so paused children are promotable *in SQL* and
-    do occupy the page. `_RESUME_SWEEP_LIMIT` paused children ahead of one
-    unpaused child would re-create the starvation inside the eligible set. The
-    ORDER BY plus rotating cursor means the second pass resumes past the first
-    page instead of re-scanning it, so the unpaused child is reached.
-    """
+    """The second line of defence, for what the SQL predicate cannot see: a DAG pause lives in
+    Redis, so paused children are promotable in SQL and do occupy the page. The ORDER BY plus
+    rotating cursor means the second pass resumes past the first page instead of re-scanning it."""
     paused_ids: list[uuid.UUID] = []
     async with session_factory() as session:
         async with session.begin():
@@ -278,9 +250,8 @@ async def test_cursor_rotates_past_a_full_page_of_paused_children(
 async def test_short_page_rotates_cursor_back_to_the_start(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """A pass that reaches the tail resets, so the next one re-scans from the
-    oldest row. Without the reset the cursor would march off the end and the
-    sweep would go permanently blind."""
+    """A pass that reaches the tail resets, or the cursor marches off the end and the sweep goes
+    blind."""
     async with session_factory() as session:
         async with session.begin():
             parent = _job(status=JobStatus.COMPLETED, created_at=_EPOCH)
@@ -296,9 +267,8 @@ async def test_short_page_rotates_cursor_back_to_the_start(
 async def test_promotion_still_emits_exactly_one_job_submitted(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """The outbox contract the sweep already owed (E1-04) survives the rewrite:
-    one promotion, one `job.submitted`, and the CAS keeps a second pass from
-    minting a duplicate."""
+    """The E1-04 outbox contract survives the rewrite: one promotion, one `job.submitted`, and the
+    CAS stops a second pass minting a duplicate."""
     async with session_factory() as session:
         async with session.begin():
             parent = _job(status=JobStatus.COMPLETED, created_at=_EPOCH)
@@ -323,18 +293,14 @@ async def test_promotion_still_emits_exactly_one_job_submitted(
     assert submitted[0].payload["event"] == "job.submitted"
 
 
-# --------------------------------------------------------------------------
 # The cascade: stop the stuck set growing at the source.
-# --------------------------------------------------------------------------
 
 
 async def test_dead_letter_cascades_cancelled_to_waiting_children(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """The behaviour the `CANCELLED` enum comment has advertised
-    ("dependency parent failed") since the DAG landed, and which nothing
-    implemented. Red before: the child stays WAITING forever.
-    """
+    """The behaviour the `CANCELLED` enum comment has advertised since the DAG landed and nothing
+    implemented: red before, the child stays WAITING forever."""
     async with session_factory() as session:
         async with session.begin():
             parent = _job(status=JobStatus.RUNNING, created_at=_EPOCH)
@@ -386,8 +352,7 @@ async def test_cascade_reaches_grandchildren(
 async def test_cascade_leaves_saga_steps_to_the_saga_coordinator(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """Saga steps are cancelled by saga membership, not by the dependency DAG.
-    Touching them here would double-cancel and race `SagaCoordinator`."""
+    """Saga steps belong to `SagaCoordinator`, not the dependency DAG."""
     saga_id = uuid.uuid4()
     async with session_factory() as session:
         async with session.begin():
@@ -433,8 +398,8 @@ async def test_cascade_leaves_saga_steps_to_the_saga_coordinator(
 async def test_cascade_only_touches_waiting_children(
     session_factory: async_sessionmaker[AsyncSession], spared_status: str
 ) -> None:
-    """A child that is already in flight or finished is not ours to cancel —
-    the WAITING predicate is a set-shaped CAS, not a filter of convenience."""
+    """A child already in flight or finished is not ours to cancel: the WAITING predicate is a CAS.
+    """
     async with session_factory() as session:
         async with session.begin():
             parent = _job(status=JobStatus.RUNNING, created_at=_EPOCH)
@@ -457,10 +422,8 @@ async def test_cascade_only_touches_waiting_children(
 async def test_failed_parent_does_not_cascade_because_retries_remain(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """`FAILED` is absent from the cascade set for the same reason it is
-    absent from `TERMINAL_JOB_STATUSES`: the retry cycle re-enters from it, so
-    the parent may still complete. Cascading here would cancel the children of
-    a job that is about to succeed."""
+    """`FAILED` is absent from the cascade set for the same reason it is absent from
+    `TERMINAL_JOB_STATUSES`: the retry cycle re-enters from it, so the parent may still complete."""
     async with session_factory() as session:
         async with session.begin():
             parent = _job(status=JobStatus.RUNNING, created_at=_EPOCH)
@@ -483,14 +446,9 @@ async def test_failed_parent_does_not_cascade_because_retries_remain(
 async def test_cascade_records_why_the_child_was_cancelled(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """The error message on the row says why a child vanished from the DAG.
-
-    It used to be the *only* trace, because there was no `job.cancelled`
-    topic. There is one now (WO-R2-113) and the cascade emits it — see
-    `test_cascade_announces_every_child_it_cancels` — so this is no longer
-    the operator's last resort, but the row-level reason is still what the
-    admin UI and the timeline read, and it stays asserted here.
-    """
+    """The row's error message says why a child vanished from the DAG. It used to be the only trace;
+    `job.cancelled` exists now (WO-R2-113), but the row-level reason is what the admin UI and the
+    timeline read."""
     async with session_factory() as session:
         async with session.begin():
             parent = _job(status=JobStatus.RUNNING, created_at=_EPOCH)
@@ -520,21 +478,13 @@ async def test_cascade_records_why_the_child_was_cancelled(
 async def test_cascade_announces_every_child_it_cancels(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """The cascade is the *other* CANCELLED writer, and it is not
-    `update_status` (WO-R2-113).
+    """The cascade is the OTHER CANCELLED writer, and it is not `update_status` (WO-R2-113).
 
-    #152 made terminal emission non-elective by routing every terminal write
-    through `update_status`, and adding CANCELLED to `_TERMINAL_EVENT_STATUSES`
-    covers the saga coordinator, which calls it. It does not cover this: the
-    cascade writes CANCELLED with a set-based `UPDATE ... WHERE id IN (...)`
-    for portability (SQLite has no `UPDATE ... WITH RECURSIVE`), so it never
-    passes through the single writer at all. Left alone, exactly the jobs
-    R2-09 cancels in bulk — a whole DAG level at a time — would stay the
-    silent terminal state the work order set out to remove.
-
-    Every cancelled descendant gets its own event, at every depth, in the
-    same transaction as the status write.
-    """
+    #152 routed every terminal write through `update_status`, but the cascade writes CANCELLED with
+    a set-based `UPDATE ... WHERE id IN (...)` for portability, so it never passes through the
+    single writer — leaving exactly the jobs R2-09 cancels in bulk as the silent terminal state that
+    order set out to remove. Every descendant gets its own event, at every depth, in the same
+    transaction."""
     from app.config import get_settings
 
     async with session_factory() as session:
@@ -577,13 +527,9 @@ async def test_cascade_announces_every_child_it_cancels(
 async def test_cascade_stamps_completed_at_on_every_child(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """WO-R2-114 has the same second writer as WO-R2-113.
-
-    Stamping `completed_at` inside `update_status` leaves the cascade's bulk
-    UPDATE untouched, so a DAG cancellation would produce terminal rows whose
-    stamp depends on which mechanism cancelled them — the inconsistency is
-    worse than the uniform NULL it replaces, because it is invisible.
-    """
+    """WO-R2-114 has the same second writer: stamping `completed_at` only inside `update_status`
+    would make the stamp depend on which mechanism cancelled the row — worse than the uniform NULL
+    it replaces, because it is invisible."""
     async with session_factory() as session:
         async with session.begin():
             parent = _job(status=JobStatus.RUNNING, created_at=_EPOCH)
@@ -611,9 +557,8 @@ async def test_cascade_stamps_completed_at_on_every_child(
 async def test_cascade_cancellation_events_roll_back_with_the_status_write(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """Same invariant the dead-letter side has (ADR 0001): the events are in
-    the caller's transaction, so an abort leaves neither cancelled rows nor
-    announcements of cancellations that did not happen."""
+    """Same invariant the dead-letter side has (ADR 0001): the events are in the caller's
+    transaction, so an abort leaves neither cancelled rows nor announcements of cancellations."""
     from app.config import get_settings
 
     async with session_factory() as session:
@@ -655,8 +600,8 @@ async def test_cascade_cancellation_events_roll_back_with_the_status_write(
 async def test_cascaded_children_never_reappear_as_sweep_candidates(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """The two halves meet: the cascade drains the stuck set at the source,
-    and what it leaves behind is not WAITING, so it cannot occupy the page."""
+    """The two halves meet: what the cascade leaves behind is not WAITING, so it cannot occupy the
+    page."""
     async with session_factory() as session:
         async with session.begin():
             parent = _job(status=JobStatus.RUNNING, created_at=_EPOCH)
@@ -689,15 +634,10 @@ async def test_cascaded_children_never_reappear_as_sweep_candidates(
 async def test_resume_sweep_publishes_the_shared_submitted_payload(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """WO-R2-116. The sweep built the `job.submitted` payload inline while
-    every other re-publish path called `_job_submitted_payload`, so the two
-    shapes could drift — and a job dispatched by this backstop would stop
-    being byte-identical to one dispatched by the normal path, which is the
-    property that helper exists to guarantee.
-
-    Asserted as equality against the helper rather than field-by-field, so a
-    field added to the helper cannot pass here while the sweep omits it.
-    """
+    """WO-R2-116: the sweep built the `job.submitted` payload inline while every other re-publish
+    path called `_job_submitted_payload`, so a backstop-dispatched job could stop being
+    byte-identical to a normally dispatched one. Asserted as equality against the helper, so a field
+    added there cannot pass while the sweep omits it."""
     from app.workers.dispatcher import _job_submitted_payload
 
     async with session_factory() as session:

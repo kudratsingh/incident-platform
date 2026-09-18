@@ -1,31 +1,10 @@
-"""Shared scheduled-replay step for `replay_dlq_by_ids` and
-`replay_dlq_by_category`.
+"""Shared scheduled-replay step for `replay_dlq_by_ids` and `replay_dlq_by_category`.
 
-R2-21. The two tools' scheduled branches had drifted apart — one caught
-`Exception`, the other only `AppError` — and neither was transactional:
-both armed the durable Redis entry *before* writing the
-`job.replay_scheduled` audit row that is the only evidence the replay was
-ever authorised, outside any savepoint and with no compensation. A
-rollback anywhere in the request left a replay that would fire with no
-audit trail, which breaks the audit-is-ground-truth invariant the
-campaign's safety grading depends on. One helper, so the two branches
-cannot diverge again.
-
-Ordering and compensation, in that order:
-
-  1. The `job.replay_scheduled` audit row is INSERTed and flushed FIRST.
-     If the audit sink is unhappy, nothing is armed.
-  2. Only then is the ZSET entry armed, at the `execute_at` the audit row
-     already records — the two cannot disagree about when it fires.
-  3. Both sit inside a SAVEPOINT, and any failure rolls the audit row
-     back AND zrems the entry. With the write ordered first, the only
-     failure that can still land after the zadd is the savepoint's own
-     release; the compensation exists for exactly that residual window.
-
-A bare `except Exception` around the pair would not have been enough on
-its own — the verifier's point. Unlike the immediate branch, the
-scheduled branch had no savepoint, so swallowing a flush failure would
-have continued the loop on a poisoned session.
+R2-21: both branches used to arm the durable Redis entry before writing the
+`job.replay_scheduled` audit row, outside any savepoint, so a rollback left a replay
+that would fire with no audit trail. Here the audit row is INSERTed and flushed
+first, the ZSET entry is armed at the `execute_at` it already records, and both sit
+in a SAVEPOINT whose failure path also zrems the entry.
 """
 
 import time
@@ -50,17 +29,11 @@ async def schedule_one_audited(
 ) -> float:
     """Arm one delayed replay, audited, in a savepoint with compensation.
 
-    Returns the epoch second the promote loop will fire the replay. The
-    caller is expected to wrap the call in its per-item try/except — this
-    raises whatever the audit write or Redis raised, having already left
-    Redis and the session consistent with each other.
+    Returns the epoch second the promote loop fires at; raises to the caller.
     """
     execute_at = time.time() + delay_seconds
-    # Set BEFORE the zadd, not after. A Redis call that raises may still
-    # have reached the server — a connection reset on the reply is the
-    # ordinary case — so "we tried to arm" is the condition that needs
-    # compensating, not "we know we armed". The zrem is a no-op when the
-    # zadd never landed.
+    # Set BEFORE the zadd: a raising Redis call may still have reached the server,
+    # so "we tried to arm" is what needs compensating.
     arm_attempted = False
     try:
         async with ctx.db.begin_nested():
@@ -104,9 +77,7 @@ async def schedule_one_audited(
                     job_id=job_id,
                 )
             except Exception as undo_exc:
-                # Redis itself is the thing that's broken. Log loudly:
-                # this is the one residual armed-without-audit case, and
-                # it needs a human, not a retry.
+                # The one residual armed-without-audit case; it needs a human.
                 logger.error(
                     "scheduled replay left armed without an audit row",
                     extra={"job_id": str(job_id), "error": str(undo_exc)},

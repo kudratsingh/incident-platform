@@ -1,18 +1,8 @@
-"""
-`kill_consumer` — chaos tool that shuts down one Kafka consumer group.
+"""`kill_consumer` — shut down one Kafka consumer group.
 
-Mechanism: set a Redis key `chaos:kill:<group_id>` with a TTL. Every
-consumer loop checks the key at the top of each poll iteration and
-exits cleanly when it appears. The worker's supervisor then decides
-whether to restart.
-
-Kept intentionally simple — no live Kafka introspection, no consumer
-group lookup, no strong verification. The agent inspects `tools/list`
-to see it's available and calls it with a group name; the platform
-either has that group or doesn't.
-
-Requires `chaos:invoke`. Registered only when `CHAOS_ENABLED=true`
-(see `app/mcp/chaos.py`).
+Sets `chaos:kill:<group_id>` with a TTL; every consumer loop checks it at the
+top of each poll and exits cleanly, then the supervisor decides about a
+restart. Requires `chaos:invoke` and `CHAOS_ENABLED=true`.
 """
 
 from app.mcp.chaos import BlastRadius, chaos_tool

@@ -1,91 +1,20 @@
-"""
-`create_bad_data_job` — inject a realistic bad-data DLQ entry, either
-already classified `human_required` or not classified at all.
+"""`create_bad_data_job` — inject a bad-data DLQ row, already classified
+`human_required` or not classified at all.
 
-The bad-data half of the lab's permanent-fault pair: this hook's row
-carries a CSV parse failure, `poison_message`'s carries a schema
-violation, and neither is replay-safe. (`poison_message` used to be
-described here as the `replay_safe` producer — it was, and it was wrong;
-WO-R2-166 moved its hint.) Doesn't touch Kafka — writes directly to
-`jobs` with `status=dead_letter` and an error string from
-`app.lab.dlq_failure_stories`, so the row's text and its hint say the
-same thing (WO-R2-146).
+Bad-data half of the lab's permanent-fault pair: a CSV parse failure here, a
+schema violation in `poison_message`, neither replay-safe (WO-R2-166). Text
+comes from `app.lab.dlq_failure_stories` so hint and text agree (WO-R2-146);
+the row that deliberately disagrees is `create_mislabeled_dlq_job`'s. Seed it
+`unclassified` when the drill grades the fence itself, or `mark_dlq_permanent`
+only re-sets the value the row already carries (WO-R2-158).
 
-A row whose hint and text deliberately *disagree* comes from
-`create_mislabeled_dlq_job`, which is a separate tool for that reason:
-this one's `remediation_hint` is a two-value `Literal` that cannot
-express `replay_safe` at all.
-
-## Why `remediation_hint` is an argument now
-
-Until v0.6.1 this hook always stamped `remediation_hint=human_required`.
-That is the right shape for a scenario that wants the row *already*
-fenced — `replay_dlq_by_category` refuses it, and the agent's
-escalate-not-replay branch is reachable immediately.
-
-It is the wrong shape for an escalation drill that grades the fence
-itself. `dlq_human_required_escalates` asks the agent to read a failure,
-decide it is not replayable, fence it with `mark_dlq_permanent`, and
-escalate. Seeded pre-classified, the middle step is a no-op the eval
-cannot see: the hint is already the value the fence would set, so before
-WO-R2-158 `mark_dlq_permanent` took its `already_marked` branch and wrote
-nothing at all — not the row, not even an audit row. An agent that
-fenced and an agent that skipped the fence left an identical world.
-
-So the hook takes the hint as an argument:
-
-  * `human_required` (the default, and the pre-v0.6.2 behaviour) — the
-    row arrives classified. Nothing left to decide.
-  * `unclassified` (or JSON `null`) — the row arrives with
-    `remediation_hint = NULL` and a bad-data error text. Nothing has
-    classified it, so the agent has to read the error, conclude a replay
-    cannot fix a bad row in the stored payload, and raise the fence
-    itself. That fence is now a real write with a real audit row, so the
-    drill measures an action rather than a coincidence.
-
-A null hint with a permanent-fault error text is a coherent pair, not a
-loosened screen: a hint is a classification and an error text is a
-symptom, and "nobody has classified this" does not disagree with "the
-symptom is a bad row". It is also the normal state of an organically
-dead-lettered job here, because LLM triage is off by default. See the
-`None` bullet in `app.lab.dlq_failure_stories`.
-
-## Deterministic ids
-
-The row's id is `uuid5(namespace, f"{tenant_id}:{fixture_name}")` — the
-same convention as `create_stuck_dag` and `scripts/seed_eval_fixtures.py`,
-with its own namespace — so a scenario can pin the id in YAML before the
-hook ever runs, given the tenant it will run as. It has to: the drill
-grades *which* row the agent fenced, and a random id cannot be named in a
-claim written before the run (commander cmd #187).
-
-The tenant is in the key for the same reason it is in `create_stuck_dag`'s:
-the idempotency probe below runs on the RLS-scoped MCP session, so a row
-another tenant created under the same `fixture_name` would be invisible to
-it and the INSERT would collide on the primary key — a 500 where the
-contract promises a 409. Per-tenant ids make that collision
-unrepresentable.
-
-Re-invoking with the same `fixture_name` is idempotent while the row still
-matches what this call declares. Once it has drifted — the agent fenced
-it, a replay moved it out of `dead_letter`, or the call now declares a
-different hint — the hook refuses rather than rewriting history. Pick a
-fresh `fixture_name` or reset the environment.
-
-## Disposal
-
-The row is tagged `payload.seeded_fixture = true`, so the reset sweep
-(`scripts/reset_eval_state.py::_delete_seeded_dlq_fixtures`) DELETEs it.
-That is a change of disposal class: these rows used to be *cancelled* by
-`_sweep_nonfixture_dlq` on the grounds that a randomly-idded chaos row
-attached to a real user reads as that user's history. A row with a
-scenario-pinned id, declared by name, is scaffolding the same way
-`create_stuck_dag`'s chain is — and leaving a `cancelled` copy behind per
-run is litter, not history (ADR 0012 rule 2). `chaos_fixture` stays in the
-payload beside the marker so the row's provenance is still readable.
-
-Chaos-only surface: gated behind `CHAOS_ENABLED=true` + `chaos:invoke`
-scope + `environment_wide` blast radius label. See ADR 0008 gating.
+Ids are `uuid5(namespace, f"{tenant_id}:{fixture_name}")` — pinnable before the
+run (commander cmd #187), per-tenant so the RLS-scoped probe below cannot miss
+a sibling's row and collide on the primary key (409, not 500). A repeat is
+idempotent while the row matches and refused once it has drifted. Rows carry
+`payload.seeded_fixture = true`, so `_delete_seeded_dlq_fixtures` DELETEs them
+instead of leaving a `cancelled` copy per run (ADR 0012 rule 2);
+`chaos_fixture` stays for provenance. ADR 0008 gated.
 """
 
 
@@ -109,30 +38,18 @@ from sqlalchemy import select
 
 logger = get_logger(__name__)
 
-# uuid5 namespace for bad-data fixture ids. Fixed and documented so a
-# scenario can precompute the id it pins:
-# uuid5(ns, f"{tenant_id}:{fixture_name}").
-# Distinct from the eval seed's namespace (aaaaaaaa-…), `create_stuck_dag`'s
-# (cccccccc-…), `poison_message`'s (eeeeeeee-dead-…) and
-# `create_mislabeled_dlq_job`'s (ffffffff-11ed-…), so these ids can never
-# collide with a boot-seeded fixture, a chain node, or another hook's row
-# under an identical `fixture_name`.
+# uuid5 namespace for bad-data fixture ids: uuid5(ns,
+# f"{tenant_id}:{fixture_name}"). Distinct from the eval seed's (aaaaaaaa-…)
+# and every sibling hook's, so one `fixture_name` cannot collide across them.
 _NAMESPACE = uuid.UUID("dddddddd-bad0-4000-8000-000000000000")
 
-# The sentinel that means "write NULL into remediation_hint". Spelled as a
-# word rather than only accepting JSON `null` because the value is baked
-# verbatim into the tool's inputSchema, and an enum of two words is
-# unambiguous where a nullable string leaves a caller guessing whether
-# omitting the field and passing null mean the same thing (they do not —
-# omitting it keeps the pre-v0.6.2 `human_required` behaviour).
-# `Final` so mypy infers `Literal["unclassified"]` rather than `str`, which
-# is what lets a sibling hook write `default=UNCLASSIFIED` on a field typed
-# as the two-value `Literal` instead of restating the string.
+# Sentinel meaning "write NULL into remediation_hint", a word rather than only
+# JSON `null` because it is baked into the inputSchema (and omitting the field
+# keeps the `human_required` default). `Final` so mypy infers the `Literal`.
 UNCLASSIFIED: Final = "unclassified"
 
-# The story each declared hint stamps. Both are bad-data texts on purpose:
-# the drill's whole subject is a row a reader can classify, and the only
-# difference between the two rows is whether anybody already has.
+# Both stories are bad-data texts; the only difference is whether
+# anybody has classified the row.
 _STORY_KEY_FOR_HINT: dict[str | None, str] = {
     RemediationHint.HUMAN_REQUIRED.value: "csv_bad_row",
     None: "unclassified_csv_bad_row",
@@ -173,12 +90,9 @@ class CreateBadDataJobInput(BaseModel):
             "plausible."
         ),
     )
-    # Deliberately a *subset* of `RemediationHint` plus the sentinel, not
-    # the whole enum: this hook writes one kind of failure — a permanent
-    # bad-data fault — and `replay_safe` or `wait_and_replay` on that text
-    # is exactly the self-contradiction WO-R2-146 was filed for. A scenario
-    # wanting those hints calls `seed_dlq_messages`, which offers all three
-    # and pairs each with a text that fits.
+    # A subset of `RemediationHint`: this hook writes one permanent bad-data
+    # fault, and `replay_safe` on that text is WO-R2-146; `seed_dlq_messages`
+    # offers all three hints with texts that fit.
     remediation_hint: Literal["human_required", "unclassified"] | None = Field(
         default=RemediationHint.HUMAN_REQUIRED.value,
         description=(
@@ -267,9 +181,8 @@ async def create_bad_data_job(
     hint = _declared_hint(inp.remediation_hint)
     job_id = fixture_id(tenant_id, inp.fixture_name)
 
-    # Primary-key read, RLS-scoped like every other tool call. An
-    # idempotent repeat returns the same row; a drifted one is refused
-    # rather than rewritten — see `_assert_matches`.
+    # RLS-scoped primary-key read: a repeat returns the same row, a
+    # drifted one is refused.
     existing = (
         await ctx.db.execute(select(Job).where(Job.id == job_id))
     ).scalar_one_or_none()
@@ -283,15 +196,9 @@ async def create_bad_data_job(
             accepted=True,
         )
 
-    # Prefer any real user in the caller's tenant to satisfy the Job
-    # FK. When the tenant is unseeded (common in local dev / fresh
-    # eval env), lazy-create a chaos-owned user in the SAME tenant.
-    # The pre-v0.4.6 shape fell back to a user from DEFAULT_TENANT_ID,
-    # violating the tenant-isolation invariant (jobs.tenant_id and
-    # users.tenant_id ended up pointing at different tenants). See
-    # ADR 0003 (RLS as defense-in-depth). `seed_dlq_messages._fixture_owner`
-    # is the same rule, and reuses `_ensure_chaos_owner` below so the two
-    # declared-fixture hooks lazy-create the same recognisable user.
+    # Any real user in the caller's tenant satisfies the Job FK; an unseeded
+    # tenant gets a chaos owner in the SAME tenant, never DEFAULT_TENANT_ID,
+    # which would split jobs.tenant_id from users.tenant_id (ADR 0003).
     user = (
         await ctx.db.execute(
             select(User).where(User.tenant_id == tenant_id).limit(1)
@@ -340,30 +247,17 @@ async def create_bad_data_job(
 
 
 def fixture_id(tenant_id: uuid.UUID, fixture_name: str) -> uuid.UUID:
-    """The row's deterministic id.
-
-    Exported so a test — or a scenario's own precompute — derives it the
-    same way the hook does instead of transcribing the recipe.
-    Per-tenant: see the module docstring for why widening the RLS-scoped
-    probe would be the wrong repair for the collision this prevents.
-    """
+    """The row's deterministic id, exported so a test or a scenario derives
+    it instead of transcribing the recipe. Per-tenant (module docstring)."""
     return uuid.uuid5(_NAMESPACE, f"{tenant_id}:{fixture_name}")
 
 
 def _declared_hint(raw: str | None) -> str | None:
     """The value to write into `remediation_hint`.
 
-    `None` and the `"unclassified"` sentinel both mean "write NULL"; the
-    two spellings exist because a scenario file that means an empty hint
-    naturally writes `null`, while the inputSchema an agent reads is
-    clearer as a two-word enum.
-
-    Anything else goes through `seed_dlq_messages._validated_hint`, which
-    raises the typed `SeedDlqHintError` (400, `unknown_remediation_hint`).
-    The `Literal` on the input model should make that unreachable over MCP
-    — it exists for a *direct* Python caller (a script, a test), because a
-    bare `ValueError` here renders as `-32603 internal tool error` with an
-    `mcp tool crashed` log line for what is really invalid input (R2-16).
+    `None` and the `"unclassified"` sentinel both mean NULL. Anything else goes
+    through `seed_dlq_messages._validated_hint`, whose typed `SeedDlqHintError`
+    keeps a direct Python caller's bad input off the `-32603` path (R2-16).
     """
     if raw is None or raw == UNCLASSIFIED:
         return None
@@ -373,10 +267,7 @@ def _declared_hint(raw: str | None) -> str | None:
 def _default_error_for(hint: str | None) -> str:
     """The canonical bad-data text for a declared hint.
 
-    Pins a story by *key* rather than taking each hint's canonical
-    default, because `default_error_for(None)` is deliberately the
-    says-nothing-about-its-class text and this hook wants the opposite: a
-    symptom a reader can act on, under a hint that has not acted on it.
+    Pinned by story key: `default_error_for(None)` says nothing about class.
     """
     return story(_STORY_KEY_FOR_HINT[hint]).error_message
 
@@ -389,30 +280,16 @@ def _assert_matches(
 ) -> None:
     """Idempotent repeat vs. drifted row.
 
-    A repeat that finds the row still `dead_letter`, in the caller's
-    tenant, carrying exactly the hint this call declares is a no-op.
-    Anything else is refused, because re-manufacturing would mean
-    rewriting a row that is now evidence:
-
-      * `remediation_hint` moved — somebody fenced it, which is the very
-        action a drill seeded `unclassified` exists to measure. Silently
-        returning `created=False` here would hand the next run a
-        pre-fenced world and grade it clean.
-      * `status` moved — a replay took the row out of `dead_letter`.
-      * this call declares a different hint than the stored row carries,
-        so returning the row would report a fixture the caller did not
-        ask for.
-
-    Same rule and same wording as `create_stuck_dag._assert_intact`; that
-    one keys on status alone because a chain's drift shows up there, while
-    this row's load-bearing drift is the hint.
+    Still `dead_letter`, in the caller's tenant, with exactly the declared hint
+    is a no-op. Anything else is refused: a moved `remediation_hint` means
+    somebody fenced it, which is the action an `unclassified` drill measures,
+    and returning `created=False` would hand the next run a pre-fenced world
+    and grade it clean.
     """
     drift: list[str] = []
     if existing.tenant_id != tenant_id:
-        # Unreachable while ids are tenant-derived; kept because it is the
-        # invariant the derivation exists to guarantee, and a non-RLS
-        # session (a script, a superuser) is the one caller that could
-        # still see a foreign row here.
+        # Unreachable while ids are tenant-derived; only a non-RLS
+        # session could see a foreign row here.
         drift.append("owned by another tenant")
     if existing.status != JobStatus.DEAD_LETTER.value:
         drift.append(
@@ -434,11 +311,8 @@ def _assert_matches(
         )
 
 
-# Chaos-created users use a deterministic email + a well-known unusable
-# password so a login attempt against them fails cleanly (bcrypt refuses
-# to parse "!") and cleanup scripts can grep them by prefix. `is_active`
-# is False so any endpoint that filters active users doesn't surface
-# them in operator-facing lists.
+# Deterministic email + an unusable password (bcrypt refuses "!") so logins
+# fail cleanly and cleanup can grep by prefix; `is_active` False hides them.
 _CHAOS_OWNER_EMAIL_PREFIX = "chaos-owner"
 _CHAOS_UNUSABLE_PASSWORD = "!chaos-owner-no-login"
 

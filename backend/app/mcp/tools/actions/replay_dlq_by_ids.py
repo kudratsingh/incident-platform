@@ -1,28 +1,12 @@
 """
 `replay_dlq_by_ids` — targeted DLQ replay, immediate or scheduled.
 
-The agent's remediation planner picks specific DLQ entries after
-reading `list_dlq_messages` + `list_dlq_messages(remediation_hint=...)`
-+ triage. This tool replays only those, avoiding the blast radius of
-the coarser `replay_dlq_messages(job_type=, limit=)` when the agent
-knows exactly which IDs are safe.
-
-If `delay_seconds` is omitted the replay fires immediately through
-the standard `JobService.replay_job` path (reset retry_count, clear
-error_message, republish via outbox). If set, each targeted job is
-pushed onto the `jobs:dlq_replay_delayed` sorted set with score =
-now + delay; the worker's promote loop fires them at their scheduled
-time. That's the `wait_and_replay` remediation category: give the
-transient dependency time to recover before retrying.
-
-`actions:execute` + idempotent (via the standard dispatch wrapper).
-
-Compensator pairing (ADR 0008 amendment): this tool is the unstick
-path for the `create_stuck_dag` chaos hook — replaying the chain's
-dead-lettered root lets the dispatcher complete it and the resolver
-promote the held descendants. Round-trip test:
-`test_create_stuck_dag_round_trip_with_replay_dlq_by_ids` in
-`tests/api/test_mcp_chaos_stuck_dag.py`.
+Replays only the named ids, avoiding the blast radius of
+`replay_dlq_messages(job_type=, limit=)`. Without `delay_seconds` it goes through
+`JobService.replay_job` at once; with it, each job is pushed onto the
+`jobs:dlq_replay_delayed` ZSET for the worker's promote loop — the `wait_and_replay`
+category. Also the un-stick path for a chain whose root dead-lettered.
+`actions:execute` + idempotent.
 """
 
 import uuid
@@ -73,8 +57,7 @@ class ReplayResult(BaseModel):
     id: str
     ok: bool
     error: str | None = None
-    # Set only when `delay_seconds` was passed. `execute_at` is the
-    # epoch second the promote loop will fire the actual replay.
+    # Set only when `delay_seconds` was: the epoch second the promote loop fires at.
     scheduled: bool = False
     execute_at: float | None = None
 
@@ -142,11 +125,7 @@ async def replay_dlq_by_ids(
 
     for job_id in inp.job_ids:
         if inp.delay_seconds is None:
-            # SAVEPOINT per item (#5) — same rationale as the sibling
-            # replay tools. Immediate replay writes go through the
-            # session; without a nested transaction, a mid-loop
-            # non-AppError commits the earlier ids' writes behind an
-            # error response.
+            # SAVEPOINT per item (#5): no earlier ids' writes behind an error.
             try:
                 async with ctx.db.begin_nested():
                     await service.replay_job(
@@ -181,11 +160,8 @@ async def replay_dlq_by_ids(
                 )
             continue
 
-        # Scheduled branch — pre-validate, then audit-then-arm inside a
-        # savepoint (`_scheduled_replay.schedule_one_audited`). Both
-        # excepts are load-bearing: catching only AppError, as this
-        # branch used to, let any other mid-loop error abort the whole
-        # tool and discard the audit rows for replays already armed.
+        # Scheduled branch — pre-validate, then audit-then-arm in a savepoint.
+        # Both excepts: AppError alone discarded audit rows for armed replays.
         try:
             execute_at = await _schedule_one(
                 job_id=job_id,
@@ -244,13 +220,8 @@ async def _schedule_one(
 ) -> float:
     """Validate + arm a single job on the DLQ-replay ZSET.
 
-    Same pre-check `JobService.replay_job` does (existence + state).
-    The `job.replay_scheduled` audit row lets operators see what was
-    scheduled before it fires; the eventual promote loop writes the
-    normal `job.replayed` row when it actually runs. Ordering,
-    savepoint and compensation live in
-    `_scheduled_replay.schedule_one_audited` — shared with
-    `replay_dlq_by_category` so the two branches cannot diverge again.
+    Same pre-check `JobService.replay_job` does. Ordering, savepoint and
+    compensation live in `_scheduled_replay.schedule_one_audited`.
     """
     job = await job_repo.get_for_tenant(job_id, ctx.principal.tenant_id)
     if job is None:

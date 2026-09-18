@@ -1,42 +1,8 @@
 """The manufactured stranded chain on a real Postgres, against the real sweep.
 
-WO-R3-274 + WO-R3-275. `tests/integration/test_resolver_stall.py` proved that a
-chain in this shape, written row by row, is held by the two stalls; this file
-proves that the shape the **hook** writes is the same shape, by feeding it to
-the same sweep — and that the two claims the hook makes about itself are true of
-the server that will run it:
-
-  * `root_status="completed"` does NOT hold on its own. The root being
-    `completed` leaves step-1 with no unmet parent, so the resume sweep promotes
-    it. Asserted in the direction that hurts: the chain drains in an unpaused
-    window, and only holds when `pause_control_loop('resume_unblocked_waiting')`
-    is set. A hook that quietly stayed stuck here would mean the description is
-    wrong, and the fault would evaporate in a live run instead.
-  * `failed_step` DOES hold on its own, with no stall at all, because no
-    `waiting` row in it has a `completed` parent.
-
-And the third world: a `pause_dag_chaos` pause is **enforced**, not just
-reported. The sweep is what enforces it (ADR 0011 via ADR 0022), so the proof is
-an unpaused sweep window declining to promote a chain the lab paused — which
-takes the real keyset query, the real `NOT EXISTS` over `job_dependencies` and
-the real `find_blocking_pause` ancestor walk. That is why this tier.
-
-**Why the hooks are called directly rather than over the wire.** The API twin
-(`tests/api/test_mcp_stranded_chain_and_lab_pause.py`) already exercises the
-JSON-RPC envelope, the scopes and the gating. What only Postgres can answer is
-what its own planner and clock do with the rows — `created_at` returned
-timezone-aware from the column the sweep orders by, the row-value keyset
-comparison, and the correlated subquery. Under the unit tier's default
-`CHAOS_ENABLED=false` the `@chaos_tool` decorator is a no-op that returns the
-function unchanged, so the handler is importable and callable here without
-opening the gate.
-
-Redis is stubbed, as in `test_resolver_stall.py`: every flag this world needs is
-one key lookup (`GET`, `MGET`, `TTL`), so a second container would prove that
-redis-py round-trips a string.
-
-Skipped automatically when Docker / testcontainers is unavailable, like every
-other file in this tier.
+WO-R3-274 + WO-R3-275. Three claims the hook makes: `root_status="completed"` does NOT hold
+alone (it needs `pause_control_loop('resume_unblocked_waiting')`), `failed_step` does, and a
+`pause_dag_chaos` pause is enforced by the sweep, not merely reported (ADR 0011 via 0022).
 """
 
 from __future__ import annotations
@@ -112,16 +78,13 @@ pytestmark = pytest.mark.skipif(
 
 _SWEEP_PAUSE_KEY = pause_key_for(ControlLoopName.RESUME_UNBLOCKED_WAITING)
 
-#: The window, counted in sweep iterations rather than wall seconds — the same
-#: discipline `test_resolver_stall.py` established, and for the same reason: a
-#: window too short to contain one pass would pass the "it held" assertions for
-#: the wrong reason.
+#: The window in sweep iterations, not wall seconds (as `test_resolver_stall.py` does):
+#: a window too short for one pass would pass the "it held" assertions for free.
 _FAST_INTERVAL = 0.01
 _MIN_TICKS = 12
 _TICK_TIMEOUT = 20.0
 
-#: What the hook is asked to backdate the chain by. Plan 01 §7.2 reads "child
-#: created_at age large"; the platform's own stranded-child proof uses 47 min.
+#: The backdate the hook is asked for — 01 §7.2's "created_at age large", 47 min.
 _CHILD_AGE_SECONDS = 47 * 60
 
 _TABLES = [
@@ -195,11 +158,7 @@ class _World:
         )
 
     async def manufacture(self, redis: _Redis, **kwargs: Any) -> Any:
-        """Run the chaos hook against the real database, in its own transaction.
-
-        `chain_name` is per-call so two chains can coexist, which is what the
-        pause comparison needs.
-        """
+        """The chaos hook on the real database; `chain_name` is per-call."""
         async with self.factory() as session:
             async with session.begin():
                 made = await create_stuck_dag(
@@ -246,8 +205,7 @@ def pg() -> Any:
 
 @pytest.fixture
 async def world(pg: Any) -> AsyncIterator[_World]:
-    """A fresh schema, one tenant, one user — torn down per test, because every
-    test here promotes (or fails to promote) rows with the same derived ids."""
+    """A fresh schema per test: the derived ids are the same in every one."""
     engine = create_async_engine(pg.get_connection_url(), pool_size=5, max_overflow=5)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all, tables=_TABLES)
@@ -288,17 +246,9 @@ async def world(pg: Any) -> AsyncIterator[_World]:
 async def _run_sweep_window(
     factory: async_sessionmaker[AsyncSession], redis: _Redis
 ) -> int:
-    """Run the real resume sweep for exactly `_MIN_TICKS` iterations.
-
-    Lifted from `test_resolver_stall.py`, including why each patch is there:
-    the interval so the window is short in wall time, `CHAOS_ENABLED` so the
-    pause check reaches Redis at all, and a counting wrapper that calls through
-    to the real check (the pause check runs every iteration; the promotion runs
-    only on unpaused ones, so counting the check is the honest measure). The
-    loop is stopped by raising `CancelledError` out of that check — at the top
-    of an iteration, before any database work — because cancelling the task from
-    outside can land inside the sweep's own transaction.
-    """
+    """Run the real resume sweep for exactly `_MIN_TICKS` iterations, as
+    `test_resolver_stall.py` does: interval, `CHAOS_ENABLED` and a counting wrapper
+    patched, and `CancelledError` raised out of the check rather than a task cancel."""
     ticks = 0
 
     async def _counting_is_paused(loop_name: ControlLoopName) -> bool:
@@ -322,23 +272,15 @@ async def _run_sweep_window(
     return ticks - 1  # the iteration that stopped the loop did no work
 
 
-# ---------------------------------------------------------------------------
 # resolver_stall — the hook writes the shape, the two stalls hold it
-# ---------------------------------------------------------------------------
 
 
 async def test_the_stranded_chain_holds_while_the_sweep_is_paused(
     world: _World,
 ) -> None:
-    """The world plan 01 §7.2 calls `resolver_stall`, manufactured end to end.
-
-    The resolver is out of the picture by construction here, as it is live: the
-    root's `job.completed` is in the past (these rows were inserted already
-    `completed`), so there is no delivery for it to react to. With the resume
-    sweep paused, nothing promotes — and every fact the plan lists comes back
-    from the agent's own read tools, including a `created_at` that Postgres
-    returns timezone-aware from the column the sweep orders by.
-    """
+    """01 §7.2's `resolver_stall`, manufactured end to end: the root's
+    `job.completed` is already in the past, so with the sweep paused nothing
+    promotes and every fact the plan lists comes back from the read tools."""
     redis = _Redis()
     await redis.set(_SWEEP_PAUSE_KEY, "paused", ex=300)
 
@@ -386,17 +328,9 @@ async def test_the_stranded_chain_holds_while_the_sweep_is_paused(
 async def test_the_same_window_drains_the_stranded_chain_when_the_sweep_runs(
     world: _World,
 ) -> None:
-    """The control, and the description's honesty claim in one test.
-
-    Identical chain, identical window, no sweep pause — and step-1 is promoted,
-    because a `completed` root leaves it with no unmet parent. This is what
-    makes "`root_status='completed'` does NOT hold by itself" a fact about the
-    platform rather than a caution in a docstring, and it is why the tool
-    description names both companion hooks.
-
-    Only step-1 moves: step-2 is still waiting on step-1, which is now `pending`
-    rather than `completed`.
-    """
+    """The control: no sweep pause, so step-1 is promoted — which is what makes
+    "`root_status='completed'` does NOT hold by itself" a fact. Only step-1 moves,
+    because step-2 waits on a `pending` parent."""
     redis = _Redis()  # no sweep pause
 
     made = await world.manufacture(
@@ -421,13 +355,8 @@ async def test_the_same_window_drains_the_stranded_chain_when_the_sweep_runs(
 async def test_the_default_dead_lettered_chain_still_holds_with_no_stall(
     world: _World,
 ) -> None:
-    """The shape this hook has always written, unchanged by the new inputs.
-
-    `dead_letter` is terminal and the sweep only promotes a row whose parents
-    are all `completed`, so twelve sweep passes move nothing. Asserted here
-    rather than trusted, because `root_status` is the first thing to touch this
-    chain's statuses since it shipped.
-    """
+    """The shape this hook has always written: `dead_letter` is terminal, so twelve
+    sweep passes move nothing. `root_status` is the first input to touch it."""
     redis = _Redis()
 
     made = await world.manufacture(redis, chain_name="default-shape")
@@ -440,22 +369,15 @@ async def test_the_default_dead_lettered_chain_still_holds_with_no_stall(
         assert await world.status_of(step_id) == JobStatus.WAITING.value
 
 
-# ---------------------------------------------------------------------------
 # downstream_child_failed — holds with no stall at all
-# ---------------------------------------------------------------------------
 
 
 async def test_the_failed_step_chain_holds_on_its_own_with_one_dlq_row(
     world: _World,
 ) -> None:
-    """`downstream_child_failed`, and the claim that it needs no companion hook.
-
-    No `waiting` row in this chain has a `completed` parent — step-1 is itself
-    `completed`, step-2 is `dead_letter`, and step-3 waits on a terminal row —
-    so an unpaused sweep window promotes nothing. The DLQ shows exactly one
-    entry and it is the descendant, not the root: the root `completed`, which
-    is the whole difference from the chain this hook used to be limited to.
-    """
+    """`downstream_child_failed` needs no companion hook: no `waiting` row has a
+    `completed` parent, so an unpaused window promotes nothing. The one DLQ entry is
+    the descendant, not the root — the difference from the old chain."""
     redis = _Redis()  # deliberately no stall of any kind
 
     made = await world.manufacture(
@@ -487,22 +409,15 @@ async def test_the_failed_step_chain_holds_on_its_own_with_one_dlq_row(
     assert dlq.items[0].remediation_hint == "human_required"
 
 
-# ---------------------------------------------------------------------------
 # paused_dag — the lab pause is enforced by the sweep, not merely reported
-# ---------------------------------------------------------------------------
 
 
 async def test_the_lab_pause_is_enforced_by_the_real_sweep(
     world: _World,
 ) -> None:
-    """The pair the plan wants: identical node statuses, one boolean apart.
-
-    Same chain as `test_the_same_window_drains_…`, same unpaused window — and
-    step-1 is NOT promoted, because `pause_dag_chaos` wrote the flag the sweep
-    itself checks through `find_blocking_pause`. That is the difference between
-    a pause that is reported and a pause that is real, and it is only provable
-    against the server that runs the ancestor walk and the keyset query.
-    """
+    """Identical node statuses, one boolean apart: same unpaused window as the
+    control, but step-1 is not promoted, because `pause_dag_chaos` wrote the flag
+    the sweep checks through `find_blocking_pause`."""
     redis = _Redis()  # the sweep runs; only the DAG is paused
 
     made = await world.manufacture(
@@ -550,15 +465,9 @@ async def test_the_lab_pause_is_enforced_by_the_real_sweep(
 async def test_the_lab_pause_lapsing_lets_the_same_window_drain_the_chain(
     world: _World,
 ) -> None:
-    """The TTL is the teardown and nothing has to be called.
-
-    Deleting the key and letting Redis expire it are indistinguishable to the
-    check (a `GET` inside an `MGET`), and waiting out a real TTL would put a
-    minimum sleep in this tier for no extra coverage. What is worth proving is
-    that the world heals *by itself* afterwards — the same window that held
-    while the flag was set now promotes step-1, so a lab pause cannot outlive
-    its scenario.
-    """
+    """The TTL is the teardown and nothing has to be called: the key is deleted
+    instead of waited out, and the same window that held now promotes step-1, so a
+    lab pause cannot outlive its scenario."""
     redis = _Redis()
 
     made = await world.manufacture(

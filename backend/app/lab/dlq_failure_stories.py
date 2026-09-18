@@ -1,118 +1,25 @@
 """The one table of dead-letter failure stories the lab may stamp on a row.
 
-A dead-lettered job the agent can see carries two things that say what
-went wrong: `jobs.remediation_hint` — the coarse category its remediation
-logic branches on — and `jobs.error_message`, the free text a planner
-actually reads. `list_dlq_messages` returns both, plus the `job_triages`
-row when one exists, in the same response.
-
-Before this table they disagreed. Live run `efdc3b2a9864` (2026-09-07)
-put the `remediate_runaway_saga_success` agent in front of a chain whose
-dead-lettered root was stamped `remediation_hint=replay_safe` and
-
-    SchemaValidationError: payload missing required field 'user_id'
-    (received keys: ['tenant_id', 'action', 'ts'])
-
-The agent read the row, judged that a payload missing a required field
-will fail the same way on every attempt, and escalated rather than
-replaying. That is what an operator should do with that text. The hint
-said the opposite, and the hint was the truth — in the lab no processor
-validates payloads, so the error string was decoration. Nothing on the
-wire told the agent that, and nothing could: a self-contradictory fixture
-grades sound reasoning as failure. WO-R2-146.
-
-So the rule this module exists to hold:
+Live run `efdc3b2a9864` shipped a `replay_safe` row whose `error_message` was a
+permanent schema fault, and graded the agent's correct escalation as a failure
+(WO-R2-146). Hence the rule this module holds, as code in
+`coherence_violations()` and walked by `tests/unit/test_dlq_text_coherence.py`:
 
     a lab row's error text must describe a failure of the same *kind* its
     remediation hint prescribes an action for.
 
-  * `replay_safe`      — a transient fault that left nothing behind.
-                         Replaying now is the whole fix.
-  * `wait_and_replay`  — a dependency shedding load or refusing
-                         connections. Replaying now burns another
-                         attempt; replaying after a delay works.
-  * `human_required`   — bad data or a schema violation baked into the
-                         stored payload. Every replay fails identically.
-  * `None`             — nothing has classified this failure. The text
-                         must not invite a replay, because a null hint
-                         means unknown and *not* replay-safe.
+  * `replay_safe`     — transient, nothing left behind; replay now.
+  * `wait_and_replay` — a dependency shedding load; replay after a delay.
+  * `human_required`  — bad data or a schema violation in the stored payload.
+  * `None`            — nothing has classified it. Asymmetric: the text may
+                        name a permanent fault (that agrees), but must not
+                        invite a replay, and may never carry a triage block.
 
-That last bullet used to read "the text must not imply a class either".
-That was too broad in one direction, and the over-reach was load-bearing
-rather than cosmetic: it made the pair an escalation drill actually needs
-— an *unclassified* row whose error text a human can read and act on —
-representable nowhere in this table. The rule for a null hint is
-asymmetric, because the harm is:
-
-  * A null-hint row whose text reads transient ("timed out, nothing was
-    committed") or backoff ("429, retry-after 120s") is incoherent. Every
-    tool description says a null hint is UNKNOWN and explicitly not
-    replay-safe, so a text that says "replaying is the fix" is telling
-    the agent to do the thing the missing classification does not
-    authorise.
-  * A null-hint row whose text names a permanent data fault is coherent.
-    A hint is a *classification*; an error text is the *symptom* the
-    failing code recorded. "Nobody has classified this" and "the symptom
-    is a bad row in the payload" do not disagree — the text is precisely
-    the evidence a triage pass (or an operator) would read to reach
-    `human_required`, and it points away from a replay, which is where a
-    null hint already sits. Refusing that pair would be refusing the
-    normal state of an organically dead-lettered job on a stack with LLM
-    triage switched off, which is this platform's default.
-
-So `coherence_violations` screens a null hint for backoff and transient
-markers and admits permanent ones. What a null hint may never carry is a
-`job_triages` row — that block *is* a classification — and
-`triage_violations` still refuses it.
-
-`coherence_violations()` is that rule as code, and every writer's pairs
-are walked through it by `tests/unit/test_dlq_text_coherence.py`. The
-markers are deliberately a small closed vocabulary rather than a
-classifier: the point is that a human adding a story can see from this
-file which words decide its class. A new story whose wording trips the
-screen gets reworded — the screen does not get loosened.
-
-Each hint maps to a *tuple* of stories rather than one string. Two
-distinct `wait_and_replay` fixtures (an unreachable SMTP relay, a
-rate-limited partner API) are more useful to read than the same sentence
-twice, and both are coherent. Element 0 is the canonical default: it is
-what a writer given only a hint stamps.
-
-## The one sanctioned incoherent pair
-
-`MISLABELED_BAD_DATA` is a story this table declares and deliberately
-keeps *out* of `DLQ_FAILURE_STORIES`: hint `replay_safe`, error text a
-permanent bad-data fault. `coherence_violations` reports it, and is meant
-to — it is the only pair in the lab whose incoherence is the point rather
-than a defect.
-
-It exists because "the classifier lied" is a real production failure and
-an agent has to be measured against it: a row can carry a
-`remediation_hint` that its own error text contradicts, because something
-upstream (LLM triage, a human, a bad backfill) classified it wrong. An
-agent that trusts the hint column and replays a row whose text says the
-payload is broken has done the thing this campaign has spent four
-releases teaching it not to do. Only `create_mislabeled_dlq_job` may
-write it, only when the caller passes `mislabel: true`, and the tool
-description says in plain words that the row is a lie.
-
-Three guardrails keep it from leaking back into the honest lab:
-
-  * It is absent from `DLQ_FAILURE_STORIES`, `ALL_STORIES` and
-    `STORIES_BY_KEY`, so no writer can reach it through `story_for`,
-    `default_error_for` or `story` — only through the one named export
-    `sanctioned_incoherent_story()`.
-  * Its text is the CSV bad-row one, never the `SchemaValidationError`
-    text from run `efdc3b2a9864`. The narrow promise "no writer pairs
-    `replay_safe` with the exact string that shipped" therefore stays
-    absolute, and the test that pins it stays a true regression test.
-  * `tests/unit/test_dlq_text_coherence.py` asserts the screen still
-    *flags* it. A change that made the screen accept this pair would be
-    the WO-R2-146 defect coming back as a loophole.
-
-Nothing here is production behaviour. The strings are never parsed to
-decide anything at runtime — `remediation_hint` remains the only source
-of truth for routing, exactly as `RemediationHint`'s own docstring says.
+The markers are a small closed vocabulary on purpose — a story that trips the
+screen gets reworded, the screen does not get loosened. Each hint maps to a
+tuple of stories, element 0 the canonical default. `MISLABELED_BAD_DATA` is the
+one sanctioned incoherent pair (see its own comment). Nothing here is
+production behaviour; `remediation_hint` stays the only source of truth.
 """
 
 from __future__ import annotations
@@ -132,16 +39,9 @@ from app.models.enums import RemediationHint
 class DlqTriage:
     """The `job_triages` row that goes with a story.
 
-    `list_dlq_messages` returns this block inline with the entry, so it is
-    as agent-visible as `error_message` and belongs to the same coherence
-    rule: a `replay_safe` row whose triage says "fix the producer, then
-    replay" contradicts its hint just as loudly as the error text does.
-
-    `suggested_fix` deliberately names no tool. Steering the agent toward
-    a specific Tier-1 call from fixture data would grade tool choice on
-    what the fixture whispered rather than on what the agent concluded,
-    and several scenarios forbid the very tools such a whisper would
-    suggest.
+    `list_dlq_messages` returns it inline, so it obeys the same coherence rule
+    as the error text. `suggested_fix` names no tool on purpose — a fixture
+    that whispers a Tier-1 call grades the whisper, not the agent.
     """
 
     root_cause_category: str
@@ -153,13 +53,8 @@ class DlqTriage:
 
 @dataclass(frozen=True)
 class DlqFailureStory:
-    """One coherent (error text, triage) pair for one remediation hint.
-
-    `key` is how a caller pins a specific variant — the eval seeder names
-    the story each of its rows uses, so a reader of the seeder can see
-    which of a hint's stories that row tells without counting tuple
-    indices.
-    """
+    """One coherent (error text, triage) pair for one remediation hint;
+    `key` pins a variant so a writer names the story instead of an index."""
 
     key: str
     hint: str | None
@@ -295,10 +190,8 @@ UNCLASSIFIED_WORKER_EXIT = DlqFailureStory(
         "3/3 without recording an outcome; no exception was captured and "
         "the failure has not been categorised"
     ),
-    # No triage row on purpose. A null hint means nothing has classified
-    # this failure, and a triage block *is* a classification — writing
-    # one would contradict the hint the same way a mismatched error text
-    # does.
+    # No triage on purpose: a null hint means nothing classified this, and a
+    # triage block is a classification.
     triage=None,
 )
 
@@ -310,15 +203,10 @@ UNCLASSIFIED_CSV_BAD_ROW = DlqFailureStory(
         "column 'quantity' at row 8,214 of 12,000 — csv_upload aborted "
         "on attempt 3/3"
     ),
-    # Same reason as the story above, and the reason this variant exists:
-    # a triage block would classify the row, and the whole point of it is
-    # that nothing has. The text is a symptom a reader can act on; the
-    # hint column is still empty, so deciding what to do with the row is
-    # work the reader has to do. `create_bad_data_job` pins this story by
-    # key for the escalation drill (`dlq_human_required_escalates`), where
-    # the agent has to read the error, fence the row itself, and escalate
-    # — none of which is measurable against a row that arrived already
-    # stamped `human_required`.
+    # No triage, same reason, and the point of this variant: the text is a
+    # symptom a reader can act on while the hint column stays empty.
+    # `create_bad_data_job` pins it by key for the escalation drill
+    # (`dlq_human_required_escalates`).
     triage=None,
 )
 
@@ -331,29 +219,12 @@ UNCLASSIFIED_SCHEMA_MISSING_FIELD = DlqFailureStory(
         "(received keys: []) — rejected on attempt 3/3 and the failure "
         "has not been categorised"
     ),
-    # `poison_message`'s default story. That hook publishes a
-    # schema-invalid payload, so a schema violation is the honest symptom
-    # for the dead-letter row it writes beside the send. Before this story
-    # existed the row read "UpstreamTimeout …" under a `replay_safe` hint,
-    # which passed the coherence screen and was still false: it described
-    # a transient fault the hook never injected, and invited a replay of a
-    # payload no replay can fix.
-    #
-    # Null hint rather than `human_required` because a freshly poisoned
-    # message arrives with nothing having classified it — LLM triage is off
-    # by default here, so an organically dead-lettered job's hint column
-    # is NULL. A permanent-fault text under a null hint is exactly the pair
-    # the module docstring's asymmetric rule admits.
-    #
-    # A different field and a different `received keys` list from
-    # `SCHEMA_MISSING_FIELD` on purpose. That story's text is verbatim from
-    # live run efdc3b2a9864 and is pinned as "the exact pair that shipped";
-    # keeping this variant distinguishable means a reader sweeping a queue
-    # can tell a poisoned row from a seeded one, and a test asserting on
-    # the shipped string cannot accidentally match this one.
-    #
-    # No triage block: a null hint may never carry one (see
-    # `UNCLASSIFIED_WORKER_EXIT`).
+    # `poison_message`'s default story: that hook publishes a schema-invalid
+    # payload, so a schema violation is the honest symptom (it used to read
+    # "UpstreamTimeout …" under `replay_safe` — screened clean and still
+    # false). Null hint because a poisoned message arrives unclassified. A
+    # different field from `SCHEMA_MISSING_FIELD` on purpose: that text is
+    # verbatim from run efdc3b2a9864 and pinned. No triage block.
     triage=None,
 )
 
@@ -366,26 +237,14 @@ MISLABELED_BAD_DATA = DlqFailureStory(
     key="mislabeled_bad_data",
     hint=RemediationHint.REPLAY_SAFE.value,
     error_message=CSV_BAD_ROW.error_message,
-    # DELIBERATELY INCOHERENT. `coherence_violations` reports this pair and
-    # must keep reporting it — see the module docstring's "one sanctioned
-    # incoherent pair" section for the whole rationale. In one line: a
-    # `remediation_hint` can be wrong in production, and an agent that
+    # DELIBERATELY INCOHERENT, and `coherence_violations` must keep reporting
+    # it: a `remediation_hint` can be wrong in production, and an agent that
     # trusts the column over the text it contradicts has to be measurable.
-    #
-    # Reachable only through `sanctioned_incoherent_story()`, and written
-    # only by `create_mislabeled_dlq_job` under an explicit `mislabel:
-    # true`. It is absent from `DLQ_FAILURE_STORIES`, so `story_for`,
-    # `default_error_for` and `story` cannot reach it and no writer can
-    # stamp it by asking for a hint.
-    #
-    # The text is `CSV_BAD_ROW`'s, not `SCHEMA_MISSING_FIELD`'s: the exact
-    # string from run efdc3b2a9864 stays paired with nothing but
-    # `human_required`, so the narrow regression test on that pair keeps
-    # its meaning.
-    #
-    # No triage block. `is_retryable=True` beside this text would be a
-    # second, different lie, and one incoherence per fixture is what the
-    # scenario is measuring.
+    # Reachable only through `sanctioned_incoherent_story()`, written only by
+    # `create_mislabeled_dlq_job` under `mislabel: true`. Its text is
+    # `CSV_BAD_ROW`'s, so the run efdc3b2a9864 string stays paired with
+    # `human_required` alone. No triage block: `is_retryable=True` here would
+    # be a second lie.
     triage=None,
 )
 
@@ -404,13 +263,9 @@ DLQ_FAILURE_STORIES: Mapping[str | None, tuple[DlqFailureStory, ...]] = (
                 SCHEMA_MISSING_FIELD,
                 CSV_BAD_ROW,
             ),
-            # Element 0 stays the story that says nothing at all about
-            # its class: that is what a writer given only "uncategorised"
-            # should stamp, and `default_error_for(None)` must keep
-            # returning it. The two permanent-fault variants are reached
-            # by key, by the hooks that want an unclassified row a reader
-            # can actually act on — bad data for `create_bad_data_job`, a
-            # schema violation for `poison_message`.
+            # Element 0 stays the story that says nothing about its class —
+            # `default_error_for(None)` must keep returning it. The two
+            # permanent-fault variants are reached by key.
             None: (
                 UNCLASSIFIED_WORKER_EXIT,
                 UNCLASSIFIED_CSV_BAD_ROW,
@@ -435,9 +290,8 @@ STORIES_BY_KEY: Mapping[str, DlqFailureStory] = MappingProxyType(
 
 
 class UnknownDlqHintError(KeyError):
-    """A hint with no story. Raised rather than returning a fallback text:
-    a fallback would be a string of unknown class stamped on a row of
-    known class, which is the defect this module exists to prevent."""
+    """A hint with no story. Raised rather than returning a fallback text of
+    unknown class."""
 
 
 def stories_for(hint: str | None) -> tuple[DlqFailureStory, ...]:
@@ -461,11 +315,8 @@ def story_for(hint: str | None) -> DlqFailureStory:
 
 
 def default_error_for(hint: str | None) -> str:
-    """The canonical error text for `hint`.
-
-    The one-line call every fixture writer makes. Replaces the per-module
-    error tables that drifted out of agreement with each other and with
-    the hints they were written beside."""
+    """The canonical error text for `hint` — the one-line call every fixture
+    writer makes."""
     return story_for(hint).error_message
 
 
@@ -483,16 +334,9 @@ def story(key: str) -> DlqFailureStory:
 def sanctioned_incoherent_story() -> DlqFailureStory:
     """The one pair this table declares and the coherence screen refuses.
 
-    A named function rather than a bare constant re-export so a reader of
-    a call site sees the word "incoherent" without opening this file, and
-    so `grep sanctioned_incoherent_story` enumerates every writer that may
-    stamp a lie — one, `create_mislabeled_dlq_job`.
-
-    `coherence_violations(s.hint, s.error_message)` on the returned story
-    is non-empty by design. See the module docstring's "one sanctioned
-    incoherent pair" section; the short version is that a wrong
-    `remediation_hint` happens in production, so an agent that trusts the
-    column over the text contradicting it has to be measurable.
+    Named rather than a bare constant so `grep sanctioned_incoherent_story`
+    enumerates every writer that may stamp a lie — one,
+    `create_mislabeled_dlq_job`. `coherence_violations` on it is non-empty.
     """
     return MISLABELED_BAD_DATA
 
@@ -501,9 +345,8 @@ def sanctioned_incoherent_story() -> DlqFailureStory:
 # The coherence rule
 # --------------------------------------------------------------------------
 
-# Words that say "this failure is baked into the stored payload and will
-# recur identically". A row carrying one of these cannot honestly be
-# replayable.
+# "Baked into the stored payload, recurs identically" — a row with one of
+# these cannot honestly be replayable.
 PERMANENT_MARKERS: tuple[str, ...] = (
     "schemavalidationerror",
     "valueerror",
@@ -545,11 +388,7 @@ def _present(markers: tuple[str, ...], text: str) -> list[str]:
 def coherence_violations(hint: str | None, error_message: str) -> list[str]:
     """Every way `error_message` contradicts `hint`. Empty means coherent.
 
-    Returns reasons rather than a bool so a failing table test names the
-    contradiction instead of only its existence — the original defect was
-    invisible for a month because nothing ever said the two fields
-    disagreed.
-    """
+    Reasons rather than a bool so a failing test names the contradiction."""
     permanent = _present(PERMANENT_MARKERS, error_message)
     backoff = _present(BACKOFF_MARKERS, error_message)
     transient = _present(TRANSIENT_MARKERS, error_message)
@@ -595,11 +434,8 @@ def coherence_violations(hint: str | None, error_message: str) -> list[str]:
                 "replay the hint forbids"
             )
     elif hint is None:
-        # Asymmetric on purpose — see the module docstring. A null hint is
-        # UNKNOWN and explicitly not replay-safe, so the contradiction is
-        # a text that says a replay (now, or after a wait) is the remedy.
-        # A text naming a permanent data fault agrees with the null hint
-        # about the only thing the null hint asserts: don't replay this.
+        # Asymmetric on purpose (module docstring): a null hint is UNKNOWN and
+        # not replay-safe, so only a text inviting a replay contradicts it.
         routable = transient + backoff
         if routable:
             reasons.append(
@@ -618,11 +454,8 @@ def coherence_violations(hint: str | None, error_message: str) -> list[str]:
 def triage_violations(
     hint: str | None, triage: DlqTriage | None
 ) -> list[str]:
-    """Every way a triage block contradicts `hint`. Empty means coherent.
-
-    `list_dlq_messages` returns the triage row inline, so `is_retryable`
-    is a second, blunter statement of the same thing the hint says.
-    """
+    """Every way a triage block contradicts `hint`; `is_retryable` is a
+    second, blunter statement of what the hint says."""
     reasons: list[str] = []
     if hint is None:
         if triage is not None:

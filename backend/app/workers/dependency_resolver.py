@@ -1,25 +1,9 @@
 """
-Dependency resolver — Kafka-driven scheduler for the job dependency DAG.
-
-A job created with dependencies starts in WAITING. This consumer watches
-`job.completed` events and, for each completing parent, examines its
-children. A child is promoted to PENDING (and a job.submitted event
-emitted via the outbox) once every one of its dependencies has reached
-COMPLETED.
-
-Idempotency: re-delivery of the same job.completed event may race another
-promoter (a second delivery, or the dispatcher's resume sweep) for the
-same child. The promotion is an atomic WAITING → PENDING compare-and-set
-(`JobRepository.promote_waiting_to_pending`), and the loser skips the
-outbox add as well — so no redundant job.submitted is minted. Any
-duplicate delivery that still reaches the dispatcher is neutralized by
-its atomic PENDING → RUNNING claim.
-
-Pause: a child is held in WAITING while it or any ancestor carries a
-`dag:paused:*` flag (set by the `pause_dag` tool). Before this check
-existed the flag was written and never read, so `pause_dag` reported
-`accepted: true` and promoted children anyway. Redis failures fail open
-— see `app.utils.dag_pause`.
+Dependency resolver — Kafka-driven scheduler for the job dependency DAG. On each `job.completed`, a
+WAITING child whose every dependency is COMPLETED becomes PENDING with a `job.submitted` outbox row.
+Promotion is an atomic compare-and-set (`JobRepository.promote_waiting_to_pending`) and the loser
+skips the outbox add too, so a race with the resume sweep mints no duplicate. A child is held in
+WAITING while it or an ancestor carries a `dag:paused:*` flag; Redis failures fail open.
 """
 
 import uuid
@@ -53,9 +37,7 @@ class DependencyResolver(BaseKafkaConsumer):
             group_id=settings.kafka_consumer_group_dependency,
         )
         self.session_factory = session_factory
-        # Optional so existing tests that construct the resolver without
-        # Redis keep working — a resolver with no client simply never
-        # sees a pause, which is the pre-change behaviour.
+        # Optional: a resolver with no client never sees a pause (tests).
         self.redis = redis
 
     async def handle_message(
@@ -99,10 +81,7 @@ class DependencyResolver(BaseKafkaConsumer):
                             self.redis, dep_repo, child_id
                         )
                         if paused_by is not None:
-                            # Stays WAITING. No outbox row, so nothing to
-                            # undo when the pause lifts — the next
-                            # job.completed redelivery (or the parent's
-                            # own event on retry) re-evaluates it.
+                            # Stays WAITING; no outbox row to undo when the pause lifts.
                             logger.info(
                                 "dependency-resolver held child (dag paused)",
                                 extra={
@@ -112,10 +91,7 @@ class DependencyResolver(BaseKafkaConsumer):
                             )
                             continue
 
-                    # E1-04: CAS the promotion — the resume sweep (or a
-                    # redelivered job.completed) may have promoted this
-                    # child already. The loser must skip the outbox add
-                    # too, or it still mints a duplicate job.submitted.
+                    # E1-04: CAS the promotion; the loser must skip the outbox add too.
                     if not await job_repo.promote_waiting_to_pending(child_id):
                         continue
                     await outbox_repo.add(

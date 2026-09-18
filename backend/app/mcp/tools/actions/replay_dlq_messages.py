@@ -1,31 +1,12 @@
 """
 `replay_dlq_messages` — bulk replay of dead-lettered jobs.
 
-Reads DLQ jobs (optionally filtered by `job_type`) and replays each
-via the existing `JobService.replay_job` — the same code path the
-admin UI's Replay button uses. Each replay resets `retry_count`,
-clears `error_message`, re-publishes to `job.submitted` through the
-outbox.
-
-`human_required` entries are excluded from the batch (R2-22). This is
-the *blind* replay tool: the caller names a status and maybe a job
-type, and takes whatever comes back. That is the one shape where the
-`human_required` fence has to hold by default, because nobody looked
-at the individual rows — `mark_dlq_permanent` exists to put a job in
-that category precisely so automation stops touching it, and
-`replay_dlq_by_category` refuses the category outright. Replaying
-those here just re-runs a known-persistent bug and buries the
-escalation under a fresh failure.
-
-`replay_dlq_by_ids` has the same gap and keeps it deliberately: there
-the caller enumerates the ids, which is an explicit "yes, this one".
-
-`include_human_required=true` is the same explicit consent for this
-tool, for the operator who has reviewed the bug and shipped the fix.
-
-`actions:execute` + idempotent. The idempotency key covers the
-entire batch: replaying the same batch twice with the same key is a
-no-op. Same key + different filter is refused as key reuse.
+Replays each through `JobService.replay_job`, the same path as the admin Replay
+button. `human_required` entries are excluded by default (R2-22): this is the *blind*
+tool, so nobody looked at the individual rows, and replaying them re-runs a known bug
+under a fresh failure. `include_human_required=true` is the explicit consent, as
+enumerating ids is for `replay_dlq_by_ids`. `actions:execute` + idempotent, with the
+key covering the whole batch — same key + different filter is refused as key reuse.
 """
 
 from app.core.exceptions import AppError
@@ -42,12 +23,8 @@ from pydantic import BaseModel, ConfigDict, Field
 
 logger = get_logger(__name__)
 
-# The one category the blind batch will not take by default. Kept as a
-# single name rather than a set mirroring `replay_dlq_by_category`'s
-# `_REPLAYABLE_CATEGORIES`: that tool allow-lists (the caller names a
-# category, so an unknown one must fail closed), this one deny-lists (the
-# caller names no category, and an uncategorised entry is unclassified,
-# not fenced). Inverting either would change the other's meaning.
+# The one category the blind batch will not take by default. Deny-list, not the
+# allow-list `replay_dlq_by_category` uses: uncategorised is unclassified, not fenced.
 _FENCED_CATEGORY = RemediationHint.HUMAN_REQUIRED.value
 
 
@@ -91,9 +68,7 @@ class ReplayDlqMessagesOutput(BaseModel):
     replayed: int
     failed: int
     jobs: list[ReplayedJob]
-    # Reported rather than silently dropped: after a batch replay the DLQ
-    # not being empty is the expected state, and an agent that cannot see
-    # why will keep re-running the tool trying to drain the remainder.
+    # Reported, not dropped: an agent that cannot see why keeps re-running.
     skipped_human_required: int = 0
     skipped_jobs: list[ReplayedJob] = []
 
@@ -130,9 +105,8 @@ async def replay_dlq_messages(
     outbox_repo = OutboxRepository(ctx.db)
     dep_repo = JobDependencyRepository(ctx.db)
 
-    # The exclusion is a query filter, not a post-fetch skip, so a batch
-    # of `limit` still returns `limit` replayable jobs rather than being
-    # thinned by whatever fenced entries happened to sort into the page.
+    # A query filter, not a post-fetch skip, so a batch of `limit` still returns
+    # `limit` replayable jobs.
     fenced: tuple[str, ...] = (
         () if inp.include_human_required else (_FENCED_CATEGORY,)
     )
@@ -145,10 +119,8 @@ async def replay_dlq_messages(
         exclude_remediation_hints=fenced,
     )
 
-    # Second query rather than a filter over the first: the exclusion above
-    # means the fenced rows are simply not in `jobs`, and the caller needs
-    # to be told they exist. Same filters, so it can never report entries
-    # outside the scope the caller asked about.
+    # Second query: the exclusion above leaves fenced rows out of `jobs`, and the
+    # caller still needs to know they exist.
     skipped: list[ReplayedJob] = []
     if fenced:
         fenced_jobs, _ = await job_repo.list_jobs(
@@ -170,13 +142,9 @@ async def replay_dlq_messages(
     replayed: list[ReplayedJob] = []
     failed = 0
     for job in jobs:
-        # SAVEPOINT per item (#5): a mid-loop exception (AppError OR any
-        # other) rolls back only this iteration. Without this, a non-
-        # AppError raised on job N would propagate up to
-        # handle_tools_call, be caught as "internal tool error", but the
-        # session would still commit the writes staged for jobs 1..N-1 —
-        # the caller sees an error while the effect landed. The
-        # savepoint bounds each item's writes to that item's success.
+        # SAVEPOINT per item (#5): a mid-loop exception rolls back only this
+        # iteration. Without it, a non-AppError on job N returned "internal tool
+        # error" while the writes for jobs 1..N-1 still committed.
         try:
             async with ctx.db.begin_nested():
                 updated = await service.replay_job(
@@ -193,9 +161,7 @@ async def replay_dlq_messages(
                 extra={"job_id": str(job.id), "error": exc.message},
             )
         except Exception as exc:
-            # Non-AppError (SQLAlchemy error, unexpected bug, etc.) —
-            # count as failed but keep the batch going. The savepoint
-            # already rolled back this item; the loop is safe to continue.
+            # Count as failed but keep going; the savepoint rolled this item back.
             failed += 1
             logger.exception(
                 "replay_dlq_messages replay crashed",

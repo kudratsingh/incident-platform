@@ -1,15 +1,9 @@
 """
-Service accounts — first-class machine principals.
+Service accounts — first-class machine principals (ADR 0007).
 
-Rationale in `docs/ADR/0007-machine-principal-scope-model.md`. Two tables:
-
-- `service_accounts` is the durable principal. Tenant-scoped, named, carries
-  the maximum scope set for its tokens, and has an active flag as a soft
-  kill switch.
-- `service_account_tokens` holds SHA-256 hashes of the actual bearer tokens.
-  Multiple active tokens per account (supports rotation without disruption),
-  each with its own scope subset, expiry, and revocation timestamp. The
-  plaintext token is shown to the operator exactly once — at mint time.
+`service_accounts` is the durable principal and carries the maximum scope set for
+its tokens; `service_account_tokens` holds SHA-256 hashes, each with its own scope
+subset and expiry. Plaintext is shown once, at mint time.
 """
 
 import uuid
@@ -29,9 +23,7 @@ if TYPE_CHECKING:
 class ServiceAccount(TimestampMixin, Base):
     __tablename__ = "service_accounts"
     __table_args__ = (
-        # Names must be unique within a tenant so operators can refer to
-        # accounts by name in tooling; global uniqueness would be too
-        # restrictive across tenants.
+        # Unique per tenant so operators can name accounts; global is too strict.
         UniqueConstraint("tenant_id", "name", name="uq_service_accounts_tenant_name"),
     )
 
@@ -45,20 +37,14 @@ class ServiceAccount(TimestampMixin, Base):
         index=True,
     )
     name: Mapped[str] = mapped_column(String(128), nullable=False)
-    # The maximum scope set for this account. Minted tokens must carry a
-    # subset of this list; enforcement lives in the token minting service.
-    # Stored as JSON for schema simplicity — the scope enum is fixed and
-    # small, and we filter on membership rather than JSON operators.
+    # The maximum scope set; minted tokens carry a subset, enforced in the minting
+    # service. JSON because the enum is small.
     scopes: Mapped[list[str]] = mapped_column(PortableJSON, nullable=False, default=list)
-    # Soft kill switch. Setting False disables *all* tokens for this account
-    # without touching them individually; useful for the Wave 3 per-principal
-    # kill switch.
+    # Soft kill switch: False disables *all* tokens for this account at once.
     is_active: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=True, server_default="true"
     )
-    # Nullable because the seed principal (`incident-commander`) is created
-    # by a migration, not a human user. SET NULL on user deletion so we don't
-    # cascade-drop service accounts.
+    # Nullable: the seed principal comes from a migration, not a user.
     created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("users.id", ondelete="SET NULL"),
@@ -81,10 +67,7 @@ class ServiceAccount(TimestampMixin, Base):
 class ServiceAccountToken(Base):
     """SHA-256 hash of a `sa_<random>` bearer token.
 
-    The plaintext is never persisted — it's returned to the operator at mint
-    time and thrown away. Verification hashes the presented token and looks
-    up the row; a hit means the token is valid *if* it isn't revoked or
-    expired.
+    The plaintext is never persisted; a hit is valid only if not revoked or expired.
     """
 
     __tablename__ = "service_account_tokens"
@@ -98,9 +81,7 @@ class ServiceAccountToken(Base):
         nullable=False,
         index=True,
     )
-    # SHA-256 of the plaintext bearer token. Unique so the lookup is a
-    # single-row hit; index on this column is the hot path on every request
-    # authenticated with an sa_ token.
+    # SHA-256 of the plaintext token; this lookup is the hot path on every request.
     token_hash: Mapped[str] = mapped_column(
         String(64), nullable=False, unique=True, index=True
     )
@@ -115,9 +96,7 @@ class ServiceAccountToken(Base):
     revoked_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
-    # Refreshed on every successful auth; useful for operators to spot
-    # tokens that are stale and safe to revoke. Best-effort — not on the
-    # request's hot path (async best-effort update).
+    # Refreshed on every successful auth, best-effort and off the hot path.
     last_used_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )

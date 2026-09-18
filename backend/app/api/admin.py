@@ -1,9 +1,6 @@
 """The operator console's HTTP surface: jobs and the DLQ, replay and resolve,
-SLOs and runbooks, the event timeline, tenants, users and the audit tab.
-
-The handlers here are thin — support and admin are checked by the dependency,
-the tenant a platform admin is acting on is resolved once, and the work itself
-belongs to the services.
+SLOs and runbooks, timelines, tenants, users and audit. The handlers are thin:
+roles are a dependency and the work belongs to the services.
 """
 
 import uuid
@@ -46,9 +43,8 @@ from redis.asyncio import Redis
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-# Redis key namespaces for the two paid-call limiters. Separate buckets
-# so exhausting the digest allowance never blocks a natural-language
-# query, and vice versa — they are different costs and different paths.
+# Separate Redis buckets so exhausting the digest allowance never blocks a
+# natural-language query.
 ADMIN_NL_QUERY_RATE_BUCKET = "admin:nl_query"
 ADMIN_DIGEST_RATE_BUCKET = "admin:digest"
 
@@ -61,15 +57,9 @@ _require_admin = require_role(UserRole.ADMIN)
 async def _set_rls_tenant(db: AsyncSession, tenant_id: uuid.UUID) -> None:
     """Point this transaction's `app.tenant_id` at `tenant_id`.
 
-    Same statement `resolve_admin_tenant` issues for cross-tenant reads.
-    The tenant-management endpoints below need it for a WRITE: their audit
-    row belongs to the tenant being acted on, which for a platform admin is
-    usually NOT the tenant `get_current_user` put in the setting — and
-    `audit_logs` carries a WITH CHECK on `tenant_id` under FORCE row-level
-    security (migration a7e3d9c41f28, ADR 0015), so the INSERT would be
-    rejected. Retargeting the setting relaxes no policy: the row is written
-    under the very tenant it records, and only platform admins reach here.
-    No-op on SQLite (tests), which has no RLS.
+    The tenant-management writes below need it: their audit row belongs to the
+    tenant acted on, and `audit_logs` has a WITH CHECK on `tenant_id` under
+    FORCE RLS (migration a7e3d9c41f28, ADR 0015). No-op on SQLite.
     """
     if db.bind is not None and db.bind.dialect.name == "postgresql":
         await db.execute(
@@ -125,13 +115,10 @@ async def admin_nl_query(
     db: AsyncSession = Depends(get_db),
     redis: Redis = Depends(get_redis),
 ) -> dict[str, Any]:
-    """Translate a plain-English question into a constrained job filter, apply
-    it via the existing list_jobs path, and return both the spec and the
-    rows. Body: `{"question": "..."}`.
+    """Translate a plain-English question into a constrained job filter and run
+    it through `list_jobs`. Body: `{"question": "..."}`.
 
-    503 when the feature flag is off. The spec is a Pydantic model with
-    enum/literal fields — the model can never smuggle raw SQL or unsafe
-    field names into the query.
+    503 when the flag is off; the spec's enum/literal fields cannot carry SQL.
     """
     from app.config import get_settings
     from app.core.exceptions import AppError, RequestValidationError
@@ -151,16 +138,10 @@ async def admin_nl_query(
             "Natural-language queries are disabled. Set LLM_NL_QUERY_ENABLED=1."
         )
 
-    # Immediately before the paid call, and deliberately not earlier.
-    # This bucket counts *Anthropic calls* (~$0.006 each), which is what
-    # the finding is about — an unbounded paid call per request. A
-    # rejected-because-empty question and a 503 from the feature flag
-    # both cost nothing, so charging them against an operator's
-    # allowance would let a typo burn the budget for a real query
-    # (WO-R2-30). Keyed on the admin user rather than the client IP:
-    # the thing worth bounding is spend attributable to a token, and
-    # several admins behind one office address should not share one
-    # allowance. Fails open on a Redis error, like every limiter here.
+    # Immediately before the paid call, not earlier: this bucket counts
+    # Anthropic calls (~$0.006 each), so an empty question or a 503 from the
+    # flag must not spend an operator's allowance (WO-R2-30). Keyed on the
+    # admin user, not the client IP. Fails open on a Redis error.
     await check_identity_rate_limit(
         redis,
         identity=current_user.id,
@@ -244,12 +225,8 @@ async def system_stats(
     db: AsyncSession = Depends(get_db),
     redis: Redis = Depends(get_redis),
 ) -> dict[str, dict[str, int]]:
-    """System-wide job counts by status, served from the CQRS read model.
-
-    Reads denormalized Redis sets maintained by ReadModelProjector — no
-    aggregate SQL on the jobs table. Numbers are eventually consistent
-    with the write side (latency dominated by Kafka lag).
-    """
+    """System-wide job counts by status, from the CQRS read model (Redis sets
+    kept by ReadModelProjector; eventually consistent)."""
     # The CQRS read-model is keyed by tenant_id, so the override hits a
     # different Redis set; we don't have to touch app.tenant_id here.
     effective_tenant = await resolve_admin_tenant(current_user, db, tenant_id)
@@ -264,17 +241,11 @@ async def user_stats(
     db: AsyncSession = Depends(get_db),
     redis: Redis = Depends(get_redis),
 ) -> dict[str, dict[str, int]]:
-    """Per-user job counts by status, served from the CQRS read model.
+    """Per-user job counts by status, from the CQRS read model.
 
-    The target user is resolved in Postgres under the caller's effective
-    tenant *before* the cache is read. That ordering is the whole point
-    (WO-R2-50): this endpoint took any user UUID and answered straight out
-    of Redis, where there is no RLS backstop to catch a cross-tenant miss —
-    and a cache read must never be the authorisation boundary. Every sibling
-    endpoint here already resolved its tenant; this one simply never did.
-
-    404 for a user in another tenant, same as for a user who does not exist:
-    the caller learns nothing either way.
+    The user is resolved in Postgres under the caller's effective tenant
+    *before* the cache is read — Redis has no RLS backstop, so a cache read
+    must never be the authorisation boundary (WO-R2-50). 404 either way.
     """
     from app.core.exceptions import NotFoundError
 
@@ -350,15 +321,11 @@ async def admin_generate_digest(
     redis: Redis = Depends(get_redis),
     session_factory: async_sessionmaker[AsyncSession] = Depends(get_session_factory),
 ) -> dict[str, Any]:
-    """Generate a digest for the caller's tenant immediately, without
-    waiting for the periodic loop. Useful for incident-response time.
+    """Generate a digest for the caller's tenant now, not waiting for the
+    periodic loop.
 
-    503 if the feature flag is off. The window is the last
-    `llm_digest_window_hours` (or `?hours=N` override, 1..168).
-
-    `db` authenticates and resolves the tenant; the digest itself runs on
-    `session_factory`'s own short transactions so the paid call is not made
-    with an aggregate query's transaction open behind it. See the body."""
+    503 if the flag is off. Window is `llm_digest_window_hours`, or `?hours=N`
+    (1..168). The digest runs on `session_factory`'s own short transactions."""
     from datetime import UTC, datetime, timedelta
 
     from app.core.exceptions import AppError
@@ -389,12 +356,9 @@ async def admin_generate_digest(
         from app.core.exceptions import NotFoundError
         raise NotFoundError(f"Tenant {effective_tenant} not found")
 
-    # Same reasoning and same position as POST /query: immediately
-    # before the paid call, so a 503 from the flag or a bad tenant id
-    # costs the operator nothing. Tighter ceiling because a digest is
-    # the more expensive of the two calls (~$0.018) and the periodic
-    # `_digest_loop` already produces these on a schedule — the
-    # on-demand endpoint is a convenience, not the main path.
+    # Same position as POST /query: immediately before the paid call. Tighter
+    # ceiling — a digest costs more (~$0.018) and `_digest_loop` already runs
+    # on a schedule.
     await check_identity_rate_limit(
         redis,
         identity=current_user.id,
@@ -406,27 +370,11 @@ async def admin_generate_digest(
     window_end = datetime.now(UTC)
     window_start = window_end - timedelta(hours=hours)
 
-    # Three phases on their own transactions, with the Anthropic round-trip
-    # between them holding none — the shape #161 gave the worker's digest loop
-    # and the residue R2-63 left on this route, which was still calling the
-    # composed `run_digest_for_tenant` on the request session (WO-R2-127).
-    #
-    # Each phase re-issues `set_config('app.tenant_id')` because the setting is
-    # **transaction-local**: `get_current_user` set it on the request's
-    # transaction, and neither of these is that transaction (WO-R2-127).
-    #
-    # Not re-issuing it does not fail loudly, which is the point. Every
-    # `tenant_isolation` policy opens with `current_setting('app.tenant_id',
-    # true) IS NULL OR ... = ''` — the ADR 0003 bootstrap hatch that lets
-    # authentication read `users` before a tenant is known — so an unset value
-    # satisfies the policy unconditionally and the statement runs with **no
-    # tenant isolation at all**. The row still lands; RLS was simply not
-    # standing behind it. (On a pooled connection that has already served a
-    # scoped request the value resets to `''` rather than to unset, and
-    # `''::uuid` can raise instead — same cause, noisier symptom.)
-    # `tests/integration/test_rls_enforcement.py` proves both halves on a live
-    # server. RLS is the backstop for a filter someone forgot; a phase that
-    # does not re-establish context is a phase running without it.
+    # Three phases on their own transactions, the Anthropic round-trip holding
+    # none (WO-R2-127). Each re-issues `set_config('app.tenant_id')` because
+    # the setting is TRANSACTION-LOCAL, and not re-issuing it fails silently:
+    # the `tenant_isolation` bootstrap branch admits an unset value, so the
+    # statement runs with no isolation (test_rls_enforcement.py proves both).
     try:
         async with session_factory() as read_session:
             async with read_session.begin():
@@ -436,9 +384,8 @@ async def admin_generate_digest(
                 )
 
         if stats is None:
-            # Empty window — no jobs to summarize. Return a 200-ish shape so
-            # the UI can show "nothing happened" without a special error path,
-            # and skip the paid call entirely.
+            # Empty window: nothing to summarize, so no paid call and a 200
+            # shape the UI needs no error path for.
             return {
                 "summary": None,
                 "window_start": window_start.isoformat(),
@@ -505,11 +452,8 @@ async def admin_list_tenants(
     current_user: User = Depends(require_platform_admin),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
-    """List every tenant in the system with per-tenant user + job counts.
-
-    Platform-admin-only. Tenant admins (`role=admin` without the platform
-    flag) can't see sibling tenants; they're scoped to their own.
-    """
+    """Every tenant with per-tenant user + job counts. Platform-admin only —
+    `role=admin` alone cannot see sibling tenants."""
     repo = TenantRepository(db)
     tenants, total = await repo.list_all(
         offset=(page - 1) * page_size, limit=page_size
@@ -554,12 +498,9 @@ async def admin_create_tenant(
         raise ConflictError(f"Tenant slug already exists: {slug}")
     tenant = await repo.create(slug=slug, name=name, is_active=True)
 
-    # Creating a tenant is the most privileged operator action on the
-    # platform; it gets an audit row like every other admin mutation
-    # (F1-08). The row belongs to the NEW tenant, so retarget the RLS
-    # setting for the write and hand it back to the admin's own tenant
-    # afterwards — deliberately not in a `finally`, because a failed INSERT
-    # aborts the transaction and the restore would only mask the real error.
+    # The most privileged operator action here gets an audit row (F1-08),
+    # and it belongs to the NEW tenant — hence the retarget around the write,
+    # not in a `finally` that would mask a failed INSERT.
     await _set_rls_tenant(db, tenant.id)
     await AuditRepository(db).log(
         "tenant.created",
@@ -616,14 +557,9 @@ async def admin_update_tenant_limits(
 ) -> dict[str, Any]:
     """Update a tenant's rate limit and/or monthly job quota.
 
-    Body fields (both optional): `rate_limit_per_minute`, `quota_jobs_per_month`.
-    Each must be a non-negative integer (0 disables the relevant check).
-
-    The bounds live on `TenantLimitsUpdate`, not here: the hand-rolled
-    `isinstance(value, int)` this replaced accepted Python bools, so a
-    JSON `true` became a rate limit of 1 (WO-R2-61). Validating in the
-    schema also means a bad body is rejected before the tenant lookup,
-    so the caller gets every problem with their request at once.
+    Both optional; 0 disables that check. The bounds live on
+    `TenantLimitsUpdate`, not here — the `isinstance(value, int)` it replaced
+    took a JSON `true` as a rate limit of 1 (WO-R2-61).
     """
     from app.core.exceptions import NotFoundError
 
@@ -643,9 +579,7 @@ async def admin_update_tenant_limits(
     if changed:
         await db.flush()
         # Who loosened which limit, and from what (F1-08). Audited under the
-        # TARGET tenant — a platform admin usually isn't in it, and the
-        # audit_logs WITH CHECK is on the row's tenant_id (see
-        # `_set_rls_tenant`). A PATCH that changes nothing writes no row.
+        # TARGET tenant — see `_set_rls_tenant`. No change, no row.
         await _set_rls_tenant(db, tenant_id)
         await AuditRepository(db).log(
             "tenant.limits_updated",
@@ -708,11 +642,7 @@ async def job_triage(
     current_user: User = Depends(_require_support_or_admin),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
-    """LLM-generated triage analysis for a dead-lettered job.
-
-    Returns 404 if no triage row exists (the job hasn't dead-lettered yet,
-    triage is disabled, or the consumer hasn't caught up).
-    """
+    """LLM triage analysis for a dead-lettered job. 404 when no row exists."""
     from app.core.exceptions import NotFoundError
 
     triage = await TriageRepository(db).get_by_job_id(job_id)
@@ -739,13 +669,9 @@ async def job_timeline(
     current_user: User = Depends(_require_support_or_admin),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
-    """Event-sourced timeline for a job — all Kafka lifecycle events in order.
-
-    Replays the immutable job_events log, which the EventLogConsumer fills
-    from every job.submitted / progress / completed / failed / dlq message.
-    Useful for forensic / time-travel debugging of a single job's full
-    history without trusting the mutable jobs row.
-    """
+    """Event-sourced timeline for a job — every Kafka lifecycle event in order,
+    replayed from the immutable job_events log rather than the mutable jobs
+    row."""
     events = await EventLogRepository(db).timeline(job_id)
     return {
         "job_id": str(job_id),

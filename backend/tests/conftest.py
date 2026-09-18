@@ -1,12 +1,8 @@
-"""
-Shared pytest fixtures.
+"""Shared pytest fixtures.
 
-Unit tests (backend/tests/unit/) use mock repositories — no DB required.
-API tests (backend/tests/api/) spin up the full FastAPI app with dependency
-overrides that swap in an in-memory SQLite session.  Because SQLite lacks
-JSONB and UUID column types we configure SQLAlchemy to render those as JSON
-and VARCHAR respectively; this is good enough for contract/shape testing.
-Integration tests targeting real Postgres live in backend/tests/integration/.
+Unit tests use mock repositories; API tests run the full app over an in-memory
+SQLite session (JSONB/UUID render as JSON/VARCHAR). Real-Postgres tests live in
+backend/tests/integration/.
 """
 
 from collections.abc import AsyncGenerator
@@ -30,9 +26,7 @@ from sqlalchemy.ext.asyncio import (
 )
 from sqlalchemy.pool import StaticPool
 
-# ---------------------------------------------------------------------------
 # SQLite in-memory engine (for API + shape tests)
-# ---------------------------------------------------------------------------
 
 _SQLITE_URL = "sqlite+aiosqlite://"
 
@@ -65,29 +59,14 @@ async def db_session(sqlite_engine) -> AsyncGenerator[AsyncSession, None]:  # ty
             await session.rollback()
 
 
-# ---------------------------------------------------------------------------
 # Postgres transaction semantics, on SQLite
-# ---------------------------------------------------------------------------
 
 
 class AbortingSession:
     """An `AsyncSession` that aborts its transaction the way Postgres does.
 
-    Postgres refuses every statement after a failed one — `current
-    transaction is aborted, commands ignored until end of transaction
-    block` — until the transaction, or a SAVEPOINT enclosing the failure,
-    is rolled back. SQLite has no such rule: a failed statement is just a
-    failed statement, and the next one runs fine.
-
-    That difference is why a whole class of bug (R2-59: a handler swallows
-    a DB error, and every write the request makes afterwards is silently
-    dropped) is invisible to this suite. This proxy forwards everything to
-    a real session and adds exactly Postgres' rule, so a unit test can
-    assert what production does.
-
-    `fail_on` picks the statement that blows up — matching on rendered SQL,
-    so it stands in for "the table isn't there" without needing a real
-    migration state.
+    SQLite does not, so R2-59 (a swallowed DB error silently dropping every
+    later write) is invisible without it. `fail_on` matches on rendered SQL.
     """
 
     def __init__(
@@ -136,8 +115,7 @@ class AbortingSession:
             raise
 
     def begin_nested(self):  # type: ignore[no-untyped-def]
-        """A SAVEPOINT — and rolling back to one un-aborts the transaction,
-        which is the entire point of the fix under test."""
+        """Rolling back to a SAVEPOINT un-aborts the transaction."""
         inner_cm = self._inner.begin_nested()
         outer = self
 
@@ -154,18 +132,10 @@ class AbortingSession:
 
 
 class _SharedSessionFactory:
-    """Stand-in for `get_session_factory` that reuses the test's session.
+    """Stand-in for `get_session_factory` that reuses the test's `db_session`.
 
-    A handler that opens its own session — the digest route does, so its
-    Anthropic round-trip holds no transaction (WO-R2-127) — would otherwise
-    reach the real engine and a database no test has set up.
-
-    Each `factory()` hands back the one `db_session` every fixture and
-    assertion already shares, with `begin()` demoted to a SAVEPOINT so a
-    handler's "own transaction" nests inside the outer one the suite rolls
-    back, and `close()` neutralised so the handler cannot close the session
-    the test is still using. What the handler observes is unchanged: it opens
-    a scope, writes, and the write is visible afterwards.
+    A handler opening its own session (the digest route does — WO-R2-127) would
+    otherwise hit the real engine; `begin()` becomes a SAVEPOINT, `close()` a no-op.
     """
 
     def __init__(self, session: AsyncSession) -> None:
@@ -195,9 +165,7 @@ class _SharedSession:
         return None
 
 
-# ---------------------------------------------------------------------------
 # FastAPI test client with DB override
-# ---------------------------------------------------------------------------
 
 @pytest_asyncio.fixture
 async def client(  # type: ignore[no-untyped-def]
@@ -234,17 +202,11 @@ async def client(  # type: ignore[no-untyped-def]
         yield ac
 
 
-# ---------------------------------------------------------------------------
 # Convenience fixtures
-# ---------------------------------------------------------------------------
 
 @pytest_asyncio.fixture
 async def default_tenant(db_session: AsyncSession):  # type: ignore[no-untyped-def]
-    """Ensure the default-tenant row exists before any user is inserted.
-
-    Conftest uses Base.metadata.create_all rather than running migrations, so
-    the seed INSERT from the f8a1c4e23507 migration doesn't run automatically.
-    """
+    """Seed the default-tenant row: create_all skips the f8a1c4e23507 INSERT."""
     from app.models.tenant import DEFAULT_TENANT_ID, Tenant
     from sqlalchemy import select
 

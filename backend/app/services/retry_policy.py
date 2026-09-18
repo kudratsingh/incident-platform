@@ -1,21 +1,10 @@
 """
 LLM-guided retry policy.
 
-When a job fails *and* it still has retries left, ask Claude whether to:
-  * keep retrying (with what backoff), or
-  * dead-letter immediately because the failure is clearly not transient.
-
-This sits on top of the deterministic exponential-backoff retry — the LLM
-only refines the decision once the first deterministic retry has already
-happened (see `llm_retry_policy_min_retry_count`). Any error from the LLM
-call (disabled flag, missing API key, timeout, network blip, schema mismatch)
-falls back to deterministic behavior. The worker never blocks on the API.
-
-The pattern mirrors `app/services/triage.py`:
-  * `messages.parse()` with a Pydantic schema — no raw JSON parsing.
-  * Default `claude-opus-4-7` with adaptive thinking.
-  * Frozen system prompt with `cache_control: ephemeral` so the policy
-    description caches across calls.
+When a job fails with retries left, ask Claude whether to keep retrying (with what
+backoff) or dead-letter now. It refines the deterministic backoff, only after the first
+retry (`llm_retry_policy_min_retry_count`), and ANY error from the call falls back to
+deterministic — the worker never blocks on the API. Same pattern as `triage.py`.
 """
 
 import asyncio
@@ -35,9 +24,7 @@ RetryAction = Literal["retry_with_backoff", "dead_letter_now"]
 
 
 class RetryDecision(BaseModel):
-    """Shape Claude fills in. `dead_letter_now` short-circuits remaining
-    deterministic retries; `retry_with_backoff` lets the worker enqueue with
-    the recommended backoff."""
+    """Shape Claude fills in: `dead_letter_now` short-circuits the remaining retries."""
 
     action: RetryAction = Field(
         description=(
@@ -111,9 +98,7 @@ async def decide_retry(
 ) -> tuple[RetryDecision, dict[str, Any], str]:
     """Call Claude and return (decision, usage_dict, model_id).
 
-    Raises RetryPolicyDisabledError when the feature is off, anthropic /
-    network exceptions on real API failures, asyncio.TimeoutError when the
-    call exceeds `llm_retry_policy_timeout_seconds`.
+    Raises RetryPolicyDisabledError when off; timeouts and API errors propagate.
     """
     settings = get_settings()
     if not settings.llm_retry_policy_enabled:

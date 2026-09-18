@@ -1,41 +1,9 @@
 """Postgres coverage for the destructive half of the eval-reset protocol.
 
-`scripts/reset_eval_state.py` runs against Postgres in every real
-deployment, but its two most dangerous statements had no automated test
-at all (D-15):
-
-  * `_sweep_nonfixture_dlq` is Postgres-only SQL (`now()`, `<> ALL(CAST(
-    :ids AS uuid[]))`) and is the exact site of the historical #90
-    regression — a sweep that flipped rows it was supposed to spare.
-  * `_purge_idempotency_records` deletes by principal and had nothing
-    pinning that scoping.
-
-and two more that the SQLite unit harness can only half-exercise:
-
-  * `_delete_seeded_dlq_fixtures` — the production predicate is JSONB
-    containment; SQLite runs a different statement, so the shape that
-    actually ships is only covered here (S-02 / D-07).
-  * `_resolve_organic_alerts` — the WO-R2-131 sweep binds five `uuid.UUID`
-    values against a real `uuid` column, which is the half SQLite's
-    `CHAR(32)` rendering cannot stand in for.
-  * `app/services/slo.py`'s lab-fixture exclusion — the production
-    predicate is JSONB containment (`payload @> '{"eval_fixture": true}'`);
-    SQLite runs `json_extract`, so the shape that ships is only covered
-    here, and so is its refusal to raise on a non-boolean value.
-  * `_delete_chaos_owner_users` — its documented side effect on
-    `audit_logs` is produced by FK referential actions, and SQLite's FK
-    enforcement is PRAGMA-dependent (the unit conftest does not enable
-    it), so the SET NULL assertions have to live on a real server
-    (D-10).
-
-Boots a real Postgres in a container and runs the full Alembic chain,
-same harness shape as `test_rls_enforcement.py`. Sessions connect as the
-container superuser: the reset script is an operator tool run without a
-tenant context, and its statements are deliberately environment-wide, so
-RLS is not what is under test here.
-
-Skipped automatically when Docker / testcontainers isn't available so the
-rest of the suite still runs.
+`scripts/reset_eval_state.py` only runs against Postgres, and SQLite cannot cover these:
+`_sweep_nonfixture_dlq` (D-15, the #90 site), `_purge_idempotency_records` (D-15), JSONB
+containment in `_delete_seeded_dlq_fixtures` and `slo.py` (S-02 / D-07), the real `uuid`
+binding in `_resolve_organic_alerts` (WO-R2-131), and `ON DELETE SET NULL` (D-10).
 """
 
 import os
@@ -51,10 +19,8 @@ import pytest_asyncio
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
-# `scripts/` isn't a package on disk; make it importable. Importing
-# reset_eval_state additionally puts the repo root and backend/ on
-# sys.path, which is what `from scripts import seed_eval_fixtures`
-# (inside `_sweep_nonfixture_dlq`) resolves against.
+# `scripts/` isn't a package on disk; make it importable, which is also what
+# `from scripts import seed_eval_fixtures` inside the reset resolves against.
 for _path in (str(REPO_ROOT), str(REPO_ROOT / "scripts")):
     if _path not in sys.path:
         sys.path.insert(0, _path)
@@ -79,10 +45,8 @@ pytestmark = pytest.mark.skipif(
 
 COMMANDER_SA_NAME = "incident-commander"
 
-# Every table these tests write into, in FK-safe delete order. The reset's
-# statements are environment-wide by design, so each test needs the whole
-# database to itself — a leftover `dead_letter` row from the previous test
-# would land in the next one's sweep.
+# Every table these tests write into, in FK-safe delete order: the reset is
+# environment-wide, so each test needs the whole database to itself.
 _TABLES_IN_DELETE_ORDER = (
     "audit_logs",
     "job_triages",
@@ -97,13 +61,8 @@ _TABLES_IN_DELETE_ORDER = (
 
 
 def _alembic(database_url: str, *args: str) -> None:
-    """Run an alembic command against the container, exactly as
-    `test_rls_enforcement.py` does.
-
-    ALEMBIC_DATABASE_URL is popped for the same reason it is there: env.py
-    prefers it over DATABASE_URL, so an inherited value would point this
-    migration at a database that is not the throwaway container.
-    """
+    """Alembic against the container; ALEMBIC_DATABASE_URL is popped because env.py
+    prefers it, so an inherited value would migrate the wrong database."""
     env = os.environ.copy()
     env["DATABASE_URL"] = database_url
     env.pop("ALEMBIC_DATABASE_URL", None)
@@ -129,11 +88,7 @@ def eval_db_url(pg: Any) -> str:
 
 @pytest_asyncio.fixture
 async def session_factory(eval_db_url: str) -> Any:
-    """A fresh engine per test.
-
-    Function-scoped on purpose: asyncpg connections are bound to the event
-    loop that opened them, and pytest-asyncio gives each test its own.
-    """
+    """A fresh engine per test: asyncpg is bound to the loop that opened it."""
     from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
     engine = create_async_engine(eval_db_url, echo=False)
@@ -204,16 +159,13 @@ async def _statuses(session: Any, ids: list[uuid.UUID]) -> dict[uuid.UUID, str]:
     return {row.id: row.status for row in rows}
 
 
-# ---------------------------------------------------------------------------
 # _sweep_nonfixture_dlq — the #90 regression class (D-15)
-# ---------------------------------------------------------------------------
 
 
 async def _seed_sweep_population(
     session_factory: Any,
 ) -> tuple[list[uuid.UUID], list[uuid.UUID], uuid.UUID]:
-    """The 4 `_dlq_specs()` fixture rows + 2 non-fixture dead_letter rows
-    + 1 running row. Returns (fixture_ids, stray_ids, running_id)."""
+    """4 `_dlq_specs()` fixtures, 2 stray dead_letter rows, 1 running."""
     from app.models.enums import JobStatus
 
     async with session_factory() as session:
@@ -240,14 +192,8 @@ async def _seed_sweep_population(
 async def test_sweep_spares_fixtures_and_cancels_only_stray_dead_letters(
     session_factory: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Default mode: exactly the non-fixture `dead_letter` rows flip to
-    `cancelled`. The fixture pool stays `dead_letter` (the baseline the
-    dlq_* scenarios are graded against) and a `running` job is not a
-    sweep target at all.
-
-    This is the assertion #90 needed: that regression swept rows the
-    exclusion was supposed to protect, and nothing failed.
-    """
+    """Default mode: only stray `dead_letter` rows flip to `cancelled`, the fixture
+    baseline stays, and `running` is not a target. The assertion #90 needed."""
     from app.models.enums import JobStatus
 
     monkeypatch.delenv("EVAL_EMPTY_DLQ_BASELINE", raising=False)
@@ -270,10 +216,8 @@ async def test_sweep_spares_fixtures_and_cancels_only_stray_dead_letters(
 async def test_sweep_in_empty_baseline_mode_cancels_fixtures_too(
     session_factory: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """`EVAL_EMPTY_DLQ_BASELINE=1` drops the fixture exclusion so a
-    scenario inherits nothing (ADR 0012 rule 2 / commander ADR 0010).
-    Still only `dead_letter` rows — the running job is untouched in
-    either mode."""
+    """`EVAL_EMPTY_DLQ_BASELINE=1` drops the fixture exclusion (ADR 0012 rule 2),
+    still only `dead_letter`."""
     from app.models.enums import JobStatus
 
     monkeypatch.setenv("EVAL_EMPTY_DLQ_BASELINE", "1")
@@ -292,18 +236,14 @@ async def test_sweep_in_empty_baseline_mode_cancels_fixtures_too(
     assert statuses[running_id] == JobStatus.RUNNING.value
 
 
-# ---------------------------------------------------------------------------
 # _purge_idempotency_records — principal scoping (D-15)
-# ---------------------------------------------------------------------------
 
 
 async def test_purge_idempotency_records_is_scoped_to_the_commander_principal(
     session_factory: Any,
 ) -> None:
-    """The purge is opt-in *and* narrow: only the seeded
-    incident-commander service account's cached responses go. Another
-    agent's records must survive, or an opt-in convenience turns into a
-    cross-principal cache wipe."""
+    """Opt-in and narrow: only the incident-commander account's records go,
+    or it is a cross-principal cache wipe."""
     from app.models.idempotency import IdempotencyRecord
     from app.models.service_account import ServiceAccount
     from sqlalchemy import select
@@ -353,33 +293,15 @@ async def test_purge_idempotency_records_is_scoped_to_the_commander_principal(
     assert len(remaining) == 2
 
 
-# ---------------------------------------------------------------------------
 # _delete_seeded_dlq_fixtures — the JSONB predicate (S-02 / D-07)
-# ---------------------------------------------------------------------------
 
 
 async def test_delete_seeded_dlq_fixtures_matches_only_the_structured_marker(
     session_factory: Any,
 ) -> None:
-    """THE D-07 assertion, on the payload shape that actually ships.
-
-    `payload` is JSONB on Postgres (`PortableJSON`), and the predicate is
-    top-level containment of `{"seeded_fixture": true}`. HEAD's
-    `CAST(payload AS text) LIKE '%"seeded_fixture"%'` deleted all four
-    rows below — the marker as a value, the marker nested one level down,
-    and the marker set to `false` all contain that substring once the
-    payload is rendered to text.
-
-    The `"banana"` row is the reason the predicate is containment rather
-    than `(payload ->> 'seeded_fixture')::boolean`: that cast raises
-    `invalid input syntax for type boolean` on a hostile value, which
-    aborts the transaction and takes the whole reset down with it.
-
-    The second declared row is why it also cannot be *equality*. Two hooks
-    write extra keys beside the marker — `create_stuck_dag` carries
-    `chain`, and since WO-R2-158 `create_bad_data_job` carries
-    `chaos_fixture` and `fixture_name` — so a `payload = '{...}'` rewrite
-    would keep passing the row above and silently stop deleting theirs.
+    """D-07, on the payload shape that ships: top-level JSONB containment of
+    `{"seeded_fixture": true}`. Not a text LIKE (it matched all the near misses), not
+    a `::boolean` cast (`"banana"` would abort the reset), not equality (hooks add keys).
     """
     from app.models.job import Job
     from sqlalchemy import select
@@ -421,26 +343,15 @@ async def test_delete_seeded_dlq_fixtures_matches_only_the_structured_marker(
     assert remaining == survivor_ids
 
 
-# ---------------------------------------------------------------------------
 # Audit ground truth — D-10 / ADR 0012 amendment
-# ---------------------------------------------------------------------------
 
 
 async def test_delete_chaos_owner_users_nulls_audit_fks_but_keeps_resource_id(
     session_factory: Any,
 ) -> None:
-    """The contract the ADR 0012 amendment pins.
-
-    Deleting declared scaffolding nulls `audit_logs.job_id` and
-    `audit_logs.user_id` via `ON DELETE SET NULL` — accepted, documented,
-    and asserted here rather than ignored: if a future migration flips
-    either FK to CASCADE the audit row would be *deleted*, and this test
-    is what says so out loud.
-
-    What must never change is `resource_id`. It is a plain string, not a
-    foreign key, every Tier-1 audit writer sets it to `str(job.id)`, and
-    it is therefore the only join key an audit-based grader can rely on
-    across a reset. A grader joining on `job_id` silently undercounts.
+    """The ADR 0012 amendment's contract: `ON DELETE SET NULL` nulls `job_id` and
+    `user_id`, so a migration flipping either to CASCADE would delete the audit row.
+    `resource_id` is a plain string and the only join key that survives a reset.
     """
     from app.models.audit import AuditLog
     from app.models.enums import JobStatus
@@ -466,13 +377,9 @@ async def test_delete_chaos_owner_users_nulls_audit_fks_but_keeps_resource_id(
                 tenant_id,
                 chaos_user.id,
                 status=JobStatus.DEAD_LETTER.value,
-                # An undeclared chaos row: provenance only, no
-                # `seeded_fixture` marker, so the sibling DELETE sweep
-                # leaves it and this one cancels it. Shaped like a
-                # pre-v0.6.3 `poison_message` row — no current hook writes
-                # one, because `create_bad_data_job` (WO-R2-158) and then
-                # `poison_message` (WO-R2-166) both gained the marker, and
-                # a row carrying it would match both sweeps.
+                # Undeclared: provenance only, no `seeded_fixture` marker, so the
+                # DELETE sweep leaves it. Shaped like a pre-v0.6.3 `poison_message`
+                # row, which no current hook writes (WO-R2-158, WO-R2-166).
                 payload={"chaos_fixture": "poison_message"},
             )
             session.add(chaos_job)
@@ -511,16 +418,12 @@ async def test_delete_chaos_owner_users_nulls_audit_fks_but_keeps_resource_id(
     assert surviving.extra_data == extra_data
 
 
-# ---------------------------------------------------------------------------
 # _rebaseline_timestamps — BUILD_PLAN 2.5, on real timestamptz columns
-# ---------------------------------------------------------------------------
 
 
 async def test_rebaseline_timestamps_on_postgres(session_factory: Any) -> None:
-    """The unit harness runs on SQLite, where DateTime(timezone=True)
-    round-trips as naive UTC; the aware/naive normalisation inside
-    `_drifted` only meets real timestamptz values here. Also pins the
-    no-op idempotency of an immediate second run against Postgres."""
+    """`_drifted`'s aware/naive normalisation only meets real timestamptz here.
+    Also pins the no-op idempotency of a second run."""
     from datetime import UTC, datetime, timedelta
 
     from app.models.deploy_marker import DeployMarker
@@ -558,14 +461,8 @@ async def test_rebaseline_timestamps_on_postgres(session_factory: Any) -> None:
             assert await seed_eval_fixtures._rebaseline_timestamps(session) == 0
 
 
-# ---------------------------------------------------------------------------
-# _rebuild_read_model — the CQRS projection, on the dialect that ships (WO-R2-56)
-#
-# The rebuild reads its membership through a window function partitioned by
-# (scope, status). The unit tier proves it on SQLite; this proves the same SQL
-# on Postgres, which is the dialect the eval reset actually runs against and
-# the one where `jobs.tenant_id` is a real UUID column rather than a string.
-# ---------------------------------------------------------------------------
+# _rebuild_read_model — the CQRS projection on the dialect that ships (WO-R2-56).
+# Same window function as the unit tier, but `jobs.tenant_id` is a real UUID here.
 
 
 class _RedisForRebuild:
@@ -646,15 +543,11 @@ async def test_rebuild_read_model_projects_postgres_rows(
     assert redis.ttls[completed_key] > 0
 
 
-# ---------------------------------------------------------------------------
 # _resolve_organic_alerts — WO-R2-131 on the server that actually runs it
-# ---------------------------------------------------------------------------
 
 
 async def _seed_alert_population(session_factory: Any) -> tuple[Any, uuid.UUID]:
-    """The five seeded fixture alerts plus one organic `slo:*` alert.
-
-    Returns (tenant_id, organic_alert_id)."""
+    """Five fixture alerts plus one organic `slo:*`."""
     from app.models.alert import Alert
 
     async with session_factory() as session:
@@ -682,13 +575,8 @@ async def _seed_alert_population(session_factory: Any) -> tuple[Any, uuid.UUID]:
 async def test_organic_alerts_are_swept_and_the_seeded_baseline_survives(
     session_factory: Any,
 ) -> None:
-    """The WO-R2-131 sweep against real Postgres.
-
-    The unit tier proves the predicate; this proves the binding. The spare
-    list is five `uuid.UUID` values against a real `uuid` column — the exact
-    place the Postgres/SQLite split bites, and the reason this statement is
-    Core `update()` rather than the `text()` its siblings use. `resolved_at`
-    lands as a real `timestamptz` from the server's own clock."""
+    """The WO-R2-131 sweep's binding: five `uuid.UUID` spares against a real `uuid`
+    column, which is why the statement is Core `update()` and not `text()`."""
     from app.models.alert import Alert
     from sqlalchemy import select
 
@@ -716,25 +604,15 @@ async def test_organic_alerts_are_swept_and_the_seeded_baseline_survives(
     ), "idempotent: a second reset over post-reset state changes nothing"
 
 
-# ---------------------------------------------------------------------------
-# SLO lab-fixture exclusion — the JSONB half of WO-R2-132
-#
-# `app/services/slo.py` branches on the dialect exactly as
-# `_delete_seeded_dlq_fixtures` does, so the statement that ships (JSONB
-# containment) is invisible to the SQLite unit harness, which runs
-# `json_extract`. Same reason this file covers the DELETE predicate: a
-# dialect-branched statement is only tested where it runs.
-# ---------------------------------------------------------------------------
+# SLO lab-fixture exclusion — the JSONB half of WO-R2-132. `slo.py` branches on the
+# dialect, so the containment it ships is invisible to the SQLite harness.
 
 
 async def test_the_evaluator_ignores_lab_fixtures_on_postgres(
     session_factory: Any,
 ) -> None:
-    """A freshly seeded eval world does not burn the budget on Postgres.
-
-    4 dead-lettered of 5 terminal jobs is an 80x burn against a 99%
-    objective, which is what made every fresh boot of the eval world page
-    about itself within one evaluation interval (WO-R2-132)."""
+    """A fresh eval world must not burn the budget: 4 of 5 terminal jobs
+    dead-lettered is an 80x burn that paged on boot (WO-R2-132)."""
     from app.models.enums import JobStatus
     from app.services.slo import compute_all, is_fast_burning
 
@@ -767,15 +645,9 @@ async def test_the_evaluator_ignores_lab_fixtures_on_postgres(
 async def test_containment_spares_real_rows_and_survives_a_hostile_value(
     session_factory: Any,
 ) -> None:
-    """Containment matches a top-level key holding boolean `true`, nothing
-    else — and does not raise on a value that is not a boolean.
-
-    `(payload ->> 'eval_fixture')::boolean` would have been the obvious
-    spelling and is the one this deliberately avoids: on
-    `{"eval_fixture": "banana"}` the cast raises, which on Postgres aborts
-    the transaction and takes the whole evaluation pass with it. Containment
-    just answers false. The near-miss payloads are the S-02 tightening,
-    restated where it now decides an SLO rather than a DELETE."""
+    """Containment matches only a top-level boolean `true`, and does not raise on a
+    non-boolean: `(payload ->> 'eval_fixture')::boolean` would abort the evaluation
+    pass on `"banana"`. The near misses are S-02, restated where it decides an SLO."""
     from app.models.enums import JobStatus
     from app.services.slo import compute_all
 

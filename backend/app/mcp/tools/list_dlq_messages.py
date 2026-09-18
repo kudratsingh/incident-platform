@@ -1,15 +1,9 @@
 """
 `list_dlq_messages` — jobs the platform gave up on.
 
-Scoped to the caller's tenant. Reads via the existing `JobRepository`
-so any RLS + tenant-scope invariants applied at the SQL layer already
-guard this path. Requires `incidents:read`.
-
-Fields emitted per row are the ones the agent's LLM needs to hypothesize
-about a failure: what job type, what error message, how many retries,
-when it died. The optional `triage` block includes the Phase-10 LLM
-triage row when present so the agent can build on the platform's own
-first-pass analysis instead of duplicating it.
+Tenant-scoped through `JobRepository`. Each row carries what a failure hypothesis
+needs — type, error, retries, when it died — plus the Phase-10 LLM `triage` row
+when there is one. Requires `incidents:read`.
 """
 
 from datetime import datetime
@@ -166,9 +160,7 @@ async def list_dlq_messages(
         status=JobStatus.DEAD_LETTER.value,
         job_type=inp.job_type,
         remediation_hint=inp.remediation_hint,
-        # Dead-letter time, not submission time — see the tool description.
-        # With no offset either, the newest dead-letters could sit past the
-        # end of the only page the agent was able to fetch (WO-R2-53).
+        # Dead-letter time, not submission time — the newest sorted last (WO-R2-53).
         sort=JobSort.DEAD_LETTERED_AT,
     )
 

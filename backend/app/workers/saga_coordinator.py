@@ -1,35 +1,9 @@
 """
-Saga coordinator — drives saga-level state and compensation.
-
-Subscribes to:
-  - job.completed → if all steps in the saga are completed, mark saga COMPLETED.
-  - job.dlq       → terminal failure of a step. Mark saga COMPENSATING,
-                    cancel any still-WAITING/PENDING downstream steps, and
-                    enqueue one `{type}.compensate` job per already-COMPLETED
-                    prior step (reverse order — the most recent successful
-                    step is the first to roll back).
-
-Compensation jobs are ordinary jobs: a real `jobs` row (saga_id set,
-type `{type}.compensate`) is created in the SAME transaction as the
-outbox row that announces it, so the dispatcher can load it. If no
-processor is registered for `{type}.compensate`, the job dead-letters,
-which is the intended forcing function: applications must define their
-compensation logic explicitly.
-
-A COMPENSATING saga settles when its compensation set is DRAINED — every
-`.compensate` job terminal (see ADR 0017):
-  - every compensation step COMPLETED            → COMPENSATED
-  - any compensation step DEAD_LETTER/CANCELLED  → FAILED
-
-Drained includes drained-at-zero. When the failing step has no completed
-predecessor there is nothing to undo, no `.compensate` job is minted and no
-compensation event will ever arrive, so `_handle_failure` settles the saga
-in its own transaction. Settling on the arrival of an event that cannot
-happen is what stranded those sagas in COMPENSATING forever (WO-R2-49).
-
-Only compensation-typed events are routed at COMPENSATING: a redelivered
-job.dlq for the ORIGINAL failed step must not re-enter `_handle_failure`
-and mint a duplicate set of compensation rows.
+Saga coordinator — saga-level state and compensation, off `job.completed` and `job.dlq`. A step's
+terminal failure marks the saga COMPENSATING, cancels WAITING/PENDING downstream steps, and mints
+one `{type}.compensate` job per already-COMPLETED step in the same transaction as its outbox row;
+an unregistered `.compensate` processor dead-letters, the intended forcing function. Settlement is
+drained-set (ADR 0017, WO-R2-49), and only compensation-typed events route at COMPENSATING.
 """
 
 import uuid
@@ -117,12 +91,8 @@ class SagaCoordinator(BaseKafkaConsumer):
                     and (is_done or is_dlq)
                 ):
                     await self._settle_if_drained(session, saga.id)
-                # Everything else is ignored: a saga that has already settled,
-                # and — critically — non-compensation events for a COMPENSATING
-                # saga. Kafka is at-least-once, so the original step's job.dlq
-                # can be redelivered after compensation started; letting it
-                # through would re-run _handle_failure and mint a second set of
-                # compensation rows. The type check IS the idempotency guard.
+                # Everything else is ignored — a redelivered original `job.dlq` would re-run
+                # `_handle_failure`, so the type check IS the idempotency guard.
 
     async def _handle_completion(self, session: AsyncSession, saga_id: uuid.UUID) -> None:
         """Mark the saga COMPLETED once every one of its steps has."""
@@ -166,12 +136,8 @@ class SagaCoordinator(BaseKafkaConsumer):
         saga.status = SagaStatus.COMPENSATING
         await session.flush()
 
-        # Cancel any waiting/pending downstream steps so they never run.
-        # `waiting_steps` filters on WAITING/PENDING and the failed step is
-        # DEAD_LETTER by the time job.dlq lands, so the id guard below is
-        # belt-and-braces — but the audit count must come from the counter,
-        # never from len(waiting) (E1-13: len(waiting) - 1 reported -1
-        # cancellations whenever there was nothing downstream to cancel).
+        # Cancel waiting/pending downstream steps. The audit count must come from the counter, never
+        # `len(waiting)` — E1-13: `len(waiting) - 1` reported -1 with nothing downstream.
         cancelled = 0
         waiting = await saga_repo.waiting_steps(saga_id)
         for w in waiting:
@@ -182,15 +148,9 @@ class SagaCoordinator(BaseKafkaConsumer):
             )
             cancelled += 1
 
-        # Enqueue compensation jobs for already-completed prior steps,
-        # in reverse order (most recent success rolls back first).
-        #
-        # E1-02: the compensation job must exist as a real `jobs` row before
-        # the dispatcher sees the event, or `_run_job` logs "job not found,
-        # skipping" and the rollback silently never happens. `create` adds and
-        # flushes inside the ambient handle_message transaction, so the row and
-        # the outbox announcement commit together — no announced-but-missing
-        # job, no orphan row if the transaction rolls back.
+        # Compensate completed steps in reverse order. E1-02: the row must exist before the
+        # dispatcher sees the event, or `_run_job` logs "job not found, skipping" and the rollback
+        # never happens — so `create` flushes inside the ambient transaction.
         completed = await saga_repo.completed_steps(saga_id)
         for done in reversed(completed):
             comp_payload = {
@@ -244,37 +204,16 @@ class SagaCoordinator(BaseKafkaConsumer):
             },
         )
 
-        # WO-R2-49. Settlement is a function of the compensation set being
-        # drained, not a side effect of a `.compensate` event arriving. With
-        # nothing completed the set is empty — drained the moment it is built
-        # — and no compensation event will ever come, so settle here, in this
-        # transaction. Without this the saga pinned at COMPENSATING forever:
-        # a non-terminal status, no terminal audit row, and a frontend
-        # polling for a transition that could not happen.
-        #
-        # Guarded on `not completed` rather than called unconditionally
-        # because the rows this method just minted are PENDING by
-        # construction: when there ARE compensations the set cannot be
-        # drained yet, and the check would be a query that can only say no.
+        # WO-R2-49: with nothing completed the set is drained the moment it is built and no
+        # `.compensate` event will arrive, so settle here or the saga pins at COMPENSATING forever.
         if not completed:
             await self._settle_if_drained(session, saga_id)
 
     async def _settle_if_drained(
         self, session: AsyncSession, saga_id: uuid.UUID
     ) -> None:
-        """Settle a COMPENSATING saga once its compensation set is drained.
-
-        Drained = every `.compensate` job terminal, INCLUDING the empty set:
-        a saga with nothing to undo has a vacuously complete rollback and
-        settles COMPENSATED with `compensation_steps: 0`. That case is
-        reached only from `_handle_failure` — an event-driven call always
-        has at least the job that triggered it in the set.
-
-        Recomputed from job statuses on every call, so a redelivered event is
-        harmless. Only `.compensate` jobs count — the original steps are
-        DEAD_LETTER/CANCELLED by definition here and would otherwise make
-        settlement impossible.
-        """
+        """Settle a COMPENSATING saga once every `.compensate` job is terminal, INCLUDING the empty
+        set. Recomputed each call, so a redelivery is harmless; only `.compensate` jobs count."""
         saga_repo = SagaRepository(session)
         all_jobs = await saga_repo.jobs(saga_id)
         comp_jobs = [j for j in all_jobs if j.type.endswith(COMPENSATE_SUFFIX)]

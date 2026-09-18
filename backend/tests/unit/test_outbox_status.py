@@ -1,35 +1,14 @@
 """`get_outbox_status` — the reading that makes a delivery stall legible.
 
-Family B's two faults look identical from the top ("jobs accepted, nothing
-executing") and have opposite evidence: a stopped consumer leaves the backlog
-in Kafka, so consumer lag climbs; a stopped outbox relay leaves the backlog in
-Postgres, so `outbox_events` rows pile up unpublished and age while lag stays
-flat. Nothing the agent could call showed the second half, so the family had no
-discriminating evidence at all (WO-R3-201 / plan 01 §7.1).
+Family B's two faults look identical from the top and have opposite evidence: a stopped consumer
+leaves the backlog in Kafka so lag climbs, a stopped relay leaves it in Postgres so `outbox_events`
+rows age while lag stays flat. Nothing showed the second half (WO-R3-201, plan 01 §7.1).
 
-What these tests hold, and why each one is here rather than being obvious:
-
-  * **A healthy outbox reads healthy.** The lesson of WO-R3-254 and WO-R3-267 is
-    that a sensor which only looks right when something is wrong is a trap: the
-    empty queue has to come back as a zero count with null ages, not as a crash
-    and not as a suspicious-looking null count.
-  * **Unknown is null with the reason, never a fabricated zero.** A relay
-    heartbeat the platform has no record of is reported as unknown. A
-    fabricated `0` would read as a relay that had just ticked, which is the one
-    wrong answer this field can give.
-  * **An abandoned row is not a delivery.** `mark_failed` stamps `published_at`
-    as well as `failed_at` (ADR 0001 Decision item 3), so a naive
-    `max(published_at)` reports a row the relay gave up on as a successful
-    publish — i.e. it makes a fully stalled relay look like it published a
-    moment ago. That is the exact shape of the defect the repo's fourth
-    description rule was written about, so it gets its own test.
-  * **The reading carries its own clock.** Every age is the database's clock at
-    the moment of the reading minus the timestamp beside it, so a caller cannot
-    be handed an age and a timestamp that disagree.
-  * **The contract delta is pinned.** One new tool, one field list, no class
-    docstring anywhere near the wire (plat #210: Pydantic copies a class
-    docstring — on a model *or* on an enum used as a field type — straight into
-    the schema the commander pins).
+What these tests hold: a healthy outbox reads healthy (WO-R3-254/267 — a sensor that only looks
+right when something is wrong is a trap); unknown is null with a reason, never a fabricated zero; an
+abandoned row is not a delivery, because `mark_failed` stamps `published_at` too (ADR 0001 item 3);
+every age is the database's clock at the reading; and the contract delta is pinned, with no class
+docstring near the wire (plat #210).
 """
 
 from __future__ import annotations
@@ -64,9 +43,8 @@ from app.models.tenant import Tenant
 from app.repositories.outbox import OutboxRepository
 from sqlalchemy.ext.asyncio import AsyncSession
 
-#: The whole read tier after this tool lands. Spelled out rather than counted
-#: so the rebless note the coordinator writes can be read straight off a test,
-#: and so a second new read tool cannot ride in on this one's count.
+# Spelled out rather than counted, so the rebless note can be read off a test and a second new read
+# tool cannot ride in on this one's count.
 READ_TIER_AFTER = [
     "get_cache_key_info",
     "get_consumer_lag",
@@ -186,9 +164,7 @@ async def _second_tenant(db: AsyncSession) -> uuid.UUID:
     return tenant_id
 
 
-# ---------------------------------------------------------------------------
 # A healthy outbox reads healthy
-# ---------------------------------------------------------------------------
 
 
 async def test_an_empty_outbox_reports_zero_and_nulls_not_a_crash(
@@ -236,13 +212,8 @@ async def test_a_drained_outbox_reports_its_last_delivery_and_nothing_waiting(
 async def test_an_idle_platform_is_not_reported_as_a_stall(
     db_session: AsyncSession, default_tenant: Any
 ) -> None:
-    """An old `last_publish_at` with nothing waiting is silence, not a fault.
-
-    The reading has to be able to express "nothing was submitted for an hour",
-    because the description tells the caller to read `last_publish_at` together
-    with `unpublished_count` and that instruction is only honest if the pair
-    really does separate the two worlds.
-    """
+    """An old `last_publish_at` with nothing waiting is silence, not a fault — the description tells
+    the caller to read it together with `unpublished_count`."""
     await _add_event(
         db_session,
         default_tenant.id,
@@ -257,20 +228,14 @@ async def test_an_idle_platform_is_not_reported_as_a_stall(
     assert out.seconds_since_last_publish > 3600
 
 
-# ---------------------------------------------------------------------------
 # A stalled outbox reads stalled
-# ---------------------------------------------------------------------------
 
 
 async def test_a_stalled_outbox_brackets_the_backlog_in_one_reading(
     db_session: AsyncSession, default_tenant: Any
 ) -> None:
-    """Oldest far above the tick interval, newest fresh: arriving, not leaving.
-
-    This pair is what makes the trend readable from a single call, which is the
-    claim the description makes, so it is asserted as a pair rather than as two
-    independent numbers.
-    """
+    """Oldest far above the tick interval, newest fresh: arriving, not leaving. Asserted as a pair,
+    because the pair is the claim."""
     await _add_event(db_session, default_tenant.id, created_seconds_ago=300)
     await _add_event(db_session, default_tenant.id, created_seconds_ago=120)
     await _add_event(db_session, default_tenant.id, created_seconds_ago=1)
@@ -289,14 +254,9 @@ async def test_a_stalled_outbox_brackets_the_backlog_in_one_reading(
 async def test_an_abandoned_row_is_never_reported_as_a_delivery(
     db_session: AsyncSession, default_tenant: Any
 ) -> None:
-    """`mark_failed` stamps `published_at` too — so the filter is load-bearing.
-
-    Without `failed_at IS NULL` in the predicate, the reading below would say
-    the relay published a second ago while the queue was stalled: the worst
-    possible answer, arrived at silently. Written through the repository's own
-    `mark_failed` rather than by hand so the test cannot drift from what the
-    relay actually writes.
-    """
+    """`mark_failed` stamps `published_at` too, so without `failed_at IS NULL` the reading would say
+    the relay published a second ago while the queue was stalled. Written through the repository's
+    own `mark_failed`, so the test cannot drift from what the relay writes."""
     row = await _add_event(db_session, default_tenant.id, created_seconds_ago=60)
     await _add_event(db_session, default_tenant.id, created_seconds_ago=30)
     await OutboxRepository(db_session).mark_failed([row.id], "abandoned")
@@ -315,12 +275,8 @@ async def test_an_abandoned_row_is_never_reported_as_a_delivery(
 async def test_rows_the_relay_will_not_retry_are_counted_and_separated(
     db_session: AsyncSession, default_tenant: Any
 ) -> None:
-    """A backlog made of capped rows does not drain, however healthy the relay.
-
-    They are inside `unpublished_count` (they really are awaiting delivery) and
-    also counted on their own, so a caller is not left to infer that the queue
-    will clear itself.
-    """
+    """A backlog made of capped rows does not drain: they are inside `unpublished_count` and counted
+    on their own, so nothing is left to inference."""
     cap = 5
     with patch(
         "app.repositories.outbox.get_settings",
@@ -361,20 +317,14 @@ async def test_another_tenants_backlog_is_not_counted(
     assert theirs.oldest_unpublished_age_s > 400
 
 
-# ---------------------------------------------------------------------------
 # Every age is measured against one clock
-# ---------------------------------------------------------------------------
 
 
 async def test_every_age_is_measured_at_the_time_the_reading_says(
     db_session: AsyncSession, default_tenant: Any
 ) -> None:
-    """`measured_at` minus the timestamp equals the age, for every pair.
-
-    The point is not arithmetic, it is that a caller can never be handed an age
-    and a timestamp that contradict each other — which is what happens when the
-    ages are taken from one clock and the timestamps from another.
-    """
+    """`measured_at` minus the timestamp equals the age for every pair, so a caller can never be
+    handed an age and a timestamp that contradict each other."""
     await _add_event(db_session, default_tenant.id, created_seconds_ago=240)
     await _add_event(db_session, default_tenant.id, created_seconds_ago=20)
     await _add_event(
@@ -401,11 +351,8 @@ async def test_every_age_is_measured_at_the_time_the_reading_says(
 async def test_a_clock_ahead_of_the_reading_reports_zero_not_a_negative_age(
     db_session: AsyncSession, default_tenant: Any
 ) -> None:
-    """The worker and the database are two hosts; skew must not print a minus.
-
-    Clamped rather than passed through: a negative age is not a thing a caller
-    can act on, and the description says so where the field is documented.
-    """
+    """The worker and the database are two hosts, so skew is clamped: a negative age is not
+    something a caller can act on."""
     redis = _RedisStub(
         {RELAY_TICK_KEY: (datetime.now(UTC) + timedelta(seconds=120)).isoformat()}
     )
@@ -416,9 +363,7 @@ async def test_a_clock_ahead_of_the_reading_reports_zero_not_a_negative_age(
     assert out.relay_heartbeat_age_s == 0.0
 
 
-# ---------------------------------------------------------------------------
 # The relay heartbeat: written by the pass, read as unknown when absent
-# ---------------------------------------------------------------------------
 
 
 async def test_the_tool_reports_the_tick_the_relay_recorded() -> None:
@@ -435,12 +380,8 @@ async def test_the_tool_reports_the_tick_the_relay_recorded() -> None:
 
 
 async def test_the_tick_key_is_not_in_the_lab_namespace() -> None:
-    """A platform signal with a platform writer.
-
-    Under `chaos:*` it would be swept by the reset script and it would imply
-    something about *why* the relay is not running, which this reading must
-    never do.
-    """
+    """Under `chaos:*` the key would be swept by the reset, and it would imply something about why
+    the relay is not running."""
     assert not RELAY_TICK_KEY.startswith("chaos:")
     assert RELAY_TICK_KEY == "outbox:relay:last_tick"
 
@@ -459,11 +400,8 @@ async def test_an_unusable_tick_record_is_unknown_with_the_reason(
     stored: str | None,
     expected_reason: str,
 ) -> None:
-    """Unknown is null plus the reason — never a fabricated zero.
-
-    A `0` here would read as "the relay ticked at the instant you asked", which
-    is the single most misleading thing this field could say.
-    """
+    """A `0` here would read as "the relay ticked at the instant you asked" — the single most
+    misleading thing this field could say."""
     redis = _RedisStub({} if stored is None else {RELAY_TICK_KEY: stored})
 
     out = await _call(db_session, redis, default_tenant.id)
@@ -510,14 +448,9 @@ async def test_recording_a_tick_never_costs_the_relay_its_pass() -> None:
 async def test_the_relay_records_its_pass_from_inside_the_tick(
     sqlite_engine: Any,
 ) -> None:
-    """The stamp is written by the work, not by the loop around it.
-
-    Written before the leader gate and the pause check it would say "the
-    coroutine is alive", which is not the question. Written inside the pass it
-    says "a pass ran", which is. Exercised through the real
-    `_outbox_relay_tick` on an empty queue — the early-return path, because an
-    idle relay is exactly the case a heartbeat exists for.
-    """
+    """The stamp is written by the work, not the loop around it: before the leader gate it would say
+    the coroutine is alive, not that a pass ran. Exercised through the real `_outbox_relay_tick` on
+    an empty queue, the case a heartbeat exists for."""
     from app.workers import dispatcher
     from sqlalchemy.ext.asyncio import async_sessionmaker
 
@@ -538,30 +471,20 @@ async def test_the_relay_records_its_pass_from_inside_the_tick(
 
 
 def test_the_mirrored_tick_interval_matches_the_relay() -> None:
-    """The tool advertises the relay's poll interval, so the two must agree.
-
-    Mirrored rather than imported: the MCP process does not import the worker
-    package (see `consumer_lag.py`'s sample-key mirror for the same shape and
-    the same reason). A mirror without a tripwire is a lie waiting to happen.
-    """
+    """The tool advertises the relay's poll interval, mirrored rather than imported because the MCP
+    process does not import the worker package — and a mirror without a tripwire is a lie waiting to
+    happen."""
     from app.workers.dispatcher import OUTBOX_RELAY_INTERVAL
 
     assert RELAY_TICK_INTERVAL_SECONDS == OUTBOX_RELAY_INTERVAL
 
 
-# ---------------------------------------------------------------------------
 # The contract delta, pinned
-# ---------------------------------------------------------------------------
 
 
 def test_the_read_tier_gained_exactly_this_tool() -> None:
-    """A tool-surface delta is a contract delta; this is the whole of it.
-
-    Chaos tools are unregistered under default unit settings, so the count here
-    is the non-chaos surface: 20 tools before this order, 21 after. With
-    `CHAOS_ENABLED=true` the eleven chaos tools join and the number the
-    commander pins moves 31 → 32.
-    """
+    """A tool-surface delta is a contract delta: 20 non-chaos tools before this order, 21 after, and
+    with `CHAOS_ENABLED=true` the number the commander pins moves 31 → 32."""
     read = sorted(
         t.name
         for t in list_tools()
@@ -590,14 +513,9 @@ def test_the_shape_of_the_new_tool_is_exactly_this() -> None:
 
 
 def test_no_class_docstring_reaches_the_pinned_schema() -> None:
-    """plat #210, generalised: a class docstring becomes a wire `description`.
-
-    Pydantic copies a model's class docstring into the schema's top-level
-    `description`, and an enum's into `$defs.<Enum>.description`. This tool has
-    no enum field and must have no docstring on either model — the prose that
-    explains them belongs in comments and in the tool description, which is
-    written for the caller.
-    """
+    """plat #210, generalised: Pydantic copies a model's class docstring into the schema's top-level
+    `description` and an enum's into `$defs.<Enum>.description`. This tool has no enum field and
+    must have no docstring on either model."""
     assert GetOutboxStatusInput.__doc__ is None
     assert GetOutboxStatusOutput.__doc__ is None
 
@@ -634,25 +552,16 @@ def test_no_class_docstring_reaches_the_pinned_schema() -> None:
 def test_the_description_carries_the_sentences_it_is_required_to(
     phrase: str,
 ) -> None:
-    """The description *is* the interface (incident-platform/CLAUDE.md §naming).
-
-    Each phrase here stands for one of the four normative description rules or
-    for one of the two misreadings this reading is most likely to produce. They
-    are pinned because a later edit that drops one is a functional regression
-    with no other symptom.
-    """
+    """The description IS the interface (CLAUDE.md §naming): each phrase stands for a normative rule
+    or a likely misreading, so an edit that drops one is a functional regression with no other
+    symptom."""
     td = next(t for t in list_tools() if t.name == "get_outbox_status")
     assert phrase in td.description
 
 
 def test_the_description_never_says_why_the_relay_is_not_running() -> None:
-    """ADR 0012: the reading is the same whatever stopped the relay.
-
-    A stopped relay reads as "last pass N seconds ago" and nothing more. The
-    wider vocabulary screen lives in `test_lab_invisibility.py`; this is the
-    narrower claim for this tool, phrased as the words a well-meaning author
-    would reach for.
-    """
+    """ADR 0012: a stopped relay reads as "last pass N seconds ago" and nothing more. The wider
+    vocabulary screen lives in `test_lab_invisibility.py`."""
     td = next(t for t in list_tools() if t.name == "get_outbox_status")
     lowered = (td.description + td.output_json_schema().__str__()).lower()
     for word in ("chaos", "paused", "pause", "deliberately stopped", "injected"):

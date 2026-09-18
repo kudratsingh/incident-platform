@@ -1,40 +1,14 @@
 """Family C's world: a child stranded `WAITING` because BOTH promoters are stopped.
 
-Plan 01 §7.2 asks for a world whose discriminator is an *absence* — a child stuck
-`WAITING` with nothing dead-lettered and nothing paused — so that the correct
-answer is to escalate rather than to replay (`create_stuck_dag`) or to un-pause
-(`pause_dag`). Two things promote a `WAITING` child whose parents have all
-reached `COMPLETED`, and that world exists only while both are stopped:
+Plan 01 §7.2 wants a world whose discriminator is an absence — a `WAITING` child with nothing
+dead-lettered and nothing paused — so the correct answer is to escalate. Two things promote such a
+child: the `dependency-resolver` consumer group, stopped by `kill_consumer` and deliberately absent
+from `ControlLoopName` (divergence H2, ADR 0027), and `_resume_unblocked_waiting_loop`, the 10 s
+resume sweep, stopped by `pause_control_loop` (divergence H3). Stalling the resolver alone strands
+nothing, so the packet is `…holds_the_child…` plus its control `…the_same_window_promotes…`.
 
-  * the `dependency-resolver` **consumer group**, which reacts to
-    `job.completed`. `kill_consumer('dependency-resolver')` has stopped any
-    consumer group since Wave 1 — it is a consumer group and not a tick loop,
-    which is why it is deliberately absent from `ControlLoopName`
-    (divergence H2, ADR 0027);
-  * `_resume_unblocked_waiting_loop`, the resume **sweep**, which exists to
-    backstop exactly this and runs every `_RESUME_SWEEP_INTERVAL` = 10 s
-    (divergence H3). `pause_control_loop('resume_unblocked_waiting')` stops it.
-
-Stalling the resolver alone strands nothing: the sweep promotes the child within
-about ten seconds, by design. That is the whole packet, and the pair of tests
-that carries it is `…holds_the_child…` plus `…the_same_window_promotes…` — the
-paused window holds the child, and *the same window* promotes it when the sweep
-is not paused. The control is what makes the first assertion mean anything: a
-window too short to contain a sweep pass would pass just as happily with the
-pause removed, which is the failure the packet's test requirement names.
-
-Real rows on a real (SQLite in-memory) engine, following
-`test_resume_sweep_promotable.py` rather than the mock-heavy `test_dispatcher.py`
-style: every claim here is about what the sweep's own SQL does to a row, and
-about what the agent's read tools say afterwards. `tests/integration/
-test_resolver_stall.py` makes the same claim against the Postgres a live lab runs
-on, where `now()` and `created_at` are the server's.
-
-Windows are counted in **sweep iterations, not wall seconds.** The loop's real
-interval is 10 s and no test should wait for two of those; the interval constant
-is patched down and the loop is then run until it has been observed to iterate
-`_MIN_TICKS` times, so the window is a deterministic multiple of the sweep
-period rather than a wall-clock guess that a loaded machine can shorten.
+Real rows on SQLite in-memory; `tests/integration/test_resolver_stall.py` is the Postgres twin.
+Windows are counted in sweep iterations, not wall seconds.
 """
 
 from __future__ import annotations
@@ -80,9 +54,7 @@ from sqlalchemy.ext.asyncio import (
 )
 from sqlalchemy.pool import StaticPool
 
-# Mixed hex on purpose, for the reason `DEFAULT_TENANT_ID` is: an all-digit UUID
-# hex round-trips through SQLite's NUMERIC affinity as a float and blows up the
-# UUID result processor.
+# Mixed hex like `DEFAULT_TENANT_ID`: all-digit hex round-trips through SQLite as a float.
 _USER_ID = uuid.UUID("b71e5c48-2a0d-4e93-8f16-5d27c0a9e4b3")
 
 #: The pause the packet adds, and the kill it composes with. Both derived from
@@ -91,29 +63,20 @@ _SWEEP_PAUSE_KEY = pause_key_for(ControlLoopName.RESUME_UNBLOCKED_WAITING)
 _RESOLVER_GROUP = get_settings().kafka_consumer_group_dependency
 _RESOLVER_KILL_KEY = kill_key_for(_RESOLVER_GROUP)
 
-#: Patched in for the window, and how many iterations the window must contain.
-#: Twelve iterations of the real loop is two minutes of sweep time — comfortably
-#: more than the one pass that would promote the child — and the wait is on the
-#: count, not on the clock, so a slow machine lengthens the window instead of
-#: silently shortening it.
+# Patched in for the window. Twelve iterations of the real loop is two minutes of sweep time, and
+# the wait is on the count rather than the clock, so a slow machine lengthens the window.
 _FAST_INTERVAL = 0.01
 _MIN_TICKS = 12
 _TICK_TIMEOUT = 15.0
 
-#: How old the stranded child looks. Plan 01 §7.2 lists "child created_at age
-#: large" among the facts the agent reads, and it is what separates a child the
-#: resolver has not got to yet from one nothing is coming for.
+# How old the stranded child looks: plan 01 §7.2 lists "child created_at age large" among the facts
+# the agent reads.
 _CHILD_AGE = timedelta(minutes=47)
 
 
 class _Redis:
-    """The keys this world needs, behind the surface the real clients expose.
-
-    Three readers share it and each wants something different: `loop_is_paused`
-    does a `GET` of the sweep's pause key, `find_blocking_pause` does an `MGET`
-    over `dag:paused:<ancestor>`, and `pause_state` does a `TTL`. A stub rather
-    than a container because every one of those is a single key lookup.
-    """
+    """The keys this world needs: `loop_is_paused` GETs the sweep's pause key, `find_blocking_pause`
+    MGETs `dag:paused:<ancestor>`, `pause_state` reads a TTL. A stub, because each is one lookup."""
 
     def __init__(self) -> None:
         self._store: dict[str, str] = {}
@@ -202,14 +165,10 @@ def _job(*, status: str, created_at: datetime) -> Job:
 async def _seed_stranded_chain(
     factory: async_sessionmaker[AsyncSession],
 ) -> tuple[uuid.UUID, uuid.UUID]:
-    """The world 01 §7.2 describes: parent `COMPLETED`, child still `WAITING`.
-
-    Inserted at the data level rather than driven through a completion, because
-    the defining property is that the parent's `job.completed` has *already
-    happened*. The resolver only ever reacts to that event, so a world where the
-    event is in the past is a world the resolver will never revisit — which is
-    exactly why the sweep exists, and exactly what the pause takes away.
-    """
+    """The world 01 §7.2 describes — parent `COMPLETED`, child still `WAITING` — inserted at the
+    data level because the defining property is that the parent's `job.completed` is already in the
+    past, so the resolver will never revisit it. That is why the sweep exists, and what the pause
+    removes."""
     created = datetime.now(UTC) - _CHILD_AGE
     async with factory() as session:
         async with session.begin():
@@ -232,12 +191,9 @@ async def _status_of(
 
 
 async def _submitted_events(factory: async_sessionmaker[AsyncSession]) -> int:
-    """`job.submitted` outbox rows — the announcement a promotion mints.
-
-    Asserted beside the status because promoting the row without the outbox add
-    is a state the CAS in `promote_waiting_to_pending` is designed to produce
-    for a *loser*, and a stalled world must produce neither half.
-    """
+    """`job.submitted` outbox rows. Promoting the row without the outbox add is the state the CAS in
+    `promote_waiting_to_pending` produces for a loser, and a stalled world must produce neither
+    half."""
     async with factory() as session:
         return (
             await session.execute(
@@ -251,28 +207,15 @@ async def _submitted_events(factory: async_sessionmaker[AsyncSession]) -> int:
 async def _run_sweep_window(
     factory: async_sessionmaker[AsyncSession], redis: _Redis
 ) -> int:
-    """Run the real sweep loop for exactly `_MIN_TICKS` iterations.
+    """Run the real sweep loop for exactly `_MIN_TICKS` iterations and return the count.
 
-    Returns the iteration count. Three things are patched and nothing else:
-
-    * `_RESUME_SWEEP_INTERVAL`, so the window is short in wall time while the
-      loop body and its own `asyncio.sleep` stay untouched;
-    * `CHAOS_ENABLED`, which is gate 1 — without it the pause check
-      short-circuits before Redis and no key is ever read;
-    * `dispatcher.loop_is_paused`, wrapped in a counter that **calls through to
-      the real check**. Counting iterations from inside the loop is the only
-      honest way to say how long the window was: the pause check happens every
-      iteration, where the promotion happens only on the iterations that are not
-      paused.
-
-    The loop is stopped by raising `CancelledError` out of that same check, the
-    way the loop tests in `test_dispatcher.py` and `test_pause_control_loop.py`
-    stop theirs — the top of an iteration, before any database work. Cancelling
-    the task from outside is *not* interchangeable here: it can land inside the
-    sweep's transaction, and an aiosqlite connection invalidated mid-statement is
-    replaced by a reconnect, which for an in-memory database is a fresh and empty
-    one. The symptom is `no such table: jobs` from the assertion afterwards.
-    """
+    Three patches and nothing else: `_RESUME_SWEEP_INTERVAL` for wall time, `CHAOS_ENABLED` because
+    gate 1 short-circuits the pause check before Redis, and a counter around
+    `dispatcher.loop_is_paused` that calls through to the real check — counting from inside the loop
+    is the only honest measure of the window. The loop is stopped by raising `CancelledError` out of
+    that check, at the top of an iteration: cancelling from outside can land inside the sweep's
+    transaction, and an invalidated aiosqlite connection reconnects to a fresh, empty database (`no
+    such table: jobs`)."""
     ticks = 0
 
     async def _counting_is_paused(loop_name: ControlLoopName) -> bool:
@@ -311,21 +254,14 @@ def _ctx(db: AsyncSession, redis: Any) -> ToolContext:
     )
 
 
-# ---------------------------------------------------------------------------
 # The composed stall, and the control that gives it meaning
-# ---------------------------------------------------------------------------
 
 
 async def test_the_composed_stall_holds_the_child_across_many_sweep_ticks(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """Both promoters stopped, and the child does not move.
-
-    The sweep is paused by its own key and the resolver has nothing to deliver
-    (the parent's completion is in the past), so nothing promotes the child for
-    as long as the pause holds. The tick count is asserted because the absence
-    of a promotion is only evidence if the sweep had the chance to promote.
-    """
+    """Both promoters stopped, and the child does not move. The tick count is asserted because an
+    absent promotion is only evidence if the sweep had the chance to promote."""
     _, child_id = await _seed_stranded_chain(session_factory)
     redis = _Redis()
     await redis.set(_SWEEP_PAUSE_KEY, "paused", ex=300)
@@ -344,13 +280,8 @@ async def test_the_composed_stall_holds_the_child_across_many_sweep_ticks(
 async def test_the_same_window_promotes_the_child_when_the_sweep_is_not_paused(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """The control. Without it the test above proves nothing.
-
-    Identical world, identical window, no pause key — and the child is promoted
-    with its `job.submitted` row. This is the red half of the packet: it is what
-    the world does with the hook absent, and the reason a window has to be
-    counted in sweep iterations rather than in seconds.
-    """
+    """The control: identical world and identical window with no pause key promotes the child with
+    its `job.submitted` row. Without it the test above proves nothing."""
     _, child_id = await _seed_stranded_chain(session_factory)
     redis = _Redis()  # no pause key
 
@@ -364,15 +295,9 @@ async def test_the_same_window_promotes_the_child_when_the_sweep_is_not_paused(
 async def test_the_pause_expiring_promotes_the_child_with_no_operator_action(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """The TTL is the teardown, and it is the *only* thing that heals this world.
-
-    Deleting the key and letting Redis expire it are indistinguishable to the
-    check, which is a `GET`, so the key is deleted rather than waited out. What
-    matters is the asymmetry: the resolver coming back does not rescue the child,
-    because the `job.completed` that would have promoted it has already been
-    consumed. The sweep resuming is what un-stalls the world, which is why the
-    sweep's pause TTL — not the kill's — bounds the fault.
-    """
+    """The TTL is the teardown, and the only thing that heals this world. Deleting the key and
+    letting Redis expire it are indistinguishable to a `GET`. The asymmetry is the point: the
+    resolver coming back rescues nothing, because the `job.completed` has already been consumed."""
     _, child_id = await _seed_stranded_chain(session_factory)
     redis = _Redis()
     await redis.set(_SWEEP_PAUSE_KEY, "paused", ex=300)
@@ -389,22 +314,15 @@ async def test_the_pause_expiring_promotes_the_child_with_no_operator_action(
     assert await _submitted_events(session_factory) == 1
 
 
-# ---------------------------------------------------------------------------
 # Why it takes both: the resolver is the other promoter
-# ---------------------------------------------------------------------------
 
 
 async def test_pausing_the_sweep_alone_leaves_the_resolver_promoting(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """Divergence H3 from the other side.
-
-    A `job.completed` redelivery reaches a resolver that is still polling, and
-    the child is promoted with the sweep's pause still set. So the pause is
-    necessary and not sufficient: a scenario that paused only the sweep would
-    hold the child until the next delivery on `job.completed` and then lose it,
-    intermittently and for a reason no reading would explain.
-    """
+    """Divergence H3 from the other side: a `job.completed` redelivery reaches a still-polling
+    resolver and the child is promoted with the sweep's pause still set. The pause is necessary, not
+    sufficient."""
     parent_id, child_id = await _seed_stranded_chain(session_factory)
     redis = _Redis()
     await redis.set(_SWEEP_PAUSE_KEY, "paused", ex=300)
@@ -423,15 +341,9 @@ async def test_pausing_the_sweep_alone_leaves_the_resolver_promoting(
 async def test_the_resolver_is_stopped_by_its_own_kill_key(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """The other half of the composed stall, at the check that performs it.
-
-    `BaseKafkaConsumer` calls `_check_chaos_kill(self.group_id)` at the top of
-    every poll and shuts down when it answers true, so a killed group never
-    reaches `handle_message` — which is the delivery the test above shows would
-    otherwise undo the stall. Asserted through the group id the resolver is
-    actually constructed with, so `kill_consumer` cannot be called with a name
-    no consumer answers to.
-    """
+    """`BaseKafkaConsumer` calls `_check_chaos_kill(self.group_id)` at the top of every poll, so a
+    killed group never reaches `handle_message`. Asserted through the group id the resolver is
+    really constructed with, so `kill_consumer` cannot be called with a name nothing answers to."""
     resolver = DependencyResolver(session_factory)
     assert resolver.group_id == _RESOLVER_GROUP
 
@@ -442,22 +354,15 @@ async def test_the_resolver_is_stopped_by_its_own_kill_key(
         assert await _check_chaos_kill(resolver.group_id) is True
 
 
-# ---------------------------------------------------------------------------
 # What the agent reads: an absence, and two contrasts
-# ---------------------------------------------------------------------------
 
 
 async def test_the_stalled_world_reads_as_waiting_with_nothing_paused(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """The facts plan 01 §7.2 asks the agent to reason from, from the real tools.
-
-    `get_dag_state` on the child: the parent is `completed`, the child is
-    `waiting`, `paused` is false and `paused_by` is null, and the child's
-    `created_at` is long past. `list_dlq_messages` is empty. Nothing to replay
-    and nothing to un-pause is the whole discriminator — the correct answer is
-    to escalate, so the reading has to support that and nothing else.
-    """
+    """The facts plan 01 §7.2 asks the agent to reason from, read through the real tools: parent
+    `completed`, child `waiting`, `paused` false, `paused_by` null, `created_at` long past, and an
+    empty DLQ. Nothing to replay and nothing to un-pause is the whole discriminator."""
     parent_id, child_id = await _seed_stranded_chain(session_factory)
     redis = _Redis()
     await redis.set(_SWEEP_PAUSE_KEY, "paused", ex=300)
@@ -489,9 +394,8 @@ async def test_the_stalled_world_reads_as_waiting_with_nothing_paused(
     child_node = next(n for n in dag.nodes if n.id == str(child_id))
     created = child_node.created_at
     if created.tzinfo is None:
-        # SQLite has no timezone-aware type and hands the offset back stripped.
-        # Postgres does not, which is one of the things the integration-tier
-        # twin of this file exists to read against the server's own clock.
+        # SQLite has no timezone-aware type and hands the offset back stripped; the integration twin
+        # reads against the server's own clock.
         created = created.replace(tzinfo=UTC)
     assert datetime.now(UTC) - created > timedelta(minutes=30)
 
@@ -499,13 +403,8 @@ async def test_the_stalled_world_reads_as_waiting_with_nothing_paused(
 async def test_a_paused_dag_reads_differently_so_the_null_is_a_real_reading(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """Anti-vacuity, the lesson INC-001 cost a paid run to learn.
-
-    `paused_by is None` only distinguishes this world from `pause_dag`'s if the
-    field can be non-null on the same read path. Same chain, same tool, one
-    `dag:paused:<parent>` flag — and the ancestor's id comes back. Without this
-    the assertions above would keep passing if the pause lookup broke.
-    """
+    """Anti-vacuity, the lesson INC-001 cost a paid run: `paused_by is None` only distinguishes this
+    world from `pause_dag`'s if the field can be non-null on the same read path."""
     parent_id, child_id = await _seed_stranded_chain(session_factory)
     redis = _Redis()
     await redis.set(dag_pause_key_for(parent_id), "1", ex=600)
@@ -522,12 +421,8 @@ async def test_a_paused_dag_reads_differently_so_the_null_is_a_real_reading(
 async def test_the_sweep_pause_does_not_reach_the_other_loops(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """`single_loop` is a blast-radius claim, so the reverse gets an assertion.
-
-    A key for a different member must not stop this sweep — the failure a shared
-    key or a prefix match would produce, and one that would silently widen every
-    scenario's fault.
-    """
+    """`single_loop` is a blast-radius claim, so a key for a different member must not stop this
+    sweep."""
     _, child_id = await _seed_stranded_chain(session_factory)
     redis = _Redis()
     await redis.set(

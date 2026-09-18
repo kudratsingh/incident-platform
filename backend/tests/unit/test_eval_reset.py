@@ -1,22 +1,9 @@
-"""Tests for the eval-reset bundle (FIX_PLAN #7, #19, #79):
+"""Tests for the eval-reset bundle (FIX_PLAN #7, #19, #79): the stale-cache hot set, the DLQ
+baseline restore, the chaos-key sweep, the production refusal from both entry points, the structured
+seeded-fixture marker, and that the reset never touches `audit_logs` (ADR 0012).
 
-  * `seed_eval_fixtures._seed_hot_set` populates the stale-cache
-    fixture that `remediate_stale_cache_success` depends on.
-  * `seed_eval_fixtures._reset_dlq_state` restores mutated fixture
-    rows back to baseline without touching non-fixture data.
-  * `reset_eval_state._clear_chaos_keys` finds and deletes every key
-    matching the chaos patterns.
-  * `reset_eval_state` refuses to run against ENVIRONMENT=production —
-    from `main()` (SystemExit) *and* from the programmatic `reset()`
-    entry point (RuntimeError, raised before anything is connected).
-  * `reset_eval_state._delete_seeded_dlq_fixtures` keys off the
-    structured top-level marker, not a substring of the serialized
-    payload.
-  * `reset_eval_state` never reads or writes `audit_logs` (ADR 0012's
-    "reset disposal vs audit ground truth" amendment).
-
-Import-guarded so the seed script's heavy DB imports (SQLAlchemy engine,
-alembic wiring) don't fire until the test needs them."""
+Import-guarded so the seeder's heavy DB imports stay lazy.
+"""
 
 from __future__ import annotations
 
@@ -52,15 +39,9 @@ def _reset_module():  # type: ignore[no-untyped-def]
     return importlib.import_module("reset_eval_state")
 
 
-# ---------------------------------------------------------------------------
-# Shared session harness
-#
-# Every destructive helper in reset_eval_state opens its own
-# `async with session.begin()`, but the `db_session` fixture already owns
-# the transaction — so `begin()` has to be a no-op while each statement
-# still hits the real DB. Hoisted to module level because four tests
-# need it (it was copy-pasted into two of them before).
-# ---------------------------------------------------------------------------
+# Shared session harness: every destructive helper opens its own `async with session.begin()`, but
+# the `db_session` fixture already owns the transaction — so `begin()` has to be a no-op while each
+# statement still hits the real DB. Module level because four tests need it.
 
 
 class _NullTx:
@@ -95,9 +76,7 @@ def _factory(session):  # type: ignore[no-untyped-def]
     return lambda: _SessionProxy(session)
 
 
-# ---------------------------------------------------------------------------
 # _seed_hot_set — FIX_PLAN #19
-# ---------------------------------------------------------------------------
 
 
 async def test_seed_hot_set_populates_expected_key() -> None:
@@ -112,26 +91,21 @@ async def test_seed_hot_set_populates_expected_key() -> None:
     parsed = json.loads(value)
     assert isinstance(parsed, list)
     assert len(parsed) >= 1
-    # Referential integrity (D-14): every hot_set member must be a job
-    # id that `_seed_dlq` actually seeds. Hardcoded stable() names
-    # drifted once when `_dlq_specs` entries were renamed, leaving 2 of
-    # 3 members pointing at jobs that never exist.
+    # Referential integrity (D-14): every hot_set member must be a job id `_seed_dlq` really seeds.
+    # Hardcoded stable() names drifted once.
     assert set(parsed) <= {str(spec["job_id"]) for spec in seed._dlq_specs()}
     # TTL passed so evals don't drift mid-run.
     assert redis.set.await_args.kwargs.get("ex") == 24 * 3600
 
 
-# ---------------------------------------------------------------------------
 # _reset_dlq_state — FIX_PLAN #7
-# ---------------------------------------------------------------------------
 
 
 async def test_reset_dlq_state_restores_mutated_fixture(
     db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
 ) -> None:
-    """A fixture DLQ job that a scenario mutated into RUNNING with
-    retry_count=0 gets flipped back to DEAD_LETTER/retry_count=3, and
-    the row's other invariants (id, tenant, type) are untouched."""
+    """A fixture DLQ job a scenario mutated goes back to DEAD_LETTER/retry_count=3, id and tenant
+    untouched."""
     seed = _seed_module()
     # Pick the first stable() DLQ spec so we know the ID + expected values.
     spec = seed._dlq_specs()[0]
@@ -177,9 +151,7 @@ async def test_reset_dlq_state_restores_mutated_fixture(
 async def test_reset_dlq_state_is_noop_when_already_baseline(
     db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
 ) -> None:
-    """A fixture already at baseline doesn't get counted — the reset
-    only touches drifted rows. Guards against a re-run turning into
-    wasted UPDATEs (and against confusing the summary count)."""
+    """A fixture already at baseline is not counted: the reset only touches drifted rows."""
     seed = _seed_module()
     spec = seed._dlq_specs()[0]
     now = datetime.now(UTC)
@@ -208,8 +180,7 @@ async def test_reset_dlq_state_is_noop_when_already_baseline(
 async def test_reset_dlq_state_leaves_non_fixture_rows_untouched(
     db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
 ) -> None:
-    """Reset targets only stable() IDs. Non-fixture jobs — a random
-    DEAD_LETTER row created by a scenario — must not be reverted."""
+    """Only stable() ids are reset; other DEAD_LETTER rows stay."""
     seed = _seed_module()
     real_job = Job(
         tenant_id=default_tenant.id,
@@ -228,9 +199,7 @@ async def test_reset_dlq_state_leaves_non_fixture_rows_untouched(
     assert real_job.retry_count == 99
 
 
-# ---------------------------------------------------------------------------
 # _rebaseline_timestamps — BUILD_PLAN 2.5 (time re-baselining)
-# ---------------------------------------------------------------------------
 
 
 def _utc(dt: datetime) -> datetime:
@@ -244,15 +213,9 @@ _SHIFT_TOL = timedelta(minutes=2)
 async def test_rebaseline_refreshes_stale_fixture_timestamps(
     db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
 ) -> None:
-    """Two days after seeding, `search_traces(since_hours=1)` found
-    nothing: created_at offsets are computed at seed time and no reset
-    restored them, so age-sensitive scenarios graded against an
-    apparently healthy system (verified live 2026-08-16 — post-reset
-    dead_letter rows still carried created_at from 2026-08-14).
-
-    The re-baseline re-anchors every fixture row to its spec offset from
-    *now* — shifted, not flattened, so the stories the offsets encode
-    keep their relative spacing."""
+    """Age-sensitive scenarios graded against an apparently healthy system because no reset
+    re-anchored `created_at` (verified live 2026-08-16). The re-baseline shifts every fixture row to
+    its spec offset from now, keeping the relative spacing."""
     seed = _seed_module()
     from app.models.alert import Alert
     from app.models.deploy_marker import DeployMarker
@@ -370,14 +333,11 @@ async def test_rebaseline_leaves_organic_rows_untouched(
 async def test_rebaseline_is_noop_when_already_fresh(
     db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
 ) -> None:
-    """Rows already at their now-relative offsets aren't rewritten, so
-    back-to-back resets keep the documented no-op idempotency."""
+    """Rows already at their now-relative offsets are not rewritten."""
     seed = _seed_module()
     spec = seed._dlq_specs()[0]
-    # Built through the same derivation the seeder uses: a row that is fresh
-    # in `created_at` but missing `started_at`/`completed_at` is not fresh,
-    # it is the incoherent shape WO-R2-69 fixed, and the re-baseline is
-    # supposed to notice.
+    # Fresh in `created_at` but missing `started_at`/`completed_at` is the incoherent shape WO-R2-69
+    # fixed.
     created, started, completed = seed._lifecycle(
         datetime.now(UTC), spec["created_offset"], spec["run_seconds"]
     )
@@ -404,16 +364,12 @@ async def test_rebaseline_is_noop_when_already_fresh(
     assert await seed._rebaseline_timestamps(db_session) == 0
 
 
-# ---------------------------------------------------------------------------
 # _clear_chaos_keys — FIX_PLAN #79
-# ---------------------------------------------------------------------------
 
 
 def test_every_chaos_key_helper_lives_under_the_chaos_namespace() -> None:
-    """`_CHAOS_KEY_PATTERNS` is only complete because every chaos key a
-    helper can produce is under `chaos:*`. A future helper that escapes
-    the namespace escapes the reset silently — so assert the property
-    statically rather than trusting a hand-typed pattern list."""
+    """`_CHAOS_KEY_PATTERNS` is complete only while every chaos key stays under `chaos:*`, so assert
+    that statically rather than trusting the pattern list."""
     from app.workers.control_loop_pause import pause_key_for
     from app.workers.kafka_consumer import kill_key_for, latency_key_for
 
@@ -425,12 +381,8 @@ def test_every_chaos_key_helper_lives_under_the_chaos_namespace() -> None:
 
 
 async def test_clear_chaos_keys_scans_and_deletes_matching_patterns() -> None:
-    """The SCAN inputs are the REAL key shapes the helpers emit.
-
-    The previous version fed `kafka:consumer:<group>:killed`, a shape no
-    code has ever written — the tuple carried two patterns matching
-    nothing (D-13), and the test cemented the fiction.
-    """
+    """The SCAN inputs are the real key shapes the helpers emit; the old ones matched nothing
+    (D-13)."""
     reset = _reset_module()
     from app.workers.control_loop_pause import ControlLoopName, pause_key_for
     from app.workers.kafka_consumer import kill_key_for, latency_key_for
@@ -462,18 +414,12 @@ async def test_clear_chaos_keys_scans_and_deletes_matching_patterns() -> None:
     assert reset._CHAOS_KEY_PATTERNS == ("chaos:*",)
 
 
-# ---------------------------------------------------------------------------
 # Tier-1 action residue — delayed replay timers + DAG pauses
-# ---------------------------------------------------------------------------
 
 
 async def test_clear_scheduled_replays_drops_pending_timers() -> None:
-    """A 5-minute replay scheduled by one scenario used to survive the
-    reset and fire during the next one.
-
-    Both sets are swept (R2-21): an un-acked claim on the in-flight set
-    is a pending replay that a later tick is *designed* to recover, so
-    leaving it would restore the bleed."""
+    """A scheduled replay used to survive the reset and fire in the next scenario. Both sets are
+    swept (R2-21): an un-acked in-flight claim is a replay a later tick would recover."""
     reset = _reset_module()
     redis = AsyncMock()
     redis.zcard.side_effect = [3, 2]
@@ -481,13 +427,8 @@ async def test_clear_scheduled_replays_drops_pending_timers() -> None:
     cleared = await reset._clear_scheduled_replays(redis)
 
     assert cleared == 5
-    # Asserted against the worker's constants, not re-hardcoded strings.
-    # The reset script duplicates these literals on purpose, so it has no
-    # import dependency on the worker package — which means this test is
-    # the only thing standing between that duplication and a silent
-    # divergence. Re-typing the literal here made the pair unguarded:
-    # renaming SCHEDULED_KEY would leave the script sweeping a key
-    # nothing writes any more, and the test would still pass (R2-76).
+    # Asserted against the worker's constants: the script duplicates these literals on purpose, so
+    # re-typing them here would leave the pair unguarded (R2-76).
     from app.workers.dlq_replay_scheduler import INFLIGHT_KEY, SCHEDULED_KEY
 
     assert [c.args[0] for c in redis.delete.await_args_list] == [
@@ -506,8 +447,7 @@ async def test_clear_scheduled_replays_noop_when_empty() -> None:
 
 
 async def test_clear_dag_pauses_removes_pause_flags() -> None:
-    """Harmless before the resolver enforced pauses; since ADR 0011 a
-    leftover flag holds the next scenario's DAG in WAITING."""
+    """Since ADR 0011 a leftover flag strands the next scenario's DAG."""
     reset = _reset_module()
     redis = AsyncMock()
     scan_results = iter([(0, [b"dag:paused:abc", b"dag:paused:def"])])
@@ -517,17 +457,12 @@ async def test_clear_dag_pauses_removes_pause_flags() -> None:
     assert await reset._clear_dag_pauses(redis) == 2
 
 
-# ---------------------------------------------------------------------------
 # Recorded consumer-lag measurements — WO-R3-254
-# ---------------------------------------------------------------------------
 
 
 async def test_clear_lag_samples_drops_the_recorded_window() -> None:
-    """The metrics loop keeps ~5 minutes of timestamped lag measurements
-    and `get_consumer_lag` returns them as `recent_samples`. Carried
-    across a reset, the first trend the next run reads is one the
-    previous run produced — the same cross-scenario bleed as a leftover
-    replay timer, one surface further out."""
+    """Carried across a reset, the lag window `get_consumer_lag` returns as `recent_samples` makes
+    the next run read the previous run's trend."""
     reset = _reset_module()
     redis = AsyncMock()
     redis.delete = AsyncMock(return_value=1)
@@ -547,45 +482,36 @@ async def test_clear_lag_samples_is_a_noop_when_nothing_was_recorded() -> None:
 
 
 def test_the_reset_clears_the_window_the_metrics_loop_writes() -> None:
-    """Asserted against the worker's constant, not a re-typed string —
-    the script duplicates the literal so it has no import dependency on
-    the worker package, which makes this test the only thing standing
-    between that duplication and a silent divergence (R2-76's lesson,
-    applied to the key added by WO-R3-254)."""
+    """Asserted against the worker's constant: the script duplicates the literal, so this test is
+    all that stands between it and a silent divergence (WO-R3-254, R2-76's lesson)."""
     from app.workers.dispatcher import LAG_SAMPLES_KEY
 
     assert _reset_module()._LAG_SAMPLES_KEY == LAG_SAMPLES_KEY
 
 
 def test_the_reset_leaves_the_lag_value_key_alone() -> None:
-    """Deliberate asymmetry, stated as a test because the two keys look
-    interchangeable: the value is loop-owned under a 90s TTL and a reset
-    that deleted it would blind backpressure for a minute for nothing,
-    while the window spans minutes and is exactly the state that bleeds.
-    Nothing in the script may name the value key."""
+    """Deliberate asymmetry: the value key is loop-owned under a 90s TTL and deleting it would blind
+    backpressure, while the window is the state that bleeds. Nothing in the script may name the
+    value key."""
     from app.utils.backpressure import BACKPRESSURE_LAG_KEY
 
     source = inspect.getsource(_reset_module())
-    # Quoted on both sides on purpose: the window key starts with the
-    # value key, so an unquoted substring search would match it and this
-    # test would fail on the very key it is here to allow.
+    # Quoted on both sides: the window key starts with the value key, so an unquoted search would
+    # match it.
     assert f'"{BACKPRESSURE_LAG_KEY}"' not in source, (
         "reset_eval_state names the lag VALUE key — the metrics loop owns "
         "it under a TTL and the reset must not touch it"
     )
 
 
-# ---------------------------------------------------------------------------
 # Empty-DLQ baseline mode — commander ADR 0010 / platform ADR 0012
-# ---------------------------------------------------------------------------
 
 
 def test_empty_dlq_baseline_defaults_off(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Opt-in on purpose: flipping the baseline is breaking for every
-    dlq_* scenario written against the standing pool, so the platform
-    ships the capability before the commander migrates."""
+    """Opt-in on purpose: flipping the baseline breaks every dlq_* scenario written against the
+    pool."""
     reset = _reset_module()
     monkeypatch.delenv("EVAL_EMPTY_DLQ_BASELINE", raising=False)
     assert reset._empty_dlq_baseline() is False
@@ -612,19 +538,9 @@ def test_empty_dlq_baseline_rejects_falsy_spellings(
 async def test_delete_seeded_dlq_fixtures_removes_declared_rows(
     db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
 ) -> None:
-    """Scenario-declared scaffolding is DELETEd, not cancelled — it
-    isn't a real user's history and cancelling would accumulate dead
-    rows across every eval run.
-
-    The predicate is the *structured* top-level marker
-    (`seed_dlq_messages.SEEDED_FIXTURE_MARKER` writes
-    `payload={"seeded_fixture": True}`), so the three adversarial
-    payloads below survive. HEAD's `CAST(payload AS text) LIKE
-    '%"seeded_fixture"%'` deleted all four (S-02): a substring match
-    against the serialized payload hits the marker as a *value*, at any
-    nesting depth, and with any value including `false` — a hard DELETE
-    with CASCADE onto `job_triages` and SET NULL onto the audit FKs.
-    """
+    """Declared scaffolding is DELETEd, not cancelled. The predicate is the structured top-level
+    marker (`seed_dlq_messages.SEEDED_FIXTURE_MARKER`), so the adversarial payloads below survive —
+    HEAD's `CAST(payload AS text) LIKE` substring match deleted all four (S-02)."""
     reset = _reset_module()
     from app.mcp.tools.chaos.seed_dlq_messages import SEEDED_FIXTURE_MARKER
 
@@ -669,20 +585,11 @@ async def test_delete_seeded_dlq_fixtures_removes_declared_rows(
 async def test_delete_seeded_dlq_fixtures_removes_a_bad_data_job_row(
     db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
 ) -> None:
-    """The disposal half of WO-R2-158, against the payload the hook really
-    writes rather than a hand-built approximation of it.
+    """The disposal half of WO-R2-158, against the payload the hook really writes.
 
-    `create_bad_data_job` used to write a randomly-idded row marked only
-    `chaos_fixture`, so this sweep never saw it and `_sweep_nonfixture_dlq`
-    merely *cancelled* it — one dead row accumulating per run, and per run
-    a row the next scenario's planner could still read. Now that the row's
-    id is pinned by a scenario in advance it is declared scaffolding, so it
-    carries the top-level marker and is DELETEd.
-
-    The payload has three keys, which is the reason the predicate has to be
-    JSONB *containment* and not equality: a strict `payload = '{...}'`
-    match would silently stop deleting these.
-    """
+    `create_bad_data_job` rows used to be merely cancelled, one dead row per run; the id is now
+    pinned in advance, so the row is declared scaffolding and DELETEd. Three payload keys is why the
+    predicate has to be JSONB containment and not equality."""
     reset = _reset_module()
     from app.mcp.tools.chaos.create_bad_data_job import fixture_id
     from app.mcp.tools.chaos.seed_dlq_messages import SEEDED_FIXTURE_MARKER
@@ -702,16 +609,9 @@ async def test_delete_seeded_dlq_fixtures_removes_a_bad_data_job_row(
         retry_count=3,
         remediation_hint=None,
     )
-    # An undeclared row: provenance only, no marker. It stays — this sweep
-    # is not the one that disposes of it.
-    #
-    # Shaped like a pre-v0.6.3 `poison_message` row, which is what such a
-    # row looks like in the wild: no current chaos hook writes one any more
-    # (WO-R2-166 gave `poison_message` a declared `fixture_name` and moved
-    # it into this sweep), so what `_sweep_nonfixture_dlq` still catches is
-    # rows from older releases and jobs that really dead-lettered on the
-    # stack. Kept as a legacy shape rather than deleted from the test,
-    # because the predicate has to keep leaving it alone.
+    # An undeclared row: provenance only, no marker, so this sweep leaves it. Shaped like a
+    # pre-v0.6.3 `poison_message` row — since WO-R2-166 `_sweep_nonfixture_dlq` catches only older
+    # releases and organic dead-letters.
     undeclared = Job(
         tenant_id=default_tenant.id,
         user_id=test_user.id,
@@ -745,19 +645,9 @@ async def test_delete_seeded_dlq_fixtures_removes_the_v063_declared_rows(
 ) -> None:
     """The disposal half of WO-R2-166, for both hooks that joined this sweep.
 
-    `poison_message` moved in when it gained a declared `fixture_name` under
-    a deterministic id; `create_mislabeled_dlq_job` was born into it. Each
-    payload is built through the hook's own `fixture_id` and the shared
-    marker constant rather than transcribed, so a hook that changes its
-    payload shape shows up here rather than quietly stopping being reachable
-    by the reset.
-
-    On the mislabelled row the disposal class carries weight beyond
-    tidiness: the row is deliberately self-contradictory (hint
-    `replay_safe`, permanent bad-data text), so a `cancelled` copy
-    accumulating one per run would leave the DLQ full of rows that teach
-    the wrong lesson to anything reading it later.
-    """
+    Each payload is built through the hook's own `fixture_id` and the shared marker, so a shape
+    change shows up here. On the mislabelled row disposal matters beyond tidiness: it is
+    deliberately self-contradictory, so a cancelled copy per run would teach the wrong lesson."""
     reset = _reset_module()
     from app.mcp.tools.chaos.create_mislabeled_dlq_job import (
         fixture_id as mislabel_fixture_id,
@@ -815,21 +705,15 @@ async def test_delete_seeded_dlq_fixtures_removes_the_v063_declared_rows(
     )
 
 
-# ---------------------------------------------------------------------------
 # _resolve_chaos_alerts — D-03, the compensator ADR 0008's amendment requires
-# ---------------------------------------------------------------------------
 
 
 async def test_resolve_chaos_alerts_clears_bad_deploy_residue(
     db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
 ) -> None:
-    """`bad_deploy` fires a critical alert that nothing ever resolved, so
-    every invocation permanently added one active critical alert to the
-    surface later alert-count/noise scenarios are graded against.
-
-    The reset resolves it (never deletes — the alert id appears in the
-    invoking scenario's trajectory), leaves non-chaos alerts alone, and
-    doesn't re-stamp alerts that were already resolved."""
+    """`bad_deploy` fires a critical alert nothing resolved, so every invocation moved the baseline
+    later alert-count scenarios are graded against. The reset resolves it (never deletes), leaves
+    non-chaos alerts alone, and does not re-stamp already-resolved ones."""
     reset = _reset_module()
     from app.models.alert import Alert
     from app.repositories.alert import AlertRepository
@@ -898,19 +782,12 @@ async def test_resolve_chaos_alerts_clears_bad_deploy_residue(
     assert not [a for a in active if a.source.startswith("chaos:")]
 
 
-# ---------------------------------------------------------------------------
 # _resolve_organic_alerts — WO-R2-131, the distractor that aborted run C
-# ---------------------------------------------------------------------------
 
 
 def test_the_spared_alert_ids_come_from_the_seed_itself() -> None:
-    """The exclusion list is the seeded baseline, read from the seeder.
-
-    Pinned because the whole design rests on it: this sweep resolves
-    everything it does not recognise, so a spare list that had been copied
-    into `reset_eval_state` and left behind would resolve a seeded fixture
-    alert on every reset and quietly move the `active alerts 3` baseline
-    every scenario's precondition reads."""
+    """The exclusion list is read from the seeder: a copy left in `reset_eval_state` would resolve a
+    seeded fixture alert on every reset and move the `active alerts 3` baseline."""
     reset = _reset_module()
     seed = _seed_module()
 
@@ -925,16 +802,9 @@ def test_the_spared_alert_ids_come_from_the_seed_itself() -> None:
 async def test_organic_alerts_are_resolved_and_the_seeded_five_survive(
     db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
 ) -> None:
-    """Both halves of the WO-R2-131 requirement in one pass.
-
-    An organic `slo:*` alert — the one `chaos:%` could never match, and the
-    one whose three stray copies aborted run C pre-spend on 2026-08-31 — is
-    resolved. The five seeded fixture alerts are untouched, so the world
-    audit's `active alerts 3` baseline is exactly what it was.
-
-    A chaos alert is in the population too: this sweep runs second and would
-    normally find it already resolved, but it must be able to catch it, or
-    the pair leaves a gap if the order ever changes."""
+    """Both halves of WO-R2-131: an organic `slo:*` alert — the shape `chaos:%` could never match,
+    whose stray copies aborted run C — is resolved, the five seeded alerts survive, and a chaos
+    alert in the population stays catchable if the sweep order ever changes."""
     reset = _reset_module()
     seed = _seed_module()
     from app.models.alert import Alert
@@ -1014,10 +884,7 @@ async def test_organic_alerts_are_resolved_and_the_seeded_five_survive(
 
 
 def _drifted_seconds(actual: datetime, target: datetime) -> bool:
-    """True when two timestamps are more than a second apart.
-
-    SQLite hands back a naive datetime for a `DateTime(timezone=True)`
-    column, so the two cannot be subtracted without normalising first."""
+    """True when two timestamps differ by more than a second; SQLite hands back naive datetimes."""
     if actual.tzinfo is None:
         actual = actual.replace(tzinfo=UTC)
     if target.tzinfo is None:
@@ -1028,13 +895,9 @@ def _drifted_seconds(actual: datetime, target: datetime) -> bool:
 async def test_an_alert_the_agent_raised_is_resolved_never_deleted(
     db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
 ) -> None:
-    """The disposal class, pinned separately from the predicate.
-
-    An alert id is quoted in the invoking scenario's output and in the
-    trajectory a graded run refers to, so deleting one would mutate history
-    the evidence points at (`reset_eval_state` module docstring, ADR 0012's
-    audit amendment). `resolved_at` is the model's own off-switch: the row
-    leaves `list_active_alerts` and stays readable."""
+    """An alert is resolved, never deleted: its id is quoted in the invoking scenario's trajectory,
+    so deleting one mutates the evidence (ADR 0012's audit amendment). `resolved_at` is the model's
+    own off-switch."""
     reset = _reset_module()
     from app.models.alert import Alert
 
@@ -1060,9 +923,7 @@ async def test_an_alert_the_agent_raised_is_resolved_never_deleted(
     assert still_there.source == "slo:job_dispatch_latency"
 
 
-# ---------------------------------------------------------------------------
 # _refuse_in_production — FIX_PLAN #79 guardrail
-# ---------------------------------------------------------------------------
 
 
 def test_refuse_in_production_exits_when_env_is_production(
@@ -1073,9 +934,8 @@ def test_refuse_in_production_exits_when_env_is_production(
     from app.config import get_settings
 
     monkeypatch.setenv("ENVIRONMENT", "production")
-    # Settings validator refuses the default `change-me-...` SECRET_KEY
-    # when ENVIRONMENT=production. Feed it something that satisfies the
-    # length requirement so the guardrail path is reachable.
+    # The Settings validator refuses the default SECRET_KEY under production; feed it a long enough
+    # one so the guardrail path is reachable.
     monkeypatch.setenv("SECRET_KEY", "a" * 48)
     get_settings.cache_clear()
     try:
@@ -1104,16 +964,9 @@ def test_refuse_in_production_allows_non_production(
 async def test_reset_refuses_production_before_creating_anything(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The programmatic entry point is gated too (D-08).
-
-    `_refuse_in_production()` ran only in `main()`, so `reset()` — which
-    is exported, takes arbitrary DB/Redis URLs, and is what the eval
-    harness imports — executed every destructive step against a
-    production platform while its own docstring claimed the script was
-    gated. The guard now raises `RuntimeError` as `reset()`'s first
-    statement: a library caller gets an exception, the CLI keeps
-    `SystemExit` (asserted above), and nothing is connected first.
-    """
+    """The programmatic entry point is gated too (D-08): `reset()` is exported and ran every
+    destructive step against production while its docstring claimed it was gated. The guard now
+    raises `RuntimeError` as its first statement, before anything connects."""
     reset = _reset_module()
     from app.config import get_settings
 
@@ -1125,9 +978,7 @@ async def test_reset_refuses_production_before_creating_anything(
 
     monkeypatch.setattr(reset, "create_async_engine", _no_engine)
     monkeypatch.setenv("ENVIRONMENT", "production")
-    # The Settings validator refuses the default `change-me-...` key under
-    # ENVIRONMENT=production; feed it a long-enough one so the guardrail
-    # path is what we actually reach.
+    # Feed a long-enough SECRET_KEY so the production guardrail is the path we reach.
     monkeypatch.setenv("SECRET_KEY", "a" * 48)
     get_settings.cache_clear()
     try:
@@ -1140,18 +991,12 @@ async def test_reset_refuses_production_before_creating_anything(
         get_settings.cache_clear()
 
 
-# ---------------------------------------------------------------------------
 # Audit ground truth — D-10 / ADR 0012 amendment
-# ---------------------------------------------------------------------------
 
 
 def _sql_literals(module) -> list[str]:  # type: ignore[no-untyped-def]
-    """Every string handed to a `text(...)` call in the module's source.
-
-    Parsed rather than grepped so prose (docstrings, comments — which
-    *do* discuss audit_logs, deliberately) can't satisfy or trip the
-    assertion. Non-literal arguments are unparsed back to source so a
-    future f-string SQL builder is still screened."""
+    """Every string handed to a `text(...)` call, parsed rather than grepped so prose that does
+    discuss audit_logs cannot satisfy or trip the assertion."""
     literals: list[str] = []
     for node in ast.walk(ast.parse(inspect.getsource(module))):
         if not isinstance(node, ast.Call):
@@ -1167,12 +1012,8 @@ def _sql_literals(module) -> list[str]:  # type: ignore[no-untyped-def]
 
 
 def test_reset_sql_never_names_audit_logs() -> None:
-    """Static tripwire: audit rows are immutable to the reset.
-
-    The commander grades against `audit_logs` (invariant 6), so the reset
-    must never write, update or delete one. Today it doesn't — this pins
-    that, and fails loudly the moment someone "tidies up" audit rows
-    alongside the jobs and users the reset legitimately deletes."""
+    """Static tripwire: the commander grades against `audit_logs` (invariant 6), so the reset must
+    never write, update or delete one."""
     reset = _reset_module()
     statements = _sql_literals(reset)
     assert statements, "expected the reset to issue raw SQL; parser found none"
@@ -1186,14 +1027,9 @@ def test_reset_sql_never_names_audit_logs() -> None:
 async def test_reset_deletes_leave_audit_rows_byte_identical(
     db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
 ) -> None:
-    """Behavioural half of the same contract.
-
-    Both hard-DELETE helpers run over a job that a pre-existing audit row
-    references. The audit row must survive with its action, `resource_id`
-    and `extra_data` untouched — `resource_id` is the durable join key
-    any grader or forensic query must use, because the FK columns are
-    nulled by design (`ON DELETE SET NULL`; asserted on the Postgres
-    harness, where FK actions actually fire)."""
+    """Behavioural half: an audit row referencing a hard-DELETEd job keeps its action, `resource_id`
+    and `extra_data`. `resource_id` is the durable join key, because the FK columns are nulled by
+    design (`ON DELETE SET NULL`)."""
     reset = _reset_module()
     from app.mcp.tools.chaos.seed_dlq_messages import SEEDED_FIXTURE_MARKER
     from app.models.audit import AuditLog
@@ -1213,12 +1049,8 @@ async def test_reset_deletes_leave_audit_rows_byte_identical(
         user_id=chaos_user.id,
         type=JobType.CSV_UPLOAD.value,
         status=JobStatus.DEAD_LETTER.value,
-        # An undeclared chaos row: provenance only, no `seeded_fixture`
-        # marker, so the sibling DELETE sweep leaves it and this one
-        # cancels it. Shaped like a pre-v0.6.3 `poison_message` row — no
-        # current hook writes one, because `create_bad_data_job`
-        # (WO-R2-158) and then `poison_message` (WO-R2-166) both gained
-        # the marker, and a row carrying it would match both sweeps.
+        # An undeclared chaos row: no `seeded_fixture` marker, so the DELETE sweep leaves it and
+        # this one cancels it (pre-v0.6.3 `poison_message` shape).
         payload={"chaos_fixture": "poison_message"},
         retry_count=3,
     )
@@ -1265,9 +1097,7 @@ async def test_reset_deletes_leave_audit_rows_byte_identical(
     assert [row.extra_data for row in surviving] == [extra_data, extra_data]
 
 
-# ---------------------------------------------------------------------------
 # _delete_chaos_owner_users — follow-up to PR #83's tenant-fallback fix
-# ---------------------------------------------------------------------------
 
 
 async def test_delete_chaos_owner_users_removes_users_and_their_jobs(
@@ -1296,12 +1126,8 @@ async def test_delete_chaos_owner_users_removes_users_and_their_jobs(
         user_id=chaos_user.id,
         type=JobType.CSV_UPLOAD.value,
         status=JobStatus.DEAD_LETTER.value,
-        # An undeclared chaos row: provenance only, no `seeded_fixture`
-        # marker, so the sibling DELETE sweep leaves it and this one
-        # cancels it. Shaped like a pre-v0.6.3 `poison_message` row — no
-        # current hook writes one, because `create_bad_data_job`
-        # (WO-R2-158) and then `poison_message` (WO-R2-166) both gained
-        # the marker, and a row carrying it would match both sweeps.
+        # An undeclared chaos row: no `seeded_fixture` marker, so the DELETE sweep leaves it and
+        # this one cancels it (pre-v0.6.3 `poison_message` shape).
         payload={"chaos_fixture": "poison_message"},
         retry_count=3,
     )
@@ -1352,12 +1178,9 @@ async def test_delete_chaos_owner_users_removes_users_and_their_jobs(
 
 
 async def test_clear_poisoned_job_cache_sweeps_the_live_read_namespace() -> None:
-    """R2-20: the reset sweeps `chaos:*`, but a stale-cache write that
-    landed on `cache:job:{tenant}:{job}` carries no chaos marker — so a
-    poisoned entry outlived the reset for the rest of its TTL, and the
-    500s it caused could not be correlated with the scenario that caused
-    them. Deleting the read cache is free: it is a 10s read-through
-    cache that repopulates from Postgres on the next request."""
+    """R2-20: a stale-cache write on `cache:job:{tenant}:{job}` carries no chaos marker, so a
+    poisoned entry outlived the reset for its TTL. Deleting the read cache is free — it repopulates
+    from Postgres on the next request."""
     import uuid as _uuid
 
     from app.utils.cache import JobCache
@@ -1385,27 +1208,16 @@ async def test_clear_poisoned_job_cache_sweeps_the_live_read_namespace() -> None
     assert fnmatch.fnmatch(poisoned, reset._JOB_CACHE_PATTERN)
 
 
-# ---------------------------------------------------------------------------
 # _purge_idempotency_records — WO-R2-18 finding 2
-# ---------------------------------------------------------------------------
 
 
 async def test_purge_idempotency_survives_two_tenants_holding_the_sa(
     db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
 ) -> None:
-    """`service_accounts.name` is unique *per tenant*, not globally.
-
-    The purge resolved it with `scalar_one_or_none()`, so a second
-    tenant that had also seeded an `incident-commander` account made the
-    whole reset raise `MultipleResultsFound` — and it raised from the
-    tail of `reset()`, where every destructive step had already
-    committed. The operator got a traceback, no summary, and a non-zero
-    exit describing a reset that had in fact already deleted rows. Two
-    tenants sharing one database is the normal shape of a dev stack, so
-    nothing unusual had to happen for this to fire (WO-R2-18).
-
-    Green-after: both commanders' records are purged, and an unrelated
-    principal's are not."""
+    """`service_accounts.name` is unique per tenant, not globally, so `scalar_one_or_none()` raised
+    `MultipleResultsFound` from the tail of `reset()` — after every destructive step had committed
+    (WO-R2-18). Two tenants in one database is the normal shape of a dev stack. Green-after: both
+    commanders are purged, an unrelated principal is not."""
     import uuid as _uuid
 
     from app.models.idempotency import IdempotencyRecord
@@ -1480,22 +1292,15 @@ async def test_purge_idempotency_is_a_noop_with_no_commander(
 
 
 def test_idempotency_purge_precedes_the_destructive_steps() -> None:
-    """Ordering, asserted on the source rather than by running a reset.
-
-    The purge can still fail for reasons this module does not control (a
-    lock, a dropped connection). What must never recur is a failure
-    there landing *after* the deletes have committed, leaving an
-    operator with a traceback and no record of what was destroyed. So it
-    runs first: nothing in the reset creates idempotency records, which
-    makes the ordering free."""
+    """Ordering asserted on the source: a purge failure must never land after the deletes have
+    committed, leaving an operator with a traceback and no record of what was destroyed. Nothing in
+    the reset creates idempotency records, so going first is free."""
     reset = _reset_module()
     body = inspect.getsource(reset.reset)
     purge_at = body.index("_purge_idempotency_records(factory)")
     for destructive in (
         "_clear_chaos_keys(redis)",
-        # Added by #162 (WO-R2-20). Listed here so the guard keeps pace
-        # with the steps it guards: a new destructive step that lands
-        # after the purge is exactly what this test exists to catch.
+        # Added by #162 (WO-R2-20); listed so the guard keeps pace with the steps it guards.
         "_clear_job_read_cache(redis)",
         "_delete_chaos_owner_users(factory)",
         "_delete_seeded_dlq_fixtures(factory)",
@@ -1507,18 +1312,13 @@ def test_idempotency_purge_precedes_the_destructive_steps() -> None:
         )
 
 
-# ---------------------------------------------------------------------------
 # _seed_consumer_lag durability — WO-R2-17
-# ---------------------------------------------------------------------------
 
 
 class _ExpiringRedis:
-    """Redis stub that actually honours `ex`, driven by a fake clock.
+    """Redis stub that honours `ex` against a fake clock.
 
-    The 24h-TTL bug is invisible to an `AsyncMock`: it records the
-    `ex` kwarg and answers every later `get`. To assert the fixtures
-    survive an aged stack the stub has to expire them the way Redis
-    would."""
+    An `AsyncMock` records the kwarg and answers every later `get`, which hides the TTL bug."""
 
     def __init__(self) -> None:
         self._store: dict[str, tuple[str, float | None]] = {}
@@ -1544,14 +1344,8 @@ class _ExpiringRedis:
 
 
 async def test_seeded_lag_fixtures_survive_a_stack_older_than_a_day() -> None:
-    """R2-17: the seven fixture lag keys were written with a 24h TTL
-    while every other fixture is durable. Six live scenarios assert a
-    non-null lag for these groups, so a stack up longer than a day since
-    its last seed/reset answered `lag: null` and burned a paid run —
-    with no precondition guarding it.
-
-    Seeds, ages the clock past 24h, and reads back the way
-    `get_consumer_lag` would."""
+    """R2-17: the seven fixture lag keys carried a 24h TTL while every other fixture is durable, so
+    a stack up longer than a day answered `lag: null` and burned a paid run."""
     seed = _seed_module()
     redis = _ExpiringRedis()
 
@@ -1568,10 +1362,8 @@ async def test_seeded_lag_fixtures_survive_a_stack_older_than_a_day() -> None:
 
 
 async def test_seed_consumer_lag_writes_no_expiry() -> None:
-    """The mechanism behind the test above, pinned directly: durable
-    like every other fixture, re-anchored by the reset rather than by a
-    TTL. `worker-dispatcher` stays out of the fixture set — the metrics
-    loop owns that key with a 90s TTL and must not be overwritten."""
+    """Durable like every other fixture, re-anchored by the reset rather than by a TTL.
+    `worker-dispatcher` stays out: the metrics loop owns that key under a 90s TTL."""
     seed = _seed_module()
     redis = AsyncMock()
 
@@ -1586,16 +1378,9 @@ async def test_seed_consumer_lag_writes_no_expiry() -> None:
     assert "worker-dispatcher" not in seed._CONSUMER_LAGS
 
 
-# ---------------------------------------------------------------------------
-# Fixture rows match the contracts that read them (WO-R2-69)
-#
-# `update_status` stamps `started_at` on the PENDING→RUNNING write and
-# `completed_at` on every terminal write, so a completed / failed /
-# dead_letter row the platform produced always has both. Seeded rows had
-# neither, and two readers take that literally: the dispatch-latency SLO
-# counts `started_at IS NULL` as a dispatch miss, and the DLQ listing's
-# `DEAD_LETTERED_AT` sort orders on `coalesce(completed_at, created_at)`.
-# ---------------------------------------------------------------------------
+# Fixture rows match the contracts that read them (WO-R2-69): `update_status` stamps `started_at`
+# and `completed_at`, and two readers take their absence literally — the dispatch-latency SLO counts
+# `started_at IS NULL` as a miss, and the DLQ sort orders on `coalesce(completed_at, created_at)`.
 
 
 def test_every_dispatched_fixture_spec_carries_a_run_duration() -> None:
@@ -1630,13 +1415,9 @@ def test_lifecycle_orders_created_started_completed() -> None:
 async def test_rebaseline_leaves_no_job_starting_before_it_was_created(
     db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
 ) -> None:
-    """THE assertion for finding 2.
-
-    The re-baseline moved `created_at` and left `started_at` where it was.
-    For the DAG trio — pinned at `now` by that loop — a start stamped by an
-    earlier run was then *earlier than the row's own creation*, i.e. a
-    negative dispatch latency in every tool that subtracts the two.
-    """
+    """THE assertion for finding 2: the re-baseline moved `created_at` and left `started_at`, so the
+    DAG trio started before it was created — a negative dispatch latency in every tool that
+    subtracts the two."""
     seed = _seed_module()
     stale = timedelta(days=2)
     now = datetime.now(UTC)
@@ -1730,9 +1511,7 @@ async def test_rebaseline_leaves_no_job_starting_before_it_was_created(
 async def test_seeded_deploy_markers_are_platform_wide(
     db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
 ) -> None:
-    """The model's contract — and the RLS policy built on it — is that a
-    deploy marker's tenant_id is always NULL. The seeder was the one writer
-    that broke it."""
+    """A deploy marker's tenant_id is always NULL — the seeder was the writer that broke it."""
     from app.models.deploy_marker import DeployMarker
 
     seed = _seed_module()
@@ -1753,23 +1532,15 @@ async def test_seeded_deploy_markers_are_platform_wide(
     assert [m.tenant_id for m in markers] == [None] * len(markers)
 
 
-# ---------------------------------------------------------------------------
 # The seeded pack's TEXTS are re-baselined too (WO-R2-146)
-# ---------------------------------------------------------------------------
 
 
 async def test_reset_restores_a_row_carrying_the_old_contradictory_text(
     db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
 ) -> None:
-    """A stack seeded before WO-R2-146 holds `replay_safe` rows whose
-    error text names a permanent schema fault. That is the pair the live
-    run graded an honest escalation on, so it must not survive a reset —
-    otherwise the fix ships and the world the agent meets is unchanged.
-
-    Also the general case: a replay overwrites `error_message` with the
-    live processor's own error, so a mutated text is the normal state of
-    a fixture after a scenario runs, not an edge case.
-    """
+    """A stack seeded before WO-R2-146 holds `replay_safe` rows whose text names a permanent fault —
+    the pair a live run graded an honest escalation on — so it must not survive a reset. Also the
+    general case: a replay overwrites `error_message` with the processor's own error."""
     from app.lab.dlq_failure_stories import coherence_violations
 
     seed = _seed_module()
@@ -1813,10 +1584,8 @@ async def test_reset_restores_a_row_carrying_the_old_contradictory_text(
 async def test_reset_restores_a_drifted_triage_row(
     db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
 ) -> None:
-    """`list_dlq_messages` returns the triage block inline with the
-    entry, so a stale triage is the same contradiction one field lower.
-    `_seed_dlq` inserts a triage row only when none exists, so nothing
-    but this restore ever updates one on a stack that already has it."""
+    """`list_dlq_messages` returns the triage inline, so a stale triage is the same contradiction
+    one field lower. `_seed_dlq` only inserts when none exists, so nothing else updates one."""
     from app.models.triage import JobTriage
 
     seed = _seed_module()
@@ -1880,8 +1649,7 @@ async def test_reset_restores_a_drifted_triage_row(
 async def test_reset_leaves_a_matching_triage_row_alone(
     db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
 ) -> None:
-    """Back-to-back resets stay no-ops — the idempotency `reset_eval_state`
-    documents, now that a second field can trigger a write."""
+    """Back-to-back resets stay no-ops though a second field can now trigger a write."""
     from app.models.triage import JobTriage
 
     seed = _seed_module()
@@ -1919,9 +1687,7 @@ async def test_reset_leaves_a_matching_triage_row_alone(
     assert await seed._reset_dlq_state(db_session) == 0
 
 
-# ---------------------------------------------------------------------------
 # WO-R3-267 — the hot_set the reset re-populates must READ as healthy
-# ---------------------------------------------------------------------------
 
 
 class _TinyRedis:
@@ -1942,21 +1708,10 @@ class _TinyRedis:
 async def test_reset_leaves_the_hot_set_reading_as_healthy(
     db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
 ) -> None:
-    """The consistency the reset owes the new evidence.
-
-    `get_cache_key_info` now reports how many of the job records an entry
-    names the database still holds, and the whole point of the reset is
-    that the next run starts from a world whose readings are the healthy
-    ones. The seed derives the hot_set from `_dlq_specs()` and the reset
-    re-baselines those same rows, so after a reset every member must
-    resolve — asserted through the tool's own resolver rather than a
-    re-implementation of it, because a copy would drift.
-
-    This is the reading-level counterpart to
-    `test_seed_hot_set_populates_expected_key`, which pins the id set:
-    that one says the members are the right ids, this one says a caller
-    asking the platform about them gets "all present".
-    """
+    """The consistency the reset owes the new evidence: `get_cache_key_info` reports how many of the
+    job records an entry names still exist, so after a reset every hot_set member must resolve —
+    asserted through the tool's own resolver, because a copy would drift. Reading-level counterpart
+    to `test_seed_hot_set_populates_expected_key`, which pins the id set."""
     from app.dependencies import Principal
     from app.mcp.registry import ToolContext
     from app.mcp.tools.cache_key_info import resolve_record_references
@@ -1989,11 +1744,7 @@ async def test_reset_leaves_the_hot_set_reading_as_healthy(
 async def test_the_hot_set_reading_is_not_healthy_by_construction(
     db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
 ) -> None:
-    """The negative control for the test above.
-
-    A resolver that answered "all present" regardless would pass it, and
-    the reset consistency claim would be vacuous. With the same key and
-    no rows behind it, the reading has to come back all-absent.
+    """Negative control: with the same key and no rows behind it the reading must read all-absent.
     """
     from app.dependencies import Principal
     from app.mcp.registry import ToolContext

@@ -1,26 +1,11 @@
 """
 `replay_dlq_by_category` — bulk replay one remediation category.
 
-The agent's simplest branch: DLQ has one or more `replay_safe`
-entries and the underlying fix is deployed → replay all of them at
-once. The category filter guarantees the loop won't accidentally
-touch `human_required` entries (which the platform refuses even if
-the caller asks).
-
-Categories accepted: `replay_safe`, `wait_and_replay`. The
-`human_required` category is **refused** — persistent bugs need a
-human review path, and auto-replaying them would just re-fail. If
-the agent tries anyway, the tool returns an error before touching
-any job.
-
-`delay_seconds` (1..3600) defers the enqueue for each matched job —
-push into the `jobs:dlq_replay_delayed` ZSET and a worker loop
-fires the replay when the delay elapses. Intended pairing with
-`wait_and_replay`: give the transient dependency time to recover
-before retrying en masse.
-
-`actions:execute` + idempotent. Bounded by `max_replays` (default
-20, capped at 100).
+Accepts `replay_safe` and `wait_and_replay`; `human_required` is refused before any
+job is touched, because a persistent bug needs a human and auto-replay just re-fails.
+`delay_seconds` (1..3600) pushes each match onto the `jobs:dlq_replay_delayed` ZSET
+for a worker loop to fire later — the pairing for `wait_and_replay`.
+`actions:execute` + idempotent, bounded by `max_replays` (default 20, cap 100).
 """
 
 from app.core.exceptions import AppError
@@ -38,9 +23,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 logger = get_logger(__name__)
 
-# Categories this tool is willing to replay. `human_required` is
-# deliberately excluded — the whole point of that classification is
-# that automatic replay is wrong.
+# `human_required` is excluded: that classification means replay is wrong.
 _REPLAYABLE_CATEGORIES = frozenset(
     {
         RemediationHint.REPLAY_SAFE.value,
@@ -85,8 +68,8 @@ class ReplayDlqByCategoryOutput(BaseModel):
     scheduled: int = 0
     failed: int
     job_ids: list[str]
-    # Populated when `delay_seconds` was set — the epoch second the
-    # last-scheduled replay fires at. Cheap "when do I check back" hint.
+    # Set when `delay_seconds` was — the epoch second the last-scheduled replay
+    # fires at, as a "when do I check back" hint.
     execute_at: float | None = None
 
 
@@ -146,9 +129,7 @@ async def replay_dlq_by_category(
 
     for job in jobs:
         if inp.delay_seconds is None:
-            # SAVEPOINT per item (#5) — same rationale as
-            # replay_dlq_messages: bound a mid-loop non-AppError so it
-            # can't commit a partial batch behind an error response.
+            # SAVEPOINT per item (#5): no partial batch behind an error response.
             try:
                 async with ctx.db.begin_nested():
                     await service.replay_job(
@@ -172,11 +153,8 @@ async def replay_dlq_by_category(
                 )
             continue
 
-        # Scheduled branch — audit-then-arm inside a savepoint, shared
-        # with `replay_dlq_by_ids` (`_scheduled_replay`). Both excepts
-        # are load-bearing: catching only AppError, as this branch used
-        # to, let any other mid-loop error abort the whole tool and
-        # discard the audit rows for replays already armed.
+        # Scheduled branch — audit-then-arm in a savepoint. Both excepts are
+        # load-bearing: AppError alone discarded audit rows for armed replays.
         try:
             execute_at = await schedule_one_audited(
                 ctx=ctx,

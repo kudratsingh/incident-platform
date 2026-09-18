@@ -14,9 +14,7 @@ class ServiceAccountCreate(BaseModel):
 
 
 class ServiceAccountScopesUpdate(BaseModel):
-    """PATCH payload — replaces the SA's scope set. Existing tokens
-    keep the scope subset they were minted with; fresh tokens use the
-    updated set."""
+    """Replaces the account's scope set; already-minted tokens keep the scopes they carry."""
 
     scopes: list[str] = Field(
         min_length=0,
@@ -65,8 +63,7 @@ class TokenResponse(BaseModel):
 
 
 class TokenMintResponse(BaseModel):
-    """Returned once, at mint time. `plaintext` is not persisted anywhere and
-    can never be retrieved again — the operator must capture it now."""
+    """Mint-time only: `plaintext` is never persisted and can never be retrieved again."""
 
     token: TokenResponse
     plaintext: str = Field(

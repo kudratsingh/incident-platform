@@ -1,14 +1,9 @@
 """
 Runbook loader.
 
-Runbooks are YAML files at the repo root in /runbooks/, one per CloudWatch
-alarm or SLO. They're loaded once at import time and exposed to operators
-via the admin API so the on-call engineer can see diagnosis steps right
-next to the alarm that fired.
-
-The file format is intentionally lightweight (a dict per file). We don't
-enforce a strict schema — fields are passed through to the API response
-verbatim so adding new advisory sections doesn't require a code change.
+Loads /runbooks/*.yaml once at import and exposes them to the admin API, so on-call sees
+diagnosis steps next to the alarm that fired. No strict schema — fields pass through
+verbatim, so a new advisory section needs no code change.
 """
 
 from pathlib import Path

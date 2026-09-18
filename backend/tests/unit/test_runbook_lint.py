@@ -1,37 +1,15 @@
 """Runbook lint — the commands in runbooks/*.yaml must be executable.
 
-`test_runbooks.py` checks the YAML *shape*: does the file load, does it have
-an id and a summary. That is worth having and it is not this. A runbook can
-satisfy every one of those assertions and still be useless at 3am, because
-the shape says nothing about whether the resources it names exist or whether
-its commands can be pasted into a shell.
+`test_runbooks.py` checks the YAML shape; this checks whether the resources a runbook names exist
+and whether its commands can be pasted into a shell. Finding R2-52 was nine that could not: two
+named a worker ECS service that does not exist, two hyphenated a log group and an ECR repository
+Terraform spells with a slash, one recommended `FLUSHDB` (which takes `delayed_queue` and
+`priority_queue` with it), one had an unterminated quote.
 
-Finding R2-52 was nine of those. Two runbooks named an ECS service that does
-not exist (workers run in-process inside the backend task; `infra/ecs.tf`
-defines exactly two services). Two named the log group and the ECR repository
-with a hyphen where Terraform uses a slash. One recommended `FLUSHDB` against
-a key prefix that has never existed, and `FLUSHDB` is the one command
-`docs/REDIS.md` singles out as too destructive to run — it takes
-`delayed_queue` and `priority_queue` with it, which are durable state with no
-TTL. One had an unterminated quote and could not be pasted at all.
-
-Every one of those is mechanically checkable against a file already in the
-repo, which is what this module does:
-
-  * resource names → `infra/*.tf`, with `${var.x}` resolved from variables.tf
-  * metric names   → the emit sites in `backend/app`
-  * Redis keys     → the key catalog in `docs/REDIS.md`
-  * shell syntax   → `shlex`, POSIX mode
-  * alarm names    → `aws_cloudwatch_metric_alarm.alarm_name`
-
-The alarm check is the one that decays fastest: #160 repointed two alarms
-from QueueDepth to ConsumerLag and #174 added the SLO alert loop, and a
-runbook that still names the old metric sends on-call to a flat graph during
-an incident. Bind it to Terraform and the code, not to review.
-
-What this cannot check: whether a command that parses does the *right* thing.
-`aws logs tail` against a real log group with the wrong `--filter-pattern`
-passes here. Semantics stay with review.
+Checked against files already in the repo: resource names → `infra/*.tf`, metric names → the emit
+sites in `backend/app`, Redis keys → `docs/REDIS.md`, shell syntax → `shlex`, alarm names →
+`aws_cloudwatch_metric_alarm.alarm_name`. Whether a command that parses does the right thing stays
+with review.
 """
 
 from __future__ import annotations
@@ -49,13 +27,10 @@ from app.services import runbooks
 from ._emitters import CUSTOM_NAMESPACE, emitted_metrics
 from ._hcl import blocks, repo_root, resolve, top_attribute, variable_defaults
 
-# ---------------------------------------------------------------------------
 # The Terraform inventory
-# ---------------------------------------------------------------------------
 
-#: Resource type -> the attribute holding the name AWS actually sees. Only the
-#: types a runbook can legitimately name; anything else is not addressable
-#: from a shell and has nothing to check.
+# Resource type → the attribute holding the name AWS actually sees. Only the types a runbook can
+# legitimately name.
 _NAME_ATTRIBUTE = {
     "aws_cloudwatch_log_group": "name",
     "aws_ecr_repository": "name",
@@ -67,12 +42,8 @@ _NAME_ATTRIBUTE = {
 
 
 def _terraform_names() -> dict[str, set[str]]:
-    """Resource type -> every resolved name of that type declared in infra/.
-
-    A name that still contains an unresolved interpolation is dropped rather
-    than compared literally: comparing a runbook against the string
-    `"${var.app_name}-backend"` would pass nothing and fail everything.
-    """
+    """Resource type → every resolved name of that type declared in infra/. A name still holding an
+    unresolved interpolation is dropped rather than compared literally."""
     variables = variable_defaults()
     found: dict[str, set[str]] = {kind: set() for kind in _NAME_ATTRIBUTE}
 
@@ -93,9 +64,7 @@ def _terraform_names() -> dict[str, set[str]]:
     return found
 
 
-# ---------------------------------------------------------------------------
 # The runbooks
-# ---------------------------------------------------------------------------
 
 
 def _runbook_paths() -> list[Path]:
@@ -142,9 +111,7 @@ _EACH_RUNBOOK = pytest.mark.parametrize(
 )
 
 
-# ---------------------------------------------------------------------------
 # Reference extraction
-# ---------------------------------------------------------------------------
 
 #: How a runbook can name each kind of resource on a command line. The AWS CLI
 #: is the only way any of these are addressable, so the flag *is* the type.
@@ -160,12 +127,8 @@ _LOG_GROUP = re.compile(r"(/ecs/[\w./-]+)")
 
 _NODE_TYPE = re.compile(r"\bcache\.\w+\.\w+\b")
 
-#: The two ways a runbook names a custom metric: as a path in a command
-#: (`CloudWatch metric IncidentPlatform/ConsumerLag`) and as a dashboard entry
-#: (`IncidentPlatform → QueueDepth, InFlightJobs`). Matching a bare space
-#: after the namespace instead would swallow ordinary prose — "on the
-#: IncidentPlatform CloudWatch namespace" would read as a metric named
-#: CloudWatch.
+# The two ways a runbook names a custom metric: a path in a command, and a dashboard entry. Matching
+# a bare space after the namespace would swallow ordinary prose.
 _METRIC_PATH = re.compile(rf"\b{CUSTOM_NAMESPACE}/(\w+)")
 _METRIC_DASHBOARD = re.compile(rf"\b{CUSTOM_NAMESPACE}\s*→\s*([\w,\s]+)")
 
@@ -184,23 +147,18 @@ def _named_metrics(doc: dict[str, Any]) -> set[str]:
 
 _RUNBOOK_ID = re.compile(r"\brb-[\w-]+\b")
 
-#: Prose naming an ECS service — "raise the desired count of the worker ECS
-#: service". Mitigations are prose, not commands, so the command-line scan
-#: above cannot see them, and "scale the worker ECS service" was two of the
-#: nine R2-52 findings.
+# Prose naming an ECS service. Mitigations are prose, not commands, so the command-line scan cannot
+# see them — and this was two of the nine R2-52 findings.
 _PROSE_ECS_SERVICE = re.compile(r"`?([\w-]+)`?\s+ECS service\b")
 
-#: Function words that can precede "ECS service" without naming one ("roll
-#: back via ECS service force-new-deployment"). Anything else in that slot is
-#: being used as a name, and a name has to exist.
+# Function words that can precede "ECS service" without naming one; anything else in that slot is a
+# name, and a name has to exist.
 _NOT_A_SERVICE_NAME = frozenset(
     {"a", "an", "the", "this", "that", "its", "each", "one", "new", "previous", "via", "per"}
 )
 
-#: A Redis key as a runbook writes one: no whitespace, at least one `:`
-#: separator, and a lowercase leading segment. Extracted only from contexts
-#: that are unambiguously keys — a `--pattern` argument or a backticked span —
-#: so that `http://<task>:8000/...` in a curl line is never mistaken for one.
+# A Redis key as a runbook writes one, extracted only from unambiguous contexts — a `--pattern`
+# argument or a backticked span — so a curl URL is never mistaken for one.
 _KEYISH = re.compile(r"^[a-z][a-z0-9_.-]*:[\w:{}*.-]*$")
 _PATTERN_ARG = re.compile(r"--pattern[= ]+'([^']+)'|--pattern[= ]+([^\s']+)")
 _BACKTICKED = re.compile(r"`([^`]+)`")
@@ -218,12 +176,8 @@ def _redis_keys(doc: dict[str, Any]) -> set[str]:
 
 
 def _documented_redis_prefixes() -> set[str]:
-    """Literal leading segments of every key pattern in the docs/REDIS.md catalog.
-
-    The catalog's first column is a backticked pattern. We keep the segments
-    up to the first one carrying a `{placeholder}` or `*`, which is the part
-    that has to match exactly for a key to exist at all.
-    """
+    """Literal leading segments of every `docs/REDIS.md` key pattern, up to the first placeholder —
+    the part that has to match exactly for a key to exist at all."""
     text = (repo_root() / "docs" / "REDIS.md").read_text()
     prefixes = set()
     for line in text.splitlines():
@@ -245,9 +199,7 @@ def _literal_prefix(key: str) -> str:
     return ":".join(literal)
 
 
-# ---------------------------------------------------------------------------
 # Meta-guards — a lint that scanned nothing would pass everything
-# ---------------------------------------------------------------------------
 
 
 def test_the_scanners_actually_found_something() -> None:
@@ -262,21 +214,14 @@ def test_the_scanners_actually_found_something() -> None:
     assert sum(len(_commands(doc)) for _, doc in _runbook_docs()) >= 20
 
 
-# ---------------------------------------------------------------------------
 # The lint
-# ---------------------------------------------------------------------------
 
 
 @_EACH_RUNBOOK
 def test_every_command_parses_as_a_shell_command(filename: str, doc: dict[str, Any]) -> None:
-    """A command an operator cannot paste is worse than no command at all.
-
-    POSIX `shlex` is the same lexer a shell uses for quoting, so this catches
-    exactly the class of fault that makes a line unusable: an unbalanced quote.
-    It deliberately does not require the first token to be an executable —
-    several steps are SQL or a CloudWatch metric path rather than a shell
-    line, and those are legitimate. Quoting has to be right either way.
-    """
+    """A command an operator cannot paste is worse than no command at all. POSIX `shlex` catches the
+    unbalanced quote; the first token is deliberately not required to be an executable, because
+    several steps are SQL or a CloudWatch metric path."""
     for step_id, command in _commands(doc):
         try:
             shlex.split(command)
@@ -310,14 +255,9 @@ def test_every_named_aws_resource_exists_in_terraform(filename: str, doc: dict[s
 
 @_EACH_RUNBOOK
 def test_mitigations_scale_an_ecs_service_that_exists(filename: str, doc: dict[str, Any]) -> None:
-    """"Scale the worker ECS service" is not a thing anyone can do here.
-
-    Workers run in-process inside the backend task — `infra/ecs.tf` declares
-    exactly two services, backend and frontend — so a responder who reaches
-    for a worker service finds nothing and loses the time it takes to work
-    that out. The instruction has to name the service that actually scales
-    workers.
-    """
+    """Workers run in-process inside the backend task and `infra/ecs.tf` declares exactly two
+    services, so "scale the worker ECS service" sends a responder looking for something that is not
+    there."""
     services = _terraform_names()["aws_ecs_service"]
     failures = []
 
@@ -351,12 +291,8 @@ def test_alarm_field_names_a_real_alarm(filename: str, doc: dict[str, Any]) -> N
 
 @_EACH_RUNBOOK
 def test_every_custom_metric_named_is_actually_emitted(filename: str, doc: dict[str, Any]) -> None:
-    """`IncidentPlatform/Foo` in a runbook must be a metric the code publishes.
-
-    This is the one that #160 and #174 would have broken silently: repointing
-    an alarm from QueueDepth to ConsumerLag leaves the runbook telling on-call
-    to open a graph that is flat by construction.
-    """
+    """`IncidentPlatform/Foo` must be a metric the code publishes — #160 repointed alarms from
+    QueueDepth to ConsumerLag, which would have left on-call at a graph flat by construction."""
     emitted = emitted_metrics()
     missing = sorted(metric for metric in _named_metrics(doc) if metric not in emitted)
     assert not missing, (
@@ -367,11 +303,8 @@ def test_every_custom_metric_named_is_actually_emitted(filename: str, doc: dict[
 
 @_EACH_RUNBOOK
 def test_every_redis_key_is_in_the_documented_catalog(filename: str, doc: dict[str, Any]) -> None:
-    """A key prefix that does not exist makes its whole step a no-op.
-
-    `redis-cli --scan --pattern 'jobs:create:*'` exits 0 and prints nothing,
-    which reads exactly like "checked, nothing wrong" (R2-52).
-    """
+    """A scan over a key prefix that never existed exits 0 and prints nothing, which reads exactly
+    like "checked, nothing wrong" (R2-52)."""
     documented = _documented_redis_prefixes()
     failures = [
         f"{filename} names Redis key {key!r} (prefix {_literal_prefix(key)!r}), "
@@ -384,13 +317,9 @@ def test_every_redis_key_is_in_the_documented_catalog(filename: str, doc: dict[s
 
 @_EACH_RUNBOOK
 def test_no_runbook_recommends_a_whole_database_flush(filename: str, doc: dict[str, Any]) -> None:
-    """`FLUSHDB`/`FLUSHALL` are unsafe on this Redis, and docs/REDIS.md says so.
-
-    Both `delayed_queue` and `priority_queue` are durable state with no TTL
-    and no rebuild path — a flush loses every pending retry silently. Naming
-    the command in order to warn against it is fine; recommending it is not,
-    so the ban is on mitigation and diagnosis text, not on the whole file.
-    """
+    """`FLUSHDB`/`FLUSHALL` are unsafe on this Redis: `delayed_queue` and `priority_queue` are
+    durable with no TTL and no rebuild path. Naming the command to warn against it is fine, so the
+    ban is on mitigation and diagnosis text rather than the whole file."""
     actionable = _strings(
         {k: v for k, v in doc.items() if k in ("diagnosis_steps", "mitigation", "escalation")}
     )
@@ -410,12 +339,8 @@ def test_no_runbook_recommends_a_whole_database_flush(filename: str, doc: dict[s
 def test_cache_node_type_advice_starts_from_the_deployed_size(
     filename: str, doc: dict[str, Any]
 ) -> None:
-    """"Scale up one size" is only actionable from the size actually deployed.
-
-    A runbook naming `cache.t3.small -> cache.t3.medium` against a deployed
-    `cache.t3.micro` tells on-call to make a change that is already two sizes
-    off, so the configured type must appear among the ones it names.
-    """
+    """"Scale up one size" is only actionable from the size actually deployed, so the configured
+    node type must appear among the ones the runbook names."""
     named = set(_NODE_TYPE.findall(_all_text(doc)))
     if not named:
         return
@@ -427,11 +352,8 @@ def test_cache_node_type_advice_starts_from_the_deployed_size(
 
 
 def test_every_runbook_referenced_by_an_alarm_or_an_slo_exists() -> None:
-    """Both directions of the link, so neither side can drift alone.
-
-    The SLO half is #174: `SLODefinition.runbook_id` is rendered straight into
-    the fast-burn alert body, so a stale id ships to whoever is paged.
-    """
+    """Both directions of the link, so neither side can drift alone. The SLO half is #174:
+    `SLODefinition.runbook_id` is rendered straight into the fast-burn alert body."""
     from app.services.slo import SLOS
 
     shipped = {rb["id"] for rb in runbooks.list_all()}

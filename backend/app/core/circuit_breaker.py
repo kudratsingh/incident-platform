@@ -24,14 +24,10 @@ class CircuitOpenError(Exception):
 
 class CircuitBreaker:
     """
-    Three-state circuit breaker for async callables.
+    Three-state circuit breaker for async callables: CLOSED / OPEN / HALF_OPEN.
 
-    CLOSED  — all calls go through; failures are counted
-    OPEN    — calls fail immediately; reopens after recovery_timeout seconds
-    HALF_OPEN — exactly one probe call is allowed through; success closes,
-                failure reopens. Callers arriving while that probe is still in
-                flight are rejected with CircuitOpenError, so a recovering
-                upstream sees one request rather than the whole backlog.
+    HALF_OPEN admits exactly one probe; concurrent arrivals get CircuitOpenError,
+    so a recovering upstream sees one request rather than the whole backlog.
     """
 
     def __init__(
@@ -55,8 +51,7 @@ class CircuitBreaker:
         return self._state
 
     async def call(self, fn: Callable[[], Awaitable[T]]) -> T:
-        # Set under the lock when this caller is the one probing a recovering
-        # upstream; it owns clearing _probe_in_flight on every exit path.
+        # This caller owns the probe and must clear _probe_in_flight.
         is_probe = False
 
         async with self._lock:
@@ -70,26 +65,19 @@ class CircuitBreaker:
                 else:
                     raise CircuitOpenError(self.name)
             elif self._state == CircuitState.HALF_OPEN:
-                # A probe is already in flight. The lock is released before
-                # `await fn()`, so without this branch every concurrent arrival
-                # would see HALF_OPEN and probe too.
+                # A probe is in flight; without this every arrival would probe too.
                 raise CircuitOpenError(self.name)
 
         try:
             result = await fn()
         except CircuitOpenError:
-            # A *nested* breaker rejected the call — this breaker's upstream was
-            # never reached, so the rejection must not count as a probe outcome
-            # and _on_failure/_on_success are deliberately bypassed. That means
-            # this branch has to undo the probe itself; leaving _probe_in_flight
-            # set would strand the breaker in HALF_OPEN, rejecting forever.
+            # A nested breaker rejected: our upstream was never reached, so this
+            # is no probe outcome — undo the probe or HALF_OPEN strands forever.
             if is_probe:
                 async with self._lock:
                     self._probe_in_flight = False
                     self._state = CircuitState.OPEN
-                    # _opened_at is left alone on purpose: the probe never
-                    # reached the upstream, so the next caller may retry
-                    # immediately rather than wait out another recovery_timeout.
+                    # _opened_at left alone: the next caller may retry at once.
             raise
         except Exception as exc:
             await self._on_failure(exc)

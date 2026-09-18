@@ -1,22 +1,11 @@
 """
 Fail-fast startup check for schema drift.
 
-Compares the alembic head on disk (i.e. what the running image
-believes the schema should be) against `alembic_version` in the
-DB (what the schema actually is). If they diverge, refuse to
-serve — a loud boot failure is strictly better than the silent
-run we hit in v0.4.1: the migration for `jobs.remediation_hint`
-was never applied, and every DLQ tool returned mystery 500s
-until an operator noticed. See PR #67 postmortem.
-
-Deliberately not auto-migrating here. The `migrate` compose
-service exists precisely so exactly one process runs
-`alembic upgrade head`; if the API/MCP tried it at boot they'd
-race on Postgres `pg_type` uniqueness under
-`CREATE TABLE`.
-
-Gated by `SKIP_MIGRATION_CHECK` so tests (SQLite in-memory,
-never migrated with alembic) don't trip it.
+Compares the alembic head on disk with `alembic_version` in the DB and
+refuses to serve on divergence — v0.4.1 shipped without the
+`jobs.remediation_hint` migration and every DLQ tool returned mystery 500s
+(PR #67 postmortem). Never auto-migrates: only the `migrate` one-shot runs
+`alembic upgrade head`. `SKIP_MIGRATION_CHECK` opts the SQLite suites out.
 """
 
 import os
@@ -68,12 +57,7 @@ async def _current_revision(
 async def assert_migrations_current(
     session_factory: async_sessionmaker,  # type: ignore[type-arg]
 ) -> None:
-    """Raise `SchemaOutOfDateError` if the DB is behind the code's head.
-
-    Called from the app + MCP lifespans. `SKIP_MIGRATION_CHECK=1`
-    (or `true`) opts out — used by CI and local dev workflows that
-    don't run alembic.
-    """
+    """Raise `SchemaOutOfDateError` if the DB is behind head; `SKIP_MIGRATION_CHECK` opts out."""
     if os.getenv("SKIP_MIGRATION_CHECK", "").lower() in ("1", "true"):
         logger.info("migration check skipped via SKIP_MIGRATION_CHECK")
         return

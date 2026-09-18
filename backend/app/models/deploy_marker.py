@@ -1,14 +1,9 @@
 """
 Deploy markers — one row per deploy landed on this environment.
 
-Populated today by `scripts/seed_eval_fixtures.py` for eval scenarios;
-future work wires the release pipeline (release.yml on tag push) to
-insert a row on every successful deploy. `get_deploy_history` reads
-the most recent N rows, falling back to env vars when empty.
-
-The `tenant_id` column is nullable because deploys are platform-wide
-today. It exists so a future per-tenant deploy story has somewhere
-to hang without a schema change.
+Populated by `scripts/seed_eval_fixtures.py`; `get_deploy_history` reads the most
+recent N rows, falling back to env vars. `tenant_id` is nullable: deploys are
+platform-wide.
 """
 
 import uuid

@@ -1,18 +1,10 @@
 """
 Outbox table for the transactional outbox pattern.
 
-A row is inserted in the same DB transaction as the state change it describes
-(job created, job completed, ...). A background relay polls unpublished rows
-and publishes them to Kafka, marking each row as published only on success.
-
-This guarantees at-least-once delivery: if the API crashes between the DB
-commit and the Kafka publish, the row sits in the outbox until the next
-relay tick.
-
-"Until the next relay tick" is bounded, not infinite. A row that can never
-publish (schema-invalid payload, oversize record) is dead-lettered — see
-`failed_at` / `error_message` below and ADR 0001's 2026 Q3 addendum — so it
-stops occupying a slot in the relay's fixed oldest-N fetch window.
+A row is inserted in the same transaction as the state change it describes; a
+background relay publishes it to Kafka — at-least-once delivery across a crash
+between commit and publish. A row that can never publish is dead-lettered
+(`failed_at` / `error_message`, ADR 0001), freeing its slot in the fetch window.
 """
 
 import uuid
@@ -45,11 +37,8 @@ class OutboxEvent(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
-    #: Set when the relay is *done* with this row — either because the
-    #: publish succeeded, or because the row was dead-lettered. It is the
-    #: "leaves the fetch window" marker, not proof of delivery: read it
-    #: together with `failed_at` (ADR 0001, Decision item 3, which specifies
-    #: `published_at=NOW, error_message=...` for the failed case).
+    #: Set when the relay is *done* with this row, published or dead-lettered — the
+    #: "leaves the window" marker, not proof of delivery. Read with `failed_at`.
     published_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
@@ -58,9 +47,7 @@ class OutboxEvent(Base):
     failed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
-    #: Why it was abandoned — the exception that finally settled it. This is
-    #: what on-call reads; `SELECT topic, error_message, attempts FROM
-    #: outbox_events WHERE failed_at IS NOT NULL` is the dead-letter queue.
+    #: Why it was abandoned; `WHERE failed_at IS NOT NULL` is the dead-letter queue.
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     __table_args__ = (

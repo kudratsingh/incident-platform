@@ -1,166 +1,68 @@
 """
-Reset mutable eval-run state so live remediation scenarios start from a
-known baseline. Platform half of the eval-reset protocol (FIX_PLAN #24);
-the commander repo's `make eval-reset` shells into this script.
+Reset mutable eval-run state so live remediation scenarios start from a known baseline. Platform
+half of the eval-reset protocol (FIX_PLAN #24); the commander's `make eval-reset` shells into this.
 
 What gets cleared/reset:
 
-  1. **`chaos:*` Redis keys** — kill flags, injected latency, any
-     scenario-set chaos state. Same effect as running
-     `restart_consumer_group` for every affected consumer, plus a
-     scan-and-delete for any chaos keys the platform doesn't yet
-     have a Tier-1 compensator for. Plus `cache:job:*` — the one
-     namespace chaos residue could reach without a `chaos:` marker
-     (R2-20); it is a 10s read-through cache, so dropping it costs a
-     single Postgres read.
-  2. **Eval fixtures** — delegates to `seed_eval_fixtures.seed(reset=True)`
-     which restores DLQ job status/retry_count/hint, re-populates the
-     consumer-lag keys, and seeds the `hot_set` fixture (FIX_PLAN #7,
-     #19). Since BUILD_PLAN 2.5 it also re-anchors every time-anchored
-     fixture column — `jobs.created_at`/`updated_at`, `alerts.fired_at`/
-     `resolved_at`, `deploy_markers.deployed_at` — to its seed-time
-     offset from *now*, so age-sensitive scenarios
-     (`search_traces(since_hours=...)` and friends) don't watch the
-     seeded world go stale as the stack ages. Only stable() fixture
-     rows are shifted; relative spacing between them is preserved.
-
-     **What this step does NOT restore: the seeded DAG trio's statuses.**
-     `dag-parent-job` (completed) → `dag-seed-job` (waiting) →
-     `dag-child-job` (waiting) is seeded as a three-node DAG, and it is
-     **drained on first boot**: the parent is `completed`, so the
-     dependency resolver — or the resume sweep, within ~10 s — promotes
-     both children and they run to `completed` long before any scenario
-     probes them. The re-anchor above then re-stamps their four timestamp
-     columns from `_dag_specs()`, whose `run_seconds` is `None` for those
-     two rows, so it writes NULL `started_at`/`completed_at` onto rows
-     that are by then `completed`. That mismatch is known and left alone;
-     no tool output reads those two columns for these rows.
-
-     Restoring the statuses here is the tempting repair and it is wrong:
-     this reset clears `chaos:*` in step 1 *before* it gets here, and the
-     resume sweep ticks every 10 s, so a row put back to `WAITING` behind
-     a `COMPLETED` parent **races the resume sweep** that is about to
-     promote it again — the outcome would depend on where in that window
-     the reset landed. **A stranded chain comes from the chaos hook
-     instead:** `create_stuck_dag(root_status="completed")` writes
-     upstream/root `completed` with the descendants `waiting` and no
-     dead-letter row, and its rows are disposed of by step 4. Held
-     stranded by `kill_consumer('dependency-resolver')` plus
-     `pause_control_loop('resume_unblocked_waiting')` — see
-     [ADR 0029](../docs/ADR/0029-stranded-chain-and-lab-pause-are-manufactured.md)
-     and ADR 0027's 2026-09-17 amendment. Pinned by
+  1. **`chaos:*` Redis keys** — kill flags, injected latency, any scenario-set chaos state. Plus
+     `cache:job:*`, the one namespace chaos residue reaches without a `chaos:` marker (R2-20).
+  2. **Eval fixtures** — `seed_eval_fixtures.seed(reset=True)` restores DLQ status/retry_count/
+     hint, re-populates the consumer-lag keys, seeds `hot_set` (FIX_PLAN #7, #19) and re-anchors
+     every time-anchored fixture column to its seed-time offset from *now*, so age-sensitive
+     scenarios don't watch the seeded world go stale. It does **not** restore the seeded DAG
+     trio's statuses, and must not: the trio is drained on first boot (the parent is
+     `completed`, so the resolver or the 10 s sweep promotes both children), and a row put back
+     to `WAITING` behind a `completed` parent races the resume sweep about to promote it again.
+     A stranded chain comes from `create_stuck_dag(root_status="completed")` plus
+     `kill_consumer('dependency-resolver')` and `pause_control_loop('resume_unblocked_waiting')`
+     — ADR 0029, ADR 0027's 2026-09-17 amendment, pinned by
      `backend/tests/unit/test_stranded_chain_and_lab_pause.py`.
-  3. **Tier-1 action residue** — pending delayed-replay timers on the
-     `jobs:dlq_replay_delayed` ZSET, and any `dag:paused:*` flag. Both
-     are effects the *agent* left behind rather than chaos state, and
-     both bleed into the next scenario: a timer fires mid-run and
-     shrinks the DLQ unprompted, a stale pause holds the next DAG in
-     WAITING (enforced since ADR 0011). The recorded window of recent
-     consumer-lag measurements
-     (`kafka:consumer_lag:worker-dispatcher:samples`) goes with them: it
-     is not the agent's residue but it bleeds the same way, showing the
-     next run a lag trend measured during the previous one.
-
-     **One `dag:paused:*` flag is now the lab's, not the agent's.** The
-     `pause_dag_chaos` hook (WO-R3-275, ADR 0029) writes the same key
-     `pause_dag` writes, deliberately — a pause a scenario sets has to
-     read back through `get_dag_state` exactly as an operator's would, so
-     it cannot wear a `chaos:` name and cannot be reached by the
-     `chaos:*` scan in step 1. `_clear_dag_pauses` is therefore the
-     teardown for that hook as well as for the agent's own pauses, and
-     `dag_pauses_cleared` in the summary counts both without
-     distinguishing them. A leftover pause after a run is no longer
-     evidence that the agent acted; check the `chaos.tool_invoked` audit
-     stream for that.
-  4. **Declared fixtures and non-fixture DLQ rows** — two disposal
-     classes, deliberately different (ADR 0012 rule 2). A row a scenario
-     *declared* for itself carries the top-level `seeded_fixture` payload
-     marker — `seed_dlq_messages`, `create_stuck_dag`,
-     `create_bad_data_job` since v0.6.2, and `poison_message` plus
-     `create_mislabeled_dlq_job` since v0.6.3, every one of them with an id
-     a scenario pins in advance — and is hard-DELETEd, because a
-     `cancelled` copy per run is litter rather than history. Everything
-     else still in `dead_letter` outside the
-     `_dlq_specs()` stable-ID set is moved to `cancelled`, so the DLQ a
-     scenario sees is exactly the fixture set it was graded against; that
-     arm now catches organically dead-lettered jobs and pre-marker legacy
-     rows rather than any current chaos hook, including ones attached to a
-     real user, which the chaos-owner-user cleanup below can't reach. Also
-     de-noises the planner on non-DLQ scenarios, which read the same
-     surface.
-  5. **The alert surface** — restored to the seeded baseline, in two
-     statements. First every still-active `chaos:%` alert gets
-     `resolved_at` stamped: the alert `bad_deploy` fires is resolved by
-     nothing else, so each invocation used to add one more permanent
-     active `critical` alert to every later alert-count/noise scenario.
-     Then every *other* still-active alert whose id is not one of the
-     five seeded fixture alerts is resolved too (**WO-R2-131**) — the
-     scheduled SLO evaluator writes `source = 'slo:<objective-id>'`,
-     which `chaos:%` never matched, so an organic fast-burn alert used
-     to survive every reset and accumulate exactly the way
-     `bad_deploy`'s did. Three stray ones aborted a paid run pre-spend
-     on 2026-08-31. The second sweep excludes the baseline rather than
-     enumerating producers, so the next producer is covered the day it
-     ships. Resolved, never deleted — the alert id appears in the
-     invoking scenario's output and trajectories.
-  6. **Idempotency records** — with `--purge-idempotency`, `DELETE`s
-     every `idempotency_records` row for the seeded incident-commander
-     service account. Off by default; the 24h TTL from [ADR 0010]
-     handles the common case, but opt-in purge is useful when a
-     scenario needs a guaranteed-fresh cache.
-  7. **CQRS read-model** — rebuilds `jobs:tenant:*` / `jobs:user:*`
-     from the `jobs` table (`read_model.rebuild_read_model`), last, so
-     it projects the rows as this reset finally leaves them. The
-     projection only moves when a Kafka event names a job, so anything
-     a scenario evicted out of it — `saturate_redis` is the tool that
-     does this on purpose — stayed missing from the admin overview for
-     every later scenario (WO-R2-56). This is the only reset step that
-     *recomputes* a surface rather than clearing one.
+  3. **Tier-1 action residue** — delayed-replay timers on `jobs:dlq_replay_delayed`, any
+     `dag:paused:*` flag, and the recent-lag window
+     (`kafka:consumer_lag:worker-dispatcher:samples`). Each bleeds into the next scenario: a timer
+     shrinks the DLQ unprompted, a stale pause holds a DAG in WAITING (ADR 0011), a carried window
+     shows a lag trend from the previous run. `pause_dag_chaos` (WO-R3-275, ADR 0029) writes the
+     same `dag:paused:*` key the agent's `pause_dag` does, so `dag_pauses_cleared` counts both and
+     a leftover pause is no longer evidence the agent acted.
+  4. **Declared fixtures and non-fixture DLQ rows** — two disposal classes on purpose (ADR 0012
+     rule 2). A row carrying the top-level `seeded_fixture` payload marker is hard-DELETEd;
+     everything else still in `dead_letter` outside the `_dlq_specs()` stable-ID set is moved to
+     `cancelled`, so the DLQ a scenario sees is the fixture set it was graded against.
+  5. **The alert surface** — every still-active `chaos:%` alert is resolved (nothing else resolves
+     what `bad_deploy` fires), then every other still-active alert outside the five seeded fixture
+     alerts (**WO-R2-131**): the SLO evaluator writes `source = 'slo:<objective-id>'`, which
+     `chaos:%` never matched, so organic fast-burn alerts survived every reset and three stray
+     ones aborted a paid run pre-spend on 2026-08-31. Resolved, never deleted — the alert id
+     appears in scenario output and trajectories.
+  6. **Idempotency records** — with `--purge-idempotency`, `DELETE`s every `idempotency_records`
+     row for the seeded incident-commander service account. Off by default; ADR 0010's 24h TTL
+     handles the common case.
+  7. **CQRS read-model** — rebuilds `jobs:tenant:*` / `jobs:user:*` from the `jobs` table
+     (`read_model.rebuild_read_model`), last, so it projects the rows as this reset leaves them.
+     The projection only moves on a Kafka event, so anything `saturate_redis` evicted stayed
+     missing from the admin overview for every later scenario (WO-R2-56).
 
 ## Guardrails
 
-- **Refuses to run against a target it was not configured for.**
-  `_assert_not_production()` delegates to
-  `eval_safety.assert_safe_target()`, which checks *two* things: the
-  `ENVIRONMENT=production` label, and — the one that actually matters
-  here — that the `database_url`/`redis_url` about to be destroyed are
-  the ones `settings` names. The label check alone was the bug
-  (WO-R2-18): it inspects the local process while every `DELETE` below
-  runs against whatever DSN the caller passed, so an operator in a
-  `development` shell passed the gate and emptied whatever
-  `DATABASE_URL` pointed at. Pass `--i-know-what-im-doing` (CLI) or
-  `allow_target_mismatch=True` (library) when the mismatch is
-  deliberate.
-- Enforced on *both* entry points: `main()` turns a refusal into a
-  stderr message + `exit(1)`, and `reset()` re-raises it as a
-  `RuntimeError` before any engine or Redis client is constructed.
-  Gating only the CLI was the earlier bug (D-08) — `reset()` is
-  exported, takes arbitrary DB/Redis URLs, and is what the eval harness
-  imports. Same belt-and-braces reasoning as ADR 0008: independent
-  gates on the same invariant.
-- **Audit rows are ground truth and this script never touches them.**
-  No statement here reads, writes, updates or deletes `audit_logs`. The
-  job and user DELETEs it does perform (`_delete_seeded_dlq_fixtures`,
-  `_delete_chaos_owner_users`) have one documented side effect: the FKs are
-  `ON DELETE SET NULL`, so `audit_logs.job_id` / `audit_logs.user_id` go
-  NULL for rows referencing deleted scaffolding (and `job_triages`
-  CASCADE-deletes with its job). The audit row itself, its `action`,
-  its `extra_data` and its **`resource_id`** all survive intact — which
-  is why `resource_id` (a string, written as `str(job_id)` by every
-  Tier-1 audit writer) is the durable join key for any audit-based
-  grading or forensics. Never join on the FK columns. See the "reset
-  disposal vs audit ground truth" amendment in
-  [ADR 0012](../docs/ADR/0012-the-lab-is-invisible-to-the-agent.md).
-- **Idempotent.** Second run against the same post-reset state is a
-  no-op summary.
+- **Refuses to run against a target it was not configured for.** `_assert_not_production()`
+  delegates to `eval_safety.assert_safe_target()`: the `ENVIRONMENT=production` label, and that
+  `database_url`/`redis_url` are the ones `settings` names. The label alone was the bug
+  (WO-R2-18) — it inspects the local process while every `DELETE` runs against the DSN the caller
+  passed. Pass `--i-know-what-im-doing` (CLI) or `allow_target_mismatch=True` (library).
+- Enforced on *both* entry points: `main()` turns a refusal into stderr + `exit(1)`, `reset()`
+  re-raises it before any engine or Redis client exists. Gating only the CLI was D-08.
+- **Audit rows are ground truth and this script never touches them.** The job and user DELETEs
+  have one documented side effect: the FKs are `ON DELETE SET NULL`, so `audit_logs.job_id` /
+  `audit_logs.user_id` go NULL and `job_triages` CASCADEs with its job. `resource_id` survives,
+  so it — not the FK columns — is the durable join key for audit-based grading (ADR 0012).
+- **Idempotent.** A second run against the same post-reset state is a no-op summary.
 
 ## Usage
 
-    docker compose exec app python /app/scripts/reset_eval_state.py
-    docker compose exec app python /app/scripts/reset_eval_state.py --purge-idempotency
+    docker compose exec app python /app/scripts/reset_eval_state.py [--purge-idempotency]
 
-Emits a JSON summary to stdout so the caller (`make eval-reset`) can
-parse it into the eval report.
+Emits a JSON summary on stdout for `make eval-reset` to parse; the redacted target goes to stderr
+so stdout stays parseable.
 """
 
 from __future__ import annotations
@@ -173,17 +75,9 @@ import sys
 import uuid
 from typing import Any
 
-# Allow running from project root without installing the package.
-#   * `../backend` so `import app...` resolves.
-#   * `..` (the repo/app root) so `from scripts import seed_eval_fixtures`
-#     resolves. Without it the script only ran under an explicit
-#     `-e PYTHONPATH=/app:/app/backend` override, which is the workaround
-#     the commander's `make eval-reset` was carrying. Setting both here
-#     makes the shipped image self-sufficient: `docker compose exec app
-#     python /app/scripts/reset_eval_state.py` now works unadorned.
-#   * `_HERE` itself so the sibling `eval_safety` helper resolves whether
-#     this module was imported flat (the unit tests put `scripts/` on
-#     `sys.path`) or as `scripts.reset_eval_state`.
+# `../backend` for `import app...`, `..` for `from scripts import seed_eval_fixtures` (without
+# it the script needed an explicit `-e PYTHONPATH=/app:/app/backend`), and `_HERE` for the sibling
+# `eval_safety` whether this module is imported flat or as `scripts.reset_eval_state`.
 _HERE = os.path.dirname(os.path.abspath(__file__))
 for _path in (
     os.path.join(_HERE, "..", "backend"),
@@ -206,59 +100,29 @@ _DB_URL = os.getenv(
 )
 _REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
-# Every Redis key namespace the chaos framework writes into.
-#
-# One pattern, because every chaos key helper MUST live under `chaos:*`:
-# `kafka_consumer.kill_key_for()` yields `chaos:kill:{group}`,
-# `kafka_consumer.latency_key_for()` yields `chaos:latency:{group}` and
-# `control_loop_pause.pause_key_for()` yields `chaos:pause:{loop}`.
-# A new chaos hook adds no pattern here — it keeps its keys inside the
-# namespace, and `test_every_chaos_key_helper_lives_under_the_chaos_namespace`
-# fails if one ever escapes. (Two `kafka:consumer:*` entries used to sit
-# here claiming to mirror those helpers; they matched no key any code
-# has ever written — D-13.)
+# One pattern, because every chaos key helper MUST live under `chaos:*` —
+# `chaos:kill:{group}`, `chaos:latency:{group}`, `chaos:pause:{loop}`. A new hook adds no pattern
+# here, and `test_every_chaos_key_helper_lives_under_the_chaos_namespace` fails if one escapes.
 _CHAOS_KEY_PATTERNS = ("chaos:*",)
 
-# The one namespace chaos residue can reach WITHOUT wearing the `chaos:`
-# name (R2-20). `create_stale_cache` used to admit any `cache:` key,
-# including the live per-job read cache `cache:job:{tenant}:{job}` that
-# `app/utils/cache.py::JobCache` owns — so a poisoned entry carried no
-# marker the sweep above could key off and outlived the reset for the
-# rest of its TTL, 500-ing `GET /jobs/{id}` in the *next* scenario with
-# nothing to correlate it to.
-#
-# The hook now refuses those keys, so this sweep is belt-and-braces for
-# an entry poisoned before the fix or by hand. Clearing it costs
-# nothing: it is a 10s read-through cache that repopulates from Postgres
-# on the next request, which is also why it is swept rather than
-# rebaselined.
+# The one namespace chaos residue can reach WITHOUT a `chaos:` name (R2-20): `create_stale_cache`
+# used to admit the live per-job read cache `app/utils/cache.py::JobCache` owns, so a poisoned
+# entry outlived the reset and 500-ed `GET /jobs/{id}` in the next scenario. The hook refuses
+# those keys now; this sweep is belt-and-braces and free (a 10s read-through cache).
 _JOB_CACHE_PATTERN = "cache:job:*"
 
-# Tier-1 *action* residue, as opposed to chaos residue above. These are
-# effects the agent itself creates during a scenario; left in place they
-# fire or apply during the next one. Mirror
-# `dlq_replay_scheduler.SCHEDULED_KEY` / `.INFLIGHT_KEY` — kept as
-# literals so this script has no import dependency on the worker package.
+# Agent-left Tier-1 residue that would fire next scenario. Literal mirrors of
+# `dlq_replay_scheduler.SCHEDULED_KEY` / `.INFLIGHT_KEY` — no worker import.
 _SCHEDULED_REPLAY_KEY = "jobs:dlq_replay_delayed"
 _INFLIGHT_REPLAY_KEY = "jobs:dlq_replay_inflight"
 
-# The metrics loop's window of recent timestamped lag measurements for
-# the one refreshed group (WO-R3-254). Mirror of
-# `app/workers/dispatcher.py:LAG_SAMPLES_KEY`, kept as a literal for the
-# same reason as the two keys above — no import dependency on the worker
-# package — and pinned against it by
+# The metrics loop's window of recent lag measurements for the refreshed group (WO-R3-254). A
+# literal mirror of `app/workers/dispatcher.py:LAG_SAMPLES_KEY`, pinned against it by
 # `tests/unit/test_consumer_lag_history.py`.
 #
-# The lag VALUE key is deliberately not touched, here or in the seeder:
-# the loop owns it under a 90s TTL, and a durable fixture written over it
-# would pin a number the loop can no longer correct. The window gets the
-# opposite treatment for the same reason it exists — it spans minutes,
-# not seconds, so measurements taken before a reset would otherwise be
-# the first "trend" the next run sees, from a world that no longer
-# exists. Cleared, not rebuilt: nothing but the loop can say when a
-# measurement was taken, and it records a fresh one within ~60s. Until
-# then `get_consumer_lag` reports the current value with no measurement
-# time and an empty window, which is the truth.
+# The lag VALUE key beside it is deliberately untouched, in the seeder too: the loop owns it
+# under a 90s TTL. The window spans minutes, so measurements from before a reset would be the
+# first "trend" the next run sees. Cleared, not rebuilt — the loop records a fresh one within 60s.
 _LAG_SAMPLES_KEY = "kafka:consumer_lag:worker-dispatcher:samples"
 
 
@@ -307,19 +171,9 @@ async def _clear_job_read_cache(redis: aioredis.Redis) -> int:
 async def _clear_scheduled_replays(redis: aioredis.Redis) -> int:
     """Drop every pending delayed-DLQ-replay timer, armed or claimed.
 
-    `replay_dlq_by_ids/-by_category(delay_seconds=...)` pushes onto the
-    `jobs:dlq_replay_delayed` ZSET and a worker loop fires it when the
-    delay elapses. Nothing cancelled those on reset, so a scenario that
-    scheduled a 5-minute replay left a live timer behind: it fires
-    mid-*next*-scenario, replays a DLQ entry nobody asked about, and
-    the DLQ shrinks under the next agent's feet.
-
-    The in-flight set is swept for the same reason (R2-21). A timer the
-    worker has claimed but not yet acked is still a pending replay — and
-    an un-acked claim is *designed* to be recovered on a later tick, so
-    leaving it behind would resurrect exactly the bleed this clears.
-
-    Returns the number of timers removed across both sets."""
+    A timer left on `jobs:dlq_replay_delayed` fires mid-next-scenario and shrinks the DLQ under
+    the next agent's feet; an unacked `jobs:dlq_replay_inflight` claim is recovered on a later
+    tick and would resurrect the same bleed (R2-21). Returns the count across both sets."""
     pending = 0
     for key in (_SCHEDULED_REPLAY_KEY, _INFLIGHT_REPLAY_KEY):
         held = int(await redis.zcard(key) or 0)
@@ -330,49 +184,24 @@ async def _clear_scheduled_replays(redis: aioredis.Redis) -> int:
 
 
 async def _clear_lag_samples(redis: aioredis.Redis) -> int:
-    """Drop the recorded window of recent consumer-lag measurements.
+    """Drop the recorded consumer-lag measurement window.
 
-    Same class of cross-scenario bleed as the timers and pauses above,
-    one surface further out: the window is what `get_consumer_lag`
-    returns as `recent_samples`, so a window carried across a reset
-    shows the next run a climb or a drain that belongs to the previous
-    one. See `_LAG_SAMPLES_KEY` for why the value key beside it is left
-    alone.
-
-    Returns 1 if a window was there, 0 if not."""
+    `get_consumer_lag` returns it as `recent_samples`, so one carried across a reset shows the
+    next run a trend from the previous one. The value key beside it is left alone."""
     return int(await redis.delete(_LAG_SAMPLES_KEY) or 0)
 
 
 async def _clear_dag_pauses(redis: aioredis.Redis) -> int:
-    """Delete every `dag:paused:*` flag.
-
-    Harmless before v0.4.9, when the flag was written and never read.
-    Now that the DependencyResolver enforces it (ADR 0011), a pause
-    left over from one scenario holds the next scenario's DAG in
-    WAITING — the same class of cross-scenario bleed as the replay
-    timers above.
-
-    Returns the number of pause flags removed."""
+    """Delete every `dag:paused:*` flag: since ADR 0011 the resolver enforces it, so a pause
+    left by one scenario holds the next one's DAG in WAITING."""
     return await _scan_delete(redis, "dag:paused:*")
 
 
 async def _rebuild_read_model(session_factory: Any, redis: aioredis.Redis) -> int:
-    """Recompute the CQRS read-model keys from the `jobs` table.
+    """Recompute the CQRS read-model keys (`jobs:tenant:*` / `jobs:user:*`) from `jobs`.
 
-    The projection (`jobs:tenant:*` / `jobs:user:*`) is derived state that
-    only moves when a Kafka event names a job, so it has no way to heal
-    itself: whatever a scenario's `saturate_redis` evicted, or a Redis
-    restart dropped, stays missing from the admin overview for every
-    later scenario. Every other reset step above restores a surface the
-    scenarios read; before WO-R2-56 this one was simply left broken.
-
-    Runs last, so it projects the job rows as this reset finally leaves
-    them — after the DLQ fixtures are restored, the non-fixture DLQ is
-    swept to `cancelled`, and the chaos-owner users (and their jobs) are
-    deleted. Rebuilding earlier would faithfully project rows that the
-    steps below it were about to change.
-
-    Returns the number of keys written.
+    Derived state that only moves when a Kafka event names a job, so whatever `saturate_redis`
+    evicted cannot heal itself (WO-R2-56). Runs last, projecting the rows as the reset leaves them.
     """
     from app.workers.read_model import rebuild_read_model
 
@@ -382,35 +211,12 @@ async def _rebuild_read_model(session_factory: Any, redis: aioredis.Redis) -> in
 
 
 async def _purge_idempotency_records(session_factory: Any) -> int:
-    """DELETE every idempotency_records row for the seeded
-    incident-commander SA. Scoped to that principal so we don't wipe
-    unrelated agents' state (if any exist).
+    """DELETE every `idempotency_records` row for the seeded incident-commander SA.
 
-    **Every** matching principal, not `scalar_one_or_none()`.
-    `service_accounts.name` is unique *per tenant*, not globally — a
-    second tenant that also seeded an `incident-commander` account made
-    `scalar_one_or_none()` raise `MultipleResultsFound`, and it raised
-    from the tail of `reset()` where every destructive step had already
-    committed: rows deleted, no summary printed, non-zero exit
-    (WO-R2-18). Two tenants each running the eval stack against one
-    database is the normal shape of a shared dev environment, so this
-    was reachable without anything unusual happening.
-
-    Purging all of them is the right reading of the intent as well as
-    the safe one: the docstring's promise is "the seeded commander's
-    cached responses", and each tenant's copy is exactly that. Other
-    principals — `some-other-agent` and friends — are still untouched,
-    which is the property the integration test pins.
-
-    The DELETE is the ORM construct rather than this module's usual
-    `text()`, because the bind is a list of UUIDs and only the mapped
-    column type knows how to render one on both dialects — raw SQL binds
-    the Python `UUID` straight through, which asyncpg accepts and the
-    SQLite unit harness rejects outright. Every other statement here
-    stays raw; this one has a typed parameter and so it is the one that
-    can't be.
-
-    Returns the number of rows deleted, across all matching accounts."""
+    **Every** matching principal, not `scalar_one_or_none()`: `service_accounts.name` is unique
+    per tenant, so a second tenant's copy raised `MultipleResultsFound` from the tail of
+    `reset()`, after every destructive step had committed (WO-R2-18). ORM `delete()` rather than
+    `text()` because the bind is a list of UUIDs that only the mapped column type can render."""
     from app.models.idempotency import IdempotencyRecord
     from app.models.service_account import ServiceAccount
     from sqlalchemy import delete, select
@@ -430,8 +236,7 @@ async def _purge_idempotency_records(session_factory: Any) -> int:
             )
             if not principal_ids:
                 return 0
-            # The IN list is one entry per tenant holding a commander
-            # account, so it is small and bounded.
+            # One entry per tenant holding a commander account: small and bounded.
             result = await session.execute(
                 delete(IdempotencyRecord).where(
                     IdempotencyRecord.principal_id.in_(principal_ids)
@@ -441,15 +246,8 @@ async def _purge_idempotency_records(session_factory: Any) -> int:
 
 
 async def _delete_chaos_owner_users(session_factory: Any) -> int:
-    """DELETE users lazy-created by `create_bad_data_job` when a
-    tenant had no real users (see PR #83 / FIX_PLAN #8). Recognisable
-    by the `chaos-owner+` email prefix + `is_active=false`.
-
-    Owned chaos jobs are removed first so the FK holds. Only touches
-    jobs where the user_id is one we're about to delete — real jobs
-    that happen to share tenant are unaffected.
-
-    Returns the number of users deleted."""
+    """DELETE users lazy-created by `create_bad_data_job` (PR #83 / FIX_PLAN #8), recognisable by
+    the `chaos-owner+` email prefix plus `is_active=false`. Their jobs go first, for the FK."""
     async with session_factory() as session:
         async with session.begin():
             # Delete chaos jobs first (FK dependency).
@@ -473,52 +271,15 @@ async def _delete_chaos_owner_users(session_factory: Any) -> int:
 
 
 async def _resolve_chaos_alerts(session_factory: Any) -> int:
-    """Stamp `resolved_at` on every still-active chaos-fired alert.
+    """Stamp `resolved_at` on every still-active alert with `source LIKE 'chaos:%'`.
 
-    The compensating action for `bad_deploy`
-    (`app/mcp/tools/chaos/bad_deploy.py`), per the ADR 0008 v0.4.5
-    amendment: the hook fires a `critical` alert with source
-    `chaos:bad_deploy` and nothing else on the platform ever resolves it
-    — `AlertService` only has `create_alert`, and no REST or MCP surface
-    touches resolution. So every invocation left one more permanently
-    active critical alert behind, contaminating the alert-count and
-    noise scenarios of every campaign that followed.
-
-    Scope, stated exactly: this resolves chaos alerts, and only chaos
-    alerts. It is not what returns the active-alert surface to the seeded
-    baseline — `_resolve_organic_alerts` below is, and it runs on the
-    next line. The split is kept because "how much chaos residue did this
-    reset find" is a distinct number worth reporting, and because a
-    predicate written against a *known* producer is the cheaper thing to
-    read when a chaos compensator regresses.
-
-    Until WO-R2-131 this was the only alert sweep, and a source string it
-    did not cover was enough to defeat it: the scheduled SLO evaluator
-    writes `source = f"slo:{definition.id}"` (`app/services/slo.py`),
-    `chaos:%` does not match that, and so an organic fast-burn alert
-    survived every reset — the same permanent-distractor failure this
-    function was written to end, reintroduced one producer later. That is
-    why its successor is written as an exclusion of the seeded baseline
-    rather than as a list of the sources it knows about.
-
-    Resolve rather than DELETE: the alert id is quoted in the invoking
-    scenario's output and trajectories, so deleting would mutate history
-    a graded run refers to. `resolved_at` is the model's designed
-    off-switch — `AlertRepository.list_active_for_tenant` filters on
-    `resolved_at IS NULL`, so a resolved row drops out of the surface the
-    agent reads while staying auditable.
-
-    The predicate is `source LIKE 'chaos:%'`, which provably spares the
-    5 seeded fixture alerts (`seed_eval_fixtures._alert_rows` uses
-    sources `kafka`/`dlq`/`api`/`db`). `CURRENT_TIMESTAMP` rather than
-    `now()` so this stays runnable on the SQLite unit harness.
-
-    Idempotent: a second run finds nothing active and returns 0.
-
-    Round-trip test:
-    `backend/tests/unit/test_eval_reset.py::test_resolve_chaos_alerts_clears_bad_deploy_residue`.
-
-    Returns the number of alerts resolved."""
+    The compensating action for `bad_deploy` (ADR 0008's v0.4.5 amendment): it fires a `critical`
+    alert nothing else resolves, so every invocation used to leave a permanent distractor behind.
+    Chaos only — `_resolve_organic_alerts`, on the next line, is what restores the whole surface.
+    Resolved, not DELETEd: the alert id is quoted in scenario output, and
+    `AlertRepository.list_active_for_tenant` filters on `resolved_at IS NULL`. The predicate
+    spares the five fixture alerts (sources `kafka`/`dlq`/`api`/`db`); `CURRENT_TIMESTAMP` rather
+    than `now()` keeps it runnable on SQLite. Idempotent."""
     async with session_factory() as session:
         async with session.begin():
             result = await session.execute(
@@ -532,14 +293,10 @@ async def _resolve_chaos_alerts(session_factory: Any) -> int:
 
 
 def _seeded_alert_ids() -> list[uuid.UUID]:
-    """The ids of the five fixture alerts, from the seeder's own specs.
+    """The ids of the five fixture alerts, read from `seed_eval_fixtures._alert_rows`.
 
-    Read from `seed_eval_fixtures._alert_rows` rather than restated here,
-    for the reason `_sweep_nonfixture_dlq` reads `_dlq_specs()`: the seed
-    is the definition of the baseline, and a second copy of it in this
-    file is a copy that can drift. The tenant argument only lands on
-    inserted rows — the ids are `stable()` UUID5s and do not depend on
-    it, which is the same call shape `_rebaseline_timestamps` uses.
+    Read rather than restated, so the seed stays the definition of the baseline. The ids are
+    `stable()` UUID5s, so the tenant argument does not affect them.
     """
     from scripts import seed_eval_fixtures  # type: ignore[import-not-found]
 
@@ -550,60 +307,17 @@ def _seeded_alert_ids() -> list[uuid.UUID]:
 
 
 async def _resolve_organic_alerts(session_factory: Any) -> int:
-    """Stamp `resolved_at` on every still-active alert that is not one of
-    the seeded fixture alerts. **WO-R2-131.**
+    """Stamp `resolved_at` on every still-active alert that is not one of the five seeded
+    fixture alerts. **WO-R2-131.**
 
-    The gap this closes, in the shape it actually bit: run C of the paid
-    sequence (2026-08-31) was aborted pre-spend because three stray SLO
-    alerts were sitting in the world. `_resolve_chaos_alerts` had not
-    missed them through carelessness — it matched `source LIKE 'chaos:%'`,
-    and the scheduled evaluator that produced them writes
-    `source = 'slo:<objective-id>'`. A sweep enumerating the producers it
-    knows about is only ever correct until the next producer, and the
-    platform had gained one two waves earlier.
-
-    So this one enumerates the **baseline** instead, which is a closed set
-    of five rows with `stable()` ids, and resolves everything else. A
-    producer added tomorrow is covered on the day it ships, without anyone
-    remembering to widen a predicate. The cost is the mirror-image
-    failure: a *sixth* seeded fixture alert would be swept until its id
-    joined `_alert_rows`. That is a change to the seed file itself, one
-    line away from the list this reads, rather than a change in a distant
-    module — which is the direction this trade should point.
-
-    Spared by id, not by source. Source is not identity: the seeded
-    fixtures use `kafka`/`dlq`/`api`/`db`, and an organically-produced
-    alert may legitimately reuse any of those strings, in which case
-    sparing by source would leave exactly the distractor this exists to
-    remove. The five ids are `uuid5` values with no tenant in them, so
-    this stays environment-wide like every other statement here.
-
-    Belt and braces, not a single point of failure: `seed(reset=True)`
-    re-baselines `alerts.fired_at`/`resolved_at` from `_alert_rows`
-    (`seed_eval_fixtures._rebaseline_timestamps`), so a seeded alert that
-    *were* resolved by mistake is restored to `resolved_at = NULL` on the
-    same reset. The explicit exclusion is what makes the sparing provable
-    without relying on that.
-
-    Resolve, never DELETE — same reasoning as the sibling above: the alert
-    id is quoted in the invoking scenario's output and trajectories, and
-    `AlertRepository.list_active_for_tenant` filters on
-    `resolved_at IS NULL`, so a resolved row leaves the agent's surface
-    while staying auditable.
-
-    Chaos alerts are already resolved by the time this runs, so it
-    normally counts only organic residue; it would catch them too if the
-    order were ever reversed. Idempotent: a second run finds nothing
-    active outside the baseline and returns 0.
-
-    Core `update()` rather than `text()` because the exclusion binds five
-    UUIDs, and `jobs.id`-style parameter binding is exactly where the
-    Postgres/SQLite split bites (`uuid[]` on one, `CHAR(32)` on the
-    other). The statement it renders is the same `UPDATE alerts SET
-    resolved_at = CURRENT_TIMESTAMP WHERE resolved_at IS NULL AND id NOT
-    IN (...)` on both.
-
-    Returns the number of alerts resolved."""
+    Run C of the paid sequence (2026-08-31) was aborted pre-spend over three stray SLO alerts:
+    `_resolve_chaos_alerts` matched `source LIKE 'chaos:%'` and the scheduled evaluator writes
+    `source = 'slo:<objective-id>'`. A sweep enumerating known producers is correct only until
+    the next one, so this enumerates the **baseline** instead — a closed set of five `stable()`
+    ids — and resolves everything else. Spared by id, not by source: an organic alert may
+    legitimately reuse `kafka`/`dlq`/`api`/`db`. Resolve, never DELETE, for the sibling's reason.
+    Core `update()` rather than `text()` because the exclusion binds five UUIDs, which is exactly
+    where the Postgres/SQLite split bites. Idempotent."""
     from app.models.alert import Alert  # type: ignore[import-not-found]
     from sqlalchemy import func, update
 
@@ -623,72 +337,20 @@ async def _resolve_organic_alerts(session_factory: Any) -> int:
 
 
 async def _delete_seeded_dlq_fixtures(session_factory: Any) -> int:
-    """DELETE rows created by a *declared-fixture* chaos hook —
-    `seed_dlq_messages`, `create_stuck_dag`, `create_bad_data_job` (since
-    v0.6.2), and since v0.6.3 `poison_message` and
-    `create_mislabeled_dlq_job`.
+    """DELETE rows created by a declared-fixture chaos hook — `seed_dlq_messages`,
+    `create_stuck_dag`, `create_bad_data_job`, `poison_message`, `create_mislabeled_dlq_job`.
 
-    Deleted rather than cancelled (the disposal `_sweep_nonfixture_dlq`
-    applies to everything else) because these are scaffolding a
-    scenario declared for itself, not history belonging to a real user.
-    Cancelling them would leave thousands of dead rows behind across
-    eval runs. See ADR 0012 rule 2.
-
-    `create_bad_data_job` moved into this sweep with WO-R2-158, and
-    `poison_message` with WO-R2-166, each when it gained a deterministic id
-    derived from the calling tenant and a `fixture_name` a scenario pins in
-    advance. Before that their rows were randomly idded and merely
-    *cancelled*, on the grounds that one attached to a real user reads as
-    that user's history. A row a scenario names before it exists is not
-    that; it is scaffolding, and the reset now disposes of it as such.
-
-    `create_mislabeled_dlq_job` (v0.6.3) was born into this sweep, and is
-    the one row where the disposal class carries weight beyond tidiness: it
-    is deliberately self-contradictory (hint `replay_safe`, permanent
-    bad-data text), so a `cancelled` copy accumulating one per run would
-    leave the DLQ full of rows that teach the wrong lesson to anything
-    reading it later.
-
-    **The marker contract.** Every one of those hooks writes a *top-level*
-    `SEEDED_FIXTURE_MARKER` key holding boolean `true`
-    (`app/mcp/tools/chaos/seed_dlq_messages.py` owns the constant; the
-    others import it). Two of them carry additional payload keys beside it,
-    so the predicate has to be *containment* rather than equality — which
-    it already is. It matches that structure and nothing else. It used to
-    be
-    `CAST(payload AS text) LIKE '%"seeded_fixture"%'`, which is a
-    substring test against the serialized payload: it also matched the
-    marker as a *value* (`{"tag": "seeded_fixture"}`), at any nesting
-    depth, and with any value at all — including `false`. That is a hard
-    DELETE, in any tenant, CASCADE-ing `job_triages` and nulling the
-    audit FKs, on a row that merely mentioned the word (S-02).
-
-    Dialect-branched because the predicate has no portable spelling:
-
-      * postgresql — `payload @> '{"seeded_fixture": true}'::jsonb`.
-        `PortableJSON` renders as JSONB on PG (`app/models/base.py`), so
-        containment is available, and it matches a top-level key with
-        boolean true only. Deliberately *not*
-        `(payload ->> 'seeded_fixture')::boolean`: a hostile value like
-        `{"seeded_fixture": "banana"}` makes that cast raise and aborts
-        the whole reset transaction. Containment just returns false.
-      * sqlite (the unit harness) — `json_extract(payload,
-        '$.seeded_fixture') = 1`, SQLite's spelling of the same test.
-
-    Deliberately **not** scoped by status: a seeded row the agent
-    replayed out of `dead_letter` is still declared scaffolding, and
-    leaving it behind accumulates exactly the litter ADR 0012's
-    delete-don't-cancel rule exists to prevent. Deliberately **not**
-    scoped by tenant either: the reset is environment-wide by design
-    (see `_sweep_nonfixture_dlq`). Residual risk after the tightening is
-    a user who deliberately writes the exact top-level
-    `{"seeded_fixture": true}` marker into a real job's payload — that
-    row is indistinguishable from scaffolding and will be deleted.
-
-    Audit rows referencing a deleted job are never touched; their
-    `resource_id` still carries the job's UUID (module docstring).
-
-    Returns the number of rows deleted."""
+    Deleted rather than cancelled (ADR 0012 rule 2): scaffolding a scenario declared for itself
+    under an id it pinned in advance is not a real user's history, and a `cancelled` copy per run
+    is litter. Each hook writes a *top-level* `SEEDED_FIXTURE_MARKER` key holding boolean `true`
+    (the constant lives in `app/mcp/tools/chaos/seed_dlq_messages.py`), and the predicate is
+    containment, not a substring test — the old `CAST(payload AS text) LIKE` form also matched the
+    marker as a *value*, at any depth and with any value including `false`, i.e. a hard DELETE on
+    a row that merely mentioned the word (S-02). Dialect-branched because containment has no
+    portable spelling: `payload @> '{"seeded_fixture": true}'::jsonb` on postgresql (not
+    `(payload ->> 'seeded_fixture')::boolean`, which raises on a hostile value and aborts the
+    reset), `json_extract(payload, '$.seeded_fixture') = 1` on sqlite. Scoped by neither status
+    nor tenant on purpose."""
     async with session_factory() as session:
         async with session.begin():
             if session.bind.dialect.name == "postgresql":
@@ -707,70 +369,24 @@ async def _delete_seeded_dlq_fixtures(session_factory: Any) -> int:
 
 
 async def _sweep_nonfixture_dlq(session_factory: Any) -> int:
-    """Move every `dead_letter` job that isn't a seeded fixture to a
-    terminal status, so the DLQ a scenario observes contains exactly
-    the fixtures it was graded against.
+    """Move every `dead_letter` job that is not a seeded fixture to `cancelled`, so the DLQ a
+    scenario observes contains exactly the fixtures it was graded against.
 
-    `_delete_chaos_owner_users` above only reaches chaos jobs owned by
-    a lazy-created `chaos-owner+*` user. When the target tenant already
-    had a real user, a chaos hook attaches the job to *that* user
-    instead — so the row survives every reset and accumulates. That is
-    how a `bad_data_job` row from 2026-07-31, owned by
-    `agent-demo@example.com`, was still sitting in the DLQ days later.
+    No chaos hook needs this arm any more — since WO-R2-166 every hook that writes a DLQ row
+    declares it, and `_delete_seeded_dlq_fixtures` removes those outright whoever owns them. What
+    is left is what the lab did not declare: a real dead-letter (processor failure, stale-RUNNING
+    recovery, an unregistered `*.compensate`), a pre-marker legacy row, or something written by
+    hand. Real history for a real user, hence `cancelled` rather than DELETE — and
+    `_delete_chaos_owner_users` cannot reach one attached to a real user. Stale entries also widen
+    the planner's surface, which pulled the agent into extra probes on scenarios that never
+    mentioned the DLQ.
 
-    No chaos hook demonstrates that any more. `create_bad_data_job` stopped
-    being the example with WO-R2-158 and `poison_message` — which was the
-    example after it — with WO-R2-166: every hook that writes a DLQ row now
-    declares it by `fixture_name` under a deterministic id, so
-    `_delete_seeded_dlq_fixtures` DELETEs all of them outright, whoever owns
-    them.
-
-    What this arm still catches is everything the lab did not declare: a job
-    that really dead-lettered on this stack (a processor failure, a stale-
-    RUNNING recovery, an unregistered `*.compensate` type), a row left by an
-    older release's chaos hook before the marker convention existed, and
-    anything a human wrote by hand. Those are real history for a real user,
-    which is why they are still `cancelled` rather than deleted — and the
-    failure mode above is unchanged for them: a chaos-era row from
-    2026-07-31 owned by `agent-demo@example.com` outlived every reset
-    because `_delete_chaos_owner_users` could not reach a job attached to a
-    real user.
-
-    The cost isn't just a dirty DLQ tab. Stale entries widen the
-    surface the agent's planner reads, which pulled it into extra
-    probes on scenarios that never mentioned the DLQ — consumer_lag
-    included. Sweeping is therefore a de-noising step for the whole
-    remediation loop, not just the DLQ scenarios.
-
-    `cancelled` rather than DELETE: these rows are real history for a
-    real user, the eval only cares that they're out of `dead_letter`,
-    and a status flip stays auditable. Fixtures are identified by the
-    stable() ID set — the `eval_fixture` payload marker agrees today,
-    but the IDs are what `_reset_dlq_state` re-baselines against, so
-    they're the authoritative definition.
-
-    Blast radius is deliberately environment-wide rather than scoped to
-    the seeded tenant: a stray `dead_letter` row in *any* tenant is
-    visible to a platform-admin-scoped agent and lands in the same
-    planner surface. Safe because `_assert_not_production()` runs first
-    on *both* entry points — inside `reset()` for library callers and in
-    `main()` for the CLI. (That claim used to name `_refuse_in_production()`
-    and "this whole script", which was false: the check ran only in
-    `main()`, so an importer of `reset()` reached this statement ungated.)
-
-    **Empty-DLQ mode** (`EVAL_EMPTY_DLQ_BASELINE=1`, commander ADR
-    0010): the fixture exclusion is dropped and *every* `dead_letter`
-    row is swept, so a scenario inherits nothing and declares whatever
-    DLQ content it needs via `seed_dlq_messages`.
-
-    Opt-in rather than default on purpose. Flipping the baseline to
-    empty is a breaking change for every `dlq_*` scenario currently
-    written against the standing 4-row pool. Making it a mode lets the
-    platform ship first, the commander migrate its scenarios, and the
-    default flip land third — at no point is either side broken. See
-    the sequencing note in ADR 0012.
-
-    Returns the number of rows swept."""
+    Fixtures are identified by the `_dlq_specs()` stable-ID set, which `_reset_dlq_state`
+    re-baselines against. Environment-wide on purpose — a stray row in any tenant reaches a
+    platform-admin-scoped agent — and safe because `_assert_not_production()` runs on both entry
+    points. With `EVAL_EMPTY_DLQ_BASELINE=1` (commander ADR 0010) the fixture exclusion is dropped
+    and every `dead_letter` row is swept; opt-in, because flipping the baseline breaks every
+    `dlq_*` scenario written against the standing pool."""
     if _empty_dlq_baseline():
         fixture_ids: list[str] = []
     else:
@@ -800,21 +416,10 @@ def _assert_not_production(
 ) -> None:
     """Raise if it is not safe to destroy state at this target.
 
-    Two checks, both in `eval_safety.assert_safe_target()`: the
-    `ENVIRONMENT=production` label (ADR 0008's environment gate) and,
-    since WO-R2-18, the identity of the `database_url`/`redis_url` the
-    caller is about to hand every `DELETE` in this module. The label
-    alone described the operator's shell, not the database being
-    emptied — which is why the arguments default to the module-level
-    DSNs but the real callers pass their own.
-
-    The single gate, shared by both entry points: `reset()` lets the
-    `RuntimeError` propagate to its (library) caller, `main()` turns it
-    into a stderr message and `exit(1)` for the CLI. There is
-    deliberately no `allow_production` parameter — overriding
-    `ENVIRONMENT` is the one documented escape hatch for *that* check,
-    and one lever is enough. `allow_target_mismatch` is the separate,
-    per-invocation lever for the target check."""
+    Two checks in `eval_safety.assert_safe_target()`: the `ENVIRONMENT=production` label (ADR
+    0008) and, since WO-R2-18, the identity of the `database_url`/`redis_url` every `DELETE` here
+    runs against. One gate, both entry points — `reset()` propagates the `RuntimeError`, `main()`
+    turns it into stderr + `exit(1)`. No `allow_production` lever, by design."""
     eval_safety.assert_safe_target(
         script="reset_eval_state.py",
         database_url=database_url,
@@ -849,44 +454,29 @@ async def reset(
     purge_idempotency: bool = False,
     allow_target_mismatch: bool = False,
 ) -> dict[str, Any]:
-    """Programmatic entry point. Returns a summary dict suitable for
-    JSON encoding by the CLI or the eval harness.
+    """Programmatic entry point; returns a JSON-encodable summary dict.
 
-    Raises `RuntimeError` — before anything is imported, connected or
-    created — when `ENVIRONMENT=production`, or when `database_url` /
-    `redis_url` are not the ones `settings` names. This coroutine
-    accepts arbitrary DB/Redis URLs, so the CLI's gate protected nothing
-    here (D-08) and the label-only gate protected nothing either: it
-    read the local process while these arguments chose the victim
-    (WO-R2-18). `allow_target_mismatch=True` is the deliberate
-    override."""
+    Raises `RuntimeError` before anything connects when `ENVIRONMENT=production`, or when
+    `database_url`/`redis_url` are not the ones `settings` names (D-08, WO-R2-18);
+    `allow_target_mismatch=True` overrides that."""
     _assert_not_production(
         database_url,
         redis_url,
         allow_target_mismatch=allow_target_mismatch,
     )
 
-    # Local import so the seed script's heavy DB imports are only paid
-    # by scenarios that actually run this reset.
+    # Local import: only callers of this reset pay the seeder's heavy DB imports.
     from scripts import seed_eval_fixtures  # type: ignore[import-not-found]
 
     engine = create_async_engine(database_url, echo=False)
-    # Platform (cross-tenant) scope: this script touches many tenants'
-    # rows and sets no `app.tenant_id`. Since WO-R2-129 that is refused
-    # rather than silently admitted, and it runs as `incident_app`
-    # (docker-compose `app` service) — a non-owner role with no
-    # BYPASSRLS — so the declaration is what keeps it working. ADR 0026.
+    # Platform (cross-tenant) scope: this script sets no `app.tenant_id`, which ADR 0026
+    # refuses, and runs as the non-owner `incident_app` role with no BYPASSRLS.
     factory = platform_session_factory(engine)
     redis = aioredis.from_url(redis_url, decode_responses=True)
 
     try:
-        # First, not last. The purge resolves a service account and can
-        # raise; run last, that raise landed *after* every destructive
-        # step had already committed, so the operator got a traceback
-        # and no summary describing what had just been deleted
-        # (WO-R2-18). Nothing in the reset creates idempotency records,
-        # so the ordering is free — the only thing it changes is which
-        # side of a failure the committed damage sits on.
+        # First, not last: the purge can raise, and run last it raised after every destructive
+        # step had committed (WO-R2-18). Free ordering — nothing here creates those records.
         idempotency_purged = 0
         if purge_idempotency:
             idempotency_purged = await _purge_idempotency_records(factory)
@@ -895,36 +485,23 @@ async def reset(
         timers_cleared = await _clear_scheduled_replays(redis)
         pauses_cleared = await _clear_dag_pauses(redis)
         lag_samples_cleared = await _clear_lag_samples(redis)
-        # Order-independent of the seed: the seeded fixture alerts use
-        # non-chaos sources, so this can neither race nor re-resolve them.
+        # Order-independent of the seed: the fixture alerts use non-chaos sources.
         chaos_alerts_resolved = await _resolve_chaos_alerts(factory)
-        # And everything else still active that is not one of the five
-        # seeded fixture alerts (WO-R2-131). Order-independent of the seed
-        # for a stronger reason: it spares by stable() id, which does not
-        # depend on the rows existing yet.
+        # Everything else active outside the five seeded alerts; spared by stable() id
+        # (WO-R2-131).
         organic_alerts_resolved = await _resolve_organic_alerts(factory)
         seed_summary = await seed_eval_fixtures.seed(
             database_url=database_url,
             redis_url=redis_url,
             reset=True,
-            # The seeder gates its own target too (WO-R2-19). Thread the
-            # override through rather than letting it re-decide: this
-            # reset already passed the gate for these exact URLs, and a
-            # deliberate mismatch that stops halfway through is worse
-            # than one that was refused up front.
+            # The seeder gates its own target too (WO-R2-19); thread the
+            # override through so a deliberate mismatch cannot stop halfway.
             allow_target_mismatch=allow_target_mismatch,
         )
-        # Delete chaos-owner users from any tenant that had
-        # `create_bad_data_job` run against it. Runs unconditionally
-        # (unlike the idempotency purge, which is opt-in) — these rows
-        # are chaos-specific and shouldn't survive a reset.
+        # Chaos-owner users from any tenant `create_bad_data_job` ran against.
         chaos_owners_deleted = await _delete_chaos_owner_users(factory)
-        # Runs after the seed/reset above, which restores replayed
-        # fixtures to `dead_letter`. Sweeping first would be harmless
-        # but pointless — the restore would repopulate the DLQ after
-        # the sweep had already looked at it.
-        # Delete scenario-declared fixtures before the sweep so they're
-        # removed outright rather than left as `cancelled` rows.
+        # After the seed/reset, which restores replayed fixtures to `dead_letter`. Declared
+        # fixtures go before the sweep, so they are deleted rather than `cancelled`.
         seeded_dlq_deleted = await _delete_seeded_dlq_fixtures(factory)
         dlq_swept = await _sweep_nonfixture_dlq(factory)
         # Last: projects the rows as every step above finally left them.
@@ -983,8 +560,7 @@ async def main() -> None:
     )
     args = parser.parse_args()
 
-    # Refuse on stderr + exit 1 before anything is connected. `reset()`
-    # re-checks the same invariant for library callers.
+    # Refuse on stderr + exit 1 before anything connects; `reset()` re-checks.
     _refuse_in_production(
         _DB_URL,
         _REDIS_URL,

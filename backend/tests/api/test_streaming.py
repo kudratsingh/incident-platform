@@ -1,28 +1,11 @@
 """SSE stream auth: the stream-token mint endpoint and the stream route.
 
-The browser cannot send an Authorization header from a native EventSource, so
-the stream authenticates with a short-lived, single-purpose stream token:
-
-  POST /jobs/{id}/stream-token   — normal header auth; authorizes the job
-                                   (tenant scope + ownership) and mints the token
-  GET  /jobs/{id}/stream?token=… — validates the stream token from the query
-                                   string; identity comes only from the token
-
-Covered here:
-  - minting requires authentication (401 with no header)
-  - minting enforces tenant scope (404 cross-tenant — cannot confirm existence)
-  - minting enforces ownership (403 for a non-owner plain user; admins allowed)
-  - the minted token is bound to the job (sub claim == job id)
-  - the stream route rejects: missing token, the primary access JWT, an
-    expired stream token, and a stream token minted for a different job
-  - the stream route accepts a freshly minted stream token (no more 401 loop)
-  - a job that already finished short-circuits off the jobs row into one
-    synthetic terminal event instead of hanging on a silent channel (E1-10)
-
-The SSE generator itself is not drained — conftest's Redis is an AsyncMock, so
-the accept test patches app.api.streaming.subscribe with an empty async
-generator and asserts on the auth decision only.  The short-circuit tests are
-the exception: they never reach subscribe(), so they can read the real body.
+A native EventSource cannot send an Authorization header, so `POST /jobs/{id}/stream-token`
+authorizes the job under normal header auth and mints a short-lived token that `GET
+/jobs/{id}/stream?token=…` validates. Covered: authn and authz on the mint, the job binding, the
+four rejections and the accept on the stream route, and the finished-job short-circuit (E1-10). The
+generator is not drained — conftest's Redis is an AsyncMock — except in the short-circuit tests,
+which never reach subscribe().
 """
 
 import asyncio
@@ -45,9 +28,7 @@ from app.workers.progress_broker import ProgressBroker
 from httpx import AsyncClient
 from jose import jwt
 
-# ---------------------------------------------------------------------------
 # Fixtures
-# ---------------------------------------------------------------------------
 
 
 @pytest_asyncio.fixture
@@ -109,11 +90,8 @@ async def second_user_headers(db_session, default_tenant) -> dict[str, str]:  # 
 
 
 def _expired_stream_token(job_id: uuid.UUID, tenant_id: uuid.UUID) -> str:
-    """A structurally valid stream token whose 60s lifetime has already passed.
-
-    Built by back-dating the mint-time clock (the sanctioned way to test
-    expiry — the real TTL is never extended for test convenience).
-    """
+    """Structurally valid but 60s expired, built by back-dating the mint clock; the real TTL is
+    never extended for test convenience."""
     settings = get_settings()
     minted_at = datetime.now(UTC) - timedelta(seconds=120)
     payload = {
@@ -138,12 +116,8 @@ async def _empty_subscribe(
 async def _never_ending_subscribe(
     *args: object, **kwargs: object
 ) -> AsyncGenerator[ProgressEvent, None]:
-    """Stand-in for a live-but-silent channel: yields nothing, never returns.
-
-    This is what the endpoint used to do to a late subscriber. The E1-10 tests
-    patch it in so that "the endpoint fell through to subscribe()" shows up as
-    a timeout rather than a happy empty body.
-    """
+    """A live-but-silent channel: yields nothing and never returns, so falling through to
+    subscribe() shows up as a timeout."""
     await asyncio.Event().wait()
     yield  # pragma: no cover — unreachable; makes this an async generator
 
@@ -167,9 +141,7 @@ async def _fetch_stream(client: AsyncClient, job_id: uuid.UUID, tenant_id: uuid.
         )
 
 
-# ---------------------------------------------------------------------------
 # POST /jobs/{id}/stream-token — authn + authz (the missing F1-03 checks)
-# ---------------------------------------------------------------------------
 
 
 async def test_stream_token_requires_auth(client: AsyncClient, job: Job) -> None:
@@ -227,20 +199,14 @@ async def test_stream_token_admin_can_mint_for_another_users_job(
     assert resp.status_code == 200
 
 
-# ---------------------------------------------------------------------------
 # GET /jobs/{id}/stream — token validation (the F2-01/F2-03 transport)
-# ---------------------------------------------------------------------------
 
 
 async def test_stream_route_rejects_missing_token(
     client: AsyncClient, job: Job
 ) -> None:
-    """No ?token → 401 from OUR token check, not from the header-only scheme.
-
-    The error_code assertion is what proves the route stopped depending on
-    the Authorization header: at HEAD the 401 is FastAPI's bare
-    {"detail": "Not authenticated"} with no error_code envelope.
-    """
+    """No ?token → 401 from our own check; the error_code envelope is what proves the route stopped
+    depending on the Authorization header."""
     resp = await client.get(f"/api/v1/jobs/{job.id}/stream")
     assert resp.status_code == 401
     assert resp.json().get("error_code") == "authentication_failed"
@@ -249,11 +215,8 @@ async def test_stream_route_rejects_missing_token(
 async def test_stream_route_rejects_primary_access_token(
     client: AsyncClient, job: Job, user_token: str
 ) -> None:
-    """The primary access JWT in the query string must NOT open a stream.
-
-    Single-purpose enforcement (F2-03): only type=stream tokens are accepted,
-    so nobody can 'fix' browser auth by pasting the real JWT into the URL.
-    """
+    """Single-purpose enforcement (F2-03): only type=stream tokens are accepted, so the real JWT
+    cannot open a stream."""
     resp = await client.get(
         f"/api/v1/jobs/{job.id}/stream", params={"token": user_token}
     )
@@ -280,12 +243,8 @@ async def test_stream_route_rejects_token_for_other_job(
     test_user: User,
     auth_headers: dict[str, str],
 ) -> None:
-    """A token minted for job A replayed against job B → 403.
-
-    Both jobs belong to the same owner, so the ONLY thing failing here is the
-    job binding — without it, any token the caller could mint would open any
-    job's stream and reopen F1-03 through the back door.
-    """
+    """Both jobs share an owner, so only the job binding can fail here; without it any token the
+    caller could mint would open any job's stream (F1-03)."""
     other_job = Job(
         tenant_id=test_user.tenant_id,
         user_id=test_user.id,
@@ -312,13 +271,8 @@ async def test_stream_route_rejects_token_for_other_job(
 async def test_stream_route_accepts_valid_stream_token(
     client: AsyncClient, job: Job, auth_headers: dict[str, str]
 ) -> None:
-    """Mint → stream with ?token= → NOT 401 (the F2-01 browser regression).
-
-    At HEAD the header-only dependency 401'd every EventSource request, which
-    is why the browser reconnect-looped forever. subscribe() is patched to an
-    empty async generator because conftest's Redis is an AsyncMock — the
-    assertion is the auth decision, not event delivery.
-    """
+    """Mint → stream with ?token= → not 401, the F2-01 browser regression. subscribe() is patched to
+    an empty generator, so the assertion is the auth decision."""
     mint = await client.post(f"/api/v1/jobs/{job.id}/stream-token", headers=auth_headers)
     assert mint.status_code == 200
     stream_token = mint.json()["token"]
@@ -331,9 +285,7 @@ async def test_stream_route_accepts_valid_stream_token(
     assert resp.headers["content-type"].startswith("text/event-stream")
 
 
-# ---------------------------------------------------------------------------
 # GET /jobs/{id}/stream — the late-subscriber short-circuit (E1-10)
-# ---------------------------------------------------------------------------
 
 
 async def _finished_job(  # type: ignore[no-untyped-def]
@@ -359,15 +311,9 @@ async def test_stream_of_completed_job_closes_immediately(
     db_session,  # type: ignore[no-untyped-def]
     test_user: User,
 ) -> None:
-    """THE E1-10 assertion at the HTTP layer.
-
-    The job finished before this client connected and Redis retained nothing
-    (conftest's redis.get returns None, i.e. the key was evicted or predates
-    the snapshot).  Pre-fix the endpoint subscribed to a channel that will
-    never speak again and the response never ended — here subscribe() is
-    patched to a generator that never returns, so falling through to it shows
-    up as the timeout it really is.
-    """
+    """THE E1-10 assertion at the HTTP layer: the job finished before this client connected and
+    Redis retained nothing, and pre-fix the response never ended. subscribe() never returns here, so
+    falling through to it shows up as the timeout it is."""
     job = await _finished_job(db_session, test_user, JobStatus.COMPLETED)
 
     resp = await _fetch_stream(client, job.id, job.tenant_id)
@@ -438,11 +384,8 @@ async def test_retained_snapshot_takes_precedence_over_the_row(
     db_session,  # type: ignore[no-untyped-def]
     test_user: User,
 ) -> None:
-    """When Redis still holds a snapshot, subscribe() owns the stream.
-
-    The DB short-circuit is the fallback for an evicted/absent key only; it
-    must never pre-empt events the pub/sub path is about to deliver.
-    """
+    """The DB short-circuit is the fallback for an absent key only; it must never pre-empt events
+    the pub/sub path is about to deliver."""
     job = await _finished_job(db_session, test_user, JobStatus.COMPLETED)
     token = create_stream_token(job.id, job.tenant_id)
     retained = ProgressEvent(
@@ -465,22 +408,12 @@ async def test_retained_snapshot_takes_precedence_over_the_row(
     assert _sse_events(resp.text) == []
 
 
-# ---------------------------------------------------------------------------
-# ...and the case where the snapshot and the row DISAGREE (WO-R2-57)
+# ...and the case where the snapshot and the row DISAGREE (WO-R2-57).
 #
-# The test above only covers a snapshot that agrees with the row — both
-# terminal-completed — so it cannot see the failure the reconciliation exists
-# to prevent: a terminal snapshot retained in front of a row that is not
-# terminal. A DLQ replay produces exactly that (the job reaches dead_letter,
-# the snapshot records it, an operator replays the job, and the replay's
-# `running` events are deliberately refused by the snapshot's ordering guard),
-# and handing that snapshot to a viewer closes the stream on its first event
-# for a job that is running right now.
-#
-# The tie-break is recency, not "the row always wins": the same disagreement
-# is produced by an ordinary race, where a job finishes microseconds after
-# this request read its row, and there the snapshot is the truthful half.
-# ---------------------------------------------------------------------------
+# A terminal snapshot retained in front of a non-terminal row is what a DLQ replay produces, and
+# handing it to a viewer closes the stream on a job that is running right now. The tie-break is
+# recency, not "the row always wins": an ordinary race produces the same disagreement with the
+# snapshot as the truthful half.
 
 
 def _subscribe_recorder(calls: list[dict[str, object]]):  # type: ignore[no-untyped-def]
@@ -506,11 +439,8 @@ async def test_stale_terminal_snapshot_does_not_close_a_running_job_stream(
     db_session,  # type: ignore[no-untyped-def]
     test_user: User,
 ) -> None:
-    """Row says running and was written after the snapshot said dead_letter.
-
-    Before WO-R2-57 the snapshot was passed straight through, so the viewer of
-    a replayed job got one `dead_letter` event and a closed stream.
-    """
+    """Before WO-R2-57 the snapshot passed straight through, so a replayed job's viewer got one
+    `dead_letter` event and a closed stream."""
     job = await _finished_job(
         db_session,
         test_user,
@@ -548,12 +478,8 @@ async def test_snapshot_newer_than_the_row_is_still_believed(
     db_session,  # type: ignore[no-untyped-def]
     test_user: User,
 ) -> None:
-    """The ordinary race: the job finished just after this request read its row.
-
-    Distrusting every terminal-snapshot-on-a-running-row would turn this into
-    a stream that waits out the broker's idle timeout for events that have
-    already been published.
-    """
+    """The ordinary race: distrusting every terminal snapshot on a running row would wait out the
+    broker's idle timeout for events already published."""
     job = await _finished_job(
         db_session,
         test_user,
@@ -619,22 +545,13 @@ async def test_non_terminal_snapshot_on_a_running_row_is_untouched(
     assert calls == [{"use_snapshot": True}]
 
 
-# ---------------------------------------------------------------------------
-# Pool isolation and the per-process stream cap (WO-R2-11)
+# Pool isolation and the per-process stream cap (WO-R2-11).
 #
-# Each open stream used to hold one connection out of the single 20-connection
-# process-wide pool for its whole life, and `worker_loop` runs in the same
-# process on that same pool — so ~20 parked dashboards starved the rate
-# limiter, `check_backpressure` and the admin stats loops. Two structural
-# answers, asserted here at the HTTP layer:
-#
-#   * streaming draws from its own bounded pool, so it cannot starve anyone,
-#   * a per-process cap refuses the extra viewer with 503 + Retry-After
-#     rather than letting it queue against a finite resource.
-#
-# The fan-out itself (N viewers → one connection) is asserted in
-# tests/unit/test_progress_broker.py, where the Pub/Sub calls are visible.
-# ---------------------------------------------------------------------------
+# Each open stream used to hold one connection out of the single 20-connection process-wide pool for
+# its whole life, and `worker_loop` shares that pool — so ~20 parked dashboards starved the rate
+# limiter and `check_backpressure`. Streaming now draws from its own bounded pool, and a per-process
+# cap refuses the extra viewer with 503 + Retry-After. The fan-out itself is asserted in
+# tests/unit/test_progress_broker.py.
 
 
 class _DeadRedis:
@@ -659,12 +576,8 @@ def _test_broker(redis: object, **overrides: object) -> ProgressBroker:
 
 
 def test_streaming_draws_from_its_own_pool_not_the_shared_one() -> None:
-    """The SSE pool is a separate object, sized independently of the default.
-
-    This is the whole point of the finding: whatever streaming does to its
-    own pool, the rate limiter, backpressure check and worker loops that hold
-    `get_redis_pool()` keep their 20 slots.
-    """
+    """The SSE pool is its own object, so whatever streaming does to it the rate limiter,
+    backpressure check and worker loops keep their 20 slots."""
     from app.core.redis import get_redis_pool, get_sse_redis_pool
 
     settings = get_settings()
@@ -676,13 +589,8 @@ def test_streaming_draws_from_its_own_pool_not_the_shared_one() -> None:
 async def test_stream_beyond_the_cap_is_refused_while_post_jobs_still_works(
     client: AsyncClient, job: Job, auth_headers: dict[str, str]
 ) -> None:
-    """Cap+1 concurrent viewers: the extra one is refused, the API stays up.
-
-    Pre-fix there was no cap at all — the (cap+1)th viewer opened happily and
-    took another connection out of the shared pool, and it was `POST /jobs`
-    (rate limiter, backpressure, quota — all Redis) that paid for it. Now the
-    refusal is explicit, addressed to the viewer, and carries Retry-After.
-    """
+    """Cap+1 viewers: the extra one is refused with Retry-After and the API stays up. Pre-fix there
+    was no cap, and `POST /jobs` paid for it out of the shared pool."""
     broker = _test_broker(_DeadRedis(), max_streams=1)
     broker.acquire()  # the one permitted stream is already open
     token = create_stream_token(job.id, job.tenant_id)
@@ -706,12 +614,8 @@ async def test_stream_beyond_the_cap_is_refused_while_post_jobs_still_works(
 async def test_a_finished_stream_hands_its_slot_back(
     client: AsyncClient, job: Job
 ) -> None:
-    """A closed stream frees capacity for the next viewer.
-
-    With a cap of one and a broker whose Redis is dead, the first stream
-    opens, degrades to an empty body and closes — and the second viewer then
-    gets in rather than meeting a permanently exhausted cap.
-    """
+    """With a cap of one and a dead Redis the first stream degrades and closes, and the second
+    viewer gets in rather than meeting an exhausted cap."""
     broker = _test_broker(_DeadRedis(), max_streams=1)
     token = create_stream_token(job.id, job.tenant_id)
 
@@ -728,11 +632,8 @@ async def test_a_finished_stream_hands_its_slot_back(
 async def test_redis_outage_degrades_the_stream_and_never_500s(
     client: AsyncClient, job: Job
 ) -> None:
-    """Fail-open, unchanged: Redis down closes the stream, it does not error.
-
-    The browser's EventSource reconnects on its own. What must never happen
-    is the Redis failure escaping the generator as a 500 out of the API.
-    """
+    """Fail-open, unchanged: Redis down closes the stream, and the failure must never escape the
+    generator as a 500."""
     broker = _test_broker(_DeadRedis(), max_streams=0)
     token = create_stream_token(job.id, job.tenant_id)
 

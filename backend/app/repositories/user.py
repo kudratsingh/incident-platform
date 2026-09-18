@@ -17,13 +17,9 @@ class UserRepository(BaseRepository[User]):
     async def get_for_tenant(
         self, user_id: uuid.UUID, tenant_id: uuid.UUID
     ) -> User | None:
-        """Tenant-scoped get_by_id. Returns None when the user belongs to a
-        different tenant — never raises, never leaks the row.
+        """Tenant-scoped get_by_id — None for another tenant's user, never raises.
 
-        `users` is the one deliberate exclusion from RLS (auth reads it
-        before `app.tenant_id` is set, ADR 0003), so this predicate is the
-        only tenant boundary on a user lookup — there is nothing underneath
-        it to catch a miss.
+        `users` is the one exclusion from RLS (ADR 0003), so this is the only boundary.
         """
         result = await self.session.execute(
             select(User).where(User.id == user_id, User.tenant_id == tenant_id)

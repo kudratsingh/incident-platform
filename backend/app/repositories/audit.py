@@ -43,29 +43,17 @@ class AuditRepository(BaseRepository[AuditLog]):
     ) -> AuditLog:
         """Convenience wrapper — callers name what happened, repo writes the row.
 
-        Principal identity: pass either `user_id` (human path, kept for
-        backward compat with all existing callers) or an explicit
-        `principal_type` + `principal_id` pair (machine path). When only
-        `user_id` is provided we default `principal_type='user'` and mirror
-        the value into `principal_id`, so every row has a populated
-        principal_type going forward.
-
-        Kafka coordinates: set only by the AuditConsumer for event.* rows —
-        they feed uq_audit_logs_kafka_coord so redelivery dedups. Inline
-        transactional writers leave them None (NULLs never collide).
+        `user_id` alone defaults to `principal_type='user'` mirrored into `principal_id`;
+        Kafka coords are the AuditConsumer's only, feeding uq_audit_logs_kafka_coord.
         """
         if principal_type is None:
             principal_type = PRINCIPAL_TYPE_USER
         if principal_id is None and principal_type == PRINCIPAL_TYPE_USER:
             principal_id = user_id
 
-        # Last resort, and only that: `app.core.middleware` already refuses
-        # to put an over-long correlation id into circulation. This is here
-        # because every other writer (worker loops, consumers, scripts) sets
-        # the contextvar itself, and losing the whole row to a too-long
-        # correlation id is a strictly worse outcome than losing the tail of
-        # the id. Postgres raises on the overflow where SQLite silently
-        # stores it, so without this the failure mode is production-only.
+        # Last resort — the middleware already refuses over-long correlation ids, but
+        # other writers set the contextvar themselves, and losing the whole row is
+        # worse than losing an id's tail. Postgres raises here where SQLite does not.
         if request_id is not None and len(request_id) > REQUEST_ID_MAX_LENGTH:
             logger.warning(
                 "truncating over-long request_id for the audit row",
@@ -105,11 +93,8 @@ class AuditRepository(BaseRepository[AuditLog]):
     ) -> tuple[list[AuditLog], int]:
         """Rows matching the filters, newest first, plus the full count.
 
-        Every filter is a SQL predicate and `total` is counted under the
-        same `WHERE`, including `exclude_action_prefixes` — the caller's
-        view of "how many rows exist" is the view it is allowed to have.
-        Who may see which stream is not decided here: the MCP read tools
-        pass `app.services.operator_audit.hidden_audit_action_prefixes`.
+        `total` uses the same `WHERE`, exclusions included: a caller is told only about
+        rows it may read (`hidden_audit_action_prefixes`).
         """
         filters = []
         if user_id is not None:
@@ -123,23 +108,16 @@ class AuditRepository(BaseRepository[AuditLog]):
             # tool to isolate machine-principal activity streams.
             filters.append(AuditLog.action.like(f"{action_prefix}%"))
         for excluded in exclude_action_prefixes:
-            # The inverse of the grouping above: whole streams a caller
-            # may not see at all. Applied as a predicate, so `_count`
-            # below reports the number of rows the caller may read —
-            # a `total` that counted withheld rows would disclose them.
-            # AND-ed with any `action` / `action_prefix` the caller
-            # supplied, which is what makes an excluded prefix return an
-            # empty page rather than an error: the caller's own filter is
-            # honoured and simply matches nothing.
+            # Whole streams a caller may not see. A predicate, so `_count` reports
+            # only readable rows — a `total` counting withheld rows would disclose
+            # them. AND-ed with the caller's filters, so it empties a page, not errors.
             filters.append(~AuditLog.action.like(f"{excluded}%"))
         if principal_type is not None:
             filters.append(AuditLog.principal_type == principal_type)
         if tenant_id is not None:
             filters.append(AuditLog.tenant_id == tenant_id)
         if request_id is not None:
-            # Correlation-id lookup — the MCP `get_trace` tool pins the
-            # query to one trace instead of scanning a recent window.
-            # Indexed as ix_audit_logs_request_id.
+            # Correlation-id lookup (`get_trace`); ix_audit_logs_request_id.
             filters.append(AuditLog.request_id == request_id)
 
         where = and_(*filters) if filters else None

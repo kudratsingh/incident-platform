@@ -1,14 +1,7 @@
-"""End-to-end tests for Wave 2 PR D — the 4 remaining chaos hooks.
+"""End-to-end tests for Wave 2 PR D — the four remaining chaos hooks.
 
-Reuses the CHAOS_ENABLED-true reload trick from `test_mcp_wave1_pr_b`
-so decorators fire against a patched settings before create_mcp_app
-mounts the routes.
-
-Coverage per tool:
-  - Invisible when CHAOS_ENABLED=false (registry omits it)
-  - Wrong scope → MCP_FORBIDDEN
-  - Happy path: observable side-effect (Redis key, alert row, kafka
-    producer called)
+Reuses the CHAOS_ENABLED-true reload trick from `test_mcp_wave1_pr_b`. Per tool: invisible when
+chaos is off, wrong scope refused, one observable side effect.
 """
 
 from __future__ import annotations
@@ -38,9 +31,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 class _RedisStub:
     def __init__(self) -> None:
         self._store: dict[str, bytes | str] = {}
-        #: Recorded `ex=` per key. Every chaos key is supposed to be
-        #: TTL-bounded (ADR 0008), and until this existed the tests could only
-        #: assert the number a tool *reported*, never the one it set.
+        # Recorded `ex=` per key: every chaos key must be TTL-bounded (ADR 0008).
         self._ttls: dict[str, int | None] = {}
 
     async def get(self, key: str) -> bytes | str | None:
@@ -54,10 +45,8 @@ class _RedisStub:
         return True
 
     async def delete(self, *keys: str) -> int:
-        # Match redis-py semantics — returns the count of keys that
-        # actually existed and were removed. Needed by
-        # invalidate_cache_key (round-trip compensator for
-        # create_stale_cache).
+        # redis-py semantics: the count of keys that existed and were removed. Needed by
+        # invalidate_cache_key.
         removed = 0
         for k in keys:
             if k in self._store:
@@ -84,9 +73,7 @@ class _RedisPipeline:
 
 
 def _mcp_app_with_chaos_enabled(db_session: AsyncSession, redis_stub: _RedisStub):
-    """Build a fresh MCP app under CHAOS_ENABLED=true so chaos tools
-    register. Reloads every chaos tool module so their decorators re-
-    evaluate against the patched settings."""
+    """Fresh MCP app under CHAOS_ENABLED=true, reloading chaos modules so decorators re-fire."""
     with patch(
         "app.mcp.standalone.assert_chaos_gate", lambda *a, **kw: None
     ), patch(
@@ -113,9 +100,8 @@ def _mcp_app_with_chaos_enabled(db_session: AsyncSession, redis_stub: _RedisStub
         importlib.reload(_cl)
         importlib.reload(_laa)
 
-        # Action tools aren't chaos-gated but the snapshot wipe above
-        # cleared them. Re-import so round-trip tests (create_stale_cache
-        # → invalidate_cache_key) can invoke the compensator.
+        # Action tools are not chaos-gated; the snapshot wipe cleared them, so re-import for the
+        # round-trip tests.
         from app.mcp.tools import actions as _actions_pkg
 
         for _mod in (
@@ -190,9 +176,7 @@ def _content(body: dict[str, Any]) -> dict[str, Any]:
     return json.loads(body["result"]["content"][0]["text"])
 
 
-# ---------------------------------------------------------------------------
 # saturate_redis
-# ---------------------------------------------------------------------------
 
 
 async def test_saturate_redis_not_registered_when_chaos_disabled(
@@ -261,11 +245,8 @@ async def test_saturate_redis_writes_expected_keys(
 async def test_saturate_redis_refuses_a_footprint_above_the_cap(
     db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
 ) -> None:
-    """Each dimension was bounded and their product was not, so the maxima
-    multiplied out to ~100 GB against the Redis every scenario shares — an OOM
-    rather than the memory pressure the tool is for (WO-R2-56). Both values
-    below are individually legal.
-    """
+    """Each dimension was bounded and their product was not: the maxima multiplied out to ~100 GB
+    against the shared Redis (WO-R2-56). Both values below are individually legal."""
     redis_stub = _RedisStub()
     app, teardown = _mcp_app_with_chaos_enabled(db_session, redis_stub)
     try:
@@ -289,9 +270,7 @@ async def test_saturate_redis_refuses_a_footprint_above_the_cap(
         teardown()
 
 
-# ---------------------------------------------------------------------------
 # inject_latency
-# ---------------------------------------------------------------------------
 
 
 async def test_inject_latency_sets_expected_redis_key(
@@ -352,9 +331,7 @@ async def test_inject_latency_rejects_out_of_range(
         teardown()
 
 
-# ---------------------------------------------------------------------------
 # bad_deploy
-# ---------------------------------------------------------------------------
 
 
 async def test_bad_deploy_fires_alert_and_sets_flag(
@@ -401,17 +378,13 @@ async def test_bad_deploy_fires_alert_and_sets_flag(
         teardown()
 
 
-# ---------------------------------------------------------------------------
 # poison_message
-# ---------------------------------------------------------------------------
 
 
 async def test_poison_message_invokes_kafka_producer(
     db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
 ) -> None:
-    """Full round-trip is unavailable in unit tests (no broker); assert
-    the producer is started + `send_and_wait` is called with the exact
-    body bytes we intended."""
+    """No broker in tests: assert the producer started and sent the exact body bytes."""
     redis_stub = _RedisStub()
     app, teardown = _mcp_app_with_chaos_enabled(db_session, redis_stub)
 
@@ -461,19 +434,9 @@ async def test_poison_message_writes_an_unclassified_schema_dlq_entry(
 ) -> None:
     """WO-R2-166 — the defaults, read back off the row.
 
-    The synthetic DLQ row is the observable side of the hook: real
-    consumers log-and-drop schema errors, so without it the agent's
-    remediation loop has nothing to react to. What that row says has now
-    been wrong twice. It shipped as `replay_safe` beside a
-    `SchemaValidationError` (WO-R2-146's live defect — the agent read it
-    right and was graded wrong), then as `replay_safe` beside an
-    `UpstreamTimeout` text, which passed the coherence screen while
-    describing a transient fault this hook never injects.
-
-    The hint moves instead of the text: a poisoned message is not safe to
-    replay, and a fresh one has been classified by nobody, so the default
-    row is NULL-hint with the schema-violation text it earned.
-    """
+    What that row says has been wrong twice: `replay_safe` beside a schema error, then beside an
+    `UpstreamTimeout` text. The hint moves, not the text — a poisoned message is not safe to replay
+    and a fresh one is classified by nobody, so the default is NULL-hint."""
     from app.lab.dlq_failure_stories import coherence_violations
     from app.models.job import Job
     from sqlalchemy import select as _select
@@ -522,9 +485,7 @@ async def test_poison_message_writes_an_unclassified_schema_dlq_entry(
         assert row.error_message is not None
         assert "SchemaValidationError" in row.error_message
         assert "missing required field" in row.error_message
-        # A permanent-fault text under a null hint is coherent — the hint is
-        # a classification, the text is a symptom, and neither invites a
-        # replay (see `app.lab.dlq_failure_stories`).
+        # A permanent-fault text under a null hint is coherent: neither invites a replay.
         assert not coherence_violations(None, row.error_message), (
             row.error_message
         )
@@ -548,13 +509,8 @@ async def test_poison_message_can_seed_the_row_already_human_required(
     default_tenant,  # type: ignore[no-untyped-def]
     test_user,  # type: ignore[no-untyped-def]
 ) -> None:
-    """The other declarable hint, for a scenario that wants the row already
-    categorised so `replay_dlq_by_category` refuses it on sight and the
-    escalate-not-replay branch is reachable without a triage step.
-
-    Same text either way: this hook injects one kind of fault, and the only
-    thing the argument changes is whether anything has classified it.
-    """
+    """The other declarable hint, for a scenario wanting the row pre-categorised so
+    `replay_dlq_by_category` refuses it on sight. Same text either way."""
     from app.lab.dlq_failure_stories import coherence_violations
     from app.models.enums import RemediationHint
     from app.models.job import Job
@@ -612,9 +568,8 @@ async def test_poison_message_can_seed_the_row_already_human_required(
 async def test_poison_message_refuses_a_replay_safe_hint_over_the_wire(
     db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
 ) -> None:
-    """The refusal an agent actually meets. `replay_safe` is not in the
-    hook's vocabulary, so the envelope rejects it as invalid input — and
-    nothing is published, because validation runs before the handler."""
+    """`replay_safe` is not in the hook's vocabulary, so the envelope refuses it before publishing.
+    """
     redis_stub = _RedisStub()
     app, teardown = _mcp_app_with_chaos_enabled(db_session, redis_stub)
 
@@ -652,16 +607,9 @@ async def test_poison_message_id_is_derived_from_tenant_and_fixture_name(
     default_tenant,  # type: ignore[no-untyped-def]
     test_user,  # type: ignore[no-untyped-def]
 ) -> None:
-    """A scenario pins this id in YAML before the hook runs, so the grader
-    can assert *which* row the agent acted on (commander cmd #187). The
-    recipe is exported rather than transcribed, and it is per-tenant: the
-    idempotency probe is RLS-scoped, so a foreign row under the same name
-    would be invisible to it and the INSERT would collide on the primary
-    key — a 500 where the contract promises a 409.
-
-    Also pins that the namespace differs from `create_bad_data_job`'s, which
-    is the property that lets both hooks use the same `fixture_name`.
-    """
+    """A scenario pins this id in YAML before the hook runs (commander cmd #187), and it is
+    per-tenant: the RLS-scoped probe cannot see a foreign row under the same name, so the INSERT
+    would collide — a 500 where the contract promises 409. Also pins the namespace split."""
     from app.mcp.tools.chaos.create_bad_data_job import (
         fixture_id as bad_data_fixture_id,
     )
@@ -712,19 +660,9 @@ async def test_poison_message_repeat_is_idempotent_until_it_drifts(
     default_tenant,  # type: ignore[no-untyped-def]
     test_user,  # type: ignore[no-untyped-def]
 ) -> None:
-    """Three properties in one round trip, because they only make sense
-    together:
-
-    1. A repeat that finds its row intact reports `created=False` and does
-       not manufacture a second row.
-    2. It still publishes. The Kafka half is a verb, not a fixture — every
-       accepted call really does put another poisoned message on the topic,
-       and the description says so.
-    3. Once the row has drifted the hook refuses, and refuses *before* the
-       producer starts. A drifted row is the run's evidence (something
-       fenced it, or a replay moved it), and rewriting it would hand the
-       next run a pre-remediated world and grade it clean.
-    """
+    """Three properties together: a repeat over an intact row reports `created=False` and writes no
+    second row; it still publishes, because the Kafka half is a verb not a fixture; and once the row
+    has drifted it refuses before the producer starts, because drift is the run's evidence."""
     from app.models.enums import RemediationHint
     from app.models.job import Job
     from sqlalchemy import select as _select
@@ -792,12 +730,8 @@ async def test_poison_message_repeat_is_idempotent_until_it_drifts(
 async def test_poison_message_kafka_unreachable_returns_clean_error(
     db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
 ) -> None:
-    """If Kafka is unreachable the tool must return a specific
-    `kafka_unavailable` error, not the generic -32603 mask. And it
-    must not leak the producer object (the `stop()` path always
-    runs). This is the regression class that broke the mcp compose
-    service in v0.4.0 → v0.4.2 when KAFKA_BOOTSTRAP_SERVERS was
-    unset."""
+    """An unreachable Kafka returns `kafka_unavailable`, not the generic -32603 mask, and never
+    leaks the producer (the v0.4.0 → v0.4.2 mcp compose regression)."""
     redis_stub = _RedisStub()
     app, teardown = _mcp_app_with_chaos_enabled(db_session, redis_stub)
 
@@ -829,12 +763,8 @@ async def test_poison_message_kafka_unreachable_returns_clean_error(
         teardown()
 
 
-# ---------------------------------------------------------------------------
-# Scope enforcement — one representative check per tool is overkill;
-# ADR-0007's dispatch layer already covers this. Do it once against
-# `saturate_redis` to prove the framework routes chaos denials into
-# `chaos.tool_denied` (see PR B's tests for the same shape).
-# ---------------------------------------------------------------------------
+# Scope enforcement once, against `saturate_redis`, to prove chaos denials route into
+# `chaos.tool_denied`; ADR 0007's dispatch layer covers the rest.
 
 
 async def test_saturate_redis_missing_chaos_scope_is_forbidden(
@@ -861,22 +791,15 @@ async def test_saturate_redis_missing_chaos_scope_is_forbidden(
         teardown()
 
 
-# ---------------------------------------------------------------------------
 # create_bad_data_job — the persistent-bug chaos hook (v0.4.0)
-# ---------------------------------------------------------------------------
 
 
 async def test_create_bad_data_job_inserts_human_required_dlq_entry(
     db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
 ) -> None:
-    """Omitting `remediation_hint` keeps the pre-v0.6.2 behaviour: the row
-    lands `human_required` so `replay_dlq_by_category` refuses to touch it
-    — the branch the agent's escalate-not-replay path exercises.
-
-    Also pins the two things WO-R2-158 added around it: the id is derived
-    from the tenant and `fixture_name` rather than random, and the row is
-    tagged as a declared fixture so the reset DELETEs it.
-    """
+    """Omitting `remediation_hint` keeps pre-v0.6.2 behaviour: the row lands `human_required` so
+    `replay_dlq_by_category` refuses it. WO-R2-158 also pins the derived id and the declared-fixture
+    tag the reset DELETEs on."""
     from app.lab.dlq_failure_stories import story
     from app.mcp.tools.chaos.create_bad_data_job import fixture_id
     from app.models.enums import RemediationHint
@@ -904,9 +827,7 @@ async def test_create_bad_data_job_inserts_human_required_dlq_entry(
             payload["remediation_hint"]
             == RemediationHint.HUMAN_REQUIRED.value
         )
-        # Deterministic and pinnable: the caller could have computed this
-        # before invoking, which is what lets a scenario name the row it
-        # grades in YAML written before the run.
+        # Deterministic and pinnable: a scenario can name the row it grades in YAML.
         assert payload["fixture_name"] == "bad-data-job"
         assert payload["job_id"] == str(
             fixture_id(default_tenant.id, "bad-data-job")
@@ -939,19 +860,9 @@ async def test_create_bad_data_job_can_leave_the_row_unclassified(
     test_user,  # type: ignore[no-untyped-def]
     declared: str | None,
 ) -> None:
-    """WO-R2-158 / the `dlq_human_required_escalates` drill.
-
-    Seeded pre-classified, the fence the drill grades is a value the row
-    already has. With `remediation_hint` unclassified the row arrives with
-    a NULL hint and a bad-data error text, so the agent has to read the
-    error, conclude a replay cannot fix a bad row in the stored payload,
-    and raise the fence itself.
-
-    Both spellings are tested because a scenario file that means an empty
-    hint naturally writes `null`, while the inputSchema an agent reads is
-    clearer as a word. Omitting the field is a third thing and must NOT
-    land here — that is the test above.
-    """
+    """WO-R2-158 / the `dlq_human_required_escalates` drill: unclassified, the row arrives
+    NULL-hinted with a bad-data text, so the agent has to raise the fence itself. Both spellings are
+    tested; omitting the field is a third thing and must not land here."""
     from app.lab.dlq_failure_stories import coherence_violations, story
     from app.mcp.tools.chaos.create_bad_data_job import fixture_id
     from app.models.job import Job
@@ -1018,15 +929,9 @@ async def test_create_bad_data_job_can_leave_the_row_unclassified(
 async def test_create_bad_data_job_repeat_is_idempotent_until_it_drifts(
     db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
 ) -> None:
-    """Same contract as `create_stuck_dag`: a repeat that finds the row
-    still matching is a no-op; once it has drifted the hook refuses rather
-    than rewriting a row that is now evidence.
-
-    The load-bearing drift here is the *hint*, not the status. A fence is
-    exactly what the drill measures, so silently returning `created=False`
-    over a fenced row would hand the next run a pre-fenced world and grade
-    it clean.
-    """
+    """Same contract as `create_stuck_dag`: a repeat over a matching row is a no-op, a drifted row
+    is refused. The load-bearing drift is the hint, not the status — the fence is what the drill
+    measures."""
     from app.models.enums import RemediationHint
     from app.models.job import Job
     from sqlalchemy import select as _select
@@ -1056,9 +961,7 @@ async def test_create_bad_data_job_repeat_is_idempotent_until_it_drifts(
             assert repeat["created"] is False
             assert repeat["job_id"] == first["job_id"]
 
-            # Declaring a different hint over the same name is drift too:
-            # returning the stored row would report a fixture the caller
-            # did not ask for.
+            # A different hint over the same name is drift too.
             mismatched = await _call(
                 ac,
                 token,
@@ -1098,14 +1001,8 @@ async def test_create_bad_data_job_repeat_is_idempotent_until_it_drifts(
 async def test_create_bad_data_job_ids_are_scoped_to_the_calling_tenant(
     db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
 ) -> None:
-    """The tenant is in the uuid5 key so two tenants can drill the same
-    `fixture_name` concurrently.
-
-    Without it the second tenant's INSERT would collide on a primary key
-    its RLS-scoped probe cannot see — a 500 where the contract promises a
-    409. Same reasoning as `create_stuck_dag`'s per-tenant chain ids
-    (WO-R2-55); widening the probe past RLS would be the wrong repair.
-    """
+    """The tenant is in the uuid5 key so two tenants can drill the same `fixture_name`; without it
+    the second INSERT collides on a key its RLS-scoped probe cannot see (WO-R2-55)."""
     from app.mcp.tools.chaos.create_bad_data_job import fixture_id
     from app.models.job import Job
     from app.models.tenant import Tenant
@@ -1241,11 +1138,8 @@ async def test_seed_dlq_messages_rejects_unknown_hint(
 async def test_create_bad_data_job_lazy_creates_chaos_owner_in_caller_tenant(
     db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
 ) -> None:
-    """FIX_PLAN #8: when the caller's tenant has no users, chaos must
-    lazy-create a user IN THE CALLER'S TENANT — never fall back to a
-    user from another tenant (violates ADR 0003 isolation). Verified
-    by creating a fresh tenant with zero users and asserting the job's
-    user_id ends up in that same tenant."""
+    """FIX_PLAN #8: with no users in the caller's tenant, chaos lazy-creates one there — never
+    borrows a user from another tenant (ADR 0003)."""
     from app.models.job import Job
     from app.models.tenant import Tenant
     from app.models.user import User
@@ -1286,9 +1180,7 @@ async def test_create_bad_data_job_lazy_creates_chaos_owner_in_caller_tenant(
                 _select(Job).where(Job.id == uuid.UUID(payload["job_id"]))
             )
         ).scalar_one()
-        # The load-bearing invariant: job.tenant_id and the owning
-        # user.tenant_id must match. Pre-v0.4.6 this would have been
-        # violated (job goes to fresh_tenant, user pulled from default).
+        # The load-bearing invariant: job.tenant_id and the owning user.tenant_id match.
         assert job.tenant_id == fresh_tenant.id
         owner = (
             await db_session.execute(
@@ -1301,10 +1193,8 @@ async def test_create_bad_data_job_lazy_creates_chaos_owner_in_caller_tenant(
         assert owner.is_active is False
         assert owner.email.startswith("chaos-owner")
 
-        # Second call in the same tenant is an idempotent repeat: same
-        # deterministic id, `created=False`, and no proliferation of
-        # chaos-owner rows. (Before WO-R2-158 this inserted a second,
-        # randomly-idded row that merely happened to reuse the owner.)
+        # A second call in the same tenant is an idempotent repeat: same id, `created=False`, no
+        # extra chaos-owner rows.
         async with AsyncClient(
             transport=ASGITransport(app=app, raise_app_exceptions=False),
             base_url="http://test",
@@ -1330,9 +1220,7 @@ async def test_create_bad_data_job_lazy_creates_chaos_owner_in_caller_tenant(
         teardown()
 
 
-# ---------------------------------------------------------------------------
 # create_mislabeled_dlq_job — the one sanctioned incoherent row (WO-R2-166)
-# ---------------------------------------------------------------------------
 
 
 async def test_create_mislabeled_dlq_job_writes_the_incoherent_pair(
@@ -1340,17 +1228,9 @@ async def test_create_mislabeled_dlq_job_writes_the_incoherent_pair(
     default_tenant,  # type: ignore[no-untyped-def]
     test_user,  # type: ignore[no-untyped-def]
 ) -> None:
-    """The fixture for "the classifier lied": hint `replay_safe`, text a
-    permanent bad-data fault. The row is supposed to contradict itself, so
-    this test asserts the contradiction is really there AND that the
-    coherence screen still reports it.
-
-    That second half is the load-bearing one. Every other lab row is held
-    to the rule that a text must match the action its hint prescribes
-    (WO-R2-146). If the screen ever stopped flagging this row, the sanctioned
-    exception would have become a hole in the rule and the original defect
-    could walk back in through it.
-    """
+    """The fixture for "the classifier lied": hint `replay_safe`, text a permanent bad-data fault.
+    The load-bearing half is that the coherence screen still reports it — a sanctioned exception
+    that stopped being flagged would be a hole in WO-R2-146's rule."""
     from app.lab.dlq_failure_stories import coherence_violations
     from app.models.enums import RemediationHint
     from app.models.job import Job
@@ -1390,9 +1270,8 @@ async def test_create_mislabeled_dlq_job_writes_the_incoherent_pair(
         assert row.error_message is not None
         assert "invalid literal for int()" in row.error_message
         assert row.error_message == payload["error_message"]
-        # The screen must still call this out. Asserting the reason, not just
-        # that there is one, so a screen that flagged it for some unrelated
-        # wording change would not satisfy this test.
+        # Assert the reason, not just that there is one, so an unrelated wording flag would not
+        # satisfy this.
         reasons = coherence_violations(
             row.remediation_hint, row.error_message
         )
@@ -1423,11 +1302,7 @@ async def test_create_mislabeled_dlq_job_needs_the_explicit_flag(
     default_tenant,  # type: ignore[no-untyped-def]
     arguments: dict[str, Any],
 ) -> None:
-    """The second gate (the tool's name is the first). `mislabel` has no
-    default and accepts only `true`, so an incoherent row can never be the
-    result of a call that did not say what it was asking for — and there is
-    no coherent row this tool could fall back to writing.
-    """
+    """The second gate after the tool's name: `mislabel` has no default and accepts only `true`."""
     from app.models.job import Job
     from sqlalchemy import func as _func
     from sqlalchemy import select as _select
@@ -1465,10 +1340,7 @@ async def test_create_mislabeled_dlq_job_id_is_deterministic_and_distinct(
     default_tenant,  # type: ignore[no-untyped-def]
     test_user,  # type: ignore[no-untyped-def]
 ) -> None:
-    """A scenario pins this id before the hook runs, and the grading here
-    is mostly "the agent left this exact row alone" — so the id has to be
-    computable in advance and must not collide with a sibling hook's row
-    under the same `fixture_name`."""
+    """The id must be computable before the run and must not collide with a sibling hook's row."""
     from app.mcp.tools.chaos.create_bad_data_job import (
         fixture_id as bad_data_fixture_id,
     )
@@ -1514,10 +1386,8 @@ async def test_create_mislabeled_dlq_job_repeat_is_idempotent_until_it_drifts(
     default_tenant,  # type: ignore[no-untyped-def]
     test_user,  # type: ignore[no-untyped-def]
 ) -> None:
-    """On this fixture a drifted row is the most interesting thing in the
-    run — it means the agent believed the label and replayed a row whose
-    text says the payload is broken. Overwriting it would destroy the
-    result, so the hook refuses instead."""
+    """A drifted row means the agent believed the label and replayed it: that is the run's result,
+    so the hook refuses."""
     from app.models.enums import JobStatus
     from app.models.job import Job
     from sqlalchemy import select as _select
@@ -1570,17 +1440,13 @@ async def test_create_mislabeled_dlq_job_repeat_is_idempotent_until_it_drifts(
 async def test_create_mislabeled_dlq_job_not_registered_when_chaos_disabled(
     db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
 ) -> None:
-    """ADR 0008 gate 1, on the newest chaos tool. A hook that can write a
-    deliberately misleading row is exactly the kind that must be absent
-    from `tools/list` on a stack with chaos off."""
+    """ADR 0008 gate 1 on the newest chaos tool: absent from `tools/list` with chaos off."""
     from app.mcp.registry import get_tool
 
     assert get_tool("create_mislabeled_dlq_job") is None
 
 
-# ---------------------------------------------------------------------------
 # create_stale_cache — hot_set chaos hook (v0.4.7 / FIX_PLAN #24 item 2)
-# ---------------------------------------------------------------------------
 
 
 async def test_create_stale_cache_not_registered_when_chaos_disabled(
@@ -1647,9 +1513,7 @@ async def test_create_stale_cache_populates_default_hot_set_key(
 async def test_create_stale_cache_refuses_key_outside_allowlist(
     db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
 ) -> None:
-    """Key must be under a prefix that `invalidate_cache_key` accepts —
-    otherwise the compensator would refuse to clear it and the
-    round-trip is broken."""
+    """The key must be under a prefix `invalidate_cache_key` accepts, or the round-trip breaks."""
     redis_stub = _RedisStub()
     app, teardown = _mcp_app_with_chaos_enabled(db_session, redis_stub)
     try:
@@ -1675,14 +1539,9 @@ async def test_create_stale_cache_refuses_key_outside_allowlist(
 async def test_create_stale_cache_round_trip_with_invalidate_cache_key(
     db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
 ) -> None:
-    """The load-bearing contract test per ADR 0008 amendment: every
-    chaos hook must name a compensator + link a round-trip test.
-    Sequence:
-      1. create_stale_cache populates the hot_set key.
-      2. invalidate_cache_key clears it.
-      3. Redis stub confirms the key is gone.
-    If this fails, the `remediate_stale_cache_success` scenario is
-    unwinnable — the compensator can't undo what the chaos hook did."""
+    """ADR 0008's amendment: every chaos hook names a compensator and links a round-trip test.
+    `create_stale_cache` populates the hot_set key, `invalidate_cache_key` clears it; without that
+    pair `remediate_stale_cache_success` is unwinnable."""
     redis_stub = _RedisStub()
     app, teardown = _mcp_app_with_chaos_enabled(db_session, redis_stub)
     try:
@@ -1725,11 +1584,8 @@ async def test_create_stale_cache_round_trip_with_invalidate_cache_key(
 async def test_create_stale_cache_refuses_the_live_job_read_cache_key(
     db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
 ) -> None:
-    """R2-20: `cache:` is a prefix of the platform's live per-job read
-    cache `cache:job:{tenant}:{job}`. Writing this hook's JSON array
-    there breaks `GET /jobs/{id}` for real users until the TTL lapses.
-    The hook must refuse the key before any Redis call, the same way
-    `get_cache_key_info` refuses a namespace it does not own."""
+    """R2-20: `cache:` prefixes the live per-job read cache, so the hook must refuse
+    `cache:job:{tenant}:{job}` before any Redis call."""
     redis_stub = _RedisStub()
     app, teardown = _mcp_app_with_chaos_enabled(db_session, redis_stub)
     live_key = f"cache:job:{default_tenant.id}:{uuid.uuid4()}"
@@ -1755,11 +1611,8 @@ async def test_create_stale_cache_refuses_the_live_job_read_cache_key(
 async def test_poison_message_lazy_creates_chaos_owner_on_unseeded_tenant(
     db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
 ) -> None:
-    """R2-16: the synthetic DLQ row is `poison_message`'s only observable
-    effect (real consumers log-and-drop schema errors). On a tenant with
-    no users the hook used to skip the row and still answer
-    accepted=true, leaving the scenario unwinnable. Both sibling hooks
-    lazy-create a chaos owner for exactly this case — so must this one."""
+    """R2-16: on a tenant with no users the hook used to skip its only observable row and still
+    answer accepted=true, leaving the scenario unwinnable."""
     from app.models.job import Job
     from app.models.tenant import Tenant
     from app.models.user import User
@@ -1825,11 +1678,8 @@ async def test_poison_message_lazy_creates_chaos_owner_on_unseeded_tenant(
 async def test_poison_message_send_failure_returns_typed_broker_error(
     db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
 ) -> None:
-    """R2-16: only `start()` was inside the broad catch, so a
-    `send_and_wait` failure (unknown topic, no leader, auth) escaped as
-    an opaque -32603 the ChaosClient buckets as a transport fault. It
-    needs its own code — `kafka_unavailable` would be a misnomer for a
-    broker that answered and rejected the send."""
+    """R2-16: only `start()` sat inside the broad catch, so a `send_and_wait` failure escaped as an
+    opaque -32603 the ChaosClient buckets as transport. It needs its own code."""
     redis_stub = _RedisStub()
     app, teardown = _mcp_app_with_chaos_enabled(db_session, redis_stub)
     producer = AsyncMock()
@@ -1861,12 +1711,8 @@ async def test_poison_message_send_failure_returns_typed_broker_error(
 async def test_seed_dlq_messages_unknown_hint_is_a_validation_error(
     db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
 ) -> None:
-    """R2-16: strengthens `test_seed_dlq_messages_rejects_unknown_hint`.
-    A bare `ValueError` reached the client as -32603 `internal tool
-    error` and logged `mcp tool crashed` — indistinguishable from a real
-    platform fault. Constraining the field on the input model rejects it
-    at parse time with -32602 instead, and the enumerated values become
-    visible in the tool's inputSchema."""
+    """R2-16: a bare `ValueError` reached the client as -32603 `internal tool error`. Constraining
+    the field on the input model refuses it at parse time and puts the values in the inputSchema."""
     redis_stub = _RedisStub()
     app, teardown = _mcp_app_with_chaos_enabled(db_session, redis_stub)
     try:
@@ -1899,10 +1745,8 @@ async def test_seed_dlq_messages_unknown_hint_is_a_validation_error(
 
 
 def test_seed_dlq_hint_literal_matches_the_enum() -> None:
-    """R2-16: the hint values are spelled out on the input model so they
-    reach the agent through the tool's inputSchema. That copy can drift
-    from `RemediationHint` — if the enum gains a member the tool would
-    silently refuse a legitimate hint. Pin the two together."""
+    """The hint literal on the input model can drift from `RemediationHint`, so pin the two
+    together."""
     import typing
 
     from app.mcp.tools.chaos.seed_dlq_messages import _HINT_VALUES
@@ -1923,17 +1767,9 @@ async def test_seeded_dlq_row_text_agrees_with_its_hint(
     test_user,  # type: ignore[no-untyped-def]
     hint: str,
 ) -> None:
-    """WO-R2-146, end to end for the declared-fixture hook.
-
-    A scenario that declares only a hint gets the canned text for it,
-    and the agent reads both fields off the same row. This hook's table
-    used to pair `replay_safe` with a SchemaValidationError, which is a
-    permanent data fault — an agent following the error refuses the
-    replay the hint asks for, and the scenario grades it wrong.
-
-    Read back through the wire rather than off the table, so a hook that
-    stopped consulting the table fails here.
-    """
+    """WO-R2-146 end to end: a scenario declaring only a hint gets the canned text for it. The table
+    used to pair `replay_safe` with a permanent schema fault. Read back through the wire, so a hook
+    that stopped consulting the table fails here."""
     from app.lab.dlq_failure_stories import coherence_violations
     from app.models.job import Job
     from sqlalchemy import select as _select
@@ -1972,17 +1808,13 @@ async def test_seeded_dlq_row_text_agrees_with_its_hint(
         teardown()
 
 
-# ---------------------------------------------------------------------------
 # pause_control_loop (WO-R3-200)
-# ---------------------------------------------------------------------------
 
 
 async def test_pause_control_loop_not_registered_when_chaos_disabled(
     db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
 ) -> None:
-    """Gate 1 of ADR 0008 at the surface: no CHAOS_ENABLED patch here, so the
-    default app must answer MCP_TOOL_NOT_FOUND and `tools/list` must not carry
-    the name — a read-scoped agent cannot learn the hook exists."""
+    """ADR 0008 gate 1 at the surface: MCP_TOOL_NOT_FOUND, and the name absent from `tools/list`."""
     from app.mcp.standalone import create_mcp_app
 
     redis_stub = _RedisStub()
@@ -2041,9 +1873,7 @@ async def test_pause_control_loop_sets_the_key_with_a_ttl(
         assert payload["loop_name"] == "outbox_relay"
         assert payload["accepted"] is True
         assert payload["ttl_seconds"] == 45
-        # The relay turns once a second, so a 45s pause is comfortably
-        # observable — and the tool says so rather than leaving it to be
-        # inferred.
+        # The relay turns once a second, so a 45s pause is comfortably observable.
         assert payload["tick_interval_seconds"] == 1.0
         assert redis_stub._store["chaos:pause:outbox_relay"] == "paused"
         # TTL-bounded and reversible without a second call (ADR 0008/0027).
@@ -2087,13 +1917,8 @@ async def test_pause_control_loop_refuses_a_loop_outside_the_enum(
     default_tenant,  # type: ignore[no-untyped-def]
     loop_name: str,
 ) -> None:
-    """Refused at parse time as invalid params — not accepted and matched
-    against nothing.
-
-    The three consumer-group names are in the list deliberately: an earlier
-    draft of the enum carried them (divergence H2), so a caller written against
-    that draft has to fail loudly rather than set a key no loop reads. The
-    right call for those is `kill_consumer`.
+    """Refused at parse time. The three consumer-group names are listed deliberately: an earlier
+    draft of the enum carried them (divergence H2), and the right call for those is `kill_consumer`.
     """
     redis_stub = _RedisStub()
     app, teardown = _mcp_app_with_chaos_enabled(db_session, redis_stub)
@@ -2168,12 +1993,8 @@ async def test_pause_control_loop_missing_chaos_scope_is_forbidden(
 async def test_pause_control_loop_advertises_every_loop_it_can_pause(
     db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
 ) -> None:
-    """The schema the caller reads is the enum the loops implement.
-
-    `tools/list` is the only place a caller learns the closed set from, so the
-    two must not be able to drift: `test_pause_control_loop.py` ties the enum
-    to the loops, and this ties the wire to the enum.
-    """
+    """`tools/list` is the only place a caller learns the closed set: this ties the wire to the
+    enum, `test_pause_control_loop.py` ties the enum to the loops."""
     from app.workers.control_loop_pause import ControlLoopName
 
     redis_stub = _RedisStub()

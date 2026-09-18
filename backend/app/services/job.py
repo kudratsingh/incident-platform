@@ -65,10 +65,7 @@ class JobService:
         A job whose parents are unfinished — or whose chain is paused — starts
         WAITING and is announced later; anything else is announced now.
         """
-        # `None` means "the platform default", which is `MAX_JOB_ATTEMPTS`
-        # — not a literal 3 restated here (WO-R2-76). Callers that want a
-        # different ceiling for one job (the saga coordinator, per step)
-        # still pass it explicitly and win.
+        # `None` means the `MAX_JOB_ATTEMPTS` default, not a literal 3 (WO-R2-76).
         if max_attempts is None:
             max_attempts = _default_max_attempts()
 
@@ -100,13 +97,8 @@ class JobService:
         has_unmet = any(p.status != JobStatus.COMPLETED for p in parent_jobs)
         initial_status = JobStatus.WAITING if has_unmet else JobStatus.PENDING
 
-        # E1-08: all-COMPLETED parents used to mean "dispatch now" even
-        # when those parents sit in a paused chain, so creating a job onto
-        # a paused DAG dispatched it immediately. Hold it WAITING instead —
-        # a WAITING job with all deps met is exactly what
-        # `_resume_unblocked_waiting_loop` promotes once the pause lifts,
-        # so no new resume machinery is needed. Dep-less jobs join no
-        # chain and are deliberately out of scope.
+        # E1-08: all-COMPLETED parents used to dispatch immediately even onto a paused
+        # chain. Hold WAITING; `_resume_unblocked_waiting_loop` promotes it on unpause.
         if initial_status == JobStatus.PENDING and deps and self.dep_repo is not None:
             for parent in parent_jobs:
                 paused_by = await find_blocking_pause(
@@ -130,18 +122,10 @@ class JobService:
         if otel_ctx:
             enriched_payload["__traceparent"] = otel_ctx
 
-        # Idempotency guard against the check-then-insert race: two concurrent
-        # POST /jobs with the same key both pass the pre-check above, both
-        # reach here, and the composite UNIQUE on (tenant_id, idempotency_key)
-        # rejects the loser with IntegrityError. Without catching it, that
-        # request 500s instead of returning the winner's row.
-        #
-        # Fix: wrap the create in a savepoint. On collision, roll back only
-        # the savepoint (leaving the outer request tx alive), then re-fetch
-        # by idempotency key. If the re-fetch finds a row, it's the winner —
-        # return it. If not, the IntegrityError was from some OTHER
-        # constraint and we surface it (should be impossible with the
-        # current schema but staying defensive).
+        # Guards the check-then-insert race: the composite UNIQUE on
+        # (tenant_id, idempotency_key) rejects the loser, so roll back only the
+        # savepoint and re-fetch — a hit is the winner's row, a miss is some
+        # other constraint and surfaces.
         session = self.job_repo.session
         try:
             async with session.begin_nested():
@@ -303,11 +287,8 @@ class JobService:
     ) -> Job:
         """Replay a failed/dead-letter job.
 
-        Callers pass either a `requesting_user_id` (human path, existing
-        admin endpoint) or an explicit `principal_type='service_account'`
-        + `principal_id=<sa_id>` (machine path, MCP tools). Writing the
-        SA id into `audit_logs.user_id` violates the users FK — that was
-        the bug PR #70 fixes.
+        Human callers pass `requesting_user_id`; machine callers pass `principal_type` +
+        `principal_id`, because an SA id in `audit_logs.user_id` violates the users FK.
         """
         job = await self.job_repo.get_for_tenant(job_id, tenant_id)
         if not job:
@@ -315,17 +296,9 @@ class JobService:
         if job.status not in (JobStatus.FAILED, JobStatus.DEAD_LETTER):
             raise JobError(f"Only failed/dead_letter jobs can be replayed, got: {job.status}")
 
-        # E1-08: a replay is a NEW dispatch, not the "work in flight"
-        # `pause_dag` deliberately does not recall — so it must respect the
-        # pause. This is the single choke point for the admin endpoint, the
-        # three MCP replay tools and the scheduled DLQ-replay loop, and the
-        # refusal has to precede every mutation below: a job already flipped
-        # to PENDING with an audit row and an outbox event has been
-        # dispatched whatever the caller does with the exception.
-        #
-        # The scheduled loop probes the pause itself and re-schedules — it
-        # never relies on this refusal, because its except deliberately
-        # drops failed items.
+        # E1-08: a replay is a NEW dispatch, so it must respect the pause. This is the
+        # single choke point for the admin endpoint, the three MCP replay tools and the
+        # scheduled DLQ-replay loop, and the refusal must precede every mutation below.
         if self.dep_repo is not None:
             paused_by = await find_blocking_pause(self.redis, self.dep_repo, job_id)
             if paused_by is not None:
@@ -334,20 +307,12 @@ class JobService:
                     "replay refused while the pause holds"
                 )
 
-        # Snapshot everything the audit trail needs BEFORE the write
-        # (R2-23). `update_status` writes through the same identity-mapped
-        # `job` object this method is holding, so every read of `job.*`
-        # below the next statement returns the post-replay value. The
-        # `previous_status` read used to sit after it and therefore
-        # recorded "pending" — the status replayed *to* — on every replay
-        # the platform has ever done, and nothing else in the system
-        # remembers what the job was replayed *from*.
+        # Snapshot before the write (R2-23): `update_status` writes through this same
+        # identity-mapped `job`, so a later read of `job.status` returns "pending".
         previous_retry_count = job.retry_count
         previous_status = job.status
 
-        # Reset retry_count so a DLQ replay actually gets fresh retries.
-        # Without this, a job at retry_count==max_attempts would dead-letter
-        # again on the first failure of its replayed run.
+        # Reset retry_count, or the job dead-letters again on its first failure.
         updated = await self.job_repo.update_status(
             job_id,
             JobStatus.PENDING,
@@ -355,27 +320,17 @@ class JobService:
                 "retry_count": 0,
                 "error_message": None,
                 "result": None,
-                # Clear the previous run's DLQ attribution too — a replay is a
-                # fresh lifecycle, and a stale value would badge the row for
-                # a dead-letter that this run has not had (F2-16).
+                # Clear the previous run's DLQ attribution — a replay is a
+                # fresh lifecycle (F2-16).
                 "dead_lettered_by": None,
-                # And the remediation category with it (R2-23). It is scoped
-                # to one dead-letter episode exactly as `dead_lettered_by`
-                # is, but nothing in production could ever clear it — so one
-                # classification governed how the agent routed every later,
-                # unrelated dead-letter of this job. That also keeps the
-                # `human_required` fence honest in both directions: the
-                # blind bulk replay skips the category (R2-22), and this is
-                # what stops that skip from becoming permanent. A job that
-                # dead-letters again arrives uncategorised, and triage (or a
-                # human) classifies the new episode on its own evidence.
+                # And the remediation category with it (R2-23): it is scoped to
+                # one dead-letter episode, so a surviving one would route every
+                # later, unrelated dead-letter of this job. That is also what
+                # stops the bulk replay's skip of it (R2-22) being permanent.
                 "remediation_hint": None,
-                # And the fence stamps that recorded who set that category
-                # and when (WO-R2-158). Same episode scope as the hint they
-                # describe: a `fenced_at` surviving a replay would sit next
-                # to a NULL `remediation_hint`, saying "an operator fenced
-                # this row" about a classification that no longer exists —
-                # the exact incoherence those columns were added to remove.
+                # And the fence stamps for that category (WO-R2-158) — a
+                # `fenced_at` beside a NULL hint describes a classification
+                # that no longer exists.
                 "fenced_at": None,
                 "fenced_by": None,
             },
@@ -418,10 +373,8 @@ class JobService:
                 "trace_id": job.trace_id,
             },
         )
-        # Same snapshots as the audit row, for the same reason: both fields
-        # read post-write here too, so the log line said `previous_status:
-        # pending, retry_count: 0` for every replay ever logged — the one
-        # place an operator looks first when the audit row is not to hand.
+        # Same snapshots as the audit row, for the same reason (R2-23) — both
+        # fields read post-write here too.
         logger.info(
             "job.replayed",
             extra={
@@ -434,21 +387,10 @@ class JobService:
                 "principal_type": principal_type,
             },
         )
-        # Invalidate here, in the service, not in the REST wrapper (E2-02):
-        # this is the single choke point every replay path goes through —
-        # the three MCP replay tools, the scheduled DLQ-replay loop in
-        # workers/dispatcher.py, and POST /admin/jobs/{id}/replay. Doing it
-        # only in the REST wrapper left GET /jobs/{id} serving the pre-replay
-        # status for a whole TTL after any agent-driven replay.
-        #
-        # Deferred to post-commit (R2-23) rather than run inline: until this
-        # transaction commits the cached row is still what every other
-        # connection reads, so evicting it now would only invite a
-        # concurrent reader to miss, read the *unchanged* row from
-        # Postgres, and cache it again — landing the stale status behind
-        # our own commit. `JobCache.invalidate` closes the slot as well as
-        # clearing it, which is what stops the reader that started before
-        # the commit from winning the write after it.
+        # Invalidate in the service, not the REST wrapper (E2-02): this is the single
+        # choke point every replay path goes through. Deferred to post-commit (R2-23) —
+        # evicting before the commit invites a reader to cache the unchanged row behind
+        # it; `JobCache.invalidate` closes the slot as well as clearing it.
         register_post_commit(
             self.job_repo.session,
             partial(JobCache.invalidate, self.redis, job_id, tenant_id),

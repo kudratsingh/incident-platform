@@ -1,22 +1,10 @@
 """
 LLM-driven triage for dead-lettered jobs.
 
-When a job exhausts its retries and dead-letters, this service asks Claude
-to classify the root cause, summarise the failure, and suggest a fix. The
-result is persisted to `job_triages` and surfaced to admins so they don't
-have to read raw stack traces to decide between Replay and Resolve.
-
-Implementation notes
---------------------
-- Uses the Anthropic Python SDK with `messages.parse()` to get a validated
-  Pydantic object back — the model's response is shape-checked against
-  `TriageAnalysis` before we touch the DB.
-- Default model is `claude-opus-4-7` with adaptive thinking — failure
-  diagnosis is an intelligence-sensitive task and the cost is per-DLQ, not
-  per-request, so paying for the top tier is the right call.
-- System prompt is cached: it carries the failure taxonomy + the platform
-  description and never changes across triages, so the per-call cost is
-  dominated by the (small) per-job context.
+Asks Claude to classify the root cause, summarise the failure and suggest a fix;
+persisted to `job_triages` so an admin can choose Replay vs Resolve without reading a
+stack trace. `messages.parse()` shape-checks the response against `TriageAnalysis` before
+the DB sees it; `claude-opus-4-7` with adaptive thinking, taxonomy prompt cached.
 """
 
 import asyncio
@@ -50,8 +38,7 @@ RootCauseCategory = Literal[
 
 
 class TriageAnalysis(BaseModel):
-    """The Pydantic schema the model fills in. Constrains every triage to the
-    same fixed shape so the admin UI can render it without conditional logic."""
+    """The Pydantic schema the model fills in — one fixed shape for every triage."""
 
     root_cause_category: RootCauseCategory = Field(
         description="One of the fixed categories that best fits the failure."
@@ -87,36 +74,21 @@ class TriageAnalysis(BaseModel):
 # Analysis → remediation category
 # ---------------------------------------------------------------------------
 
-# Below this, the analysis is a guess and gets no category (R2-24). NULL
-# already means "not categorised, treat as unknown, not replay-safe", which
-# is the honest reading of a guess — and it is what every DLQ tool already
-# advertises, so declining to write costs nothing in contract terms.
-#
-# Both directions are gated, not just the replayable ones. A low-confidence
-# `replay_safe` feeds `replay_dlq_by_category` a job that re-fails; a
-# low-confidence `human_required` over-claims a persistent bug and escalates
-# a job nobody needed to look at. The column is for what triage knows, not
-# for what it suspects.
+# Below this, the analysis is a guess and gets no category (R2-24) — NULL already means
+# "not categorised, not replay-safe". Both directions are gated: a low-confidence
+# `replay_safe` re-fails, and a low-confidence `human_required` escalates needlessly.
 _MIN_HINT_CONFIDENCE = 0.5
 
-# Retryable, but not *yet* — something else has to come back first, which is
-# exactly the distinction `wait_and_replay` exists to carry. Replaying these
-# immediately is not wrong so much as early: it burns the retry against a
-# dependency that is still down.
+# Retryable, but not *yet* — the distinction `wait_and_replay` carries. Replaying now
+# burns the retry against a dependency that is still down.
 _DEPENDENCY_CATEGORIES = frozenset({"external_api_failure", "infrastructure"})
 
 
 def remediation_hint_for(analysis: TriageAnalysis) -> str | None:
     """Map a `TriageAnalysis` onto a `RemediationHint`, or None.
 
-    None is a real answer and the default one: the caller writes no
-    category rather than a placeholder, because NULL is the value every
-    DLQ tool already treats as "unknown, not replay-safe". Returning a
-    category is a claim, and this only makes claims it can support.
-
-    `is_retryable` is read before the root cause because it is the
-    narrower question — the model is asked directly whether replaying
-    as-is is likely to work, and the taxonomy only refines the yes.
+    None is the default and a real answer — NULL is what every DLQ tool treats as
+    "unknown, not replay-safe". `is_retryable` is read first as the narrower question.
     """
     if analysis.confidence < _MIN_HINT_CONFIDENCE:
         return None
@@ -135,9 +107,7 @@ def remediation_hint_for(analysis: TriageAnalysis) -> str | None:
 # Prompts
 # ---------------------------------------------------------------------------
 
-# Frozen across requests so it caches cleanly. No timestamps or per-request
-# data is interpolated here — those go in the user message after the
-# cache_control breakpoint.
+# Frozen across requests so it caches cleanly; per-request data goes in the user message.
 _SYSTEM_PROMPT = """\
 You are the on-call triage assistant for an internal Incident & Workflow
 Platform. Each job in the system goes through retries; when it exhausts
@@ -199,12 +169,8 @@ async def triage_failure(
 ) -> tuple[TriageAnalysis, dict[str, Any], str]:
     """Call Claude and return (analysis, usage_dict, model_id).
 
-    Raises TriageDisabledError when triage is off, anthropic / network
-    exceptions on real API failures, and asyncio.TimeoutError when the call
-    exceeds `llm_triage_timeout_seconds` (ADR 0005). As in `retry_policy`,
-    this service does not decide what a failure means — the caller owns the
-    fallback, because "no triage row" and "retry later" are the consumer's
-    call to make, not the prompt's.
+    Raises TriageDisabledError when off; anthropic errors and `llm_triage_timeout_seconds`
+    timeouts propagate (ADR 0005). The caller owns the fallback, not this service.
     """
     settings = get_settings()
     if not settings.llm_triage_enabled:

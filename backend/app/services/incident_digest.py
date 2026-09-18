@@ -1,26 +1,10 @@
 """
 Periodic incident summaries.
 
-The digest worker collects per-tenant failure stats for a window and
-hands a small structured aggregate to Claude. The model returns:
-
-  * a one-paragraph narrative ("what happened, what we did, what we learned")
-  * a short list of `key_concerns` — failure modes that recurred
-  * a short list of `recommended_actions` — concrete next steps for ops
-
-Persisted to `incident_summaries` for the admin Digests tab.
-
-Why the LLM rather than a static template: the value here is in
-identifying *patterns* across hundreds of events — "every csv_upload
-failure mentioned malformed UTF-8 in column 3" is a sentence a template
-can't generate, but a model with the raw aggregates can. A static
-template gets you a count; an LLM gets you a hypothesis.
-
-Implementation mirrors the other LLM services in this codebase:
-  * messages.parse() + Pydantic schema → no raw JSON parsing.
-  * claude-opus-4-7 + adaptive thinking.
-  * Frozen system prompt with cache_control: ephemeral so the
-    instructions cache across digests.
+Collects per-tenant failure stats for a window and asks Claude for a one-paragraph
+narrative plus `key_concerns` and `recommended_actions`; persisted to `incident_summaries`
+for the admin Digests tab. An LLM rather than a template because the value is the pattern
+across hundreds of events, not the count. Same shape as the other LLM services here.
 """
 
 import asyncio
@@ -113,14 +97,10 @@ def is_enabled() -> bool:
 
 
 def _top_errors(error_messages: list[str], n: int = 5) -> list[dict[str, Any]]:
-    """Bucket error messages by a normalized fingerprint and return the top N
-    with their counts. Keeps the LLM payload small even when there are
-    thousands of failures.
+    """Bucket error messages by fingerprint; return the top N with counts.
 
-    The fingerprint truncates to 120 chars and collapses runs of digits to a
-    single `#`. That way "attempt 1" / "attempt 2" / "attempt 17" all bucket
-    together — the recurring *pattern* is what's interesting, not the
-    specific attempt number.
+    Truncates to 120 chars and collapses digit runs to `#`, so "attempt 1" and
+    "attempt 17" bucket together.
     """
     import re
 
@@ -149,15 +129,8 @@ async def generate_digest(
 ) -> tuple[IncidentDigest, dict[str, Any], str]:
     """Call Claude and return (digest, usage, model_id).
 
-    The caller has already done the SQL aggregation — this service is
-    pure LLM glue. `error_messages` is the list of `error_message`
-    fields from jobs that failed or dead-lettered in the window; we
-    fingerprint+truncate them internally so the model sees only the
-    top recurring patterns.
-
-    Raises DigestDisabledError when the feature is off, anthropic / network
-    exceptions on real API failures, and asyncio.TimeoutError when the call
-    exceeds `llm_digest_timeout_seconds` (ADR 0005).
+    `error_messages` is fingerprinted internally. Raises DigestDisabledError when off;
+    anthropic errors and `llm_digest_timeout_seconds` timeouts propagate (ADR 0005).
     """
     settings = get_settings()
     if not settings.llm_digest_enabled:
@@ -219,12 +192,9 @@ async def collect_window_stats(
     window_start: datetime,
     window_end: datetime,
 ) -> tuple[dict[str, int], dict[str, int], list[str]] | None:
-    """The read half: aggregate the window. None when there is nothing to
-    summarize (no jobs), which is the caller's signal to skip the LLM call.
+    """The read half: aggregate the window; None when there are no jobs to summarize.
 
-    Split out of `run_digest_for_tenant` so the worker can finish this
-    transaction *before* the Anthropic round-trip — see
-    `run_digest_for_all_active_tenants`.
+    Split out so the transaction closes before the Anthropic round-trip.
     """
     by_status, failed_by_type, errors = await DigestRepository(session).window_stats(
         tenant.id, window_start, window_end
@@ -287,32 +257,11 @@ async def run_digest_for_tenant(
     window_start: datetime,
     window_end: datetime,
 ) -> DigestRow | None:
-    """Generate one digest for one tenant and persist it, on one session.
+    """Generate and persist one tenant's digest on one session; None for an empty window.
 
-    Returns the persisted row, or None if there was nothing to summarize
-    (empty window — no jobs). Caller manages the transaction boundary and
-    only commits when this returns non-None.
-
-    Raises DigestDisabledError when the feature is off; lets anthropic
-    exceptions and asyncio.TimeoutError propagate so the caller can decide
-    whether to retry.
-
-    NOTE: this composes all three steps on the caller's session, so the LLM
-    round-trip happens inside whatever transaction the caller holds. Nothing
-    in the application calls it any more, and that is the point: the admin
-    route (`POST /admin/digests/generate`) was its last caller and the reason
-    this note used to say the shape was "acceptable" there. WO-R2-127 moved
-    that route onto the same read / call / write split the worker uses, so
-    the composed form now has no caller to be acceptable for.
-
-    Kept rather than deleted because `tests/unit/test_incident_digest.py`
-    pins the empty-window contract through it and the three parts below are
-    the real surface; it is a deletion candidate, not a supported entry
-    point. Do not reach for it from a request path — holding a transaction
-    across the round-trip pins a pooled connection `idle in transaction` for
-    as long as the model takes, and the caller's tenant RLS context does not
-    survive the transaction boundary either way. Use the three parts; see
-    `run_digest_for_all_active_tenants` or the admin route.
+    **Deletion candidate, not a supported entry point** — WO-R2-127 moved its last caller to
+    the read/call/write split, and only `tests/unit/test_incident_digest.py` still needs it.
+    Never call it from a request path: it holds the transaction across the LLM round-trip.
     """
     stats = await collect_window_stats(session, tenant, window_start, window_end)
     if stats is None:
@@ -358,13 +307,9 @@ async def run_digest_for_all_active_tenants(
 
     for tenant in active:
         try:
-            # Three phases, deliberately not one transaction. The Anthropic
-            # round-trip sits BETWEEN them, holding no connection: the old
-            # shape opened `session.begin()`, issued the aggregate query, and
-            # then awaited the API inside that transaction — pinning a pooled
-            # connection and an open read-write transaction, per tenant,
-            # serially, for as long as the API took. The deadline added above
-            # bounds that; not holding the transaction removes it.
+            # Three phases, deliberately not one transaction: the Anthropic
+            # round-trip sits between them holding no connection, where the old
+            # shape pinned one per tenant for as long as the API took.
             async with session_factory() as session:
                 async with session.begin():
                     stats = await collect_window_stats(

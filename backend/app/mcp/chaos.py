@@ -1,22 +1,9 @@
 """
-Chaos framework — the three gates from ADR 0008 rolled into one decorator.
+Chaos framework — ADR 0008's three gates rolled into one decorator.
 
-Registration path:
-  1. `CHAOS_ENABLED` env flag → if false, `@chaos_tool` is a no-op; the
-     tool never enters the registry, so `tools/list` never shows it and
-     `tools/call` returns MCP_TOOL_NOT_FOUND. The agent literally cannot
-     see chaos exists in a chaos-disabled environment.
-  2. Scope check (`chaos:invoke`) is done by the standard tool dispatch
-     path in `handlers.py` — same layer, same error shape as any other
-     scope failure.
-  3. The `@chaos_tool` decorator can optionally enforce a per-tool
-     blast-radius label (informational for now; Wave 2 wires alarms on
-     the rate of high-blast-radius invocations).
-
-Every chaos invocation is audited to a separate action name
-(`chaos.tool_invoked`) so operators can filter it independently — this
-routing happens in `handlers.py` based on the `is_chaos` flag on the
-tool definition.
+`CHAOS_ENABLED=false` makes `@chaos_tool` a no-op, so the tool never enters the
+registry and the agent cannot see chaos exists. The `chaos:invoke` scope check and
+the routing of the audit row to `chaos.tool_invoked` both happen in `handlers.py`.
 """
 
 from collections.abc import Callable
@@ -32,17 +19,11 @@ logger = get_logger(__name__)
 
 
 class BlastRadius(StrEnum):
-    """Coarse categorization of what a chaos tool can affect. Used
-    today only as an audit-log field and a startup-time filter; Wave 2
-    will wire alarms on the rate of higher-blast invocations."""
+    """Coarse categorization of what a chaos tool can affect; an audit-log field."""
 
     SINGLE_CONSUMER = "single_consumer"
-    #: Narrower than SINGLE_CONSUMER, and added for `pause_control_loop`
-    #: (ADR 0027). A Kafka consumer group is a whole subscription: killing one
-    #: stops every message on its topics. A background loop is one named
-    #: coroutine inside the worker — the process, its consumers and the other
-    #: ten loops carry on. Labelling that `single_consumer` would overstate it
-    #: on every audit row.
+    #: Narrower than SINGLE_CONSUMER, added for `pause_control_loop` (ADR 0027):
+    #: a background loop is one coroutine, not a whole Kafka subscription.
     SINGLE_LOOP = "single_loop"
     SINGLE_SERVICE = "single_service"
     SHARED_DEPENDENCY = "shared_dependency"
@@ -57,13 +38,8 @@ def chaos_tool[InputT: BaseModel, OutputT: BaseModel](
     output_model: type[OutputT],
     blast_radius: BlastRadius,
 ) -> Callable[[ToolHandler], ToolHandler]:
-    """Register a chaos tool. No-op when `CHAOS_ENABLED=false`.
-
-    Chaos tools always require `chaos:invoke` — that's non-negotiable.
-    Blast-radius classification is stored on the tool definition (via
-    the description for now; Wave 2 promotes it to a first-class field
-    when we start alarming on it).
-    """
+    """Register a chaos tool; a no-op when `CHAOS_ENABLED=false`. Always needs
+    `chaos:invoke`."""
     settings = get_settings()
     if not settings.chaos_enabled:
         logger.info(

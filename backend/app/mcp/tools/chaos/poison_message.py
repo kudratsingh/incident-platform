@@ -1,96 +1,21 @@
-"""
-`poison_message` — publish a schema-invalid payload to a Kafka topic AND
-drop a matching dead-letter row that is **not** replay-safe.
+"""`poison_message` — publish a schema-invalid payload to a Kafka topic AND drop
+a matching dead-letter row that is **not** replay-safe.
 
-Two effects (both observable via `list_dlq_messages` +
-`get_consumer_lag`):
+Kafka side: an inline short-lived producer bypasses `publish_raw`'s validation;
+the consumer logs, commits and moves on. DLQ side: a synthetic `jobs` row with a
+schema-validation text from `app.lab.dlq_failure_stories`, because real consumers
+log-and-drop schema errors rather than routing them, so without the row there is
+nothing downstream to observe. WO-R2-166 moved the hint, not the text: a poisoned
+message is never safe to replay, and both earlier pairings lied about it (live run
+`efdc3b2a9864` graded a correct refusal as a failure). `unclassified` is the
+default because LLM triage is off; `replay_safe` cannot be asked for, that row
+being `create_mislabeled_dlq_job`'s job.
 
-1. **Kafka side.** Sends a schema-invalid payload; the target consumer's
-   `_process_one` catches `SchemaValidationError`, logs, commits, and
-   moves on. Bypasses `publish_raw` (which validates) using an inline
-   short-lived aiokafka producer. Unchanged — the injection is real.
-
-2. **DLQ side.** Writes a synthetic `jobs` row with
-   `status=dead_letter`, a schema-validation error string from
-   `app.lab.dlq_failure_stories`, and a `remediation_hint` the caller
-   declares: `unclassified` (the default, `NULL` in the column) or
-   `human_required`. That row is how the agent's remediation loop sees
-   the poisoning — the platform's real consumers don't route schema
-   errors to DLQ (they log-and-drop), so without this synthetic row the
-   agent would see no downstream effect.
-
-## Why the row is no longer `replay_safe` (WO-R2-166)
-
-Until v0.6.2 this hook stamped `remediation_hint=replay_safe`. That was
-wrong in the way that costs a paid eval run, and it was wrong twice over.
-
-The first version paired `replay_safe` with the schema-validation text,
-which live run `efdc3b2a9864` proved unwinnable: the agent read "payload
-missing required field", correctly judged that every replay fails on the
-same field, and escalated — graded as a failure. WO-R2-146 repaired the
-*pair* by moving the text, so the row read `UpstreamTimeout …` instead.
-It passed the coherence screen and it was still a lie: this hook injects
-a schema violation and nothing else, so a row claiming a transient
-timeout described a fault that never happened, and invited a replay of a
-payload no replay can fix.
-
-Both repairs picked the wrong half. The truth this hook has to tell is
-the one in its own name: **a poisoned message is not safe to replay.** So
-the hint moves instead of the text. The row now says what was actually
-injected, and says nothing that authorises a replay.
-
-`unclassified` is the default because that is the honest arrival state: a
-freshly poisoned message has been classified by nobody. LLM triage is off
-by default on this platform, so an organically dead-lettered job's
-`remediation_hint` is NULL, and a null hint under a permanent-fault text
-is the coherent pair `app.lab.dlq_failure_stories` admits. `human_required`
-is offered for a scenario that wants the row *already* categorised, so
-`replay_dlq_by_category` refuses it on sight and the agent's
-escalate-not-replay branch is reachable without a triage step.
-
-What a caller cannot ask for is `replay_safe`, on any argument. A scenario
-that deliberately wants a mislabelled row calls
-`create_mislabeled_dlq_job`, which exists precisely so that this hook
-never has to be able to lie.
-
-## Deterministic ids
-
-The row's id is `uuid5(namespace, f"{tenant_id}:{fixture_name}")` — the
-same convention as `create_bad_data_job` and `create_stuck_dag`, with its
-own namespace, so the id cannot collide with a bad-data fixture, a chain
-node or a boot-seeded row even under an identical `fixture_name`. A
-scenario can pin the id in YAML before the hook runs, given the tenant it
-will run as; it has to, because the graders assert *which* row the agent
-acted on and a random id cannot be named in a claim written before the
-run (commander cmd #187).
-
-Re-invoking with the same `fixture_name` is idempotent on the DLQ row
-while that row still matches what the call declares; once it has drifted
-— someone fenced it, a replay moved it out of `dead_letter`, or this call
-declares a different hint — the hook refuses rather than rewriting
-history. The refusal happens **before** the Kafka send, so a refused call
-has no side effect at all.
-
-The Kafka half is not idempotent and does not pretend to be: every
-accepted call really does put another schema-invalid message on the
-topic, including a call that finds its row already present. That is the
-tool's primary verb; the description says so.
-
-## Disposal
-
-The row is tagged `payload.seeded_fixture = true`, so the reset sweep
-(`scripts/reset_eval_state.py::_delete_seeded_dlq_fixtures`) DELETEs it —
-a change of disposal class from the pre-v0.6.3 shape, where a randomly
-idded row marked only `chaos_fixture` was *cancelled* by
-`_sweep_nonfixture_dlq` on the grounds that it stood in for something
-that happened to a real user's job. A row with a scenario-pinned id,
-declared by name, is not that: it is scaffolding, the same way
-`create_bad_data_job`'s and `create_stuck_dag`'s rows are, and leaving a
-`cancelled` copy behind per run is litter rather than history (ADR 0012
-rule 2). `chaos_fixture` stays in the payload beside the marker so the
-row's provenance is still readable.
-
-Requires `chaos:invoke`. Registered only when `CHAOS_ENABLED=true`.
+Ids are `uuid5(ns, f"{tenant_id}:{fixture_name}")`, pinnable and per-tenant. A
+repeat is idempotent on the row and refused *before* the send once it has drifted,
+so a refused call publishes nothing; publishing is never idempotent. Rows carry
+`payload.seeded_fixture = true`, so the reset DELETEs them (ADR 0012 rule 2).
+Requires `chaos:invoke`.
 """
 
 import json
@@ -104,13 +29,9 @@ from app.lab.dlq_failure_stories import story
 from app.mcp.chaos import BlastRadius, chaos_tool
 from app.mcp.registry import ToolContext
 
-# One spelling of "write NULL into remediation_hint" and one resolver for
-# it across the declared-fixture hooks, imported rather than restated —
-# same reason `create_bad_data_job` imports `_validated_hint` from
-# `seed_dlq_messages` instead of re-deriving it. `_ensure_chaos_owner` is
-# shared for a harder reason: the reset's `_delete_chaos_owner_users`
-# sweep recognises that user by email prefix, so a hook that lazy-created
-# its own would leave rows the reset cannot reach.
+# One spelling of "write NULL into remediation_hint", imported rather than
+# restated. `_ensure_chaos_owner` is shared for a harder reason: the reset's
+# `_delete_chaos_owner_users` only recognises that user by email prefix.
 from app.mcp.tools.chaos.create_bad_data_job import (
     UNCLASSIFIED,
     _declared_hint,
@@ -125,37 +46,27 @@ from sqlalchemy import select
 
 
 class PoisonMessageBrokerUnavailableError(AppError):
-    """Kafka broker isn't reachable from the MCP process. The tool
-    can't drop the poisoned message so the DLQ side-effect also
-    doesn't fire. Returned instead of a generic -32603 so the caller
-    sees a specific, actionable error."""
+    """Broker unreachable: nothing published, no DLQ row. A specific
+    code rather than a generic -32603."""
 
     status_code = 503
     error_code = "kafka_unavailable"
 
 
 class PoisonMessageSendFailedError(AppError):
-    """The broker answered but refused the send — unknown topic, no
-    partition leader, message too large, ACL denial.
+    """The broker answered but refused the send — unknown topic, no leader,
+    message too large, ACL denial.
 
-    Deliberately NOT `kafka_unavailable`: that code names an
-    unreachable broker, and the operator response differs (bring the
-    broker up vs. create the topic / fix the payload). Before R2-16
-    only `start()` was inside the broad catch, so every one of these
-    escaped as `-32603 internal tool error` — which the commander's
-    ChaosClient buckets as a transport fault, hiding a fixture bug as
-    flakiness."""
+    NOT `kafka_unavailable`: different operator response, and before R2-16
+    these escaped as `-32603`, which ChaosClient buckets as a transport fault."""
 
     status_code = 502
     error_code = "kafka_send_failed"
 
 
 class PoisonMessageFixtureNameInUseError(AppError):
-    """The declared `fixture_name` names a row that no longer matches the
-    call. Same 409 shape and same reasoning as
-    `create_bad_data_job`'s `bad_data_fixture_name_in_use`: a drifted row
-    is evidence, and re-manufacturing it would hand the next run a
-    pre-remediated world and grade it clean."""
+    """`fixture_name` names a row that no longer matches the call. Same 409 as
+    `bad_data_fixture_name_in_use`: a drifted row is evidence."""
 
     status_code = 409
     error_code = "poison_fixture_name_in_use"
@@ -163,20 +74,13 @@ class PoisonMessageFixtureNameInUseError(AppError):
 
 logger = get_logger(__name__)
 
-# uuid5 namespace for poisoned-message fixture ids. Fixed and documented
-# so a scenario can precompute the id it pins:
-# uuid5(ns, f"{tenant_id}:{fixture_name}").
-# Distinct from the eval seed's namespace (aaaaaaaa-…), `create_stuck_dag`'s
-# (cccccccc-…), `create_bad_data_job`'s (dddddddd-bad0-…) and
-# `create_mislabeled_dlq_job`'s (ffffffff-11ed-…), so the same
-# `fixture_name` under two hooks is two independent rows rather than a
-# primary-key collision. "dead" is the mnemonic: this is the dead-letter
-# row that stands in for a poisoned message.
+# uuid5 namespace for poisoned-message fixture ids: uuid5(ns,
+# f"{tenant_id}:{fixture_name}"). Distinct from every sibling hook's, so one
+# `fixture_name` under two hooks is two rows. "dead" is the mnemonic.
 _NAMESPACE = uuid.UUID("eeeeeeee-dead-4000-8000-000000000000")
 
-# The story each declared hint stamps. Both are schema-violation texts on
-# purpose: this hook injects exactly one kind of fault, and the only
-# difference between the two rows is whether anybody has classified it.
+# Both stories are schema-violation texts: the only difference is
+# whether anybody classified it.
 _STORY_KEY_FOR_HINT: dict[str | None, str] = {
     RemediationHint.HUMAN_REQUIRED.value: "schema_missing_field",
     None: "unclassified_schema_missing_field",
@@ -184,35 +88,21 @@ _STORY_KEY_FOR_HINT: dict[str | None, str] = {
 
 
 def fixture_id(tenant_id: uuid.UUID, fixture_name: str) -> uuid.UUID:
-    """The row's deterministic id.
-
-    Exported so a test — or a scenario's own precompute — derives it the
-    same way the hook does instead of transcribing the recipe. Per-tenant
-    for the same reason `create_bad_data_job`'s is: the idempotency probe
-    below runs on the RLS-scoped MCP session, so a row another tenant
-    created under the same name would be invisible to it and the INSERT
-    would collide on the primary key — a 500 where the contract promises
-    a 409.
+    """The row's deterministic id, exported so a test or a scenario derives it
+    instead of transcribing the recipe. Per-tenant, or the RLS-scoped probe
+    below would miss a sibling's row and collide: a 500 where 409 is promised.
     """
     return uuid.uuid5(_NAMESPACE, f"{tenant_id}:{fixture_name}")
 
 
 def _dlq_error_for_topic(topic: str, hint: str | None) -> str:
-    """The error text on the synthetic DLQ row this hook writes.
+    """The error text on the synthetic DLQ row.
 
-    Module level, and separate from the handler, so the coherence table
-    test can check the (hint, text) pairs this hook produces without a
-    broker (`tests/unit/test_dlq_text_coherence.py`).
-
-    The text is the schema-validation story for the declared hint —
-    a permanent fault, which is what this hook actually injects. It is
-    coherent under both hints the input model admits: `human_required`
-    requires a permanent marker, and a null hint admits one (a
-    classification is not a symptom; see the asymmetric rule in
-    `app.lab.dlq_failure_stories`).
-
-    The row names its topic and the producer correction it needs, without
-    exposing the lab hook through agent-readable error text.
+    Module level so `tests/unit/test_dlq_text_coherence.py` can check this
+    hook's (hint, text) pairs without a broker. The text is the
+    schema-validation story for the declared hint — a permanent fault, which is
+    what this hook injects — and names the topic and the producer correction
+    without exposing the lab hook.
     """
     base = story(_STORY_KEY_FOR_HINT[hint]).error_message
     return (
@@ -231,9 +121,8 @@ class PoisonMessageInput(BaseModel):
         "'job.progress'. The message will fail schema validation on the "
         "consumer side because we pass a payload the schema rejects.",
     )
-    # Kept as a dict so the operator can craft exactly which shape gets
-    # sent. Default is an empty object — every topic's schema requires
-    # some fields, so `{}` reliably poisons every one.
+    # A dict so the caller picks the shape; `{}` poisons every topic,
+    # which all require fields.
     payload: dict[str, object] = Field(
         default_factory=dict,
         description="Payload to send. Defaults to `{}`, which fails every "
@@ -267,11 +156,8 @@ class PoisonMessageInput(BaseModel):
             "accepted call publishes another poisoned message."
         ),
     )
-    # Deliberately a *subset* of `RemediationHint` plus the sentinel, and
-    # deliberately missing `replay_safe`: this hook injects a schema
-    # violation, and a schema violation is never safe to replay. A
-    # scenario that wants a row whose hint contradicts its text calls
-    # `create_mislabeled_dlq_job`, which says so in its name.
+    # A subset of `RemediationHint`: a schema violation is never safe to
+    # replay; `create_mislabeled_dlq_job` owns the contradicting row.
     remediation_hint: Literal["human_required", "unclassified"] | None = Field(
         default=UNCLASSIFIED,
         description=(
@@ -361,9 +247,8 @@ async def poison_message(
     hint = _declared_hint(inp.remediation_hint)
     job_id = fixture_id(tenant_id, inp.fixture_name)
 
-    # Primary-key read, RLS-scoped like every other tool call, and BEFORE
-    # the producer: a call that is going to be refused must not have
-    # poisoned a topic on its way to the refusal.
+    # RLS-scoped, and BEFORE the producer: a refused call must not have
+    # poisoned a topic.
     existing = (
         await ctx.db.execute(select(Job).where(Job.id == job_id))
     ).scalar_one_or_none()
@@ -373,11 +258,8 @@ async def poison_message(
     body = json.dumps(inp.payload).encode()
     key_bytes = inp.partition_key.encode() if inp.partition_key else None
 
-    # aiokafka's error class is behind the inline import, so catch
-    # broadly and surface a clean AppError. `start()` is inside the
-    # try so a bootstrap failure still hits `stop()` — otherwise the
-    # producer object leaks with an "Unclosed AIOKafkaProducer"
-    # warning.
+    # aiokafka's error class is behind the inline import, so catch broadly.
+    # `start()` is inside the try so a bootstrap failure still hits `stop()`.
     producer = AIOKafkaProducer(
         bootstrap_servers=settings.kafka_bootstrap_servers,
     )
@@ -405,9 +287,8 @@ async def poison_message(
             )
 
     if existing is not None:
-        # Idempotent repeat: the row this call declares is already there
-        # and still matches. The topic got another poisoned message, which
-        # is the half of this tool that is a verb rather than a fixture.
+        # Idempotent repeat: the row already matches, but the topic still
+        # got another poisoned message.
         return PoisonMessageOutput(
             topic=inp.topic,
             payload_bytes=len(body),
@@ -419,18 +300,11 @@ async def poison_message(
             created=False,
         )
 
-    # Synthetic DLQ entry — the observable effect the agent's
-    # remediation loop keys off. Real consumers log+commit schema
-    # errors rather than routing to DLQ, so without this row the
-    # agent has nothing to hypothesize about.
-    #
-    # An unseeded tenant is the normal case on a fresh eval stack, not a
-    # defensive edge (R2-16). Skipping the row there while still
-    # answering `accepted=true` made the scenario silently unwinnable and
-    # mis-scored the agent — a wasted paid run. Both sibling hooks
-    # (`create_bad_data_job`, `seed_dlq_messages`) lazy-create the same
-    # chaos owner for exactly this case, and reusing their helper means
-    # the reset's `_delete_chaos_owner_users` sweep reaches this row too.
+    # Synthetic DLQ entry — the observable effect the remediation loop keys
+    # off. An unseeded tenant is the normal case on a fresh eval stack, not a
+    # defensive edge (R2-16): skipping the row while answering `accepted=true`
+    # made a scenario silently unwinnable. Reusing the siblings' helper keeps
+    # the reset's `_delete_chaos_owner_users` able to reach this row.
     user = (
         await ctx.db.execute(
             select(User).where(User.tenant_id == tenant_id).limit(1)
@@ -492,27 +366,16 @@ def _assert_matches(
 ) -> None:
     """Idempotent repeat vs. drifted row.
 
-    Same rule and same wording as `create_bad_data_job._assert_matches`:
-    a repeat that finds the row still `dead_letter`, in the caller's
-    tenant, carrying exactly the hint this call declares is a no-op on the
-    row. Anything else is refused, because re-manufacturing would mean
-    rewriting a row that is now evidence:
-
-      * `remediation_hint` moved — somebody fenced it, which on an
-        `unclassified` poisoned row is the very action a scenario seeds it
-        to measure. Silently reporting `created=False` here would hand the
-        next run a pre-fenced world and grade it clean.
-      * `status` moved — a replay took the row out of `dead_letter`.
-      * this call declares a different hint than the stored row carries,
-        so returning the row would report a fixture the caller did not
-        ask for.
+    Same rule as `create_bad_data_job._assert_matches`: still `dead_letter`, in
+    the caller's tenant, with exactly the declared hint is a no-op on the row.
+    Anything else is refused — a moved hint means somebody fenced it, which is
+    what a scenario seeds an `unclassified` row to measure, and reporting
+    `created=False` would hand the next run a pre-fenced world.
     """
     drift: list[str] = []
     if existing.tenant_id != tenant_id:
-        # Unreachable while ids are tenant-derived; kept because it is the
-        # invariant the derivation exists to guarantee, and a non-RLS
-        # session (a script, a superuser) is the one caller that could
-        # still see a foreign row here.
+        # Unreachable while ids are tenant-derived; only a non-RLS
+        # session could see a foreign row here.
         drift.append("owned by another tenant")
     if existing.status != JobStatus.DEAD_LETTER.value:
         drift.append(

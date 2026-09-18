@@ -50,12 +50,8 @@ async def add_tenant_member(
 ) -> UserResponse:
     """Enrol a user into the caller's own tenant.
 
-    The authenticated way into an existing tenant, and since WO-R2-25 the
-    only way: public registration may create a brand-new tenant or join the
-    shared default one, and nothing else (ADR 0024).
-
-    The tenant is taken from `current_user`, so there is no tenant parameter
-    to tamper with, and the new account is always `role=user`.
+    The only authenticated way into an existing tenant since WO-R2-25 (ADR
+    0024). Tenant comes from `current_user`; the new account is `role=user`.
     """
     svc = _auth_service(db)
     user = await svc.add_tenant_member(

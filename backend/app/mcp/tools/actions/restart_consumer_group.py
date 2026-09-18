@@ -1,20 +1,10 @@
 """
-`restart_consumer_group` — the compensating counterpart to BOTH
-consumer-affecting chaos hooks: `kill_consumer` (Wave 1 PR B) and
-`inject_latency`.
+`restart_consumer_group` — the compensator for `kill_consumer` and `inject_latency`.
 
-Clears the Redis kill flag so a stopped consumer's next supervisor
-restart succeeds, AND deletes any injected-latency flag so the
-restarted consumer runs at full speed. A real task recycle would drop
-the injected slowness too; before v0.4.5 the chaos help text promised
-latency clearing this tool didn't perform, leaving `inject_latency`
-with no Tier-1 remediation at all. In a real deploy this would also send a
-kubectl/ECS API call to force a task recycle; here we do the honest
-demoable thing: delete the kill key, let the worker's supervisor
-loop pick the consumer back up. Same shape as the chaos side —
-observable via `get_consumer_lag` recovery.
-
-`actions:execute` + idempotent.
+Deletes the kill flag so the supervisor's next restart succeeds, and the
+injected-latency flag so the consumer returns at full speed — before v0.4.5 it
+skipped the second, leaving `inject_latency` with no Tier-1 remediation. Recovery
+shows up in `get_consumer_lag`. `actions:execute` + idempotent.
 """
 
 from app.config import get_settings
@@ -31,16 +21,10 @@ logger = get_logger(__name__)
 def _known_groups() -> frozenset[str]:
     """Every consumer-group name the platform can speak about.
 
-    Two disjoint vocabularies, deliberately unioned rather than picked
-    between: the groups the platform actually runs (from settings —
-    `worker-dispatcher`, `audit-writer`, `sse-broadcaster`, …) and the
-    groups the eval surface advertises through `get_consumer_lag`, seven
-    of which are synthetic fixtures. Only `worker-dispatcher` is in
-    both, and a scenario can legitimately drive a restart against either
-    set.
-
-    Read at call time rather than at import so a settings override in a
-    test or a deployment is reflected without a reload."""
+    The union of the groups settings actually runs and the ones `get_consumer_lag`
+    advertises — a scenario can restart either. Read at call time so a settings
+    override is reflected without a reload.
+    """
     settings = get_settings()
     from_settings = {
         value
@@ -68,13 +52,9 @@ class RestartConsumerGroupInput(BaseModel):
 
 class RestartConsumerGroupOutput(BaseModel):
     consumer_group: str
-    # v0.4.9: the `kill_key` / `latency_key` string fields are gone.
-    # They spelled out `chaos:kill:*` / `chaos:latency:*` in the
-    # response of a tool that only requires `actions:execute` — so an
-    # agent with no chaos scope still learned the test rig existed, and
-    # at least one investigation chased the harness instead of the
-    # fault. The booleans carry the whole operational outcome; the key
-    # names were never actionable, only revealing.
+    # v0.4.9: the `kill_key` / `latency_key` fields are gone — they spelled out
+    # `chaos:*` key names in a tool needing only `actions:execute`. The booleans
+    # carry the whole outcome.
     kill_key_cleared: bool
     latency_key_cleared: bool
     group_recognized: bool = Field(
@@ -129,10 +109,7 @@ async def restart_consumer_group(
     latency_key = latency_key_for(inp.consumer_group)
     kill_cleared = bool(await ctx.redis.delete(kill_key))
     latency_cleared = bool(await ctx.redis.delete(latency_key))
-    # Reported, never enforced (R2-17). A hard whitelist here would
-    # refuse a legitimate group added after this build; the honest fix
-    # is to execute as before and tell the caller what we know about
-    # the name.
+    # Reported, never enforced (R2-17): a whitelist would refuse a new group.
     recognized = inp.consumer_group in _known_groups()
     logger.warning(
         "action restart_consumer_group",

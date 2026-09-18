@@ -1,52 +1,9 @@
 """
-One Redis Pub/Sub connection for every open SSE stream in the process.
-
-The problem this replaces
-------------------------
-`GET /jobs/{id}/stream` used to call `redis.pubsub()` per viewer and hold that
-subscription for the life of the generator.  A Pub/Sub subscription owns its
-connection while it is subscribed, so the process's open-stream count *was*
-its held-connection count — and those connections came out of the single
-20-slot pool that `worker_loop`, the rate limiter, `check_backpressure`, the
-job cache and the admin stats loops all share in the same process.  The
-practical viewer ceiling was well under 20, and past it the failures landed
-everywhere except on the viewer who caused them: the rate limiter failed open
-silently, `check_backpressure` 500'd `POST /jobs`, admin stats errored.  The
-frontend reconnects every 2s until terminal, so one tab parked on a waiting
-job pinned a slot indefinitely (WO-R2-11).
-
-The shape of the fix
---------------------
-**Fan-out.**  The broker owns exactly ONE Pub/Sub connection for the whole
-process.  It SUBSCRIBEs a job's channel when that job's first viewer arrives
-and UNSUBSCRIBEs when its last one leaves; a single reader task pumps messages
-off that connection into a per-viewer `asyncio.Queue`.  N viewers of one job,
-and M jobs, cost one connection — the linear relationship between viewers and
-connections is gone rather than widened, which is what makes the ceiling a
-policy choice instead of an accident of pool size.
-
-**A dedicated pool.**  That one connection comes from `get_sse_redis_client()`
-(see `core/redis.py`), not the shared pool, so even a broker bug cannot reach
-the request path's 20 slots.
-
-**A cap.**  `acquire()` reserves a slot up front and raises
-`StreamCapacityError` (503 + Retry-After) when the process is full.  The
-refusal is addressed to the viewer asking for the stream, which is the whole
-point: the old failure mode charged the cost to unrelated callers.
-
-**Timeouts.**  A stream with no event for `SSE_STREAM_IDLE_TIMEOUT_SECONDS`
-ends, and no stream outlives `SSE_STREAM_MAX_DURATION_SECONDS`.  EventSource
-reconnects on its own, so ending a stream costs a live viewer one reconnect
-and reclaims the slot from a dead one.
-
-Fail-open, unchanged
---------------------
-Every Redis failure here degrades the stream and nothing else: a snapshot read
-that raises is treated as "no snapshot", a SUBSCRIBE that raises closes that
-one stream, and a reader that dies closes the streams it was feeding.  None of
-them escape into the request path as a 500, and none of them touch the durable
-path — job state lives in Postgres, and `api/streaming.py` still short-circuits
-a finished job off its `jobs` row.
+One Redis Pub/Sub connection for every open SSE stream. A per-viewer `redis.pubsub()` made the
+open-stream count the held-connection count against the shared 20-slot pool, so the rate limiter
+and `check_backpressure` failed instead of the viewer (WO-R2-11). The broker SUBSCRIBEs per channel
+over `get_sse_redis_client()`, `acquire()` refuses over budget with `StreamCapacityError`, and the
+SSE idle/max-duration settings reclaim dead slots. Redis failures degrade the stream alone.
 """
 
 import asyncio
@@ -92,14 +49,8 @@ def _job_id_from_channel(channel: str | bytes) -> str:
 
 
 class StreamSlot:
-    """One reserved unit of the per-process stream budget.
-
-    `release()` is idempotent because the route releases from two places: the
-    generator's `finally` (the normal path) and a response background task
-    (the path where the generator is never driven at all, e.g. the client
-    vanishes between the handler returning and the first byte). Whichever runs
-    first frees the slot; the second is a no-op.
-    """
+    """One reserved unit of the per-process stream budget. `release()` is idempotent because the
+    route releases from both the generator's `finally` and a response background task."""
 
     __slots__ = ("_broker", "_released")
 
@@ -135,10 +86,7 @@ class ProgressBroker:
         self._subscribers: dict[str, set[asyncio.Queue[_QueueItem]]] = {}
         self._pubsub: object | None = None
         self._reader: asyncio.Task[None] | None = None
-        # Serialises channel bookkeeping. The reader deliberately does NOT
-        # take it: it only reads `_subscribers` and puts into queues, both of
-        # which are atomic between awaits on a single event loop, and taking
-        # the lock there would deadlock teardown.
+        # Serialises channel bookkeeping. The reader must NOT take it, or teardown deadlocks.
         self._lock = asyncio.Lock()
         self._active = 0
 
@@ -149,12 +97,8 @@ class ProgressBroker:
         return self._active
 
     def acquire(self) -> StreamSlot:
-        """Reserve a stream slot, or refuse with 503 + Retry-After.
-
-        Synchronous and allocation-free on purpose: it runs in the request
-        handler before any Redis work, so a refusal costs nothing and cannot
-        itself be starved by the condition it is refusing.
-        """
+        """Reserve a stream slot, or refuse with 503 + Retry-After. I/O-free, so a refusal cannot
+        be starved by what it is refusing."""
         if self._max_streams > 0 and self._active >= self._max_streams:
             logger.warning(
                 "sse_stream_capacity_rejected",
@@ -183,20 +127,8 @@ class ProgressBroker:
     ) -> AsyncGenerator[ProgressEvent, None]:
         """Yield this job's progress events until it ends, times out or closes.
 
-        The first event is the retained snapshot (if any), read AFTER the
-        channel subscription is live. That ordering is load-bearing and
-        unchanged from the per-viewer implementation: subscribe-then-read can
-        at worst deliver one event twice (harmless — the UI is last-write-wins
-        on a progress bar), while read-then-subscribe leaves a gap in which an
-        event published between the two is lost, which is the silent-hang this
-        snapshot exists to prevent.
-
-        `use_snapshot=False` streams live events only. The endpoint passes it
-        when it has already compared the snapshot against the `jobs` row and
-        found the snapshot stale — a terminal snapshot in front of a job the
-        row says is running again (WO-R2-57). Yielding it there would close
-        the stream on the first event, which is the disagreement this flag
-        exists to resolve; the broker itself has no row to compare against.
+        The snapshot is read AFTER the subscription is live, or an event published between the two
+        is lost. `use_snapshot=False` skips it, for an endpoint that found it stale (WO-R2-57).
         """
         queue: asyncio.Queue[_QueueItem] = asyncio.Queue(maxsize=QUEUE_MAXSIZE)
         await self._register(job_id, queue)
@@ -296,11 +228,7 @@ class ProgressBroker:
                 await self._teardown()
 
     async def _teardown(self) -> None:
-        """Drop the shared connection once nobody is watching anything.
-
-        Caller holds `_lock`. The reader never takes it, so cancelling here
-        cannot deadlock.
-        """
+        """Drop the shared connection once nobody is watching. Caller holds `_lock`."""
         reader, self._reader = self._reader, None
         pubsub, self._pubsub = self._pubsub, None
         if reader is not None:
