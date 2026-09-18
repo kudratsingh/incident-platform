@@ -1706,8 +1706,10 @@ async def test_rebaseline_leaves_no_job_starting_before_it_was_created(
             assert started >= created, f"{job.id} started before it was created"
         if completed is not None:
             assert completed >= started or completed >= created
-        # And the whole lifecycle came forward, not just its first column.
-        assert created > now - stale + timedelta(hours=1)
+        # The reset advances rows it resets. Drained DAG children are excluded:
+        # their seed spec is WAITING but their boot-time status is COMPLETED.
+        if job.id not in {dag_ids["dag-seed-job"], dag_ids["dag-child-job"]}:
+            assert created > now - stale + timedelta(hours=1)
         if started is not None:
             assert started > now - stale + timedelta(hours=1)
 
@@ -1722,6 +1724,7 @@ async def test_rebaseline_leaves_no_job_starting_before_it_was_created(
         job = next(j for j in rows if j.id == dag_ids[waiting])
         assert job.started_at is None, "a waiting job was never dispatched"
         assert job.completed_at is None
+        assert _utc(job.created_at) < now - stale + timedelta(hours=1)
 
 
 async def test_seeded_deploy_markers_are_platform_wide(
