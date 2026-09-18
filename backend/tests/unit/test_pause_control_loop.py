@@ -1,26 +1,15 @@
 """`pause_control_loop` — the enum is only a safety boundary if it is true.
 
-The hook is one Redis key and one `if` per loop, so the interesting risk is not
-the mechanism. It is the enum drifting away from the loops: a member whose loop
-never reads its key accepts a pause and does nothing, which is worse than a
-refusal because the caller believes the fault landed. Half of this file is
-therefore static — it parses `workers/dispatcher.py` and asserts the enum, the
-`LOOP_FUNCTIONS` map and the loops `worker_loop` actually starts are the same
-set, and that each of those loops really calls `loop_is_paused` with its own
-member.
+The mechanism is one Redis key and one `if` per loop, so the risk is the enum drifting from the
+loops: a member whose loop never reads its key accepts a pause and does nothing, which is worse than
+a refusal because the caller believes the fault landed. Half this file is therefore static — it
+parses `workers/dispatcher.py` and asserts the enum, `LOOP_FUNCTIONS` and the loops `worker_loop`
+starts are one set, each calling `loop_is_paused` with its own member.
 
-The other half is behavioural, and each test pins a decision that is easy to
-undo by accident:
-
-  * the delayed-retry pause must not stop the worker's liveness heartbeat;
-  * the outbox-relay pause must sit inside the leader gate, so leadership does
-    not move when a replica is paused;
-  * the check fails open on a Redis error, and short-circuits with no Redis
-    call at all when `CHAOS_ENABLED=false`;
-  * a key that goes away — TTL expiry — resumes the loop with no manual step.
-
-`chaos:pause:<loop>` being swept by `make eval-reset` is asserted here too,
-against the reset script's own pattern tuple rather than against a copy of it.
+The behavioural half pins the liveness tick before the pause check, the relay pause inside the
+leader gate, fail-open on a Redis error, the `CHAOS_ENABLED=false` short-circuit, and TTL expiry
+resuming with no manual step. `chaos:pause:<loop>` sweeping is asserted against the reset script's
+own pattern tuple.
 """
 
 from __future__ import annotations
@@ -49,19 +38,13 @@ _DISPATCHER_SOURCE = pathlib.Path(dispatcher.__file__).read_text(encoding="utf-8
 _DISPATCHER_TREE = ast.parse(_DISPATCHER_SOURCE)
 
 
-# ---------------------------------------------------------------------------
 # Static: the enum against the code
-# ---------------------------------------------------------------------------
 
 
 def _worker_loop_started_loops() -> set[str]:
-    """Every module-level `_*_loop` coroutine `worker_loop` starts as a task.
-
-    Derived from the source rather than from a list in a docstring, because the
-    docstring is what went stale: the repo's own constitution said "nine
-    background loops" and then listed eleven (divergence H1). `worker_loop`
-    creating the task is the only statement that makes a loop run.
-    """
+    """Every module-level `_*_loop` coroutine `worker_loop` starts as a task, derived from the
+    source because the docstring is what went stale — the constitution said nine loops and listed
+    eleven (divergence H1)."""
     worker_loop = next(
         node
         for node in _DISPATCHER_TREE.body
@@ -95,14 +78,9 @@ def test_the_ast_walk_finds_the_loops_at_all() -> None:
 
 
 def test_the_enum_is_exactly_the_loops_worker_loop_starts() -> None:
-    """The bijection. A twelfth loop cannot ship unpausable, and a member
-    cannot outlive the loop it names.
-
-    If this fails after adding a loop: add the enum member, the
-    `LOOP_FUNCTIONS` row, the `TICK_INTERVAL_SECONDS` row and the per-tick
-    check — not an exemption here. The enum is what `pause_control_loop`
-    advertises as the complete set, so an unchecked member is the tool lying.
-    """
+    """The bijection: a twelfth loop cannot ship unpausable, and a member cannot outlive its loop.
+    If this fails after adding a loop, add the enum member, the `LOOP_FUNCTIONS` row, the
+    `TICK_INTERVAL_SECONDS` row and the per-tick check — not an exemption here."""
     assert set(LOOP_FUNCTIONS.values()) == _worker_loop_started_loops()
     assert set(LOOP_FUNCTIONS) == set(ControlLoopName)
     assert len(set(LOOP_FUNCTIONS.values())) == len(LOOP_FUNCTIONS), (
@@ -111,11 +89,8 @@ def test_the_enum_is_exactly_the_loops_worker_loop_starts() -> None:
 
 
 def test_the_kafka_consumer_groups_are_not_in_the_enum() -> None:
-    """Divergence H2, pinned. `dependency-resolver`, `saga-coordinator` and
-    `read-model` are consumer groups, not loops; `kill_consumer` has stopped
-    any consumer group since Wave 1. A second mechanism for the same thing
-    means two keys and two ways for a teardown to miss one.
-    """
+    """Divergence H2: those three are consumer groups, and `kill_consumer` has stopped any group
+    since Wave 1. A second mechanism means two keys and two ways for a teardown to miss one."""
     values = {member.value for member in ControlLoopName}
     for group in ("dependency_resolver", "saga_coordinator", "read_model"):
         assert group not in values, (
@@ -153,20 +128,14 @@ def _pause_members_checked_in(loop_name: str) -> set[str]:
 def test_each_enumerated_loop_checks_its_own_pause_key(
     member: str, loop_name: str
 ) -> None:
-    """Every member's loop reads that member's key — and only that one.
-
-    This is the assertion that makes the enum honest, and it is static because
-    driving eleven loops through a live Redis would test the harness rather than
-    the loops.
-    """
+    """Every member's loop reads that member's key, and only that one. Static, because driving
+    eleven loops through a live Redis would test the harness."""
     assert _pause_members_checked_in(loop_name) == {member}
 
 
 def test_the_liveness_heartbeat_is_ticked_before_the_pause_check() -> None:
-    """`worker_tick()` is the whole worker's heartbeat, and it lives in the
-    delayed-retry loop. Pausing one loop must not report the process wedged,
-    so the tick has to come first in statement order.
-    """
+    """`worker_tick()` is the whole worker's heartbeat and lives in this loop, so it has to come
+    first in statement order: pausing one loop must not report the process wedged."""
     func = next(
         node
         for node in _DISPATCHER_TREE.body
@@ -243,9 +212,7 @@ def test_the_digest_interval_is_clamped_the_way_the_loop_clamps_it() -> None:
         assert tick_interval_seconds(ControlLoopName.DIGEST) == 86400.0
 
 
-# ---------------------------------------------------------------------------
 # The key, and the teardown that has to reach it
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("member", sorted(ControlLoopName, key=lambda m: m.value))
@@ -256,12 +223,8 @@ def test_every_pause_key_lives_under_the_chaos_namespace(
 
 
 def test_make_eval_reset_sweeps_every_pause_key() -> None:
-    """Asserted against the reset script's real pattern tuple, not a copy.
-
-    `04:129` says "reset script already sweeps `chaos:*`; verify" — this is the
-    verification. A pause key that escaped the namespace would survive the
-    reset and stall the next scenario's loop with nothing to correlate it to.
-    """
+    """Asserted against the reset script's real pattern tuple (04:129): a pause key that escaped the
+    namespace would survive the reset and stall the next scenario's loop."""
     from tests.unit.test_eval_reset import _reset_module
 
     patterns = _reset_module()._CHAOS_KEY_PATTERNS
@@ -277,9 +240,7 @@ def test_the_key_helper_accepts_the_enum_and_its_value_identically() -> None:
     assert pause_key_for("outbox_relay") == "chaos:pause:outbox_relay"
 
 
-# ---------------------------------------------------------------------------
 # The closed set, refused before the handler runs
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -287,21 +248,11 @@ def test_the_key_helper_accepts_the_enum_and_its_value_identically() -> None:
     ["dependency_resolver", "saga_coordinator", "read_model", "", "outbox-relay"],
 )
 def test_a_name_outside_the_enum_is_refused_at_parse_time(loop_name: str) -> None:
-    """The enum is a safety boundary, and a boundary that accepts is not one.
-
-    `loop_name` is typed as `ControlLoopName`, so Pydantic refuses anything else
-    while building the input model — before the handler, and therefore before any
-    Redis write. That matters more than it looks: a key nothing reads would be
-    accepted with `accepted: true`, and the caller would believe a fault landed
-    where none did, which is the failure mode this file's static half exists to
-    prevent one layer up.
-
-    The first three names are the Kafka consumer groups the plan's draft enum
-    carried (ADR 0027, divergence H2). They are the ones a caller written against
-    the plan will actually try — `dependency_resolver` especially, since Family C
-    stalls that group — and the refusal has to teach, so the message is asserted
-    to name the closed set rather than only to fail.
-    """
+    """The enum is a safety boundary, and a boundary that accepts is not one: `loop_name` is typed
+    as `ControlLoopName`, so Pydantic refuses anything else before the handler and before any Redis
+    write — otherwise a key nothing reads comes back `accepted: true`. The first three names are the
+    Kafka consumer groups the plan's draft enum carried (ADR 0027, divergence H2), which is what a
+    caller will actually try, so the message is asserted to name the closed set."""
     from app.mcp.tools.chaos.pause_control_loop import PauseControlLoopInput
     from pydantic import ValidationError
 
@@ -314,15 +265,9 @@ def test_a_name_outside_the_enum_is_refused_at_parse_time(loop_name: str) -> Non
 
 
 def test_make_eval_reset_sweeps_the_kill_key_the_pause_composes_with() -> None:
-    """Family C needs two chaos keys at once, and one scan has to clear both.
-
-    A `WAITING` child is only stranded while the `dependency-resolver` consumer
-    group is killed AND this sweep is paused (ADR 0027's 2026-09-17 amendment), so
-    this is the first world whose teardown depends on two keys from two different
-    mechanisms. Asserted against the reset script's real pattern tuple: a
-    narrowing that left the kill key behind would strand a child in the *next*
-    scenario with nothing to correlate it to.
-    """
+    """Family C needs two chaos keys at once and one scan has to clear both: a `WAITING` child is
+    stranded only while the `dependency-resolver` group is killed AND this sweep is paused (ADR
+    0027's 2026-09-17 amendment). Asserted against the reset script's real pattern tuple."""
     from app.config import get_settings
     from app.workers.kafka_consumer import kill_key_for
     from tests.unit.test_eval_reset import _reset_module
@@ -338,9 +283,7 @@ def test_make_eval_reset_sweeps_the_kill_key_the_pause_composes_with() -> None:
         )
 
 
-# ---------------------------------------------------------------------------
 # The check itself
-# ---------------------------------------------------------------------------
 
 
 async def test_the_check_does_no_redis_work_when_chaos_is_disabled() -> None:
@@ -367,11 +310,8 @@ async def test_the_check_reads_the_key_when_chaos_is_enabled() -> None:
 
 
 async def test_the_check_fails_open_when_redis_raises() -> None:
-    """A Redis blip must not stall the outbox relay. `_check_chaos_kill` makes
-    the same trade for the same reason; the strict variant that fails closed
-    exists only to decide a *restart*, and nothing here restarts anything —
-    the key's TTL ends the pause.
-    """
+    """A Redis blip must not stall the outbox relay. `_check_chaos_kill` trades the same way; the
+    strict variant that fails closed exists only to decide a restart."""
     client = AsyncMock()
     client.get.side_effect = RuntimeError("redis down")
     with patch(
@@ -381,9 +321,7 @@ async def test_the_check_fails_open_when_redis_raises() -> None:
         assert await loop_is_paused(ControlLoopName.OUTBOX_RELAY) is False
 
 
-# ---------------------------------------------------------------------------
 # Behaviour: two loops whose insertion point is load-bearing
-# ---------------------------------------------------------------------------
 
 
 def _paused_then(*values: bool) -> AsyncMock:
@@ -424,11 +362,8 @@ async def test_an_unpaused_delayed_retry_loop_still_does_its_work() -> None:
 
 
 async def test_a_paused_outbox_relay_still_takes_the_leader_gate() -> None:
-    """ADR 0020: the pause must hold whichever replica is leader, and must not
-    move leadership. Checking in front of the gate would make a paused replica
-    stop contending — the pause would still hold (the key is global) but
-    leadership would have moved for an unrelated reason.
-    """
+    """ADR 0020: checking in front of the leader gate would make a paused replica stop contending,
+    so leadership would move for an unrelated reason."""
     entered: list[bool] = []
 
     class _Gate:
@@ -473,9 +408,7 @@ async def test_the_relay_resumes_on_its_own_when_the_key_expires() -> None:
     tick.assert_awaited_once()
 
 
-# ---------------------------------------------------------------------------
 # Registration gating
-# ---------------------------------------------------------------------------
 
 
 def test_the_tool_is_absent_from_the_registry_when_chaos_is_disabled() -> None:
@@ -488,12 +421,8 @@ def test_the_tool_is_absent_from_the_registry_when_chaos_is_disabled() -> None:
 
 
 def test_the_tool_declares_the_single_loop_blast_radius_and_the_chaos_scope() -> None:
-    """Registration under a chaos-enabled settings object, inspected directly.
-
-    `BlastRadius.SINGLE_LOOP` is a new fifth member of a closed enum, so it is
-    a snapshot delta on this tool's description — worth pinning where a reader
-    of the tool will look for it.
-    """
+    """`BlastRadius.SINGLE_LOOP` is a new fifth member of a closed enum, so it is a snapshot delta
+    on this tool's description."""
     from app.core.scopes import Scope
     from app.mcp.chaos import BlastRadius
     from app.mcp.registry import _restore_for_tests, _snapshot_for_tests, list_tools
@@ -518,23 +447,14 @@ def test_the_tool_declares_the_single_loop_blast_radius_and_the_chaos_scope() ->
         _restore_for_tests(snap)
 
 
-# ---------------------------------------------------------------------------
 # The contract delta, pinned
-# ---------------------------------------------------------------------------
 
 
 def test_the_enum_docstring_stays_short_enough_to_be_a_wire_description() -> None:
-    """`loop_name` is typed as `ControlLoopName`, so Pydantic copies this class's
-    docstring into `$defs.ControlLoopName.description` in the pinned
-    `inputSchema`.
-
-    The repo's rule is "no class docstring on a model whose schema reaches the
-    wire", and the reason is mechanical, not stylistic — it applies to an enum
-    used as a field type just as much. The first draft of this module had a
-    fourteen-line docstring here and shipped all of it into the tool contract.
-    A one-line docstring written for a caller is fine; prose for a reader of the
-    module belongs in a comment.
-    """
+    """`loop_name` is typed as `ControlLoopName`, so Pydantic copies this class's docstring into
+    `$defs.ControlLoopName.description` in the pinned `inputSchema`. The rule is mechanical, not
+    stylistic: no class docstring on anything whose schema reaches the wire — the first draft
+    shipped fourteen lines of it into the tool contract."""
     doc = ControlLoopName.__doc__ or ""
     assert doc.strip() and "\n" not in doc.strip(), (
         "ControlLoopName's docstring is multi-line and would ship into the "
@@ -543,13 +463,8 @@ def test_the_enum_docstring_stays_short_enough_to_be_a_wire_description() -> Non
 
 
 def test_the_shape_of_the_new_tool_is_exactly_this() -> None:
-    """One new tool, and this is its whole surface.
-
-    The rebless note the coordinator writes needs a field list, and the delta is
-    easier to trust from a test than from a paragraph. Registration happens under
-    a patched chaos-enabled settings object because the unit tier runs with the
-    gate closed.
-    """
+    """One new tool, and this is its whole surface: the rebless note needs a field list, and
+    registration happens under a patched chaos-enabled settings object."""
     from app.mcp.registry import _restore_for_tests, _snapshot_for_tests, list_tools
 
     snap = _snapshot_for_tests()

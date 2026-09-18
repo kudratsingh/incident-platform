@@ -1,15 +1,9 @@
 """End-to-end tests for `get_cache_key_info` — the cache-key read tool.
 
-Same JSON-RPC pattern as `test_mcp_wave2_read_tools.py`: build the
-standalone MCP app, mint a scoped SA token, POST, assert shape.
-
-The load-bearing test is the observe → remediate → confirm round trip
-(`test_stale_cache_write_is_observable_and_invalidatable`): the
-`create_stale_cache` chaos hook writes the hot_set key, this tool sees
-it (existence + TTL + type + size), `invalidate_cache_key` deletes it,
-and this tool confirms it gone. Before this tool existed, no read
-surface could observe that key at all — the fault the hook injects was
-invisible to the caller expected to find and fix it.
+Same JSON-RPC pattern as `test_mcp_wave2_read_tools.py`. The load-bearing one is the observe →
+remediate → confirm round trip: `create_stale_cache` writes the hot_set key, this tool sees it,
+`invalidate_cache_key` deletes it, this tool confirms it gone. Before it existed the fault the hook
+injects was invisible to the caller expected to find and fix it.
 """
 
 from __future__ import annotations
@@ -43,15 +37,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 
 class _RedisStub:
-    """Enough of the async Redis surface for `get_cache_key_info` and
-    its round-trip partners (`create_stale_cache` → SET,
-    `invalidate_cache_key` → DEL): `get`, `set`, `delete`, `type`,
-    `ttl`, `strlen`, and the collection size commands.
-
-    Values are held as native Python objects; `type()` derives the
-    Redis type name from the Python type, mirroring a
-    `decode_responses=True` client (str returns, `"none"` for a
-    missing key)."""
+    """Enough async Redis for this tool and its round-trip partners (`create_stale_cache` → SET,
+    `invalidate_cache_key` → DEL). Values are native Python objects and `type()` derives the Redis
+    name from the Python type, mirroring a `decode_responses=True` client."""
 
     def __init__(self) -> None:
         self._store: dict[str, Any] = {}
@@ -214,9 +202,7 @@ def _content(body: dict[str, Any]) -> dict[str, Any]:
     return json.loads(body["result"]["content"][0]["text"])
 
 
-# ---------------------------------------------------------------------------
 # tools/list registration
-# ---------------------------------------------------------------------------
 
 
 async def test_get_cache_key_info_is_listed(
@@ -238,9 +224,7 @@ async def test_get_cache_key_info_is_listed(
     assert "cache:" in json.dumps(tools["get_cache_key_info"]["inputSchema"])
 
 
-# ---------------------------------------------------------------------------
 # happy paths
-# ---------------------------------------------------------------------------
 
 
 async def test_reports_existing_string_key_with_ttl_type_and_size(
@@ -275,9 +259,8 @@ async def test_reports_missing_key_as_absent(
     token = await _token(
         db_session, default_tenant.id, [Scope.TELEMETRY_READ.value]
     )
-    # The tenant in the key is the caller's own. It used to be a hardcoded
-    # nil UUID, which since R2-54 is a *cross-tenant* probe and refused —
-    # a small illustration of how easy that key was to build by accident.
+    # The tenant in the key is the caller's own; the hardcoded nil UUID it used to be is a cross-
+    # tenant probe since R2-54, and refused.
     info = _content(
         await _call(
             ac,
@@ -312,9 +295,7 @@ async def test_collection_key_reports_element_count_and_no_expiry(
     assert info["size"] == 4
 
 
-# ---------------------------------------------------------------------------
 # constraint: platform-owned cache namespaces only
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -357,24 +338,16 @@ async def test_wrong_scope_is_forbidden(
     assert body["error"]["code"] == protocol.MCP_FORBIDDEN
 
 
-# ---------------------------------------------------------------------------
 # acceptance: the chaos hook's write is observable through this tool
-# ---------------------------------------------------------------------------
 
 
 async def test_stale_cache_write_is_observable_and_invalidatable(
     db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
 ) -> None:
-    """The full observe → remediate → confirm loop across three scopes:
-
-      1. `create_stale_cache` (chaos:invoke) writes the hot_set key.
-      2. `get_cache_key_info` (telemetry:read) sees it — existence,
-         string type, the hook's TTL, and the hook's exact byte size.
-      3. `invalidate_cache_key` (actions:execute) deletes it.
-      4. `get_cache_key_info` confirms it is gone.
-
-    Step 2 is what this tool exists for: without it the hook's write
-    was invisible to every read surface."""
+    """The full observe → remediate → confirm loop across three scopes: the chaos hook writes the
+    hot_set key, `get_cache_key_info` sees existence, type, the hook's TTL and its exact byte size,
+    `invalidate_cache_key` deletes it, and this tool confirms. Step 2 is what this tool exists for.
+    """
     redis_stub = _RedisStub()
     app, teardown = _mcp_app_with_chaos_enabled(db_session, redis_stub)
     try:
@@ -430,16 +403,12 @@ async def test_stale_cache_write_is_observable_and_invalidatable(
         teardown()
 
 
-# ---------------------------------------------------------------------------
-# the record check (WO-R3-267)
-# ---------------------------------------------------------------------------
+# The record check (WO-R3-267).
 #
-# The gap: `exists / type / ttl_seconds / size` read the same for a current
-# hot-set entry and one that no longer matches the records it names — both
-# are strings with a TTL, differing only in byte count. Two paid live runs
-# of `remediate_stale_cache_success` split on that reading, one acting and
-# one escalating, so the tests below are written as the discrimination the
-# caller actually needs: same key, same tool, two worlds, two readings.
+# `exists / type / ttl_seconds / size` read the same for a current hot-set entry and one that no
+# longer matches the records it names — both strings with a TTL, differing only in byte count. Two
+# paid live runs of `remediate_stale_cache_success` split on that reading, so the tests below are
+# written as the discrimination the caller needs: same key, same tool, two worlds, two readings.
 
 
 async def _seed_jobs(
@@ -498,12 +467,8 @@ async def test_entry_naming_records_the_platform_holds_finds_all_of_them(
 async def test_entry_naming_records_the_platform_lacks_finds_none_of_them(
     mcp_client, db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
 ) -> None:
-    """The stale reading, on the same key: the entry still names three
-    records and the database holds none of them.
-
-    Byte-for-byte this is the reading that used to be indistinguishable
-    from the healthy one above — same key, same type, same kind of TTL,
-    a handful of bytes apart."""
+    """The stale reading on the same key: the entry names three records and the database holds none
+    — byte for byte what used to be indistinguishable from the healthy reading above."""
     ac, redis_stub = mcp_client
     await _seed_jobs(db_session, default_tenant.id, test_user.id, 3)
     await redis_stub.set(
@@ -595,10 +560,8 @@ async def test_unknowable_references_are_null_not_zero(
     value: str,
     why: str,
 ) -> None:
-    """Unknown is not a value. Where the platform cannot work out what an
-    entry refers to it says so with a null, never with a 0 — a 0 would
-    read as "names nothing", which is a finding rather than an absence
-    of one."""
+    """Unknown is not a value: a 0 would read as "names nothing", which is a finding rather than the
+    absence of one."""
     ac, redis_stub = mcp_client
     await redis_stub.set(key, value, ex=600)
 
@@ -632,9 +595,8 @@ async def test_collection_key_reports_null_references(
 async def test_missing_key_reports_null_references(
     mcp_client, db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
 ) -> None:
-    """Nothing there is nothing to check — and, since remediation ends
-    with this call, the confirm-the-delete reading must not carry
-    counts left over from the entry that was deleted."""
+    """Nothing there is nothing to check, and the confirm-the-delete reading must carry no counts
+    left over from the entry that was deleted."""
     ac, _ = mcp_client
     token = await _token(
         db_session, default_tenant.id, [Scope.TELEMETRY_READ.value]
@@ -655,10 +617,8 @@ async def test_missing_key_reports_null_references(
 async def test_an_entry_naming_another_tenants_records_finds_none(
     mcp_client, db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
 ) -> None:
-    """The lookup is the caller's own tenant, like every other read on
-    this surface. A platform-global key listing a sibling tenant's job
-    ids resolves to nothing rather than confirming those rows exist —
-    the safe direction, and the same answer a deleted row gives."""
+    """The lookup is the caller's own tenant, so a key naming a sibling tenant's job ids resolves to
+    nothing rather than confirming those rows exist."""
     ac, redis_stub = mcp_client
     other = Tenant(name="other", slug=f"other-{uuid.uuid4().hex[:8]}")
     db_session.add(other)
@@ -697,13 +657,9 @@ async def test_an_entry_naming_another_tenants_records_finds_none(
 async def test_the_hook_written_entry_reads_as_naming_records_nothing_holds(
     db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
 ) -> None:
-    """End to end, through the hook that writes the condition.
-
-    Nothing marks the entry as stale and nothing new is written beside
-    it: the hook puts the world in a state — a cached list of names the
-    database has no records for — and the read tool measures that state
-    at call time. The healthy entry on the same key, listing job ids the
-    database does have, reads the other way."""
+    """End to end through the hook that writes the condition: nothing marks the entry stale and
+    nothing is written beside it — the hook puts the world in a state and the tool measures it at
+    call time."""
     redis_stub = _RedisStub()
     app, teardown = _mcp_app_with_chaos_enabled(db_session, redis_stub)
     try:

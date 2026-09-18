@@ -1,15 +1,7 @@
-"""End-to-end tests for Wave 2 PR C — the 9 read tools.
+"""End-to-end tests for Wave 2 PR C — the nine read tools.
 
-Same pattern as `test_mcp_standalone.py`: build the standalone MCP
-app, mint a scoped SA token, POST JSON-RPC, assert shape.
-
-One test class per tool grouping:
-  - list_dlq_messages
-  - get_trace / search_traces
-  - get_dag_state
-  - get_redis_health / get_postgres_health
-  - get_deploy_history
-  - get_incident / list_incidents
+Same pattern as `test_mcp_standalone.py`: build the standalone MCP app, mint a scoped SA token, POST
+JSON-RPC. One class per tool grouping.
 """
 
 from __future__ import annotations
@@ -43,24 +35,17 @@ from app.services.service_account import ServiceAccountService
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
-# `scripts/` is not an installed package, so the repo root goes on sys.path
-# for `test_seed_pins_manifest_shape` below. Guarded and module-level, the
-# same shape as tests/unit/test_eval_seed_boot.py — the previous version
-# ran an unguarded `sys.path.insert` inside the test body, appending a
-# duplicate entry every time the test ran and never removing it.
+# `scripts/` is not an installed package, so the repo root goes on sys.path once at module level,
+# guarded — the previous version re-inserted a duplicate entry on every test run.
 _REPO_ROOT = str(pathlib.Path(__file__).resolve().parents[3])
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 
 class _RedisStub:
-    """Enough of the async Redis surface for the tools we exercise:
-    `get`, `set`, `mget`, `ttl`, `ping`, `info`.
-
-    `mget`/`ttl` back the DAG pause reads in `get_dag_state`. They have
-    to be real here: `app.utils.dag_pause` fails open on any exception,
-    so a missing stub method would silently report "not paused" and the
-    pause assertions below would pass without testing anything."""
+    """Enough async Redis for the tools exercised here. `mget`/`ttl` must be real:
+    `app.utils.dag_pause` fails open, so a missing stub method would silently report "not paused".
+    """
 
     def __init__(self, info: dict[str, Any] | None = None) -> None:
         self._store: dict[str, bytes | str] = {}
@@ -163,9 +148,7 @@ def _content(body: dict[str, Any]) -> dict[str, Any]:
     return json.loads(body["result"]["content"][0]["text"])
 
 
-# ---------------------------------------------------------------------------
 # list_dlq_messages
-# ---------------------------------------------------------------------------
 
 
 async def test_list_dlq_messages_returns_dead_letter_jobs(
@@ -215,9 +198,7 @@ async def test_list_dlq_messages_wrong_scope_forbidden(
     assert body["error"]["code"] == protocol.MCP_FORBIDDEN
 
 
-# ---------------------------------------------------------------------------
 # get_trace / search_traces
-# ---------------------------------------------------------------------------
 
 
 async def test_get_trace_returns_matching_job(
@@ -251,13 +232,8 @@ async def test_get_trace_returns_matching_job(
 async def test_get_trace_finds_audit_row_outside_newest_200(
     mcp_client, db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
 ) -> None:
-    """D-02: the trace's audit row must be found by request_id, not by
-    happening to fall inside the newest-200 audit window.
-
-    Every MCP call appends an `agent.tool_invoked` row to audit_logs, so in
-    a live run the seeded rows for a trace scroll out of a fixed recent
-    window and get_trace silently returns audit_events=[] for rows still
-    present in the DB.
+    """D-02: the audit row is found by request_id, not by falling inside the newest-200 window —
+    every MCP call appends an `agent.tool_invoked` row, so a trace's seeded rows scroll out of it.
     """
     ac, _ = mcp_client
     trace_id = "trace-window-decay"
@@ -283,9 +259,7 @@ async def test_get_trace_finds_audit_row_outside_newest_200(
             created_at=base,
         )
     )
-    # 205 unrelated rows, each explicitly newer (SQLite ordering on equal
-    # timestamps is unstable, so set created_at rather than relying on
-    # insertion order).
+    # 205 unrelated rows, each explicitly newer: SQLite ordering on equal timestamps is unstable.
     for i in range(205):
         db_session.add(
             AuditLog(
@@ -402,9 +376,7 @@ async def test_search_traces_filters_by_status(
     assert trace_ids == {"tr-failed-0", "tr-failed-1", "tr-failed-2"}
 
 
-# ---------------------------------------------------------------------------
 # get_dag_state
-# ---------------------------------------------------------------------------
 
 
 async def test_get_dag_state_returns_parents_and_children(
@@ -558,9 +530,7 @@ async def test_get_dag_state_unknown_job_404(
     assert body["error"]["data"]["error_code"] == "not_found"
 
 
-# ---------------------------------------------------------------------------
 # health
-# ---------------------------------------------------------------------------
 
 
 async def test_get_redis_health_returns_stats(
@@ -590,9 +560,7 @@ async def test_get_postgres_health_reports_dialect(
     assert payload["active_connections"] is None
 
 
-# ---------------------------------------------------------------------------
 # get_deploy_history
-# ---------------------------------------------------------------------------
 
 
 async def test_get_deploy_history_env_fallback_when_table_empty(
@@ -700,10 +668,8 @@ async def test_get_deploy_history_environment_filter(
 async def test_get_deploy_history_falls_back_to_env_on_db_error(
     mcp_client, db_session: AsyncSession, default_tenant, monkeypatch  # type: ignore[no-untyped-def]
 ) -> None:
-    """The P0 fix — if the deploy_markers query blows up (missing table
-    during a staged rollout, transient connection issue, etc.) the tool
-    must NOT surface HTTP 500. It falls back to the env-based synthetic
-    entry and stamps `source: env` with a note explaining the fallback."""
+    """The P0 fix: a failing deploy_markers query must not surface a 500. It falls back to the
+    env-based synthetic entry and stamps `source: env` with a note."""
     from sqlalchemy.exc import ProgrammingError
 
     monkeypatch.setenv("APP_VERSION", "v0.9.9-fallback")
@@ -730,16 +696,10 @@ async def test_get_deploy_history_falls_back_to_env_on_db_error(
 
 
 def test_seed_pins_manifest_shape() -> None:
-    """The pin manifest the seed script writes — scenarios pin against
-    these UUIDs, so the shape needs to be stable.
-
-    The location is `default_pins_path()`: `EVAL_PINS_PATH` if set, else
-    `<tempdir>/eval-fixtures-pins.json`. It is deliberately *not*
-    `/app/eval-fixtures-pins.json`, which this docstring used to name —
-    that path is root-owned in the shipped image and every boot died with
-    EACCES writing it. `backend/tests/unit/test_eval_seed_boot.py` owns
-    that rule; asserted here too so the two cannot drift apart silently.
-    """
+    """Scenarios pin against these UUIDs, so the manifest shape must stay stable. The location is
+    `default_pins_path()` — `EVAL_PINS_PATH` or a tempdir, deliberately not
+    `/app/eval-fixtures-pins.json`, which is root-owned in the shipped image and killed every boot
+    with EACCES. `backend/tests/unit/test_eval_seed_boot.py` owns that rule."""
     from scripts.seed_eval_fixtures import collect_pins, default_pins_path
 
     assert not default_pins_path().startswith("/app/")
@@ -761,9 +721,7 @@ def test_seed_pins_manifest_shape() -> None:
     assert "dag" in manifest and "seed_job_id" in manifest["dag"]
 
 
-# ---------------------------------------------------------------------------
 # get_consumer_lag — dynamic key derivation
-# ---------------------------------------------------------------------------
 
 
 async def test_get_consumer_lag_arbitrary_group_reads_correct_key(
@@ -819,13 +777,8 @@ async def test_get_consumer_lag_unknown_group_returns_null_not_error(
 async def test_get_consumer_lag_distinguishes_unknown_from_zero(
     mcp_client, db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
 ) -> None:
-    """R2-17 / #160: the dispatcher deliberately does not emit
-    ConsumerLag when lag is unknown, because a fabricated 0 reads as
-    healthy — the same reasoning the CloudWatch backlog alarm documents
-    for absent datapoints. The tool must carry that distinction in its
-    OUTPUT, not just in its description: `lag: 0` (drained, healthy) and
-    `lag: null` (could not determine) are opposite conclusions and an
-    agent reading JSON has to tell them apart."""
+    """R2-17 / #160: a fabricated 0 reads as healthy, so the tool carries the distinction in its
+    OUTPUT — `lag: 0` (drained) and `lag: null` (could not determine) are opposite conclusions."""
     ac, redis_stub = mcp_client
     redis_stub._store["kafka:consumer_lag:healthy-consumer"] = "0"
 
@@ -857,11 +810,8 @@ async def test_get_consumer_lag_distinguishes_unknown_from_zero(
 async def test_get_consumer_lag_reports_which_group_is_live_refreshed(
     mcp_client, db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
 ) -> None:
-    """R2-17: the FRESHNESS contract (~60s refresh, 90s TTL) holds for
-    `worker-dispatcher` alone. The other seven are static fixtures the
-    seed script writes and nothing refreshes, so `inject_latency`'s
-    'watch the group's lag grow' is false for all of them. The agent
-    cannot read docs/REDIS.md — the tool has to say so itself."""
+    """R2-17: the ~60s refresh and 90s TTL hold for `worker-dispatcher` alone — the other seven are
+    static fixtures nothing refreshes, and the tool has to say so itself."""
     ac, redis_stub = mcp_client
     redis_stub._store["kafka:consumer_lag:worker-dispatcher"] = "42"
     redis_stub._store["kafka:consumer_lag:billing-consumer"] = "15000"
@@ -889,10 +839,8 @@ async def test_get_consumer_lag_reports_which_group_is_live_refreshed(
 async def test_get_consumer_lag_description_scopes_its_freshness_claim(
     mcp_client, db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
 ) -> None:
-    """Contract test for the corrected description. The old text
-    promised a ~60s refresh loop and a 90s TTL for all eight advertised
-    groups; that is true of exactly one. Pin the correction so it cannot
-    silently regress into a blanket claim again."""
+    """The old text promised the refresh and TTL for all eight groups; it is true of one. Pin the
+    correction so it cannot regress into a blanket claim."""
     ac, _ = mcp_client
     token = await _token(
         db_session, default_tenant.id, [Scope.TELEMETRY_READ.value]
@@ -914,10 +862,8 @@ async def test_get_consumer_lag_description_scopes_its_freshness_claim(
         "the ~60s refresh claim is still stated for every advertised "
         "group; it holds only for worker-dispatcher"
     )
-    # The non-live groups must be described as unchanging, and in
-    # lab-free words: ADR 0012 rule 1 bans "fixture"/"seed" from the
-    # non-chaos wire surface, so the honest wording has to be
-    # operational ("a recorded constant") rather than about the rig.
+    # ADR 0012 rule 1 bans "fixture"/"seed" from the non-chaos wire surface, so the honest wording
+    # is operational: "a recorded constant".
     assert "static" in description.lower()
     # Every advertised group is still named, so the correction narrowed
     # the freshness claim without shrinking the menu.
@@ -927,9 +873,7 @@ async def test_get_consumer_lag_description_scopes_its_freshness_claim(
     assert not missing, f"groups dropped from the description: {missing}"
 
 
-# ---------------------------------------------------------------------------
 # list_incidents / get_incident
-# ---------------------------------------------------------------------------
 
 
 async def test_list_incidents_defaults_to_unresolved(
@@ -1035,13 +979,8 @@ async def test_get_incident_unknown_id_returns_not_found(
     assert body["error"]["data"]["error_code"] == "not_found"
 
 
-# ---------------------------------------------------------------------------
-# Result-window honesty (WO-R2-53)
-#
-# The agent cannot read the docs — the tool description IS the interface — so
-# a description that does not match the query behind it is a functional
-# defect, not a documentation nit.
-# ---------------------------------------------------------------------------
+# Result-window honesty (WO-R2-53): the agent cannot read the docs, so the tool description IS the
+# interface and one that does not match its query is a functional defect.
 
 
 def _dlq_job(tenant_id, user_id, *, name: str, created, dead_lettered) -> Job:  # type: ignore[no-untyped-def]
@@ -1060,13 +999,8 @@ def _dlq_job(tenant_id, user_id, *, name: str, created, dead_lettered) -> Job:  
 async def test_list_dlq_messages_orders_by_dead_letter_time_not_submission(
     mcp_client, db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
 ) -> None:
-    """"Most recent first" has to mean most recently dead-lettered.
-
-    Ordering by `created_at` is job *submission* time: a long-running job
-    submitted yesterday that died a minute ago sorted below a job submitted
-    an hour ago that died three hours ago. With no offset, the newest
-    dead-letters were invisible on the only page the agent could fetch.
-    """
+    """"Most recent first" has to mean most recently dead-lettered: ordering by `created_at` put the
+    newest dead-letters past the end of the only page the agent could fetch."""
     now = datetime.now(UTC)
     ac, _ = mcp_client
     db_session.add(
@@ -1119,9 +1053,8 @@ async def test_list_dlq_messages_orders_by_dead_letter_time_not_submission(
 async def test_search_traces_does_not_spend_its_limit_on_untraced_jobs(
     mcp_client, db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
 ) -> None:
-    """The limit was applied in SQL and NULL trace_ids dropped afterwards, so
-    on a table dominated by untraced jobs the matching traced rows were never
-    returned — the tool answered "no traces" for a trace that exists."""
+    """The limit was applied in SQL and NULL trace_ids dropped afterwards, so the tool answered "no
+    traces" for traces that exist."""
     now = datetime.now(UTC)
     ac, _ = mcp_client
     for n in range(2):
@@ -1220,9 +1153,7 @@ async def test_get_trace_is_not_truncated_when_everything_fits(
     assert payload["total_jobs"] == 1
 
 
-# ---------------------------------------------------------------------------
 # get_outbox_status (WO-R3-201) — end to end, through the JSON-RPC envelope
-# ---------------------------------------------------------------------------
 
 
 async def _outbox_row(
@@ -1311,11 +1242,8 @@ async def test_get_outbox_status_reads_stalled_on_an_aging_backlog(
 async def test_get_outbox_status_takes_no_arguments(
     mcp_client, db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
 ) -> None:
-    """`extra="forbid"`: a caller inventing a filter is told, not ignored.
-
-    The description promises no paging and no filtering; silently accepting a
-    `limit` would make that promise unverifiable from the caller's side.
-    """
+    """`extra="forbid"`: the description promises no paging and no filtering, so an invented `limit`
+    is refused rather than silently ignored."""
     ac, _ = mcp_client
     token = await _token(
         db_session, default_tenant.id, [Scope.TELEMETRY_READ.value]

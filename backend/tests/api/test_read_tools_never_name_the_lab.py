@@ -1,31 +1,15 @@
 """No read tool's RESPONSE says `chaos` to a principal without `chaos:invoke`.
 
-WO-R3-187 (owner decision O-4), the regression half. `test_lab_invisibility`
-already screens every non-chaos tool's `tools/list` surface — description,
-`inputSchema`, `outputSchema` — for lab vocabulary. Nothing screened what
-comes back from a `tools/call` on a world the lab has actually seeded, which
-is where the leak this work order closes lived: `list_audit_events` returned
-`chaos.tool_invoked` rows naming the hook and its arguments.
+WO-R3-187 (owner decision O-4), the regression half. `test_lab_invisibility` screens every non-chaos
+tool's `tools/list` surface; nothing screened what a `tools/call` returns from a world the lab has
+seeded, which is where the leak lived — `list_audit_events` returned `chaos.tool_invoked` rows
+naming the hook and its arguments.
 
-Scope, stated exactly, because both halves are deliberate:
-
-  - **Responses, every read tool, parameterised off the registry.** A tool
-    added later is picked up automatically: `_ARGUMENTS` must cover the
-    registry or the sweep fails naming the tool it cannot call. That failure
-    is the point — the author of the next read tool decides what a sensible
-    call looks like, and cannot skip the screen by forgetting it exists.
-  - **Descriptions are NOT in scope.** Chaos tools' descriptions carry a
-    `[chaos: <blast_radius>]` prefix and `tools/list` is not principal-scoped,
-    so a read-scoped token can enumerate them. That is recorded, deferred and
-    load-bearing elsewhere: ADR 0016 defers principal-scoped `tools/list`,
-    and the commander identifies chaos hooks in its contract snapshot by that
-    exact prefix, so masking them would silently empty every scenario's
-    `chaos_setup` validation. Divergence report row G4.
-
-The residual response-side leaks this sweep does not yet cover are named in
-`_KNOWN_RESIDUAL_LEAKS` below, each with a tripwire test that fails when its
-channel changes — so the list cannot quietly become stale, and closing one
-forces this file to grow instead of being forgotten.
+Responses only, every read tool, parameterised off the registry: `_ARGUMENTS` must cover it or the
+sweep fails naming the tool it cannot call. Descriptions are NOT in scope — the `[chaos:
+<blast_radius>]` prefix is how the commander identifies hooks in its contract snapshot, and ADR 0016
+defers principal-scoped `tools/list` (divergence G4). Residual leaks are listed in
+`_KNOWN_RESIDUAL_LEAKS`, each with a tripwire.
 """
 
 from __future__ import annotations
@@ -65,16 +49,12 @@ from app.workers.kafka_consumer import kill_key_for
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
-# The word, and the case-insensitive test for it. Deliberately the bare
-# substring rather than `test_lab_invisibility`'s inflection-aware pattern:
-# this screen reads DATA, not prose, so `chaos:bad_deploy`,
-# `chaos-owner+…@chaos.local` and `chaos:sat:{run}` all have to trip it, and
-# none of them is a word with an inflection.
+# The bare substring rather than `test_lab_invisibility`'s inflection-aware pattern: this screen
+# reads DATA, so `chaos:bad_deploy` and `chaos:sat:{run}` all have to trip it.
 _BANNED = "chaos"
 
-# The scopes the agent token carries after the split this work order lands
-# (`scripts/seed_incident_commander.py`): read the platform, act on it, never
-# fire the lab.
+# The scopes the agent token carries after this work order's split: read the platform, act on it,
+# never fire the lab.
 AGENT_SCOPES = [
     Scope.TELEMETRY_READ.value,
     Scope.INCIDENTS_READ.value,
@@ -115,34 +95,14 @@ _KNOWN_RESIDUAL_LEAKS = {
 class _RedisStub:
     """Enough Redis for the read surface, seeded the way a chaos run leaves it.
 
-    The `chaos:*` keys are here on purpose: `saturate_redis`, `bad_deploy` and
-    `pause_control_loop` leave exactly these behind, and a read tool that
-    enumerated keys — none does today — would hand the agent the lab.
-    `get_cache_key_info` cannot name them: `chaos:` is not in its
-    readable-prefix allowlist, and the refusal it returns for one only ever
-    quotes the key the caller supplied.
-
-    `chaos:pause:outbox_relay` is what makes the sweep below the assertion
-    WO-R3-200 needs: the pause hook's whole effect is that key, and the world
-    a `jobs_not_progressing` scenario hands the agent has it set while the
-    agent reads every probe here.
-
-    `chaos:pause:resume_unblocked_waiting` plus `chaos:kill:dependency-resolver`
-    are Family C's world (WO-R3-213), and they are here because that world is the
-    first that arms **two** keys from two different mechanisms at once. A scenario
-    whose correct answer is to escalate is the one where naming the lab does most
-    damage: there is nothing to fix, so a hint that something was done *to* the
-    platform is the only lead in the world. Both keys are set while every read
-    tool below is called.
-
-    `outbox:relay:last_tick` is the other half of that world (WO-R3-201). It is
-    the relay's own record of its last pass, and in a paused-relay world it is
-    stale — several minutes old — because the pass that would refresh it is the
-    pass that is not running. `get_outbox_status` therefore reads a real,
-    non-null heartbeat age here rather than the "unknown" branch, which is what
-    makes its response worth screening: the tool is being called against the
-    very world it exists to describe, and it still must not name the lab.
-    """
+    The `chaos:*` keys are deliberate: `saturate_redis`, `bad_deploy` and `pause_control_loop` leave
+    exactly these, and `get_cache_key_info` cannot name them because `chaos:` is not in its readable
+    prefix allowlist. `chaos:pause:outbox_relay` is WO-R3-200's world;
+    `chaos:pause:resume_unblocked_waiting` plus `chaos:kill:dependency-resolver` are Family C's
+    (WO-R3-213), the first world arming two keys from two mechanisms — and the one where naming the
+    lab does most damage, because the correct answer is to escalate. `outbox:relay:last_tick` is
+    stale here (WO-R3-201), so `get_outbox_status` reads a real heartbeat age rather than the
+    unknown branch."""
 
     def __init__(self) -> None:
         self._store: dict[str, str] = {
@@ -196,16 +156,10 @@ async def chaos_world(  # type: ignore[no-untyped-def]
     default_tenant,
     test_user: User,
 ):
-    """A world a chaos run has been through, built at the data level.
-
-    The hooks themselves are not fired here — that needs a broker, a real
-    Redis and `CHAOS_ENABLED=true`, and bad_deploy would seed the
-    residual alert leak listed above, which is not this PR's to close. What is
-    reproduced is every row shape the hooks leave behind that a read tool
-    can reach: the `chaos.` audit stream with its `tool_name` + `arguments`
-    payload (the leak being closed), a declared DLQ fixture job, a seeded
-    alert, and a trace shared between a chaos invocation and a real job.
-    """
+    """A world a chaos run has been through, built at the data level — the hooks themselves need a
+    broker, a real Redis and `CHAOS_ENABLED=true`. Reproduced is every row shape a read tool can
+    reach: the `chaos.` audit stream with its `tool_name` + `arguments` payload, a declared DLQ
+    fixture job, a seeded alert, and a trace shared with a real job."""
     tenant_id = default_tenant.id
     now = datetime.now(UTC)
 
@@ -337,14 +291,8 @@ async def agent_client(  # type: ignore[no-untyped-def]
 
 
 def _read_tools() -> list[ToolDefinition]:
-    """Every registered tool a read-scoped principal may call.
-
-    Keyed on the scope, not on a name list: `telemetry:read` and
-    `incidents:read` are the two read scopes in ADR 0007's taxonomy, so this
-    is the whole surface the agent's investigation runs on. Action tools
-    (`actions:execute`) are excluded because calling them mutates; chaos
-    tools are excluded because they are the lab and may name it.
-    """
+    """Every registered tool a read-scoped principal may call, keyed on the scope rather than a name
+    list (ADR 0007). Action tools mutate; chaos tools are the lab and may name it."""
     return [t for t in list_tools() if t.required_scope in _READ_SCOPES]
 
 
@@ -369,12 +317,8 @@ _ARGUMENTS: dict[str, dict[str, Any]] = {
 
 
 def test_every_read_tool_has_a_call_in_the_argument_table() -> None:
-    """The registry is the authority; this table has to keep up with it.
-
-    A new read tool fails here by name, with the reason: the sweep below
-    parameterises off `_read_tools()`, and a tool nobody supplied arguments
-    for would otherwise be silently unscreened.
-    """
+    """The registry is the authority: a new read tool fails here by name, because the sweep
+    parameterises off `_read_tools()` and would otherwise leave it unscreened."""
     missing = sorted(t.name for t in _read_tools() if t.name not in _ARGUMENTS)
     assert missing == [], (
         f"read tools with no entry in _ARGUMENTS: {missing}. Add a sensible "
@@ -390,13 +334,8 @@ async def test_read_tool_response_never_names_the_lab(
     agent_client: tuple[AsyncClient, str, str],
     tool_name: str,
 ) -> None:
-    """THE sweep. Call the tool as the agent; screen the whole envelope.
-
-    The screen is on the serialized JSON-RPC response, not on a parsed
-    field: an error message, a validation detail and a nested `extra_data`
-    blob are all things the agent reads, and the first version of this leak
-    lived inside `extra_data`.
-    """
+    """THE sweep: call the tool as the agent and screen the serialized response rather than a parsed
+    field — the first version of this leak lived inside `extra_data`."""
     ac, token, cache_key = agent_client
     arguments = {
         k: (cache_key if v == "{cache_key}" else v)
@@ -415,10 +354,8 @@ async def test_read_tool_response_never_names_the_lab(
     )
     body = resp.json()
 
-    # A tool that errors proves nothing about the world it was supposed to
-    # read, so the call has to have actually run. Every read tool on this
-    # harness can: the health probes report their own failures as data
-    # rather than raising, and the rest read Postgres or the Redis stub.
+    # A tool that errors proves nothing about the world it was supposed to read, so the call has to
+    # have actually run; every read tool on this harness can.
     assert "error" not in body, (
         f"{tool_name} did not run — fix the call in _ARGUMENTS rather than "
         f"letting an error response pass the screen: {body.get('error')}"
@@ -435,13 +372,8 @@ async def test_the_sweep_would_catch_the_leak_it_closed(
     db_session: AsyncSession,
     chaos_world: uuid.UUID,
 ) -> None:
-    """The screen is load-bearing, so prove it fires.
-
-    Same seeded world, same call, one difference: the token also holds
-    `chaos:invoke`, which is what makes the chaos rows visible. The response
-    then contains the word — i.e. the sweep above is passing because the
-    filter works, not because the world is empty or the screen is inert.
-    """
+    """The screen is load-bearing, so prove it fires: same world and same call, but the token also
+    holds `chaos:invoke`, and the word comes back."""
     ac, _agent_token, _cache_key = agent_client
     svc = ServiceAccountService(
         ServiceAccountRepository(db_session),
@@ -474,9 +406,7 @@ async def test_the_sweep_would_catch_the_leak_it_closed(
     )
 
 
-# ---------------------------------------------------------------------------
 # Tripwires on the residual leaks
-# ---------------------------------------------------------------------------
 
 
 def test_the_residual_leak_list_is_documented() -> None:
@@ -490,14 +420,9 @@ def test_the_residual_leak_list_is_documented() -> None:
 
 
 def test_bad_deploy_alert_source_still_leaks_pending_o8() -> None:
-    """Tripwire for owner decision O-8, not an endorsement.
-
-    When the source is renamed (together with the reset predicate — see the
-    entry in `_KNOWN_RESIDUAL_LEAKS`), this fails, and the fix is to seed a
-    `bad_deploy` alert into `chaos_world` above and delete this test. Read
-    off the module constants rather than the running registry because the
-    chaos tools are unregistered under default settings.
-    """
+    """Tripwire for owner decision O-8, not an endorsement: when the source is renamed together with
+    the reset predicate this fails, and the fix is to seed a `bad_deploy` alert into `chaos_world`
+    and delete this test."""
     from app.mcp.tools.chaos import bad_deploy
 
     assert bad_deploy.BAD_DEPLOY_KEY.startswith(f"{_BANNED}:"), (

@@ -57,13 +57,8 @@ async def test_str_value_is_decoded() -> None:
 
 
 async def test_redis_error_fails_open(caplog: pytest.LogCaptureFixture) -> None:
-    """A raising GET is "lag unknown", not "reject the job".
-
-    This was the only unguarded Redis call on `POST /jobs`: an outage 500'd
-    every submission while rate_limit.py, quota.py and cache.py all degraded
-    quietly. Delete the try/except in check_backpressure and this test goes
-    red with ConnectionError.
-    """
+    """A raising GET is "lag unknown", not "reject the job": the only unguarded Redis call on `POST
+    /jobs` used to 500 every submission during an outage."""
     redis = AsyncMock()
     redis.get.side_effect = ConnectionError("Connection refused")
 
@@ -84,19 +79,16 @@ async def test_redis_error_fails_open(caplog: pytest.LogCaptureFixture) -> None:
     ],
 )
 async def test_redis_error_fails_open_for_any_error_type(exc: Exception) -> None:
-    """Fail-open is keyed on "the read failed", not on a specific exception
-    class — redis-py raises several unrelated types (and wraps others), so
-    narrowing this to ConnectionError would reopen the hole."""
+    """Fail-open is keyed on "the read failed", not on an exception class — redis-py raises several
+    unrelated types."""
     redis = AsyncMock()
     redis.get.side_effect = exc
     await check_backpressure(redis)  # must not raise
 
 
 async def test_dispatcher_consumer_lag_returns_none_when_not_started() -> None:
-    """consumer_lag returns None (not 0) when the consumer hasn't joined
-    yet — "unknown" must not be confused with "healthy" (FIX_PLAN #2).
-    Metrics loop skips the cache write on None so backpressure fails
-    open on absence."""
+    """consumer_lag returns None, not 0, before the consumer joins: unknown is not healthy (FIX_PLAN
+    #2), and the metrics loop skips the cache write on None."""
     from app.workers.dispatcher import JobDispatcherConsumer
 
     with patch(
@@ -109,9 +101,7 @@ async def test_dispatcher_consumer_lag_returns_none_when_not_started() -> None:
 
 
 async def test_dispatcher_consumer_lag_returns_none_on_empty_assignment() -> None:
-    """A consumer that's started but hasn't been assigned any partitions
-    yet also returns None. Distinct from `lag=0` which means "assigned
-    partitions, everything consumed"."""
+    """Started but unassigned also returns None, distinct from `lag=0`."""
     from app.workers.dispatcher import JobDispatcherConsumer
 
     with patch(
@@ -141,9 +131,8 @@ async def test_dispatcher_consumer_lag_returns_none_on_kafka_error() -> None:
 
 
 async def test_metrics_loop_skips_cache_write_when_lag_is_none() -> None:
-    """The metrics loop must not overwrite the lag cache key with a
-    fabricated 0 when the consumer reports unknown. The previous key
-    TTLs out naturally and backpressure fails open on absence."""
+    """The metrics loop never overwrites the lag cache with a fabricated 0; the old key TTLs out and
+    backpressure fails open on absence."""
     from unittest.mock import MagicMock
 
     from app.workers.dispatcher import _metrics_loop
@@ -153,9 +142,8 @@ async def test_metrics_loop_skips_cache_write_when_lag_is_none() -> None:
     consumer.in_flight = set()
     consumer.consumer_lag = AsyncMock(return_value=None)  # unknown
 
-    # asyncio.sleep is the first await in the loop — patch it to trigger
-    # CancelledError on the second call so the loop exits after one
-    # iteration.
+    # asyncio.sleep is the first await: patch it to raise CancelledError on the second call so the
+    # loop exits after one iteration.
     import asyncio as _asyncio
 
     call_count = {"n": 0}
@@ -181,9 +169,7 @@ async def test_metrics_loop_skips_cache_write_when_lag_is_none() -> None:
 
 
 async def test_idempotency_reaper_loop_deletes_expired_records() -> None:
-    """The reaper loop calls delete_expired() every hour and logs the
-    count when non-zero. Scaffolding follows the metrics_loop pattern:
-    patch asyncio.sleep to break out after one iteration."""
+    """The reaper loop calls delete_expired() each hour and logs a non-zero count."""
     import asyncio as _asyncio
     from unittest.mock import MagicMock
 
@@ -234,9 +220,7 @@ async def test_idempotency_reaper_loop_deletes_expired_records() -> None:
 
 
 async def test_idempotency_reaper_loop_survives_repo_error() -> None:
-    """A raised exception from delete_expired must not crash the loop
-    — it's a housekeeping task, correctness doesn't depend on it, and
-    the worker process must not die because a cleanup query failed."""
+    """A raised delete_expired must not kill the loop — housekeeping, not correctness."""
     import asyncio as _asyncio
     from contextlib import asynccontextmanager
     from unittest.mock import MagicMock

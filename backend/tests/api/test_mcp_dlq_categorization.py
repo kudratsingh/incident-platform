@@ -1,11 +1,6 @@
-"""End-to-end tests for the DLQ categorization surface added in v0.4.0.
-
-Covers:
-  - list_dlq_messages exposes remediation_hint and filters by it
-  - replay_dlq_by_ids replays targeted set + surfaces per-id errors
-  - replay_dlq_by_category walks the safe categories
-  - replay_dlq_by_category REFUSES human_required
-  - mark_dlq_permanent sets the hint + writes an audit row
+"""The DLQ categorization surface added in v0.4.0: the `remediation_hint` field and filter,
+`replay_dlq_by_ids`, `replay_dlq_by_category` and its refusal of `human_required`, and
+`mark_dlq_permanent`'s hint plus audit row.
 """
 
 from __future__ import annotations
@@ -88,18 +83,10 @@ class _RedisStub:
     async def eval(self, script: str, numkeys: int, *args: Any) -> list[str]:
         """Python transcription of `_CLAIM_READY_LUA`.
 
-        The unit tests mock `redis.eval` outright, which is why the
-        pre-R2-21 `_ZsetPipe`/`zrangebyscore` stubs went dead the moment
-        the drain moved to Lua: nothing in this file could serve an EVAL,
-        so nothing covered the drain. Emulating the one script the DLQ
-        path uses buys back the behavioural coverage — claim, ack, and
-        the expired-claim reclaim that makes a worker crash survivable.
-
-        Scope note, same as `test_queue.py`'s: this is a transcription,
-        not the interpreter. The real script's boundedness and reclaim
-        markers are pinned by
-        `test_claim_lua_reclaims_expired_claims_and_stays_bounded`.
-        """
+        The unit tests mock `redis.eval`, so the pre-R2-21 ZSET stubs went dead when the drain moved
+        to Lua and nothing covered it. Emulating this one script buys back claim, ack and
+        expired-claim reclaim. A transcription, not the interpreter: boundedness and the reclaim
+        markers are pinned by `test_claim_lua_reclaims_expired_claims_and_stays_bounded`."""
         if script != dlq_replay_scheduler._CLAIM_READY_LUA:
             raise NotImplementedError("stub serves only the claim script")
         assert numkeys == 2
@@ -216,9 +203,7 @@ async def _seed_categorized_dlq(
     return ids
 
 
-# ---------------------------------------------------------------------------
 # list_dlq_messages — categorization surface
-# ---------------------------------------------------------------------------
 
 
 async def test_list_dlq_exposes_remediation_hint(
@@ -261,9 +246,7 @@ async def test_list_dlq_filters_by_category(
     )
 
 
-# ---------------------------------------------------------------------------
 # replay_dlq_by_ids
-# ---------------------------------------------------------------------------
 
 
 async def test_replay_dlq_by_ids_replays_targeted_set(
@@ -323,9 +306,7 @@ async def test_replay_dlq_by_ids_reports_per_id_failures(
     assert bad["error"]
 
 
-# ---------------------------------------------------------------------------
 # replay_dlq_by_category
-# ---------------------------------------------------------------------------
 
 
 async def test_replay_dlq_by_category_replays_safe(
@@ -373,9 +354,7 @@ async def test_replay_dlq_by_category_refuses_human_required(
     assert body["error"]["data"]["error_code"] == "dlq_category_refused"
 
 
-# ---------------------------------------------------------------------------
 # mark_dlq_permanent
-# ---------------------------------------------------------------------------
 
 
 async def test_mark_dlq_permanent_sets_hint(
@@ -431,13 +410,9 @@ async def test_mark_dlq_permanent_sets_hint(
 async def test_mark_dlq_permanent_on_an_unclassified_row_fences_and_audits(
     mcp_client, db_session, default_tenant, test_user  # type: ignore[no-untyped-def]
 ) -> None:
-    """The shape the `dlq_human_required_escalates` drill runs on: a row
-    nobody has classified, fenced by the agent.
-
-    The hint goes from NULL to `human_required`, `fenced_at`/`fenced_by`
-    record that an operator did it rather than triage, and the reason
-    lands on an audit row.
-    """
+    """The shape the `dlq_human_required_escalates` drill runs on: NULL → `human_required`, with
+    `fenced_at`/`fenced_by` recording an operator rather than triage, and the reason on an audit
+    row."""
     job = Job(
         tenant_id=default_tenant.id,
         user_id=test_user.id,
@@ -507,17 +482,10 @@ async def test_mark_dlq_permanent_re_fence_still_writes_and_audits(
 ) -> None:
     """WO-R2-158, the finding that blocked the drill.
 
-    RED before: on a row already `human_required` this tool took an
-    `already_marked` early return and wrote nothing at all — not the row,
-    not even an audit row. An agent that fenced the row and an agent that
-    skipped the step left identical worlds, so an eval grading the fence
-    graded a no-op (confirmed live 2026-09-08).
-
-    Re-fencing is still an operator action: a deliberate decision about
-    this row, taken now, with a reason worth keeping. So it stamps
-    `fenced_at`/`fenced_by` and writes the audit row. `already_marked`
-    stays in the response — it now says only "you were not the first",
-    which is what a caller that cares actually wants to know.
+    RED before: on a row already `human_required` the tool took an `already_marked` early return and
+    wrote nothing at all — not the row, not even an audit row — so an agent that fenced and one that
+    skipped left identical worlds (confirmed live 2026-09-08). Re-fencing is still an operator
+    action, so it stamps the fence and audits; `already_marked` now says only "you were not first".
     """
     ids = await _seed_categorized_dlq(db_session, default_tenant, test_user)
     already_marked_id = ids[RemediationHint.HUMAN_REQUIRED.value]
@@ -592,12 +560,8 @@ async def test_mark_dlq_permanent_re_fence_still_writes_and_audits(
 async def test_a_re_fence_moves_fenced_at_forward(
     mcp_client, db_session, default_tenant, test_user  # type: ignore[no-untyped-def]
 ) -> None:
-    """`fenced_at` is the verification surface, so it has to answer "did
-    MY call land" rather than "has anyone ever fenced this".
-
-    Two marks under different idempotency keys, so both execute (the same
-    key would return the stored response without re-running — ADR 0010).
-    """
+    """`fenced_at` is the verification surface, so it must answer "did MY call land". Two marks
+    under different idempotency keys, so both execute (ADR 0010)."""
     ids = await _seed_categorized_dlq(db_session, default_tenant, test_user)
     job_id = ids[RemediationHint.REPLAY_SAFE.value]
     token = await _token(
@@ -646,12 +610,8 @@ async def test_a_re_fence_moves_fenced_at_forward(
 async def test_list_dlq_shows_the_fence_stamps(
     mcp_client, db_session, default_tenant, test_user  # type: ignore[no-untyped-def]
 ) -> None:
-    """The fence has to be readable through the surface the agent uses.
-
-    `remediation_hint` cannot carry this: `human_required` is the same
-    value from triage and from an operator, so a row classified by triage
-    and a row somebody fenced were identical over the wire.
-    """
+    """`remediation_hint` cannot carry the fence: `human_required` is the same value from triage and
+    from an operator, so the two rows were identical over the wire."""
     ids = await _seed_categorized_dlq(db_session, default_tenant, test_user)
     fenced_id = ids[RemediationHint.REPLAY_SAFE.value]
     triaged_id = ids[RemediationHint.HUMAN_REQUIRED.value]
@@ -720,16 +680,11 @@ async def test_mark_dlq_permanent_refuses_non_dlq(
     assert body["error"]["data"]["error_code"] == "not_found"
 
 
-# ---------------------------------------------------------------------------
 # delay_seconds — scheduled DLQ replay (wait_and_replay category)
-# ---------------------------------------------------------------------------
 
 
 async def _redis_stub_from_mcp_client(mcp_client) -> _RedisStub:  # type: ignore[no-untyped-def]
-    """Recover the `_RedisStub` the fixture yielded so we can assert
-    ZSET side-effects directly. The fixture's dependency override
-    generator holds it as its bound `redis_stub` closure — we roundtrip
-    through the app to reach it."""
+    """Recover the `_RedisStub` the fixture yielded, to assert ZSET side effects directly."""
     app = mcp_client._transport.app  # type: ignore[attr-defined]
     override = app.dependency_overrides[get_redis]
     gen = override()
@@ -885,14 +840,11 @@ async def test_replay_dlq_by_category_with_delay_schedules_all_matched(
     assert len(stub._zsets.get("jobs:dlq_replay_delayed", {})) == 2
 
 
-# ---------------------------------------------------------------------------
-# R2-21 — scheduled replays are durable and always audited
+# R2-21 — scheduled replays are durable and always audited.
 #
-# Three failure shapes, one root cause: the scheduled path was neither
-# transactional (audit row written after the zadd, no savepoint, no
-# compensation) nor recoverable (the promote loop popped the whole due
-# batch destructively before attempting any replay).
-# ---------------------------------------------------------------------------
+# Three failure shapes, one root cause: the scheduled path was neither transactional (audit row
+# written after the zadd, no savepoint, no compensation) nor recoverable (the promote loop popped
+# the whole due batch destructively before attempting any replay).
 
 
 def _armed(stub: _RedisStub) -> set[str]:
@@ -939,14 +891,9 @@ def _factory_for(session: AsyncSession) -> Any:
 async def test_scheduled_branch_survives_a_non_app_error_mid_loop(
     mcp_client, db_session, default_tenant, test_user  # type: ignore[no-untyped-def]
 ) -> None:
-    """The scheduled branch caught only `AppError`, unlike the immediate
-    branch directly above it. A non-AppError on the second id aborted the
-    whole tool, so the first id stayed armed on the ZSET while its audit
-    row died with the request transaction — an agent remediation that
-    fires with no audit evidence.
-
-    Post-fix: the loop survives, the first id is armed AND audited, the
-    second is neither."""
+    """The scheduled branch caught only `AppError`, so a non-AppError on the second id aborted the
+    whole tool: the first id stayed armed on the ZSET while its audit row died with the transaction.
+    """
     ids = await _seed_categorized_dlq(db_session, default_tenant, test_user)
     first = ids[RemediationHint.REPLAY_SAFE.value]
     second = ids[RemediationHint.WAIT_AND_REPLAY.value]
@@ -990,15 +937,9 @@ async def test_scheduled_branch_survives_a_non_app_error_mid_loop(
 async def test_scheduled_entry_is_disarmed_when_its_audit_row_is_rolled_back(
     mcp_client, db_session, default_tenant, test_user  # type: ignore[no-untyped-def]
 ) -> None:
-    """`_schedule_one` wrote the durable ZSET entry BEFORE the audit row
-    and never compensated it. Any later failure left a replay that would
-    fire with no audit evidence at all.
-
-    Modelled here as a failure that lands after the zadd — the residual
-    window once the audit write is moved first (a savepoint release can
-    still raise). The savepoint rolls the audit row back, so the entry
-    must be zrem'd too: armed-without-audit is the one state that is
-    never allowed."""
+    """`_schedule_one` wrote the durable ZSET entry BEFORE the audit row and never compensated it.
+    Modelled as a failure after the zadd — the residual window once the audit write moves first — so
+    the entry must be zrem'd too: armed-without-audit is the one state never allowed."""
     ids = await _seed_categorized_dlq(db_session, default_tenant, test_user)
     job_id = ids[RemediationHint.WAIT_AND_REPLAY.value]
     token = await _token(
@@ -1093,10 +1034,8 @@ async def test_category_scheduled_branch_matches_the_by_ids_shape(
 async def test_scheduled_replay_drains_through_the_claim_and_is_acked(
     mcp_client, db_session, default_tenant, test_user  # type: ignore[no-untyped-def]
 ) -> None:
-    """First test in this file to exercise the drain at all. Schedules
-    through the real tool, rewinds the score, and runs one promote pass:
-    the job flips to PENDING, the canonical `job.replayed` row is written
-    and the claim is released."""
+    """First test here to exercise the drain: schedule through the real tool, rewind the score, run
+    one promote pass — PENDING, the canonical `job.replayed` row, claim released."""
     ids = await _seed_categorized_dlq(db_session, default_tenant, test_user)
     job_id = ids[RemediationHint.WAIT_AND_REPLAY.value]
     token = await _token(
@@ -1138,13 +1077,9 @@ async def test_scheduled_replay_drains_through_the_claim_and_is_acked(
 async def test_scheduled_replay_survives_a_worker_crash_between_claim_and_replay(
     mcp_client, db_session, default_tenant, test_user  # type: ignore[no-untyped-def]
 ) -> None:
-    """`pop_ready` ZREM'd the whole due batch before any replay was
-    attempted, so a crash or redeploy in that window silently discarded
-    operator/agent-scheduled replays with no record of the loss.
-
-    Pass 1 dies mid-replay: the entry has left the scheduled set but is
-    held as a claim, not lost. Pass 2, after the claim TTL lapses,
-    reclaims and fires it."""
+    """`pop_ready` ZREM'd the whole due batch before any replay, so a crash in that window discarded
+    scheduled replays with no record. Pass 1 dies mid-replay and holds a claim; pass 2 reclaims it
+    once the TTL lapses."""
     ids = await _seed_categorized_dlq(db_session, default_tenant, test_user)
     job_id = ids[RemediationHint.WAIT_AND_REPLAY.value]
     token = await _token(

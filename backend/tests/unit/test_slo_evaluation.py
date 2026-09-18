@@ -1,22 +1,10 @@
 """Scheduled SLO evaluation, real-condition alerts, and cancellations (WO-R2-29).
 
-Two findings that had to land together. Turning on scheduled evaluation while
-the dispatch-latency objective still counted every cancellation as a dispatch
-failure would have meant paging on saga rollbacks — the alerting would have
-been worse than none, because it would have been confidently wrong.
-
-  * `compute_all` had exactly one caller, a read-only admin endpoint, so
-    nothing evaluated the objectives on a schedule and no real platform
-    condition ever created an Alert. The alert webhook is the incident
-    commander's production trigger and its only producer was a chaos tool.
-  * the `job_dispatch_latency` SLO admitted CANCELLED into its denominator.
-    Those rows never left PENDING — they were cancelled while WAITING — so
-    each arrived with `started_at IS NULL` and was counted as a dispatch miss.
-
-Real rows on a real (SQLite in-memory) engine: both halves are SQL predicates
-and a unique constraint. The engine is module-local so committed rows never
-leak into the shared session-scoped `sqlite_engine` other suites roll back
-against.
+Two findings that had to land together. `compute_all` had one caller, a read-only admin endpoint, so
+nothing evaluated the objectives on a schedule and the alert webhook's only producer was a chaos
+tool. And `job_dispatch_latency` admitted CANCELLED rows, which never left PENDING, so each was
+counted as a dispatch miss. Real rows on a module-local SQLite engine, so committed rows never leak
+into the shared `sqlite_engine`.
 """
 
 import asyncio
@@ -171,22 +159,15 @@ async def _alerts(factory: async_sessionmaker[AsyncSession]) -> list[Alert]:
         return list((await session.execute(select(Alert))).scalars().all())
 
 
-# ---------------------------------------------------------------------------
 # Finding 2 — cancellations are not dispatch failures
-# ---------------------------------------------------------------------------
 
 
 async def test_a_six_step_saga_rollback_does_not_move_the_objective(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """THE assertion for finding 2, in the shape the spec names.
-
-    A saga that rolls back cancels its remaining steps; the dependency
-    cascade does the same to a stranded parent's WAITING descendants. Those
-    rows never left PENDING, so every one of them reached the objective with
-    `started_at IS NULL` and was counted as a job we failed to dispatch. A
-    rollback is a decision, not an outage, and it must not cost error budget.
-    """
+    """THE assertion for finding 2: cancelled saga steps and cascaded WAITING descendants never left
+    PENDING, so each reached the objective with `started_at IS NULL`. A rollback is a decision, not
+    an outage, and must not cost error budget."""
     await _seed_jobs(session_factory, status=JobStatus.COMPLETED, count=20)
     before = await _latency_state(session_factory)
 
@@ -210,15 +191,9 @@ async def test_a_six_step_saga_rollback_does_not_move_the_objective(
 async def test_a_cancellation_cascade_does_not_trip_the_fast_burn_alarm(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """Why the two findings had to land together.
-
-    `cascade_cancel_blocked_children` cancels a whole DAG subtree in one
-    write, so cancellations arrive in bulk rather than one at a time. With
-    them in the denominator a single cascade could push the objective past
-    14.4× on its own — so switching on scheduled evaluation first would have
-    paged an operator, at critical severity, because a dependency parent
-    failed and the platform correctly cleaned up after it.
-    """
+    """Why the two findings had to land together: `cascade_cancel_blocked_children` cancels a whole
+    subtree in one write, so with cancellations in the denominator a single cascade could pass 14.4×
+    on its own and page at critical severity for correct cleanup."""
     await _seed_jobs(session_factory, status=JobStatus.COMPLETED, count=2)
     await _seed_jobs(
         session_factory,
@@ -238,13 +213,8 @@ async def test_a_cancellation_cascade_does_not_trip_the_fast_burn_alarm(
 async def test_a_job_that_never_started_is_still_a_dispatch_miss(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """The fix must not over-correct.
-
-    A job that reached a terminal state without anything ever claiming it is
-    exactly what "we failed to dispatch it" means — no processor registered,
-    or the dispatcher's safety net firing. Only CANCELLED leaves the
-    denominator; `started_at IS NULL` stays a failure everywhere else.
-    """
+    """The fix must not over-correct: only CANCELLED leaves the denominator, and `started_at IS
+    NULL` stays a dispatch failure everywhere else."""
     await _seed_jobs(session_factory, status=JobStatus.COMPLETED, count=9)
     await _seed_jobs(
         session_factory,
@@ -262,19 +232,10 @@ async def test_a_job_that_never_started_is_still_a_dispatch_miss(
 async def test_slow_dispatch_is_still_a_failure_and_cancellations_are_not(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """The portable fallback, asserted directly — and deliberately so.
-
-    `_compute_latency_slo` builds `EXTRACT(EPOCH FROM started_at -
-    created_at)`. SQLite does not raise on that: it evaluates the expression
-    to NULL, so the comparison never matches and the SQL path silently
-    reports zero latency failures on this engine. (The `started_at IS NULL`
-    branch of the same CASE does work, which is why the tests above are
-    meaningful.) Calling the fallback directly is therefore the only way this
-    suite can assert the threshold behaviour at all.
-
-    Both paths take their denominator from `_dispatched_in_window`, so this
-    also proves the cancellation exclusion on the second implementation.
-    """
+    """The portable fallback, asserted directly. `EXTRACT(EPOCH FROM ...)` evaluates to NULL on
+    SQLite, so the SQL path silently reports zero latency failures here and calling the fallback is
+    the only way to assert the threshold. Both paths take their denominator from
+    `_dispatched_in_window`."""
     await _seed_jobs(session_factory, status=JobStatus.COMPLETED, count=8)
     await _seed_jobs(
         session_factory,
@@ -327,11 +288,8 @@ async def test_queued_and_waiting_jobs_stay_out_of_the_denominator(
 
 
 class _PostgresishSession:
-    """The two attributes `_dispatched_in_window` reads, on a fake bind.
-
-    `_not_a_lab_fixture` branches on the dialect name, so rendering the
-    Postgres spelling needs a session that claims to be one. Nothing here
-    executes; the statement is compiled, not run."""
+    """The two attributes `_dispatched_in_window` reads, on a fake bind: `_not_a_lab_fixture`
+    branches on the dialect name. Nothing executes; the statement is compiled, not run."""
 
     class _Bind:
         dialect = postgresql.dialect()
@@ -357,14 +315,8 @@ def _rendered_denominator() -> str:
 
 
 def test_the_sql_denominator_excludes_cancellations_too() -> None:
-    """The SQL path is never exercised by this suite, so assert it directly.
-
-    `_compute_latency_slo` uses `EXTRACT(EPOCH FROM ...)`, which SQLite does
-    not have, so every test above runs the Python fallback. Production runs
-    the other one. Both now build their WHERE clause from
-    `_dispatched_in_window`, and this compiles it to make the exclusion
-    visible rather than merely intended.
-    """
+    """The SQL path is never exercised by this suite — SQLite has no `EXTRACT` — so compile it and
+    make the exclusion visible rather than merely intended."""
     sql = _rendered_denominator()
 
     assert "'cancelled'" not in sql
@@ -375,16 +327,10 @@ def test_the_sql_denominator_excludes_cancellations_too() -> None:
 
 
 def test_the_sql_denominator_excludes_lab_fixtures_by_jsonb_containment() -> None:
-    """The Postgres spelling of the WO-R2-132 exclusion, rendered.
-
-    The unit suite runs SQLite, so `json_extract` is the arm it executes and
-    the arm that actually ships is invisible to it. Containment (`@>`) is the
-    safe test — it matches a top-level key holding boolean `true` only, where
-    a `::boolean` cast would raise on `{"eval_fixture": "banana"}` and take
-    the evaluation pass down with it — and `COALESCE` is what keeps a NULL
-    payload from turning the whole predicate NULL. Behaviour on a real
-    server is asserted in
-    `backend/tests/integration/test_eval_reset_postgres.py`."""
+    """The Postgres spelling of the WO-R2-132 exclusion, rendered. Containment (`@>`) matches a
+    top-level key holding boolean `true` only, where a `::boolean` cast would raise on
+    `{"eval_fixture": "banana"}`, and `COALESCE` keeps a NULL payload from nulling the predicate.
+    Server behaviour: `backend/tests/integration/test_eval_reset_postgres.py`."""
     sql = _rendered_denominator()
 
     for marker in slo_mod._LAB_FIXTURE_PAYLOAD_MARKERS:
@@ -393,9 +339,7 @@ def test_the_sql_denominator_excludes_lab_fixtures_by_jsonb_containment() -> Non
     assert "::boolean" not in sql
 
 
-# ---------------------------------------------------------------------------
 # Finding 1 — scheduled evaluation creates real alerts
-# ---------------------------------------------------------------------------
 
 
 def _webhook_settings(**overrides: Any) -> Settings:
@@ -422,16 +366,9 @@ async def _run_evaluation(
 async def test_a_seeded_burn_produces_one_alert_and_one_webhook_per_window(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """THE assertion for finding 1.
-
-    Before this order nothing evaluated the objectives on a schedule, so the
-    answer here was zero alerts and zero deliveries — not "not yet", but
-    ever. And a loop without de-duplication would answer with one alert per
-    tick, which is how an alerting channel gets muted.
-
-    50 of 100 jobs dead-lettering is a 50% failure rate against a 1% budget:
-    50× burn, comfortably past the 14.4× threshold.
-    """
+    """THE assertion for finding 1: before this, zero alerts and zero deliveries — not "not yet",
+    ever — and a loop without de-duplication would answer one alert per tick. 50 of 100 jobs
+    dead-lettering is 50× burn against a 1% budget."""
     await _seed_jobs(session_factory, status=JobStatus.COMPLETED, count=50)
     await _seed_jobs(session_factory, status=JobStatus.DEAD_LETTER, count=50)
 
@@ -505,12 +442,8 @@ async def test_an_idle_platform_raises_nothing(
 async def test_a_burn_alerts_again_in_the_next_window(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """De-duplication must not become suppression.
-
-    The key carries a time bucket, so a burn that outlives the window gets a
-    fresh key and alerts again — an incident that is still burning an hour
-    later is worth saying twice.
-    """
+    """De-duplication must not become suppression: the key carries a time bucket, so a burn that
+    outlives the window gets a fresh key and alerts again."""
     now = datetime(2026, 8, 30, 10, 30, 0, tzinfo=UTC)
     window = 3600.0
 
@@ -531,9 +464,8 @@ async def test_two_objectives_burning_raise_one_alert_each(
 ) -> None:
     """De-duplication is per objective, not global — the key is built from
     the SLO id. Two things being wrong at once must not hide one of them."""
-    # The latency objective has a 5% budget, so it needs a far higher failure
-    # share than completion's 1% to reach the same 14.4x: 60 of 70 never
-    # dispatched is ~86%, which burns both.
+    # The latency objective's 5% budget needs a far higher failure share to reach the same 14.4x: 60
+    # of 70 never dispatched is ~86%, which burns both.
     await _seed_jobs(session_factory, status=JobStatus.COMPLETED, count=10)
     await _seed_jobs(
         session_factory,
@@ -552,19 +484,10 @@ async def test_two_objectives_burning_raise_one_alert_each(
 async def test_the_database_refuses_a_duplicate_dedup_key(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """The guarantee that makes cross-replica de-duplication safe.
-
-    `worker_loop` runs in every API replica, so two of them evaluate the same
-    window at the same time. A "look for a recent alert, then insert" check
-    is a race both can win; the unique constraint is what makes the database
-    settle it, and `run_evaluation` treats the resulting IntegrityError as
-    "already alerted".
-
-    Asserted at the constraint rather than by racing two evaluations: this
-    suite's SQLite engine serialises everything onto one connection, so a
-    `gather` of two passes would prove nothing about concurrency and would
-    only test the driver.
-    """
+    """The guarantee that makes cross-replica de-duplication safe: `worker_loop` runs in every
+    replica, so look-then-insert is a race both can win and the unique constraint settles it
+    (`run_evaluation` reads the IntegrityError as "already alerted"). Asserted at the constraint,
+    because this suite's SQLite serialises everything onto one connection."""
     from sqlalchemy.exc import IntegrityError
 
     async def _insert(key: str) -> None:
@@ -614,10 +537,8 @@ async def test_slo_evaluation_loop_is_registered_in_worker_loop(
     monkeypatch: pytest.MonkeyPatch,
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """Required by the spec, and the reason is the whole finding: the
-    computation already existed and was already correct — what was missing was
-    anything that ran it. A loop that is written but never registered leaves
-    the alert webhook with no producer, exactly as before."""
+    """Required by the spec, and the whole finding: the computation already existed and was correct
+    — what was missing was anything that ran it."""
     started: set[str] = set()
 
     def _recorder(name: str) -> Any:
@@ -659,15 +580,11 @@ async def test_slo_evaluation_loop_is_registered_in_worker_loop(
     )
 
 
-# ---------------------------------------------------------------------------
-# The eval world may run with evaluation ON (WO-R2-132)
+# The eval world may run with evaluation ON (WO-R2-132).
 #
-# Every other test here builds its population by hand. These two build it from
-# `scripts/seed_eval_fixtures.py`'s own specs, because the claim is about that
-# world specifically: a fresh boot of it, evaluated, must raise nothing. A
-# hand-written copy of the fixture shape would keep passing after the seed
-# changed, which is the failure this packet exists to end.
-# ---------------------------------------------------------------------------
+# These two build their population from `scripts/seed_eval_fixtures.py`'s own specs, because the
+# claim is about that world specifically. A hand-written copy of the fixture shape would keep
+# passing after the seed changed.
 
 
 def _seed_module() -> Any:
@@ -687,10 +604,8 @@ def _seed_module() -> Any:
 async def _seed_the_eval_world(
     factory: async_sessionmaker[AsyncSession],
 ) -> int:
-    """Insert the standing eval fixtures the way the seed script does:
-    the 4 DLQ rows, the 2 failed-trace rows and the 3-node DAG, each with
-    the lifecycle `_lifecycle` derives and the `eval_fixture` payload
-    marker. Returns how many rows landed."""
+    """Insert the standing eval fixtures the way the seed script does — 4 DLQ rows, 2 failed traces
+    and the 3-node DAG, each with its lifecycle and the `eval_fixture` payload marker."""
     seed = _seed_module()
     now = datetime.now(UTC)
     rows: list[Job] = []
@@ -730,17 +645,10 @@ async def _seed_the_eval_world(
 async def test_a_freshly_seeded_eval_world_raises_nothing(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """THE assertion for WO-R2-132, in the shape the work order names.
-
-    Two evaluation passes — more than one interval's worth of ticks — over a
-    world containing nothing but the seeded fixtures. Before the exclusion
-    this raised a critical fast-burn alert on `job_completion_rate` on the
-    first pass and delivered a webhook for it, within one
-    `SLO_EVALUATION_INTERVAL_SECONDS` of every boot and again every hour on
-    the next dedup bucket. That is why the eval world ran with
-    `SLO_EVALUATION_INTERVAL_SECONDS=0` — which also switched off the only
-    non-chaos producer of the alert the agent under test is woken by.
-    """
+    """THE assertion for WO-R2-132: two passes over a world of nothing but seeded fixtures. Before
+    the exclusion this raised a critical fast-burn on `job_completion_rate` within one interval of
+    every boot, which is why the eval world ran with `SLO_EVALUATION_INTERVAL_SECONDS=0` — switching
+    off the only non-chaos producer of the alert the agent under test is woken by."""
     seeded = await _seed_the_eval_world(session_factory)
     assert seeded == 9, "the seeded world is 4 DLQ + 2 failed + 3 DAG rows"
 
@@ -756,12 +664,8 @@ async def test_a_freshly_seeded_eval_world_raises_nothing(
 async def test_a_real_burn_beside_the_fixtures_still_alerts(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """The exclusion must narrow what is measured, not switch it off.
-
-    Same seeded world, plus 50 real dead-letters in 100 real jobs. The
-    objective sees only the real traffic — total 100, not 105 — and still
-    pages, which is the behaviour a Family A latency scenario will depend
-    on once it injects a fault the platform itself produces."""
+    """The exclusion must narrow what is measured, not switch it off: the same seeded world plus 50
+    real dead-letters in 100 real jobs still pages, on a total of 100 rather than 105."""
     await _seed_the_eval_world(session_factory)
     await _seed_jobs(session_factory, status=JobStatus.COMPLETED, count=50)
     await _seed_jobs(session_factory, status=JobStatus.DEAD_LETTER, count=50)
