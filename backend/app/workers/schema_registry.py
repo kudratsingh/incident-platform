@@ -1,21 +1,10 @@
 """
-JSON Schema registry for Kafka topics.
+File-based JSON Schema registry for Kafka topics, loaded once at import from
+`backend/app/schemas/kafka/`. Producers validate before publish, consumers after deserialize.
 
-A file-based registry — schemas are committed alongside the code in
-backend/app/schemas/kafka/ and loaded once at import time. Real production
-would use Confluent Schema Registry or Apicurio, but the contract here is
-the same: every producer validates before publish, every consumer validates
-after deserialize, and schema evolution is enforced by versioned $id fields.
-
-Evolution rules (informal for now):
-  - Adding optional fields           → backward and forward compatible (allowed).
-  - Adding required fields           → breaks consumers; bump $id version.
-  - Removing or renaming fields      → breaks consumers; bump $id version.
-  - Changing the type of a field     → always breaking; bump $id version.
-
-`additionalProperties: true` in every schema means new fields can appear in
-messages without breaking older consumers; the consumers just ignore what
-they don't know about.
+Evolution: adding an optional field is compatible (every schema sets `additionalProperties: true`);
+adding a required field, removing or renaming one, or changing a type breaks consumers and needs an
+`$id` version bump.
 """
 
 import json
@@ -41,11 +30,8 @@ _FORMAT_CHECKER = FormatChecker()
 #: rather than written out, so a new topic cannot be added without one.
 _TOPIC_FIELD_PREFIX = "kafka_topic_"
 
-#: Topics that deliberately reuse another topic's schema, as
-#: {settings field suffix: schema stem}. Everything not listed here derives
-#: its own filename from its field name, so this stays a list of *decisions*
-#: rather than a copy of the topic list — the shape the old hand-written dict
-#: had, where an omission was indistinguishable from a topic with no schema.
+#: Topics that deliberately reuse another's schema, as {settings field suffix: schema stem}.
+#: Anything unlisted derives its filename from its field name: a list of *decisions*.
 _SHARED_SCHEMA = {
     # DLQ uses the same shape as job.failed (with dead_lettered=True).
     "job_dlq": "job_failed",
@@ -57,13 +43,8 @@ class SchemaRegistryError(RuntimeError):
 
 
 def topic_schema_files() -> dict[str, str]:
-    """Every `Settings.kafka_topic_*` value mapped to its schema filename.
-
-    Walks the Settings model rather than repeating its fields. CLAUDE.md
-    states that every topic in `Settings.kafka_topic_*` must have a matching
-    `.schema.json`; deriving the mapping is what makes that a fact about the
-    code instead of a request to whoever adds the next topic.
-    """
+    """Every `Settings.kafka_topic_*` value mapped to its schema filename, walked off the model so
+    "every topic has a schema" is a fact rather than a request."""
     settings = get_settings()
     mapping = {}
     for field in type(settings).model_fields:
@@ -76,14 +57,8 @@ def topic_schema_files() -> dict[str, str]:
 
 
 def _load_all() -> dict[str, Draft202012Validator]:
-    """Load a validator per configured topic, keyed by topic name.
-
-    Raises rather than skipping a topic whose schema file is missing. The
-    alternative — registering what exists and leaving the rest unvalidated —
-    is the failure this guard exists to prevent, and it fails at the worst
-    possible moment: silently, in production, one topic at a time. Failing at
-    import turns it into a boot error on the deploy that introduced it.
-    """
+    """Load a validator per configured topic. Raises rather than skipping a missing schema file,
+    which would leave that topic silently unvalidated in production."""
     validators: dict[str, Draft202012Validator] = {}
     missing = []
     for topic, filename in topic_schema_files().items():
@@ -116,25 +91,14 @@ class SchemaValidationError(ValueError):
 class UnknownTopicError(SchemaValidationError):
     """Raised when `validate` is called for a topic with no registered schema.
 
-    A subclass of SchemaValidationError on purpose: both callers already treat
-    that as "this message is not publishable / not consumable" and handle it
-    (the producer logs and drops, the consumer commits past the poison pill).
-    An unmapped topic is the same situation — an event nobody can vouch for —
-    so it takes the same path rather than needing new handling at every call
-    site, while still being catchable on its own where the distinction matters.
+    A `SchemaValidationError` subclass on purpose: an unvouchable event takes the existing
+    not-publishable / not-consumable path, while staying catchable on its own.
     """
 
 
 def validate(topic: str, payload: dict[str, Any]) -> None:
-    """Raise SchemaValidationError if `payload` is not valid for `topic`.
-
-    Raises UnknownTopicError for a topic with no schema. This used to return
-    silently, which meant an unregistered topic got *no* validation at all
-    while every call site believed it had been validated — the check reported
-    success by doing nothing. `_load_all` makes that state unreachable for
-    topics declared in Settings; this covers a topic name passed as a bare
-    string from somewhere else.
-    """
+    """Raise SchemaValidationError if `payload` is not valid for `topic`, or `UnknownTopicError` if
+    the topic has no schema — never success-by-doing-nothing."""
     validator = _VALIDATORS.get(topic)
     if validator is None:
         raise UnknownTopicError(

@@ -1,42 +1,9 @@
 """
-Redis sorted sets for delayed DLQ replays.
-
-Distinct from `app/workers/queue.py`'s `jobs:delayed` set. That one
-holds jobs still in the retry cycle (fail-with-backoff); this one
-holds explicit operator-initiated replays that should fire after a
-wait window — the `wait_and_replay` remediation category.
-
-Members are `{tenant_id}:{principal_id}:{job_id}` strings so the
-promote loop knows *who* asked for the replay (audit + tenancy) and
-which job to reset. Score is the epoch second the replay should
-fire. Rescheduling the same triple updates the score in place — the
-tool's idempotency wrapper already dedupes exact-repeat calls, so
-this is only reached when the caller varies the delay.
-
-Two keys, not one (R2-21):
-
-  * `jobs:dlq_replay_delayed` — armed replays, scored by fire-at time.
-  * `jobs:dlq_replay_inflight` — replays a worker has *claimed* and is
-    executing, scored by the claim deadline.
-
-The reader used to ZREM the whole due batch before attempting any
-replay, so a worker crash or redeploy in that window silently
-discarded operator/agent-scheduled replays with no record of the
-loss. `jobs:delayed` survives the same window because
-`_promote_delayed_once` re-pushes on failure; this path could not
-borrow that trick, because its policy is deliberately NOT to
-re-enqueue a replay that failed on its merits (the operator sees the
-`job.replay_scheduled` row with no matching `job.replayed` row and
-re-issues). A re-push would turn "logged and dropped" into "retried
-forever".
-
-So the claim splits the two cases the old shape conflated. A replay
-that *failed* is acked and dropped, policy unchanged. A replay whose
-worker *died* was never acked, so its claim lapses and the next tick
-reclaims it. The cost is a replay that can fire twice if the worker
-dies after `replay_job` commits but before the ack — bounded and
-benign: the job is no longer `dead_letter`/`failed` by then, so the
-second attempt is refused with a `JobError` and logged.
+Redis sorted sets for delayed DLQ replays (the `wait_and_replay` remediation), distinct from
+`queue.py`'s `jobs:delayed`. Members are `{tenant_id}:{principal_id}:{job_id}` scored by fire-at.
+Claim, don't pop (R2-21): `jobs:dlq_replay_delayed` holds armed replays, `jobs:dlq_replay_inflight`
+ones a worker claimed. A *failed* replay is acked and dropped — policy is deliberately NOT to
+re-enqueue it — where one whose worker *died* was never acked, so a later tick reclaims it.
 """
 
 import time
@@ -47,37 +14,13 @@ from redis.asyncio import Redis
 SCHEDULED_KEY = "jobs:dlq_replay_delayed"
 INFLIGHT_KEY = "jobs:dlq_replay_inflight"
 
-# How long a claim is held before another worker may reclaim it. Must
-# comfortably exceed one replay (a single transaction: status update +
-# audit row + outbox insert) so a slow-but-alive worker is never raced
-# by a peer, and stay short enough that a crashed worker's replays are
-# not stuck for long. 60s against a POLL_INTERVAL of 0.5s.
+# How long a claim is held before reclaim: longer than one replay, short enough that a crashed
+# worker's replays are not stuck. 60s against a 0.5s POLL_INTERVAL.
 CLAIM_TTL_SECONDS = 60.0
 
-# Claim, don't pop. One EVAL over both keys:
-#
-#   1. Re-claim anything in the in-flight set whose deadline has passed.
-#      This IS the crash recovery — a worker that died between the claim
-#      and the replay never acked, so its entries come back here. It runs
-#      FIRST so recovered work is never starved by a large fresh batch.
-#   2. Move newly-due members out of the scheduled set, up to the
-#      remaining room in this call's budget.
-#   3. Stamp every claimed member with a fresh deadline.
-#
-# Boundedness (E1-12), same discipline as `queue._POP_READY_LUA`: the
-# ZRANGEBYSCOREs are LIMITed and the ZREM is chunked, so the result can
-# never reach Lua's `unpack` ceiling (LUAI_MAXCSTACK, 8000 by default) —
-# which, once hit, fails the EVAL on every subsequent tick and wedges the
-# set permanently, since nothing is ever removed.
-#
-# Script contract:
-#   KEYS[1] : scheduled sorted-set key
-#   KEYS[2] : in-flight sorted-set key
-#   ARGV[1] : now, epoch seconds (as string; Redis parses it)
-#   ARGV[2] : claim deadline, epoch seconds
-#   returns : member strings this call owns, AT MOST 1000. Empty list
-#             when nothing is due. A backlog larger than the limit drains
-#             across successive ticks.
+# One EVAL: lapsed in-flight claims first (the crash recovery, and unstarvable that way), then
+# newly-due members up to the budget, then a fresh deadline on all of them. At most 1000 per call.
+# Bounded (E1-12) like `queue._POP_READY_LUA`, because Lua's `unpack` ceiling wedges the set.
 _CLAIM_READY_LUA = """
 local budget = 1000
 local claimed = redis.call('ZRANGEBYSCORE', KEYS[2], '-inf', ARGV[1], 'LIMIT', 0, budget)
@@ -117,15 +60,8 @@ async def arm_replay(
     job_id: uuid.UUID,
     execute_at: float,
 ) -> None:
-    """Arm a replay to fire at an explicit epoch second.
-
-    The primitive the audited tool path uses: it needs the `execute_at`
-    up front so the `job.replay_scheduled` audit row can be written
-    BEFORE the entry is armed, and so the row and the entry agree about
-    when it fires. Pair with `cancel_scheduled_replay` if the audit row
-    does not survive — an armed entry with no audit evidence is the one
-    state the audit-is-ground-truth invariant does not allow.
-    """
+    """Arm a replay at an explicit epoch second, so the `job.replay_scheduled` audit row can be
+    written first and agree. Pair with `cancel_scheduled_replay` if that row does not survive."""
     await redis.zadd(
         SCHEDULED_KEY, {_member(tenant_id, principal_id, job_id): execute_at}
     )
@@ -138,13 +74,8 @@ async def schedule_replay(
     job_id: uuid.UUID,
     delay_seconds: int,
 ) -> float:
-    """Schedule a DLQ replay to fire `delay_seconds` from now.
-
-    Convenience wrapper over `arm_replay` for callers that have nothing
-    to write first — the promote loop's paused-DAG deferral, which is
-    re-arming an entry whose audit row was written when the operator
-    scheduled it. Returns the epoch second the replay is scheduled for.
-    """
+    """Schedule a DLQ replay `delay_seconds` from now; returns that epoch second. For callers with
+    nothing to write first, i.e. the promote loop's paused-DAG deferral."""
     execute_at = time.time() + delay_seconds
     await arm_replay(
         redis,
@@ -171,20 +102,10 @@ async def cancel_scheduled_replay(
 async def claim_ready(
     redis: Redis,
 ) -> list[tuple[uuid.UUID, uuid.UUID, uuid.UUID]]:
-    """Claim every scheduled replay whose `execute_at` has passed, plus
-    every in-flight claim whose deadline lapsed (a worker died holding
-    it). One atomic EVAL, so two concurrent readers can't take the same
-    member.
+    """Claim every due scheduled replay plus every lapsed in-flight claim, in one atomic EVAL.
 
-    The caller owns each returned triple until it calls `ack_replay`. If
-    the process dies first, the claim lapses and a later tick recovers
-    it — which is the whole point of the pair. Bounded: at most 1000
-    members per call, so callers must not assume they received every due
-    member.
-
-    Malformed members (from a bad manual write) can't be parsed into a
-    triple, so nobody can ever ack them; they are acked here instead of
-    being reclaimed on every tick forever.
+    The caller owns each triple until `ack_replay`, so dying first lets the claim lapse for a later
+    tick. At most 1000 per call; unparseable members are acked here.
     """
     now = time.time()
     raw = await redis.eval(
@@ -215,10 +136,8 @@ async def ack_replay(
     principal_id: uuid.UUID,
     job_id: uuid.UUID,
 ) -> None:
-    """Release a claim. Called once the replay has been fired, deferred
-    onto the scheduled set again, or failed on its merits — every outcome
-    the promote loop is able to observe. Only a dead worker leaves a
-    claim un-acked, which is exactly the case reclaim exists for."""
+    """Release a claim, on every outcome the promote loop can observe. Only a dead worker leaves
+    one un-acked."""
     await redis.zrem(INFLIGHT_KEY, _member(tenant_id, principal_id, job_id))
 
 

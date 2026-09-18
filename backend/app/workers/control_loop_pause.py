@@ -1,58 +1,9 @@
-"""The `chaos:pause:<loop>` mechanism, and the closed set of loops it names.
+"""The `chaos:pause:<loop>` mechanism, and the closed set of loops it names (ADR 0027).
 
-Counterpart to `kafka_consumer.kill_key_for` / `_check_chaos_kill`, which do
-the same job one layer over: a Redis flag with a TTL, read at the top of every
-iteration, that stops one unit of background work without touching the process
-around it. That mechanism pauses a **Kafka consumer group**; this one pauses a
-**background loop** in `dispatcher.worker_loop`. The two are deliberately
-separate, and the split is the whole reason this module exists rather than a
-fourth argument on `kill_consumer`:
-
-  * a consumer group is addressed by its group id, an open string — any group
-    id at all is a legal argument, and the check lives in `BaseKafkaConsumer`,
-    so one code path covers every group that will ever exist;
-  * a background loop is a named coroutine in one module. There is no id to
-    pass and no shared base class to put the check in, so each loop carries
-    its own check and the set of loops is therefore *closed*. `ControlLoopName`
-    is that closed set, and it is the safety boundary: a member exists only if
-    the matching loop really reads its key, which
-    `tests/unit/test_pause_control_loop.py` asserts against
-    `dispatcher.worker_loop` by walking the AST rather than by trusting this
-    docstring.
-
-Where the check sits inside a loop matters more than it looks:
-
-  * **After the liveness tick, never before it.** `_promote_delayed_loop` calls
-    `supervisor.worker_tick()`, which is the heartbeat the deep health check
-    reads for *all* the loops (`workers/supervisor.py`). A pause that skipped
-    it would report the whole worker wedged — a process-wide signal for a
-    single-loop fault, which is both a lie and a blast radius nobody asked
-    for.
-  * **Inside the outbox relay's leader gate, not in front of it.** The relay is
-    single-writer via a Postgres advisory lock (ADR 0020). Checking before the
-    gate would make a paused replica stop contending for leadership, handing
-    it to another replica; the pause would still hold there, because the key is
-    global, but leadership would have moved for a reason unrelated to
-    leadership. Checking inside keeps the gate's behaviour identical, paused or
-    not.
-  * **Before the work, after the sleep.** Three loops (`_digest_loop`,
-    `_slo_evaluation_loop`, `_idempotency_reaper_loop`) sleep at the top of
-    their body rather than the bottom. The check goes where the work is, so the
-    pause is read at the moment it decides something.
-
-Failure posture is **fail open**, matching `_check_chaos_kill`: an unreachable
-Redis reads as "not paused" and the loop keeps working. The opposite choice
-would let a Redis blip stall the outbox relay in production, which is a real
-outage in exchange for a lab convenience. The supervisor's kill-window check
-(`_check_chaos_kill_strict`) fails closed for the opposite reason — it is
-deciding whether to *resurrect* something chaos stopped, and there "unknown"
-must not read as "cleared". Nothing here resurrects anything: the key's own
-TTL ends the pause.
-
-Nothing in this module runs unless `CHAOS_ENABLED=true` (ADR 0008 gate 1). The
-flag is read in-process on every call and short-circuits before any Redis
-round-trip, so a production deployment pays one boolean per tick per loop and
-never a network hop.
+A background loop has no group id and no shared base class, so each carries its own check and
+`ControlLoopName` is a *closed* set — the boundary `tests/unit/test_pause_control_loop.py` proves
+against `dispatcher.worker_loop`. Place the check after `supervisor.worker_tick()`, inside the
+relay's advisory-lock gate (ADR 0020), and before the work. Fails open; needs `CHAOS_ENABLED=true`.
 """
 
 from enum import StrEnum
@@ -63,26 +14,8 @@ from app.core.logging import get_logger
 logger = get_logger(__name__)
 
 
-# The docstring below is deliberately ONE line, and written for a caller rather
-# than for a reader of this file. `pause_control_loop`'s `loop_name` field is
-# typed as this enum, so Pydantic copies the class docstring into
-# `$defs.ControlLoopName.description` in the tool's `inputSchema` — which is a
-# pinned contract the commander snapshots. The repo's rule about never putting a
-# class docstring on a Pydantic model whose schema reaches the wire applies to an
-# enum for exactly the same reason. Everything that belongs to a reader of this
-# module is in these comments and in the module docstring.
-#
-# Closed on purpose (see the module docstring). Every member names a loop
-# registered by `dispatcher.worker_loop` that reads `pause_key_for(<member>)` on
-# each iteration; `LOOP_FUNCTIONS` below maps each one to the coroutine that does
-# the reading, and the test parses `dispatcher.py` to prove the mapping.
-#
-# The three Kafka consumer groups an earlier draft of this enum carried —
-# `dependency_resolver`, `saga_coordinator`, `read_model` — are deliberately
-# absent. They are not loops, they are consumer groups, and
-# `kill_consumer('<group id>')` has stopped any consumer group since Wave 1. A
-# second mechanism for the same thing would mean two keys, two checks and two
-# ways for a teardown to miss one.
+# The docstring below must stay ONE line: Pydantic copies it to `$defs.ControlLoopName.description`
+# in `pause_control_loop`'s pinned `inputSchema`. Closed set; `kill_consumer` covers the groups.
 class ControlLoopName(StrEnum):
     """One background loop inside the worker process."""
 
@@ -100,13 +33,7 @@ class ControlLoopName(StrEnum):
 
 
 #: Each member, against the `dispatcher` coroutine that reads its key.
-#:
-#: This mapping is the enum's proof of honesty, and it is why the enum can be
-#: trusted as a safety boundary: `test_pause_control_loop.py` parses
-#: `workers/dispatcher.py`, collects the loop coroutines `worker_loop` actually
-#: starts, and asserts a bijection with the values here — so a twelfth loop
-#: cannot ship unpausable and un-enumerated, and a member cannot outlive the
-#: loop it names.
+#: `test_pause_control_loop.py` asserts a bijection with `dispatcher.py` — no unpausable loop.
 LOOP_FUNCTIONS: dict[ControlLoopName, str] = {
     ControlLoopName.OUTBOX_RELAY: "_outbox_relay_loop",
     ControlLoopName.DELAYED_RETRY_PROMOTE: "_promote_delayed_loop",
@@ -122,22 +49,9 @@ LOOP_FUNCTIONS: dict[ControlLoopName, str] = {
 }
 
 
-#: Nominal seconds between iterations of each loop, or `None` where the loop
-#: reads its own interval from settings every pass (`digest`,
-#: `slo_evaluation` — the tool resolves those at call time).
-#:
-#: Here rather than imported from `dispatcher`, because `dispatcher` imports
-#: this module and the cycle would be real. Mirrored constants with a tripwire
-#: test are the house convention for exactly this case (see
-#: `reset_eval_state.py`'s literal key mirrors);
-#: `test_pause_control_loop.py::test_the_mirrored_tick_intervals_match_the_dispatcher`
-#: imports both sides and fails if one moves.
-#:
-#: What it is for: a pause takes effect on the loop's NEXT tick, so the
-#: interval is the difference between a pause the caller can observe and one
-#: that expires unnoticed. `pause_control_loop` returns it for the loop it was
-#: asked about rather than leaving the caller to guess — an hourly loop and a
-#: twice-a-second loop take the same argument and behave nothing alike.
+#: Nominal seconds between iterations, `None` where the loop reads its own interval each pass
+#: (`digest`, `slo_evaluation`). Mirrored, not imported, because `dispatcher` imports this module;
+#: `test_the_mirrored_tick_intervals_match_the_dispatcher` fails if one side moves.
 TICK_INTERVAL_SECONDS: dict[ControlLoopName, float | None] = {
     ControlLoopName.OUTBOX_RELAY: 1.0,
     ControlLoopName.DELAYED_RETRY_PROMOTE: 0.5,
@@ -154,13 +68,8 @@ TICK_INTERVAL_SECONDS: dict[ControlLoopName, float | None] = {
 
 
 def tick_interval_seconds(loop_name: ControlLoopName) -> float | None:
-    """Seconds between iterations of one loop, as configured right now.
-
-    `None` means the loop is not currently iterating at all: today that is
-    `slo_evaluation` with `SLO_EVALUATION_INTERVAL_SECONDS=0`, which is how the
-    demo stack runs it. A pause on a loop that is not iterating changes
-    nothing, and the caller is better told that than left to infer it.
-    """
+    """Seconds between iterations of one loop, as configured now. `None` means it is not iterating,
+    so a pause changes nothing — today `slo_evaluation` with the interval set to 0."""
     mirrored = TICK_INTERVAL_SECONDS[loop_name]
     if mirrored is not None:
         return mirrored
@@ -175,25 +84,15 @@ def tick_interval_seconds(loop_name: ControlLoopName) -> float | None:
 
 
 def pause_key_for(loop_name: ControlLoopName | str) -> str:
-    """Redis key the `pause_control_loop` tool sets for one loop.
-
-    Under `chaos:*` like every other key the framework writes, which is what
-    makes `scripts/reset_eval_state.py::_CHAOS_KEY_PATTERNS` complete without
-    a new pattern — asserted, not assumed, by
-    `test_eval_reset.py::test_every_chaos_key_helper_lives_under_the_chaos_namespace`.
-    """
+    """Redis key `pause_control_loop` sets. Under `chaos:*`, so `_CHAOS_KEY_PATTERNS` needs no new
+    pattern (`test_every_chaos_key_helper_lives_under_the_chaos_namespace`)."""
     value = loop_name.value if isinstance(loop_name, ControlLoopName) else loop_name
     return f"chaos:pause:{value}"
 
 
 async def loop_is_paused(loop_name: ControlLoopName) -> bool:
-    """Whether this loop should skip its work this iteration.
-
-    Best-effort by design — see the module docstring on fail-open. The Redis
-    import is deferred for the same reason `_check_chaos_kill` defers it: unit
-    paths that exercise a loop must not have to stand up a Redis client for a
-    check that is switched off anyway.
-    """
+    """Whether this loop should skip its work this iteration. Fails open, and defers the Redis
+    import so unit paths need no client for a check that is off anyway."""
     if not get_settings().chaos_enabled:
         return False
     try:

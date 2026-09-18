@@ -1,58 +1,9 @@
 """
-Job progress pub/sub via Redis.
-
-The worker publishes ProgressEvents to a per-job channel.
-The SSE endpoint reads that channel through the process-wide fan-out broker in
-`workers/progress_broker.py` and forwards events to the browser.  This module
-owns the wire format, the channel naming and the retained snapshot; the broker
-owns the connection.
-
-Channel naming: job:progress:{job_id}
-Retained snapshot: job:progress:last:{job_id} (string, 1h TTL)
-
-Pub/Sub is at-most-once: a subscriber that connects after the terminal event
-was published sees nothing at all and would hold a silent connection forever.
-Every publish therefore also SETs the event as a retained snapshot, and every
-subscriber reads that snapshot as its first event — so a late subscriber to a
-finished job is told the job finished instead of waiting on a dead channel.
-The snapshot is a convenience, never a source of truth: if Redis evicts it the
-behaviour degrades to exactly the pre-snapshot stream (durable state lives in
-the `jobs` table, and the SSE endpoint short-circuits off it).
-
-**Ordering (WO-R2-57).** The snapshot used to be written unconditionally, so
-the last *write* won rather than the latest *event* — and the events reaching
-this module come off Kafka, where at-least-once delivery means a consumer
-rebalance or a failed handler redelivers a `job.progress` the stream has
-already moved past. That redelivery overwrote a terminal snapshot with
-`running`, and then nothing corrected it: no further event is coming for a
-finished job, so for the snapshot's full hour every late subscriber was told
-the job was still running and sat on a channel that would never speak again.
-The exact hang the snapshot exists to prevent, produced by the snapshot.
-
-`publish` therefore only writes a snapshot that supersedes the retained one
-(`_supersedes`), on two rules that need no clock and no coordination:
-
-  * A non-terminal event never replaces a terminal one. Terminal→terminal
-    stays allowed, so a DLQ replay's eventual `job.completed` still lands.
-  * Within one source topic, an event never replaces one with an equal or
-    higher offset. Offsets are per-topic-partition and every event for a job
-    shares a partition (the Kafka key is `{tenant}:{user}`), so within a topic
-    they are exactly the order the producer wrote — and a redelivery is a
-    replay of an offset already seen. Across topics they are incomparable,
-    which is what the terminal rule is for.
-
-The event's own `timestamp` is deliberately not the ordering key: it is
-stamped when the event is *republished* here, so a redelivered stale event
-carries the newest timestamp of all.
-
-A superseded event is dropped entirely rather than published-but-not-retained.
-Any subscriber that could still be listening has already been sent the
-terminal snapshot and closed; delivering it a stale `running` afterwards would
-only walk a progress bar backwards.
-
-The inverse staleness — a terminal snapshot pinned in front of a job that a
-DLQ replay put back in flight — is reconciled at the SSE endpoint, which holds
-the `jobs` row and can see the disagreement (`api/streaming.py`).
+Job progress pub/sub via Redis: channel `job:progress:{job_id}` plus snapshot
+`job:progress:last:{job_id}` (1h TTL), which every subscriber reads first so a late one to a
+finished job is not stranded. `progress_broker.py` owns the connection. Ordering (WO-R2-57):
+`publish` retains only an event that `_supersedes` the retained one, because a redelivered
+`job.progress` once overwrote terminal snapshots; the `timestamp` is NOT the ordering key.
 """
 
 import json
@@ -71,13 +22,8 @@ CHANNEL_PREFIX = "job:progress"
 LAST_EVENT_PREFIX = "job:progress:last"
 LAST_EVENT_TTL_SECONDS = 3600
 
-# Statuses after which no further progress event can arrive, so the stream is
-# closed. `cancelled` is here because saga rollbacks cancel jobs and their
-# streams used to hang forever. It was aspirational until WO-R2-113: no
-# producer published it, and the only thing that ever set it was the DB
-# short-circuit in api/streaming.py, which a client had to reconnect to reach.
-# `SseConsumer` now publishes it from the `job.cancelled` topic, so a stream
-# already open closes on the event like every other terminal status.
+# Statuses after which no further progress event can arrive, so the stream closes. `cancelled` is
+# for saga rollbacks, and got a producer only with WO-R2-113 (`SseConsumer` on `job.cancelled`).
 TERMINAL_STATUSES = frozenset({"completed", "failed", "dead_letter", "cancelled"})
 
 
@@ -92,11 +38,8 @@ class ProgressEvent:
     message: str
     retry_count: int = 0
     timestamp: str = ""
-    # Provenance of the event this was built from, carried so the snapshot
-    # write can be ordered (see _supersedes). `source` is the Kafka topic and
-    # `sequence` the offset within it; both are absent for events published
-    # outside the consumer (tests, and any future direct publisher), which
-    # leaves only the terminal rule in force.
+    # Provenance for `_supersedes`: `source` is the Kafka topic, `sequence` its offset. Absent
+    # outside the consumer.
     source: str = ""
     sequence: int | None = None
 
@@ -117,13 +60,8 @@ def _last_key(job_id: str) -> str:
 
 
 def _parse_event(raw: Any) -> ProgressEvent | None:
-    """Decode a retained snapshot. Returns None for anything unusable.
-
-    Unknown keys are dropped rather than raising: a snapshot written by a
-    newer version during a rolling deploy is still a usable event to every
-    field this process knows about, and discarding it would strand late
-    subscribers on the very hang the snapshot exists to prevent.
-    """
+    """Decode a retained snapshot, or None if unusable. Unknown keys are dropped rather than
+    raising, so a newer version's snapshot mid-deploy stays usable."""
     try:
         decoded = json.loads(raw)
         if not isinstance(decoded, dict):
@@ -136,11 +74,7 @@ def _parse_event(raw: Any) -> ProgressEvent | None:
 
 
 def _supersedes(new: ProgressEvent, retained: ProgressEvent | None) -> bool:
-    """Should `new` replace the retained snapshot `retained`?
-
-    See the module docstring for why these two rules, and why the event's own
-    timestamp is not one of them.
-    """
+    """Should `new` replace the retained snapshot `retained`? (Rules: module docstring.)"""
     if retained is None:
         return True
     # A finished job does not go back to running because Kafka said it twice.
@@ -170,18 +104,8 @@ async def read_last_event(redis: Redis, job_id: str) -> ProgressEvent | None:
 # Type alias for the publish callable passed into processors
 ProgressPublisher = Callable[[int, str], Awaitable[None]]
 
-# Floors on how often a processor's progress reaches Kafka (WO-R2-57). Each
-# publish is a Kafka message and an immutable `job_events` row, so a processor
-# that reports once per unit of work makes its event count a caller-chosen
-# number: a csv_upload with chunk_size=1 over the 1,000,000-row maximum wrote
-# a million of each, for one job, at the caller's discretion.
-#
-# Both floors must be met, which is what makes the bound hold in every
-# direction: at most one event per whole percent (so the count can never
-# exceed ~102 however many chunks there are) and at most one per half second
-# (so a job that races through its work reports a handful of times rather than
-# a hundred). What survives is a function of elapsed work, which is what a
-# progress bar is for.
+# Floors on how often progress reaches Kafka (WO-R2-57): each publish is a Kafka message and an
+# immutable `job_events` row, and chunk_size=1 over a 1,000,000-row csv wrote a million of each.
 MIN_PROGRESS_INTERVAL_SECONDS = 0.5
 MIN_PROGRESS_DELTA_PERCENT = 1
 
@@ -194,11 +118,7 @@ def rate_limited(
 ) -> ProgressPublisher:
     """Wrap a publisher so it drops updates that say too little, too soon.
 
-    The first update and any update at 100% always go out: the first is what
-    tells a subscriber the job started, and the last is the one a stream ends
-    on — dropping either would trade a bounded event count for a hung stream.
-    Terminal events are published by the dispatcher, not through this wrapper,
-    so nothing here can swallow one.
+    The first update and any at 100% always go out, or a bounded event count buys a hung stream.
     """
     last_at: float | None = None
     last_percent = 0
@@ -233,13 +153,8 @@ async def publish(
     source: str = "",
     sequence: int | None = None,
 ) -> None:
-    """Retain and fan out one progress event, unless it is stale.
-
-    `source`/`sequence` are the Kafka topic and offset the event came from;
-    passing them lets the retained snapshot be ordered rather than
-    last-write-wins. Callers with no such provenance may omit them and keep
-    the terminal-guard half of the protection.
-    """
+    """Retain and fan out a progress event unless it is stale. `source`/`sequence` (the Kafka
+    topic and offset) order the snapshot instead of last-write-wins."""
     event = ProgressEvent(
         job_id=job_id,
         status=status,
@@ -251,10 +166,7 @@ async def publish(
     )
     retained = await read_last_event(redis, job_id)
     if not _supersedes(event, retained):
-        # Reordered or redelivered. Dropping it keeps the snapshot on the
-        # furthest-along event and keeps live subscribers from walking
-        # backwards; nothing is lost, because a superseded event by
-        # definition says less than what is already retained.
+        # Reordered or redelivered: dropping it keeps the snapshot furthest-along.
         logger.info(
             "dropping superseded progress event",
             extra={
@@ -275,9 +187,5 @@ async def publish(
     await redis.publish(_channel(job_id), payload)
 
 
-# Subscribing lives in `workers/progress_broker.py`, not here. It used to be a
-# `subscribe(redis, job_id)` generator that opened its own `redis.pubsub()`
-# per viewer, which made the process's open-stream count its held-connection
-# count against a 20-slot shared pool (WO-R2-11). The broker keeps the
-# snapshot-then-live-events semantics documented above and shares one Pub/Sub
-# connection across every open stream.
+# Subscribing lives in `workers/progress_broker.py`: a per-viewer `redis.pubsub()` made the
+# open-stream count the held-connection count against a 20-slot pool (WO-R2-11).

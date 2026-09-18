@@ -1,15 +1,7 @@
 """
-Kafka producer — publishes job lifecycle events to Kafka topics.
-
-Every state transition (submitted, progress, completed, failed) is published
-here. The producer is a module-level singleton started once at app startup
-and stopped on shutdown. If the broker is unreachable at boot the singleton
-stays unset and the publish paths lazily retry the start (throttled), so a
-boot-time outage self-heals when the broker comes back.
-
-Partitioning strategy: all events are keyed by user_id so that all events for
-a given user land on the same partition and are processed in order by each
-consumer group.
+Kafka producer for job lifecycle events — a module-level singleton. If the broker is unreachable at
+boot the singleton stays unset and the publish paths retry the start (throttled), so a boot-time
+outage self-heals. The key carries the user, so one user's events share a partition, in order.
 """
 
 import asyncio
@@ -28,18 +20,12 @@ logger = get_logger(__name__)
 
 _producer: AIOKafkaProducer | None = None
 
-# Lazy-restart throttle. Starting a producer against a down broker costs a full
-# connection timeout, and both the outbox relay (one tick per second) and every
-# progress event go through the publish paths — without a floor between attempts
-# a broker outage turns into a stall on every publish.
+# Lazy-restart throttle: a start against a down broker costs a full connection timeout.
 _START_RETRY_MIN_INTERVAL = 5.0
 _last_start_attempt: float = 0.0
 
-# The start lock is created lazily and re-created whenever the running event
-# loop changes. A module-level asyncio.Lock binds to the loop that first
-# acquires it and raises "bound to a different event loop" everywhere else
-# (Lock.acquire resolves the loop unconditionally on py3.12), which breaks under
-# per-test event loops.
+# Re-created whenever the running loop changes: a module-level `asyncio.Lock` binds to the loop
+# that first acquires it.
 _start_lock: asyncio.Lock | None = None
 _start_lock_loop: asyncio.AbstractEventLoop | None = None
 
@@ -54,13 +40,8 @@ def _get_start_lock() -> asyncio.Lock:
 
 
 async def start_producer() -> None:
-    """Start the module-level Kafka producer. Call once at app startup.
-
-    Idempotent, and the global is assigned only *after* ``start()`` succeeds:
-    "failed to start" and "never started" must be the same observable state
-    (``_producer is None``) or the lazy restart below can never fire and
-    ``_get_producer()`` hands out an un-started, unusable producer.
-    """
+    """Start the producer, once at app startup. The global is assigned only *after* ``start()``
+    succeeds, or the lazy restart below can never fire."""
     global _producer
     if _producer is not None:
         return
@@ -71,12 +52,8 @@ async def start_producer() -> None:
         key_serializer=lambda k: k.encode() if isinstance(k, str) else k,
         # Wait for all in-sync replicas to acknowledge — strongest durability guarantee
         acks="all",
-        # Broker-side dedup of producer retries (requires acks="all"): a
-        # network-level resend of the same batch can no longer append twice.
-        # This covers ONLY broker-retry duplicates — app-level duplicates
-        # (outbox relay crash window, resolver-vs-resume-sweep race) still
-        # happen and are made safe by the dispatcher's atomic
-        # PENDING->RUNNING claim (JobRepository.claim_for_running).
+        # Broker-side dedup of producer retries (needs acks="all"). ONLY those — app-level
+        # duplicates are made safe by `JobRepository.claim_for_running`.
         enable_idempotence=True,
         # Retry up to 5 times on transient errors
         retry_backoff_ms=200,
@@ -102,13 +79,8 @@ def _get_producer() -> AIOKafkaProducer:
 
 
 async def _ensure_producer() -> AIOKafkaProducer:
-    """Return the running producer, starting it first if boot-time start failed.
-
-    This is the self-heal: the outbox relay retries every tick, so the first
-    tick after the broker returns restarts the producer and the backlog drains.
-    Attempts are throttled to one per ``_START_RETRY_MIN_INTERVAL`` seconds;
-    inside that window this raises rather than paying another connect timeout.
-    """
+    """Return the running producer, starting it if boot-time start failed — the self-heal.
+    Throttled to one attempt per ``_START_RETRY_MIN_INTERVAL``; inside that window it raises."""
     global _last_start_attempt
     producer = _producer
     if producer is not None:
@@ -144,10 +116,8 @@ async def _publish(topic: str, key: str, payload: dict[str, Any]) -> None:
 
 
 async def publish_raw(topic: str, key: str, payload: dict[str, Any]) -> None:
-    """Send a message and propagate errors. Used by the outbox relay so it can
-    leave the row unpublished on failure and retry on the next tick. Schema
-    violations raise SchemaValidationError so the relay marks the row failed
-    rather than republishing forever."""
+    """Send a message and propagate errors, so the outbox relay can retry the row — or fail it on
+    `SchemaValidationError`."""
     # Validate before ensuring the producer: a schema bug must surface as
     # SchemaValidationError (so the relay fails the row) and must not burn one
     # of the throttled producer-start attempts.
@@ -165,11 +135,8 @@ async def publish_job_progress(
     message: str,
     retry_count: int = 0,
 ) -> None:
-    """Publish a progress update straight to Kafka.
-
-    The one lifecycle event that skips the outbox: progress is disposable, so
-    losing one to a broker blip costs nothing worth a transaction.
-    """
+    """Publish progress straight to Kafka — the one event that skips the outbox, being
+    disposable."""
     settings = get_settings()
     await _publish(
         topic=settings.kafka_topic_job_progress,

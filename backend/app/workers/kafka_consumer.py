@@ -1,21 +1,9 @@
 """
-Base Kafka consumer — handles connection lifecycle, offset management, and
-graceful shutdown. Subclasses implement handle_message() for their specific logic.
-
-Offset management strategy:
-  - After each successful handle_message(), the consumer commits
-    {TopicPartition: message.offset + 1} — exactly that message's partition.
-    The argument-less commit() form is never used: it would snapshot every
-    assigned partition's fetch position, committing past unprocessed messages.
-  - If handle_message() raises, nothing is committed; the consumer seeks back
-    to the failed offset and abandons the rest of that partition's batch, so
-    the NEXT POLL redelivers the message (at-least-once delivery). Other
-    partitions keep processing.
-  - Schema-invalid messages are poison pills: committed past, per-partition,
-    so they can never stall their partition.
-  - Duplicate deliveries are made safe by the dispatcher's atomic
-    PENDING->RUNNING claim (`JobRepository.claim_for_running`) — idempotency
-    keys only dedupe job CREATION, not execution.
+Base Kafka consumer — connection lifecycle, offsets, graceful shutdown; subclasses implement
+`handle_message()`. Each success commits `{TopicPartition: offset + 1}` for that partition alone,
+never the argument-less `commit()`, which would commit past unprocessed messages. A raising handler
+commits nothing and seeks back, so the next poll redelivers (at-least-once, made safe by
+`JobRepository.claim_for_running`). Schema-invalid messages are committed past as poison pills.
 """
 
 import asyncio
@@ -50,12 +38,7 @@ def latency_key_for(group_id: str) -> str:
 
 
 async def _check_chaos_kill(group_id: str) -> bool:
-    """Return True when a `chaos:kill:<group>` key exists in Redis.
-
-    Best-effort — Redis unavailable → return False. We never want the
-    chaos check to block real message processing on a Redis blip.
-    Import is deferred so plain-Kafka test paths don't spin up a real
-    Redis client."""
+    """True when `chaos:kill:<group>` exists. Fails open, and defers the Redis import."""
     try:
         from app.core.redis import get_redis_client
 
@@ -67,19 +50,10 @@ async def _check_chaos_kill(group_id: str) -> bool:
 
 
 async def _check_chaos_kill_strict(group_id: str) -> bool:
-    """Return True when a `chaos:kill:<group>` key exists in Redis, and RAISE
-    when the lookup itself fails.
+    """Return True when a `chaos:kill:<group>` key exists in Redis, and RAISE when the lookup fails.
 
-    Supervisor kill-window use: a lookup failure must read as still-killed,
-    not as cleared — the poll-loop variant above deliberately fails open,
-    this one deliberately does not. Treating an unknown kill state as
-    "cleared" resurrects the consumer in the middle of the very window the
-    chaos scenario is measuring.
-
-    Trade-off: if Redis stays down for the whole window, the consumer stays
-    down with it. Acceptable because the kill key carries a TTL — by the time
-    Redis answers again the key has usually expired, so the restart proceeds.
-    Import is deferred for the same reason as above."""
+    Fails CLOSED, unlike the variant above: for the supervisor's kill window an unknown state must
+    not read as "cleared" and resurrect the consumer mid-measurement. The key's TTL bounds it."""
     from app.core.redis import get_redis_client
 
     client = get_redis_client()
@@ -104,19 +78,7 @@ async def _check_chaos_latency(group_id: str) -> int:
 
 
 class BaseKafkaConsumer(ABC):
-    """
-    Base class for all Kafka consumers in this application.
-
-    Usage:
-        class MyConsumer(BaseKafkaConsumer):
-            async def handle_message(self, topic: str, key: str | None, value: dict) -> None:
-                ...
-
-        consumer = MyConsumer(topics=["job.submitted"], group_id="my-group")
-        await consumer.start()          # in app startup
-        asyncio.create_task(consumer.run())
-        await consumer.stop()           # in app shutdown
-    """
+    """Base class for every Kafka consumer here: `start()`, `run()` as a task, `stop()`."""
 
     def __init__(self, topics: list[str], group_id: str) -> None:
         self.topics = topics
@@ -165,20 +127,13 @@ class BaseKafkaConsumer(ABC):
         return self._chaos_killed
 
     async def run(self) -> None:
-        """
-        Main consume loop. Runs until stop() is called.
-        Commits each message's offset (per partition) only after successful
-        handle_message(); failed messages are seeked back for redelivery.
-        """
+        """Main consume loop, until `stop()`. Commits per partition only on success."""
         if self._consumer is None:
             raise RuntimeError("Consumer not started — call start() first")
 
         while self._running:
-            # Chaos framework kill switch (ADR 0008). If the
-            # `kill_consumer` MCP tool has flipped the group's kill key,
-            # exit the loop cleanly; the worker's supervisor decides
-            # whether to restart. Only active when CHAOS_ENABLED=true;
-            # otherwise the check short-circuits without a Redis call.
+            # Chaos kill switch (ADR 0008): exit cleanly on the kill key and let the supervisor
+            # decide about a restart.
             if get_settings().chaos_enabled:
                 if await _check_chaos_kill(self.group_id):
                     self._chaos_killed = True
@@ -222,13 +177,8 @@ class BaseKafkaConsumer(ABC):
     async def _process_batch(self, records: dict[TopicPartition, list[ConsumerRecord]]) -> bool:
         """Process one getmany() batch; return True when any partition failed.
 
-        Messages are processed in order within each partition. On the first
-        failure the consumer seeks back to the failed offset and abandons the
-        REST of that partition's batch — aiokafka discards its buffered
-        records for a partition on seek and refetches from the seek offset,
-        so the next poll redelivers from the failure point. Other partitions
-        keep processing: a persistently failing message head-of-line-blocks
-        only its own partition.
+        In order within each partition. The first failure seeks back and abandons the REST of that
+        partition's batch, so a persistently failing message blocks only its own partition.
         """
         consumer = self._consumer
         if consumer is None:
@@ -244,10 +194,8 @@ class BaseKafkaConsumer(ABC):
                         # seek() is synchronous in aiokafka — do not await.
                         consumer.seek(tp, message.offset)
                     except Exception as exc:
-                        # A rebalance can deassign the partition between the
-                        # failure and the seek (IllegalStateError). The new
-                        # assignee resumes from the last committed offset,
-                        # which is at or before this message — nothing lost.
+                        # A rebalance can deassign the partition here; the new assignee resumes
+                        # committed.
                         logger.warning(
                             "seek-back failed — partition likely reassigned; "
                             "redelivery falls to committed offset",
@@ -263,12 +211,8 @@ class BaseKafkaConsumer(ABC):
         return had_failure
 
     async def _process_one(self, message: ConsumerRecord) -> bool:
-        """Process a single message, committing its partition's offset on success.
-
-        Returns True when the partition may advance past this message (handled
-        successfully, or a poison pill committed past); False when the message
-        must be redelivered — the caller seeks back to this offset.
-        """
+        """Process one message, committing its partition's offset on success. False means the
+        caller must seek back to this offset for redelivery."""
         value: dict[str, Any] = message.value
         key: str | None = message.key
         tp = TopicPartition(message.topic, message.partition)
@@ -330,9 +274,6 @@ class BaseKafkaConsumer(ABC):
         partition: int = 0,
         offset: int = 0,
     ) -> None:
-        """Implement this in each subclass to handle a single message.
-
-        partition and offset are passed as keyword-only args so consumers that
-        don't need Kafka coordinates can ignore them with `**_`. Required by
-        EventLogConsumer for at-least-once dedup."""
+        """Handle one message. `partition`/`offset` are keyword-only (`**_` to ignore); the event
+        log needs them to dedup."""
         ...

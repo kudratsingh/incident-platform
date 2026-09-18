@@ -1,23 +1,10 @@
 """
-Worker dispatcher — the heart of Phase 2.
+Worker dispatcher: promotes delayed retries, dispatches each job to its processor,
+and handles retry backoff and dead-lettering. `worker_loop` hosts the 8 Kafka
+consumer groups and the 11 background loops.
 
-Responsibilities:
-  1. Poll the Redis queue for pending jobs (every POLL_INTERVAL seconds).
-  2. Promote delayed-retry jobs whose backoff has elapsed.
-  3. Dispatch each job to the correct processor based on job type.
-  4. Handle retries with exponential backoff.
-  5. Move exhausted jobs to dead_letter status.
-  6. Publish progress events throughout.
-
-Concurrency model selection (this is the core design decision):
-  ┌──────────────────┬──────────────┬───────────────────────────────────────┐
-  │ Job type         │ Model        │ Why                                   │
-  ├──────────────────┼──────────────┼───────────────────────────────────────┤
-  │ bulk_api_sync    │ asyncio      │ Many concurrent I/O calls, no GIL     │
-  │ csv_upload       │ threading    │ Blocking file I/O / non-async SDK     │
-  │ doc_analysis     │ multiprocess │ CPU-bound, GIL must be escaped        │
-  │ report_gen       │ multiprocess │ CPU-bound, GIL must be escaped        │
-  └──────────────────┴──────────────┴───────────────────────────────────────┘
+Concurrency by type: bulk_api_sync asyncio (concurrent I/O), csv_upload threading
+(blocking SDK), doc_analysis + report_gen multiprocessing (CPU-bound, GIL escaped).
 """
 
 import asyncio
@@ -75,110 +62,72 @@ tracer = get_tracer(__name__)
 
 POLL_INTERVAL = 0.5  # seconds between queue checks
 
-# Resume sweep: slower than the retry loops on purpose. It only exists
-# to catch children whose promotion event has already passed (held by a
-# DAG pause, or a missed job.completed), so seconds of latency after a
-# pause lifts is fine and the DB scan stays cheap.
+# Slower than the retry loops on purpose: only catches children whose promotion
+# event has already passed (a DAG pause, or a missed job.completed).
 _RESUME_SWEEP_INTERVAL = 10  # seconds
-# Promotable WAITING rows examined per pass. This bounds *promotable* work
-# only — the SQL below excludes rows with an unmet parent, so the limit can
-# no longer be consumed by rows that are never going to move (R2-09).
+# Bounds *promotable* work only — the SQL below excludes unmet-parent rows (R2-09).
 _RESUME_SWEEP_LIMIT = 200
 
-# Delay applied when a delayed-retry promotion fails and the job is pushed
-# back onto `jobs:delayed`. Short on purpose: the backoff the job was
-# waiting out has already elapsed, this is only spacing against a
-# transient DB error, not a new backoff.
+# Re-push delay when a delayed-retry promotion fails. Short: the backoff has already
+# elapsed, so this is spacing against a transient error, not a new backoff.
 _PROMOTE_RETRY_DELAY_SECONDS = 5.0
 
-# Stale-PENDING backstop. Deliberately much slower and much older than the
-# retry loop: it exists only for the crash windows nothing else covers, and
-# every pass it takes is a pass the normal path already failed to take.
+# Stale-PENDING backstop: much slower and much older than the retry loop because it
+# exists only for the crash windows nothing else covers.
 _STALE_PENDING_SWEEP_INTERVAL = 60  # seconds between passes
 _STALE_PENDING_AGE_SECONDS = 300  # how long PENDING-without-progress is "stale"
 _STALE_PENDING_LIMIT = 100  # PENDING rows examined per pass
 
-# E1-08 / ADR 0011 amendment. Delay applied when a dispatch is held back
-# because the job's DAG is paused: the work is pushed onto `jobs:delayed`
-# to be re-evaluated rather than dropped. 10s matches the resume sweep's
-# cadence, so a held retry resumes on the same clock as a held child.
+# E1-08 / ADR 0011 amendment. A dispatch held back by a paused DAG is pushed onto
+# `jobs:delayed`, not dropped; 10s matches the resume sweep's cadence.
 _PAUSE_RECHECK_SECONDS = 10.0
 
-# Same idea for a *scheduled* DLQ replay whose DAG is paused, but on the
-# replay's own ZSET and with a longer window: an operator-scheduled replay
-# is not latency-sensitive, and re-scheduling keeps
-# `_promote_dlq_replay_loop`'s deliberate no-re-enqueue-on-failure policy
+# Same for a *scheduled* DLQ replay held by a paused DAG, on its own ZSET and longer:
+# re-scheduling leaves `_promote_dlq_replay_loop`'s no-re-enqueue-on-failure policy
 # for real failures.
 _PAUSED_REPLAY_DEFER_SECONDS = 30
 
-# E1-17 / ADR 0019. Crash-recovery sweep for jobs stranded in RUNNING by a
-# hard worker crash. Slow on purpose: the *age* threshold that decides what
-# is an orphan is `settings.stale_running_threshold_seconds` (900s), so a
-# minute of scan latency on top of it is noise, and the scan stays cheap.
+# E1-17 / ADR 0019. Crash-recovery sweep for RUNNING orphans. Slow on purpose: the
+# age threshold is `settings.stale_running_threshold_seconds` (900s), so a minute of
+# scan latency on top is noise.
 _STALE_RUNNING_SWEEP_INTERVAL = 60.0  # seconds between passes
 _STALE_RUNNING_SWEEP_LIMIT = 100  # RUNNING rows examined per pass
 
-# WO-R2-28. The lease that tells one replica's sweep that another replica is
-# still executing a job. `jobs.heartbeat_at` is renewed every
-# `_RUNNING_LEASE_RENEW_INTERVAL` and read as live for
-# `_RUNNING_LEASE_TTL_SECONDS` after the last renewal.
-#
-# The ratio is what matters: six renewal attempts fit inside one TTL, so a
-# transient database blip, a slow pass or a GC pause cannot expire a lease on
-# a healthy worker. Widening the TTL further only delays real crash recovery,
-# which the age threshold (900s) already dominates; narrowing it towards the
-# renewal interval trades a false `job.dlq` for nothing.
+# WO-R2-28. The lease telling one replica's sweep that another is still executing a
+# job: `jobs.heartbeat_at`, renewed every interval and read as live for the TTL. The
+# ratio is what matters — six renewals fit one TTL, so a blip, a slow pass or a GC
+# pause cannot expire a healthy worker's lease.
 _RUNNING_LEASE_RENEW_INTERVAL = 20.0  # seconds between check-ins
 _RUNNING_LEASE_TTL_SECONDS = 120.0  # how long a check-in vouches for a job
 
 MAX_CONCURRENT_JOBS = 10  # cap on simultaneously running jobs
 
-# WO-R2-07 / ADR 0021. How long a job may stay RUNNING *past* the
-# stale-RUNNING threshold before the sweep reclaims it despite being one of
-# this process's in-flight ids.
-#
-# ADR 0019 made that exclusion unconditional, which was right while execution
-# was unbounded — the sweep could not tell a slow job from a stuck one, so it
-# had to assume slow. `job_execution_timeout_seconds` now draws that line:
-# a local job still RUNNING long past its own deadline is stuck, not slow,
-# and the exclusion has to lapse or it is once again the one state nothing
-# recovers. The grace only has to cover the deadline breach plus the
-# dead-letter write it triggers; reaping inside that window would fan out a
-# spurious `job.dlq` and then be overwritten by the write already in flight.
-#
-# Sized against the threshold, not the deadline, because the sweep's SQL has
-# already filtered to rows older than the threshold by the time this applies.
+# WO-R2-07 / ADR 0021. How long a job may stay RUNNING past the stale-RUNNING
+# threshold before the sweep reclaims it despite being one of this process's in-flight
+# ids. ADR 0019's unconditional exclusion made a hung local job the one unrecoverable
+# state; the grace covers only the deadline breach and the dead-letter write it
+# triggers. Sized against the threshold, not the deadline.
 _IN_FLIGHT_EXCLUSION_GRACE_SECONDS = 300.0
 
-# Cap on jobs dispatched but not yet finished — running plus waiting for a
-# concurrency slot. `handle_message` no longer blocks on the semaphore (that
-# stalled the poll loop and got the group evicted), so without a cap a
-# saturated worker would spawn a task per message without limit.
-#
-# Past the cap `handle_message` raises `DispatchBacklogFull`, which is the
-# base consumer's existing backpressure primitive: the offset is not
-# committed and the partition seeks back for redelivery. Crucially that
-# happens *without* the poll loop stopping — `getmany()` keeps being called
-# and the group keeps its member, which is the whole point of the fix.
+# Cap on jobs dispatched but not yet finished (running plus waiting for a slot).
+# `handle_message` no longer blocks on the semaphore, so without a cap a saturated
+# worker would spawn a task per message. Past the cap it raises `DispatchBacklogFull`:
+# the offset is not committed and the partition seeks back, without the poll loop
+# stopping — `getmany()` keeps being called and the group keeps its member.
 _MAX_DISPATCH_BACKLOG = MAX_CONCURRENT_JOBS * 10
 
 
 class JobExecutionTimeout(Exception):
     """A processor overran `job_execution_timeout_seconds`.
 
-    Deliberately NOT a bare `TimeoutError`. Processors raise `TimeoutError`
-    themselves all the time (an HTTP client giving up on an upstream), and
-    that is an ordinary transient failure that has earned its retries.
-    Only the dispatcher's own deadline dead-letters, so the two must be
-    distinguishable at the `except` — see `_execute_processor`.
+    Deliberately NOT a bare `TimeoutError`: a processor's own `TimeoutError` is an
+    ordinary transient failure with retries still owed. See `_execute_processor`.
     """
 
 
 class DispatchBacklogFull(Exception):
-    """Raised by `handle_message` when the dispatch backlog is at its cap.
-
-    Signals the base consumer to leave the offset uncommitted and seek back,
-    so the message is redelivered once the worker has drained.
+    """Raised by `handle_message` at the dispatch backlog cap: the base consumer
+    leaves the offset uncommitted and seeks back for redelivery.
     """
 
 # Strategy map: job type → processor coroutine
@@ -189,19 +138,16 @@ _PROCESSORS = {
     JobType.REPORT_GEN: cpu_processors.process_report_gen,
 }
 
-# The DLQ event's payload shape moved to `app/schemas/job_events.py` when
-# `JobRepository.update_status` became the single producer of terminal events
-# (ADR 0001 addendum). Nothing in this module builds a terminal payload by hand
-# any more — writing the status IS emitting the event.
+# Terminal-event payloads live in `app/schemas/job_events.py` and are built by
+# `JobRepository.update_status` alone (ADR 0001 addendum) — writing the status IS
+# emitting the event.
 
 
 def _execution_timeout_seconds(job_type: str) -> float:
     """The execution deadline for `job_type`, in seconds.
 
-    One knob for every type today. The seam exists because the processors do
-    not share a cost model — csv_upload runs on a 4-thread pool, doc_analysis
-    and report_gen on a process pool — so the first per-type deadline has an
-    obvious place to go that is not a call site.
+    One knob for every type today; the seam exists so the first per-type deadline
+    has somewhere to go that is not a call site.
     """
     return float(get_settings().job_execution_timeout_seconds)
 
@@ -214,21 +160,9 @@ async def _execute_processor(
 ) -> dict[str, Any]:
     """Run `processor` under a hard deadline.
 
-    Raises `JobExecutionTimeout` when the deadline expires, and lets every
-    other exception through untouched — including a `TimeoutError` the
-    processor raised itself, which is an ordinary transient failure with
-    retries still owed to it. `asyncio.timeout` re-raises an inner
-    `TimeoutError` unchanged, so `expired()` is the only thing that reliably
-    tells "we cancelled it" from "it gave up": catching bare `TimeoutError`
-    around the call would silently dead-letter every upstream blip.
-
-    Cancellation reaches the processor at its next await point. One caveat
-    worth stating plainly: a processor parked in `run_in_executor` unblocks
-    *here* immediately, but the thread or process it handed the work to runs
-    to completion regardless — neither can be preempted in Python. The
-    concurrency slot and the job row are released either way, which is what
-    the finding is about; the leaked pool worker is a narrower problem and is
-    recorded in ADR 0021 rather than papered over here.
+    Raises `JobExecutionTimeout` only when `deadline.expired()`; a `TimeoutError` the
+    processor raised itself passes through with its retries intact. Work already
+    handed to a thread or process pool is not cancelled by this (ADR 0021).
     """
     try:
         async with asyncio.timeout(timeout_seconds) as deadline:
@@ -252,9 +186,7 @@ async def _run_job(
     job_id = uuid.UUID(job_id_str)
     token = job_id_var.set(job_id_str)
 
-    # ------------------------------------------------------------------ #
-    # 1. Load job and atomically claim PENDING -> RUNNING                  #
-    # ------------------------------------------------------------------ #
+    # 1. Load job and atomically claim PENDING -> RUNNING
     held_by: uuid.UUID | None = None
     async with session_factory() as session:
         async with session.begin():
@@ -281,23 +213,12 @@ async def _run_job(
             retry_count = job.retry_count
             max_attempts = job.max_attempts
             prior_error = job.error_message  # filled when this is a retry
-            # E1-04: the status check above is only a cheap pre-filter (and
-            # a distinct log line) — under at-least-once delivery a second
-            # delivery of this job can pass it concurrently. The atomic
-            # conditional UPDATE (WHERE status='pending') is the
-            # authoritative gate: exactly one delivery wins. It must stay
-            # in THIS short transaction — the winner's commit happens at
-            # the end of this block, before processor execution, so the
-            # loser's UPDATE re-evaluates against the committed row and
-            # matches zero rows.
-            # E1-08: pre-claim pause re-check. Every other pause probe is
-            # at promotion time, which makes them all advisory — a
-            # `job.submitted` already sitting in Kafka when `pause_dag`
-            # lands would still claim RUNNING and execute. Probed inside
-            # this transaction (one parents() query + one Redis MGET) so
-            # no extra session is opened; the pause is only *held* after
-            # the block, because `push_delayed` must not run inside the
-            # DB transaction.
+            # E1-04: the status check above is only a cheap pre-filter. The atomic
+            # conditional UPDATE (WHERE status='pending') is the gate that lets
+            # exactly one delivery win, and must stay in THIS short transaction.
+            # E1-08: pause re-checked pre-claim, or a `job.submitted` already in
+            # Kafka would still claim RUNNING and run. Held only after the block —
+            # `push_delayed` must not run inside the DB transaction.
             held_by = await find_blocking_pause(
                 redis, JobDependencyRepository(session), job_id
             )
@@ -312,9 +233,8 @@ async def _run_job(
                     return
 
     if held_by is not None:
-        # Status stays PENDING — the job is re-dispatched by the delayed
-        # set once the pause lifts, exactly like a held retry. Dropping it
-        # here would strand the job until the stale-PENDING backstop.
+        # Status stays PENDING; the delayed set re-dispatches once the pause lifts.
+        # Dropping it here would strand the job until the stale-PENDING backstop.
         logger.info(
             "execution held (dag paused)",
             extra={"job_id": job_id_str, "paused_by": str(held_by)},
@@ -341,39 +261,22 @@ async def _run_job(
     )
     logger.info("job started", extra={"type": job_type, "retry_count": retry_count})
 
-    # Restore the OTel trace context that was injected at job creation time so
-    # this span becomes a child of the original HTTP request span.
+    # Restore the trace context injected at creation, so this span parents to the
+    # original HTTP request span.
     otel_carrier: dict[str, str] = payload.pop("__traceparent", {})
     parent_ctx = extract_context(otel_carrier) if otel_carrier else None
 
-    # ------------------------------------------------------------------ #
-    # 2. Execute processor                                                  #
-    # ------------------------------------------------------------------ #
-    # Resolve the processor. Two things can go wrong here, and both must
-    # end in DEAD_LETTER (never leave the job in RUNNING or FAILED-without-retry):
-    #
-    #   1. The job's `type` string isn't a valid JobType member. This is
-    #      the common case for saga compensation jobs, whose type is
-    #      `{parent_type}.compensate` (e.g. "csv_upload.compensate") and
-    #      is NOT a JobType enum value. Applications register their own
-    #      compensation processors in _PROCESSORS keyed by the compensate
-    #      string; if they haven't, the job must dead-letter so the saga
-    #      status settles instead of hanging in COMPENSATING forever.
-    #   2. The string IS a valid JobType but no processor is registered
-    #      for it. Same terminal outcome for the same reason.
-    #
-    # Historical bug: `JobType(job_type)` was evaluated outside the None
-    # check, so a `.compensate` string raised ValueError, which propagated
-    # into _run_and_release's fire-and-forget task and was silently
-    # swallowed — leaving the job stuck in RUNNING and the saga stuck in
-    # COMPENSATING.
+    # 2. Execute processor.
+    # Both resolution failures must end in DEAD_LETTER so the saga settles instead of
+    # hanging in COMPENSATING: a type that is not a JobType member (saga
+    # `{parent_type}.compensate` jobs), and a valid member with no processor.
+    # `JobType(job_type)` outside the guard once raised ValueError into the
+    # fire-and-forget task, stranding the job in RUNNING.
     processor: Any = None
     try:
         processor = _PROCESSORS.get(JobType(job_type))
     except ValueError:
-        # Not a JobType member — could still be a registered compensation
-        # type (though currently _PROCESSORS is keyed by JobType only; kept
-        # as a future extension point). Fall through to the DEAD_LETTER path.
+        # Not a JobType member — fall through to the DEAD_LETTER path.
         processor = None
 
     if processor is None:
@@ -428,23 +331,11 @@ async def _run_job(
             )
 
         except JobExecutionTimeout as exc:
-            # Terminal on the first breach — deliberately NOT a retry.
-            #
-            # The deadline is a function of the payload, and a retry does not
-            # change the payload: three more attempts would spend three more
-            # full deadlines, holding a concurrency slot each, to arrive back
-            # here. (The pathological shape this fix exists for —
-            # `{row_count: 1_000_000, chunk_size: 1}` — is ~22h of chunk
-            # reads; the deadline turns that into 10 minutes, and retrying it
-            # would turn it back into 40.) Dead-lettering routes it straight
-            # into the machinery that already exists for jobs needing a human
-            # or agent decision: the DLQ tab, LLM triage, saga compensation,
-            # Tier-1 replay.
-            #
-            # `retry_count` is left alone for the same reason the crash sweep
-            # leaves it alone (ADR 0019) — it is the attempt history triage
-            # and the DLQ tab reason about, and this was not an attempt that
-            # failed on its merits.
+            # Terminal on the first breach, deliberately NOT a retry: the deadline is
+            # a function of the payload, so more attempts would spend more full
+            # deadlines to arrive back here. `retry_count` is left alone for the same
+            # reason the crash sweep leaves it alone (ADR 0019) — this was not an
+            # attempt that failed on its merits.
             span.record_exception(exc)
             span.set_status(trace.StatusCode.ERROR, str(exc))
             error = f"Execution timed out: {exc}"
@@ -452,19 +343,16 @@ async def _run_job(
                 async with session.begin():
                     repo = JobRepository(session)
                     audit = AuditRepository(session)
-                    # Terminal status and `job.dlq` outbox row in one write,
-                    # via the single writer (ADR 0001 addendum). A hand-rolled
-                    # status write here would kill the job in Postgres with no
-                    # consumer hearing: saga stranded, id pinned in the read
-                    # model, triage never run, SSE never closed.
+                    # Terminal status and `job.dlq` outbox row in one write via the
+                    # single writer (ADR 0001 addendum). A hand-rolled status write
+                    # would kill the job in Postgres with no consumer hearing.
                     await repo.update_status(
                         job_id,
                         JobStatus.DEAD_LETTER,
                         extra={
                             "error_message": error,
-                            # Badged so the admin DLQ table can tell a job
-                            # that overran from one that threw, without an
-                            # audit join per row (F2-16).
+                            # Badged so the admin DLQ table can tell an overrun
+                            # from a throw without an audit join per row (F2-16).
                             "dead_lettered_by": "execution_timeout",
                         },
                         event_message=error,
@@ -491,9 +379,8 @@ async def _run_job(
             await metrics.emit_count(
                 "JobDeadLettered", dimensions={"JobType": str(job_type)}
             )
-            # Distinct from the aggregate above on purpose: a rise in
-            # deadline breaches is a capacity/payload signal, and it is
-            # invisible inside the general dead-letter count.
+            # Distinct from the aggregate above: deadline breaches are a
+            # capacity/payload signal, invisible inside the dead-letter count.
             await metrics.emit_count(
                 "JobExecutionTimeout", dimensions={"JobType": str(job_type)}
             )
@@ -523,9 +410,8 @@ async def _run_job(
                 and retry_policy.is_enabled()
                 and new_retry_count >= settings.llm_retry_policy_min_retry_count
             ):
-                # Best-effort consult. Any failure (timeout, schema, network,
-                # missing API key) falls back to the deterministic backoff —
-                # the worker never blocks waiting on the API.
+                # Best-effort consult: any failure falls back to the deterministic
+                # backoff, and the worker never blocks waiting on the API.
                 try:
                     decision, _usage, _model = await retry_policy.decide_retry(
                         job_type=job_type,
@@ -554,9 +440,8 @@ async def _run_job(
                         extra={"error": str(policy_exc)},
                     )
 
-            # `<`, not `<=`, and deliberately unchanged (WO-R2-172): the
-            # ceiling counts RUNS, so a job on its `max_attempts`-th failure
-            # has no run left to give and dead-letters here.
+            # `<`, not `<=`, deliberately (WO-R2-172): the ceiling counts RUNS, so
+            # the `max_attempts`-th failure has no run left and dead-letters here.
             if new_retry_count < max_attempts and not llm_dead_lettered:
                 async with session_factory() as session:
                     async with session.begin():
@@ -583,15 +468,10 @@ async def _run_job(
                                 "dead_lettered": False,
                             },
                         )
-                # Guarded like the other three `push_delayed` call sites. The
-                # transaction above has already committed status=PENDING and
-                # the `job.failed` "retrying" event; if Redis is down, the
-                # correct outcome is a job sitting in PENDING with no timer,
-                # which `_requeue_stale_pending_once` re-publishes. Letting
-                # the error escape instead sent it to `_run_and_release`'s
-                # safety net, which terminally dead-lettered a job that still
-                # had retries left — Redis is a performance dependency here,
-                # never a correctness one.
+                # Guarded like the other `push_delayed` call sites: PENDING is already
+                # committed, so a Redis outage leaves a job with no timer for
+                # `_requeue_stale_pending_once`. Letting the error escape reached
+                # `_run_and_release`'s net, which dead-lettered a job with retries left.
                 try:
                     await queue.push_delayed(redis, job_id_str, delay)
                 except Exception as push_exc:
@@ -612,17 +492,14 @@ async def _run_job(
                             "error_message": str(exc),
                         }
                         if llm_dead_lettered:
-                            # Persisted on the row, not only in the audit
-                            # extra_data below, because the admin DLQ table
-                            # badges per row and cannot afford an audit join
-                            # per row (F2-16). Left unset otherwise: retries
-                            # exhausting is the default mechanism and claims
-                            # no attribution.
+                            # On the row, not only in audit extra_data: the DLQ
+                            # table badges per row and cannot afford a join
+                            # (F2-16). Unset otherwise — exhausted retries are
+                            # the default and claim no attribution.
                             job_extra["dead_lettered_by"] = "llm_retry_policy"
-                        # `message` is the one field of the DLQ event a call
-                        # site still colours; everything else is derived from
-                        # the row inside `update_status`, which writes the
-                        # `job.dlq` outbox row in this transaction.
+                        # `message` is the only DLQ-event field a call site still
+                        # colours; `update_status` derives the rest from the row
+                        # and writes the `job.dlq` outbox row here.
                         dlq_message = (
                             f"LLM dead-lettered: {llm_reasoning}"
                             if llm_dead_lettered
@@ -653,16 +530,13 @@ async def _run_job(
             job_id_var.reset(token)
             return
 
-        # ------------------------------------------------------------------ #
-        # 3. Persist result                                                    #
-        # ------------------------------------------------------------------ #
+        # 3. Persist result
         async with session_factory() as session:
             async with session.begin():
                 repo = JobRepository(session)
                 audit = AuditRepository(session)
-                # `update_status` writes the `job.completed` outbox row in
-                # this same transaction — the dependency resolver and the
-                # saga coordinator both key off that event.
+                # `update_status` writes the `job.completed` outbox row in this
+                # transaction; the resolver and the saga coordinator key off it.
                 await repo.update_status(
                     job_id, JobStatus.COMPLETED,
                     extra={"result": result},
@@ -685,44 +559,12 @@ class JobDispatcherConsumer(BaseKafkaConsumer):
     """
     Consumes `job.submitted` and dispatches each job to `_run_job`.
 
-    Concurrency: an asyncio.Semaphore bounds *executing* jobs to
-    MAX_CONCURRENT_JOBS. The slot is acquired inside the spawned task, never
-    in `handle_message` (WO-R2-07, ADR 0021).
-
-    That distinction is the whole finding. `handle_message` runs on the
-    consumer's poll loop, so awaiting the semaphore there stopped the loop
-    from calling `getmany()`: MAX_CONCURRENT_JOBS slow jobs took the worker
-    out of the group entirely once `fetcher_idle_time` passed
-    `max_poll_interval_ms`, with nothing to restart it — and the
-    stale-RUNNING sweep skipped exactly those in-flight ids, so nothing
-    could recover it either. It was described as backpressure, but Kafka
-    backpressure that stops polling is eviction on a timer.
-
-    Backpressure now comes from two bounded mechanisms that both keep the
-    loop polling: `_MAX_DISPATCH_BACKLOG` (raise `DispatchBacklogFull`, the
-    offset is not committed, the partition seeks back) and
-    `job_execution_timeout_seconds` (no job holds a slot indefinitely).
-
-    Offset semantics: the base class commits offsets after `handle_message`
-    returns. We spawn `_run_and_release` as a background task and return
-    immediately, so the offset advances at dispatch time rather than at job
-    completion. The trade-off:
-      * Pro: high throughput, the consumer is never blocked by a long job.
-      * Con: a worker crash between commit-and-completion leaves the job in DB
-        as RUNNING with no message left to redeliver it.
-      * Con: a job may now be committed while still queued for a slot rather
-        than already executing, so a crash in that window leaves it PENDING
-        with no message either. That one has a backstop —
-        `_requeue_stale_pending_once` re-publishes PENDING rows with no
-        progress — where the RUNNING window needs the sweep below.
-
-    Crash recovery for that window is `_stale_running_sweep_loop`, which
-    dead-letters RUNNING rows older than `stale_running_threshold_seconds`
-    that are not in `self.in_flight_job_ids` (ADR 0019). It does NOT
-    re-publish them: a partially-executed job is unsafe to re-run. The
-    in-flight set is what stops the sweep from reaping this process's own
-    legitimately-long jobs, so it must be populated before the task is
-    spawned and cleared only when the task settles.
+    The concurrency slot is taken inside the spawned task, never in `handle_message`
+    (WO-R2-07, ADR 0021): awaiting it on the poll loop stopped `getmany()` and evicted
+    the worker from the group. Backpressure is `_MAX_DISPATCH_BACKLOG` plus
+    `job_execution_timeout_seconds`, which both keep the loop polling. Offsets commit
+    at dispatch, so a crash leaves RUNNING rows for `_stale_running_sweep_loop` (ADR
+    0019, which reads `in_flight_job_ids`) and PENDING rows for the stale-PENDING one.
     """
 
     def __init__(
@@ -740,11 +582,9 @@ class JobDispatcherConsumer(BaseKafkaConsumer):
         self.redis = redis
         self.semaphore = asyncio.Semaphore(max_concurrent)
         self.in_flight: set[asyncio.Task[None]] = set()
-        # Job ids this process is actively executing. Read by
-        # `_sweep_stale_running_once` to exclude live work from crash
-        # recovery (E1-17). Deliberately separate from `in_flight` above:
-        # that holds Task objects for shutdown draining, this answers
-        # "is job X mine right now?" without inspecting task internals.
+        # Job ids this process is executing; `_sweep_stale_running_once` reads it
+        # to exclude live work from crash recovery (E1-17). Separate from
+        # `in_flight`, which holds Task objects for shutdown draining.
         self.in_flight_job_ids: set[str] = set()
 
     async def handle_message(
@@ -764,12 +604,9 @@ class JobDispatcherConsumer(BaseKafkaConsumer):
             )
             return
 
-        # Bounded backlog, checked but never *awaited* — this method runs on
-        # the poll loop and must return promptly no matter how saturated the
-        # worker is. Raising leaves the offset uncommitted and seeks the
-        # partition back (see `BaseKafkaConsumer._process_one`), so the
-        # message returns after the worker drains, while `getmany()` keeps
-        # being called and the group keeps its member.
+        # Checked, never *awaited*: this method runs on the poll loop. Raising
+        # leaves the offset uncommitted and seeks the partition back (see
+        # `BaseKafkaConsumer._process_one`) while `getmany()` keeps being called.
         if len(self.in_flight) >= _MAX_DISPATCH_BACKLOG:
             logger.warning(
                 "dispatch backlog full — message not accepted, will be redelivered",
@@ -784,10 +621,9 @@ class JobDispatcherConsumer(BaseKafkaConsumer):
                 f"dispatch backlog at capacity ({_MAX_DISPATCH_BACKLOG})"
             )
 
-        # Claim the id BEFORE spawning the task, not inside it: between
-        # `create_task` and the coroutine's first step there is a scheduling
-        # gap in which the sweep could run and see the row as an orphan.
-        # `_run_and_release`'s finally block is the only place it is dropped.
+        # Claim the id BEFORE spawning: the gap before the coroutine's first step
+        # is one the sweep could read as an orphan. Dropped only in the `finally`
+        # of `_run_and_release`.
         self.in_flight_job_ids.add(job_id_str)
         task = asyncio.create_task(self._run_and_release(job_id_str))
         self.in_flight.add(task)
@@ -796,30 +632,23 @@ class JobDispatcherConsumer(BaseKafkaConsumer):
     async def _run_and_release(self, job_id_str: str) -> None:
         """Wait for a concurrency slot, run the job, and always give the slot
         and the in-flight claim back."""
-        # The concurrency slot is taken HERE, inside the task — the poll loop
-        # has already moved on. Waiting for capacity is work the dispatcher
-        # does in the background, not something the consumer does instead of
-        # polling.
+        # Slot taken HERE, inside the task: waiting for capacity is background
+        # work, not something the consumer does instead of polling.
         try:
             await self.semaphore.acquire()
         except BaseException:
-            # Cancelled while queued for a slot — `worker_loop`'s shutdown
-            # path awaits `in_flight`, so this is reachable on an orderly
-            # stop. Drop the claim: an id in `in_flight_job_ids` with no task
-            # behind it makes the sweep skip a row nobody is executing.
+            # Cancelled while queued for a slot (reachable on an orderly stop).
+            # Drop the claim: an id in `in_flight_job_ids` with no task behind it
+            # makes the sweep skip a row nobody is executing.
             self.in_flight_job_ids.discard(job_id_str)
             raise
 
         try:
             await _run_job(job_id_str, self.session_factory, self.redis)
         except Exception as exc:
-            # Last-resort safety net. `_run_job` is expected to handle its
-            # own failures and settle the job in a terminal state; if it
-            # somehow escapes with an exception, this task is fire-and-forget
-            # (spawned via asyncio.create_task) so the exception would
-            # otherwise be silently swallowed and the job would stay in
-            # RUNNING forever. Log loudly and mark the job DEAD_LETTER so an
-            # admin sees it in the DLQ tab rather than losing it.
+            # Last-resort safety net: this task is fire-and-forget, so an escape
+            # from `_run_job` would be silently swallowed and leave the job in
+            # RUNNING forever. Log loudly and dead-letter so it lands on the DLQ tab.
             logger.exception(
                 "run_job escaped with unhandled exception — force-dead-lettering",
                 extra={"job_id": job_id_str, "error": str(exc)},
@@ -836,15 +665,11 @@ class JobDispatcherConsumer(BaseKafkaConsumer):
             self.in_flight_job_ids.discard(job_id_str)
 
     async def _force_dead_letter(self, job_id_str: str, error: str) -> None:
-        """Best-effort: mark a job DEAD_LETTER when _run_job escapes with an
-        unhandled exception. Used only from the _run_and_release safety net.
+        """Best-effort DEAD_LETTER when `_run_job` escapes — the `_run_and_release` net.
 
-        The DEAD_LETTER write and its `job.dlq` outbox row are one
-        transactional write inside `update_status` (ADR 0001 addendum). Before
-        that, this path wrote the status and an audit row and nothing else, so
-        the job died in Postgres and no consumer ever heard: the saga stayed
-        RUNNING, the read model kept the id in its old status set, triage never
-        ran, and the SSE stream never closed.
+        The status write and its `job.dlq` outbox row are one write inside
+        `update_status` (ADR 0001 addendum); without the event nothing downstream
+        hears, so the saga, read model, triage and SSE stream all stall.
         """
         try:
             job_id = uuid.UUID(job_id_str)
@@ -854,11 +679,9 @@ class JobDispatcherConsumer(BaseKafkaConsumer):
             async with session.begin():
                 repo = JobRepository(session)
                 job = await repo.get_by_id(job_id)
-                # Any terminal state, not just DEAD_LETTER. `_run_job` can
-                # settle a job COMPLETED and *then* escape (the metrics emit
-                # and contextvar reset run after the commit), and overwriting
-                # a completed job with DEAD_LETTER now also mints a `job.dlq`
-                # event — turning a silent row-level lie into a broadcast one.
+                # Any terminal state, not just DEAD_LETTER: `_run_job` can settle a
+                # job COMPLETED and *then* escape, and overwriting it now also mints
+                # a `job.dlq` event — a broadcast lie rather than a row-level one.
                 if job is None or job.status in TERMINAL_JOB_STATUSES:
                     return
                 await repo.update_status(
@@ -876,20 +699,10 @@ class JobDispatcherConsumer(BaseKafkaConsumer):
     async def consumer_lag(self) -> int | None:
         """Sum of (log_end_offset - committed_offset) across all assigned partitions.
 
-        Returns `None` for genuinely-unknown states (consumer not started,
-        no assignment yet, Kafka query failed) — never 0. The pre-v0.4.6
-        shape returned 0 for these paths, which downstream readers
-        (backpressure, `get_consumer_lag` MCP tool) couldn't distinguish
-        from "lag is really 0 = healthy". A dead consumer looked identical
-        to a healthy one, which was one of the noise sources compounding
-        the seven-run debug loop. Practice 9: unknown is not healthy.
-
-        `None` propagates: `_metrics_loop` skips the Redis cache write
-        (letting the TTL drop the last-known value) and skips the
-        CloudWatch gauge emission (an absent metric is more accurate
-        than a fabricated 0). `check_backpressure` treats a missing
-        cache entry as fail-open — the same behaviour as pre-fix, so no
-        regression on the API side.
+        Returns `None`, never 0, for genuinely-unknown states (not started, no
+        assignment, Kafka query failed): a fabricated 0 reads as healthy. `None`
+        propagates — `_metrics_loop` skips the Redis cache write and the gauge, and
+        `check_backpressure` fails open on the absent entry.
         """
         consumer = self._consumer
         if consumer is None:
@@ -917,15 +730,9 @@ class JobDispatcherConsumer(BaseKafkaConsumer):
 def _job_submitted_payload(job: Job) -> dict[str, Any]:
     """The canonical `job.submitted` outbox payload for a job row.
 
-    Shared by every path that re-publishes an existing job (delayed-retry
-    promotion, the stale-PENDING backstop, the resume sweep) so a job
-    dispatched by a backstop is byte-identical to one dispatched by the
-    normal path.
-
-    The resume sweep built its own copy inline until WO-R2-116 — identical at
-    the time, which is the only state a duplicated literal is ever observed
-    in and the reason the drift shows up later, in whichever path the next
-    field was not added to.
+    Shared by every re-publish path (delayed-retry promotion, stale-PENDING
+    backstop, resume sweep) so a backstop dispatch is byte-identical to a normal
+    one — the resume sweep kept its own inline copy until WO-R2-116.
     """
     return {
         "event": "job.submitted",
@@ -943,31 +750,13 @@ async def _promote_delayed_once(
     session_factory: async_sessionmaker[AsyncSession],
     redis: Any,
 ) -> None:
-    """One pass of delayed-retry promotion: pop the due entries and
-    re-publish each through the outbox.
+    """One pass of delayed-retry promotion: pop the due entries and re-publish each
+    through the outbox.
 
-    Failure isolation is the whole point (E1-03). `pop_ready_delayed` is
-    destructive — the Lua script ZREMs the batch before returning it — so
-    every popped id is now held only by this coroutine. The pre-fix shape
-    wrapped the entire loop in one `try`, so the first DB error abandoned
-    the rest of the batch: those jobs were already out of `jobs:delayed`
-    and sat in PENDING with nothing left to publish them.
-
-    So: each item gets its own try/except (the discipline already applied
-    to `_promote_dlq_replay_loop`), and — unlike that loop, which
-    deliberately does NOT re-enqueue because the operator can see the
-    missed replay in the audit trail — a failed delayed retry is pushed
-    back onto `jobs:delayed`. A retry has no such audit trail; losing it
-    is silent.
-
-    The re-push happens *outside* the failed session context (the session
-    is dead once it raised) and in its own try, because Redis can be the
-    thing that's broken. If the re-push fails too the job is genuinely
-    stranded in PENDING, and only `_requeue_stale_pending_once` recovers
-    it.
-
-    A paused DAG takes the same re-push route for the same reason (E1-08,
-    ADR 0011 amendment): the retry is held, never dropped.
+    `pop_ready_delayed` is destructive, so each item gets its own try/except (E1-03)
+    and a failure is pushed back onto `jobs:delayed` — unlike `_promote_dlq_replay_loop`,
+    a lost retry leaves no audit trail. The re-push runs outside the dead session, and
+    a paused DAG takes the same route (E1-08, ADR 0011 amendment).
     """
     settings = get_settings()
     ready_ids = await queue.pop_ready_delayed(redis)
@@ -989,10 +778,9 @@ async def _promote_delayed_once(
                             extra={"job_id": job_id_str},
                         )
                         continue
-                    # E1-08: a retry is a new dispatch, so the pause has
-                    # to hold it. Probed here — after the row exists, so a
-                    # deleted job still takes the drop path above — and
-                    # before the outbox add, which is the actual dispatch.
+                    # E1-08: a retry is a new dispatch, so the pause holds it.
+                    # Probed after the row exists (a deleted job still drops
+                    # above) and before the outbox add, the actual dispatch.
                     held_by = await find_blocking_pause(
                         redis, JobDependencyRepository(session), job_id
                     )
@@ -1021,10 +809,9 @@ async def _promote_delayed_once(
             continue
 
         if held_by is not None:
-            # Held, not dropped: the pop already ZREM'd this id, so the
-            # "job not found" `continue` above would lose the retry for
-            # good. Re-push (outside the transaction) and let the next
-            # pass re-evaluate the pause.
+            # Held, not dropped: the pop already ZREM'd this id, so dropping it
+            # loses the retry for good. Re-push outside the transaction and let
+            # the next pass re-evaluate the pause.
             logger.info(
                 "delayed retry held (dag paused)",
                 extra={"job_id": job_id_str, "paused_by": str(held_by)},
@@ -1043,24 +830,19 @@ async def _promote_delayed_loop(
     session_factory: async_sessionmaker[AsyncSession],
     redis: Any,
 ) -> None:
-    """
-    Periodically re-queue delayed retry jobs once their backoff has elapsed.
+    """Re-queue delayed retry jobs once their backoff has elapsed.
 
-    The re-publish goes through the outbox (not direct Kafka) so the retry
-    survives a worker crash between Redis pop and Kafka publish.
-
-    The outer try only has to cover the pop itself now — per-item failures
-    are handled inside `_promote_delayed_once`.
+    Re-publishes through the outbox, not direct Kafka, so the retry survives a crash
+    between the Redis pop and the Kafka publish. Per-item failures are handled inside
+    `_promote_delayed_once`.
     """
     while True:
-        # Liveness for the deep health check: this loop turns twice a second
-        # and touches Redis and Postgres, so its silence is the closest thing
-        # the worker has to "the loops are wedged" (`workers/supervisor.py`).
+        # Liveness for the deep health check: this loop's silence is the closest
+        # thing the worker has to "the loops are wedged" (`workers/supervisor.py`).
         worker_tick()
         try:
-            # AFTER worker_tick(), never before: that call is the heartbeat the
-            # deep health check reads for every loop, so a single-loop pause
-            # that skipped it would report the whole worker wedged
+            # AFTER worker_tick(), never before: skipping the heartbeat during a
+            # single-loop pause would report the whole worker wedged
             # (`workers/control_loop_pause.py`).
             if not await loop_is_paused(ControlLoopName.DELAYED_RETRY_PROMOTE):
                 await _promote_delayed_once(session_factory, redis)
@@ -1080,32 +862,11 @@ _ResumeCursor = tuple[Any, uuid.UUID]
 def _promotable_waiting_stmt(cursor: _ResumeCursor | None) -> Any:
     """WAITING jobs with no unmet parent, oldest first, after `cursor`.
 
-    The eligibility test lives in SQL rather than in the Python loop, and that
-    is the whole fix for R2-09. Previously the query was `status == WAITING
-    LIMIT 200` and the `unmet_count` check happened per-row afterwards, so
-    permanently-blocked children — the ones whose parent is DEAD_LETTER or
-    CANCELLED and therefore never reaching COMPLETED — were still *candidates*.
-    They consumed the 200 slots and were then discarded, every pass, forever.
-    Nothing cascades them away and nothing purges them, so once a tenant
-    accumulated 200 of them the sweep promoted nothing for anybody: the set is
-    platform-wide, so one tenant's stuck backlog starved every other tenant's
-    held children.
-
-    Raising the limit does not fix this — the blocked set grows without bound,
-    so any constant is eventually swallowed. Excluding the rows does fix it:
-    with `NOT EXISTS (unmet parent)` in the WHERE clause, the LIMIT can only
-    ever truncate work that a later pass can still promote.
-
-    `ORDER BY created_at, id` plus the rotating cursor is the second line of
-    defence, for the residual case the predicate cannot see: children that are
-    promotable in SQL but held back in Python by a DAG pause (the pause lives
-    in Redis). More than `_RESUME_SWEEP_LIMIT` of those under one long pause
-    would re-starve an unordered query. The cursor makes each pass resume where
-    the last stopped, so every eligible row is reached within a bounded number
-    of passes instead of depending on whatever order the planner happened to
-    return. `id` is in the sort key because `created_at` alone is not unique —
-    bulk-created siblings share a timestamp, and a non-deterministic tiebreak
-    would let the cursor skip rows.
+    The eligibility test lives in SQL, not the Python loop — the whole R2-09 fix:
+    `status == WAITING LIMIT 200` let permanently-blocked children (DEAD_LETTER or
+    CANCELLED parent) consume every slot forever, platform-wide. `ORDER BY created_at,
+    id` plus the rotating cursor covers what the predicate cannot see, a child held
+    back in Python by a DAG pause in Redis; `created_at` alone is not unique.
     """
     parent = aliased(Job)
     has_unmet_parent = (
@@ -1127,8 +888,8 @@ def _promotable_waiting_stmt(cursor: _ResumeCursor | None) -> Any:
     )
     if cursor is not None:
         # Bind each half against its own column type: `Job.id` is a UUID
-        # TypeDecorator, and an untyped literal would reach the driver as a
-        # raw uuid.UUID that SQLite cannot bind.
+        # TypeDecorator, and an untyped literal reaches the driver as a raw
+        # uuid.UUID that SQLite cannot bind.
         stmt = stmt.where(
             tuple_(Job.created_at, Job.id)
             > tuple_(
@@ -1146,16 +907,13 @@ async def _resume_unblocked_waiting_once(
 ) -> _ResumeCursor | None:
     """One pass of the resume sweep. Returns the cursor for the next pass.
 
-    A short page (fewer rows than the limit) means the tail was reached, so
-    the cursor resets to None and the next pass starts from the oldest row
-    again — that is the "rotating" part. A full page hands back the last row
-    examined, so the next pass continues past it.
+    A short page means the tail was reached, so the cursor resets to None and the
+    next pass restarts from the oldest row; a full page hands back its last row.
     """
     settings = get_settings()
     examined = 0
-    # Read the cursor off the last row *inside* the transaction. After the
-    # commit these instances are expired, and touching an attribute then
-    # would emit a lazy refresh against a closed session.
+    # Read the cursor *inside* the transaction: after the commit these instances are
+    # expired, and an attribute touch emits a lazy refresh on a closed session.
     next_cursor: _ResumeCursor | None = None
     async with session_factory() as session:
         async with session.begin():
@@ -1173,26 +931,22 @@ async def _resume_unblocked_waiting_once(
                 next_cursor = (rows[-1].created_at, rows[-1].id)
 
             for child in rows:
-                # The DAG pause lives in Redis, so it cannot be pushed into
-                # the query above; it stays a per-row check. A paused child
-                # is skipped but still counts against this pass's page,
-                # which is exactly what the cursor exists to survive.
+                # The DAG pause lives in Redis, so it stays a per-row check. A
+                # paused child still counts against this pass's page, which is
+                # exactly what the cursor exists to survive.
                 if (
                     await find_blocking_pause(redis, dep_repo, child.id)
                     is not None
                 ):
                     continue
 
-                # E1-04: CAS the promotion — the DependencyResolver
-                # (or a concurrent sweep pass) may promote the same
-                # child first. The loser must skip the outbox add
-                # too, or it still mints a duplicate job.submitted.
+                # E1-04: CAS the promotion — the DependencyResolver or a concurrent
+                # pass may win it first, and the loser must skip the outbox add too
+                # or it still mints a duplicate job.submitted.
                 if not await job_repo.promote_waiting_to_pending(child.id):
                     continue
-                # WO-R2-116: the shared builder, not a fourth hand-assembled
-                # copy of the same seven keys. The shapes were identical when
-                # this was written; the helper is what keeps them identical
-                # after the next field is added to one of them.
+                # WO-R2-116: the shared builder, not a fourth hand-assembled copy
+                # of the same keys.
                 await outbox_repo.add(
                     tenant_id=child.tenant_id,
                     topic=settings.kafka_topic_job_submitted,
@@ -1214,30 +968,13 @@ async def _resume_unblocked_waiting_loop(
     session_factory: async_sessionmaker[AsyncSession],
     redis: Any,
 ) -> None:
-    """Promote WAITING jobs whose parents are all done and whose DAG is
-    no longer paused.
+    """Promote WAITING jobs whose parents are done and whose DAG is no longer paused.
 
-    The DependencyResolver only reacts to `job.completed`. Once
-    `pause_dag` became enforcing, a child held during a pause had no
-    second chance: the parent's completion event was already consumed,
-    so lifting the pause (or letting its TTL expire) would strand the
-    child in WAITING forever. This loop is what makes the pause
-    *temporary* rather than terminal, and it doubles as a backstop for
-    any child whose promotion event was missed.
-
-    Cross-tenant by design — it's a platform-level scheduler, not a
-    request path, so it deliberately doesn't go through the
-    tenant-scoped `JobRepository.list_jobs`.
-
-    Deliberately NOT leader-gated, unlike `_outbox_relay_loop` (ADR 0020):
-    `promote_waiting_to_pending` below is a CAS, so a second replica
-    sweeping the same child loses the compare-and-set and skips the outbox
-    add with it. Concurrent sweeps are wasted scans, not duplicate events.
-
-    The cursor is per-replica in-memory state, and deliberately so: it is a
-    fairness hint, not a correctness mechanism. Two replicas holding
-    different cursors just scan different pages, and a restart losing one
-    only means that replica starts from the oldest row again.
+    The DependencyResolver only reacts to `job.completed`, so without this a child held
+    across a pause stays WAITING forever once that event is consumed; it also backstops
+    missed promotions. Cross-tenant, and deliberately NOT leader-gated (ADR 0020) — the
+    CAS in `promote_waiting_to_pending` makes concurrent sweeps wasted scans, not
+    duplicate events. The cursor is a per-replica fairness hint, not correctness.
     """
     cursor: _ResumeCursor | None = None
     while True:
@@ -1263,42 +1000,15 @@ async def _requeue_stale_pending_once(
     session_factory: async_sessionmaker[AsyncSession],
     redis: Any,
 ) -> None:
-    """One pass of the stale-PENDING backstop: re-publish PENDING jobs that
-    nothing is going to pick up.
+    """One pass of the stale-PENDING backstop: re-publish PENDING jobs that nothing
+    is going to pick up.
 
-    Covers the two crash windows the per-item isolation in
-    `_promote_delayed_once` cannot (E1-03). Both leave a job PENDING with
-    no Redis timer and no Kafka message — invisible to every other loop:
-
-      1. The worker dies between the destructive Lua pop and the outbox
-         commit. The ids are already ZREM'd; nothing re-pushes them.
-      2. The worker dies between the retry transaction's commit (which
-         writes status=PENDING) and `queue.push_delayed`. The job never
-         made it into `jobs:delayed` at all.
-
-    The `jobs:delayed` ZSCORE check is what makes this safe to run.
-    A hit means the promotion loop still owns the job — it is legitimately
-    waiting out a backoff, and the LLM retry policy can set those to
-    minutes. Re-publishing then would run the job early, defeating the
-    backoff. Only a job that is old AND has no timer is actually orphaned.
-
-    Duplicate-safe by construction, which is why this depends on the
-    atomic claim from WO-P4-03: the sweep can still false-positive when
-    Kafka consumer lag exceeds the staleness window (the job.submitted is
-    real, just not consumed yet), and the resulting second delivery loses
-    `JobRepository.claim_for_running` and executes nothing.
-
-    That claim is also why this stays ungated while `_outbox_relay_loop`
-    is leader-gated (ADR 0020). Two replicas sweeping the same stale job
-    publish two `job.submitted`; exactly one of them wins the claim and
-    runs. A leader gate would suppress the redundant scan but not the
-    false-positive above, which no gate can see — the CAS is the stronger
-    guarantee and the one that must not be removed.
-
-    Cross-tenant by design — same justification as
-    `_resume_unblocked_waiting_loop`: a platform-level scheduler, not a
-    request path, so it deliberately doesn't go through the tenant-scoped
-    `JobRepository.list_jobs`.
+    Covers the two crash windows `_promote_delayed_once` cannot (E1-03): a death
+    between the destructive Lua pop and the outbox commit, and one between the retry
+    commit and `queue.push_delayed`. The `jobs:delayed` ZSCORE check makes it safe — a
+    hit means the job is legitimately waiting out a backoff. Ungated while the relay
+    is leader-gated (ADR 0020) because `claim_for_running` (WO-P4-03) is stronger: it
+    also covers the false positive no gate can see. Cross-tenant by design.
     """
     settings = get_settings()
     now = datetime.now(UTC)
@@ -1313,13 +1023,9 @@ async def _requeue_stale_pending_once(
                         Job.status == JobStatus.PENDING,
                         Job.updated_at < cutoff,
                         # WO-R2-28: and not already re-published inside this
-                        # window. Without it the row stayed inside its own
-                        # predicate — nothing about a re-publish changed the
-                        # row — so a dispatcher that was behind got the same
-                        # job re-published every 60s for as long as the lag
-                        # lasted. `IS NULL` keeps rows that predate the
-                        # column, and every row that has never been swept,
-                        # eligible on the first pass.
+                        # window. Without it a lagging dispatcher got the same
+                        # job re-published every 60s. `IS NULL` keeps never-swept
+                        # and pre-column rows eligible on the first pass.
                         or_(
                             Job.requeued_at.is_(None),
                             Job.requeued_at < cutoff,
@@ -1330,10 +1036,8 @@ async def _requeue_stale_pending_once(
             ).scalars()
 
             for job in rows:
-                # `updated_at` is the right staleness signal (not
-                # `created_at`): the retry transaction's
-                # update_status(PENDING) touches it, so the age measured
-                # here is time-since-last-progress.
+                # `updated_at`, not `created_at`: update_status(PENDING) touches
+                # it, so the age measured here is time-since-last-progress.
                 if await redis.zscore(queue.DELAYED_KEY, str(job.id)) is not None:
                     continue
                 await outbox_repo.add(
@@ -1342,16 +1046,10 @@ async def _requeue_stale_pending_once(
                     key=f"{job.tenant_id}:{job.user_id}",
                     payload=_job_submitted_payload(job),
                 )
-                # Stamped in the SAME transaction as the outbox insert, which
-                # is the whole de-duplication guarantee: either both land or
-                # neither does, so the sweep can never publish a job it will
-                # not remember publishing (nor mark one it did not publish).
-                #
-                # `updated_at` is pinned to its own value so the ORM's
-                # `onupdate` does not fire. Re-publishing is not progress —
-                # if it were recorded as progress the operator-visible age
-                # would reset every window and a job stuck for an hour would
-                # read as five minutes old.
+                # Stamped in the SAME transaction as the outbox insert — the whole
+                # de-duplication guarantee. `updated_at` is pinned to its own value
+                # so `onupdate` does not fire: re-publishing is not progress, and
+                # recording it as progress would reset the operator-visible age.
                 await session.execute(
                     update(Job)
                     .where(Job.id == job.id)
@@ -1392,78 +1090,23 @@ async def _sweep_stale_running_once(
 ) -> int:
     """One pass of the stale-RUNNING crash recovery sweep (E1-17, ADR 0019).
 
-    `JobDispatcherConsumer` commits its Kafka offset at dispatch time, so a
-    hard worker crash (SIGKILL, OOM, node loss) leaves up to
-    MAX_CONCURRENT_JOBS rows in RUNNING with no message left to redeliver
-    them and no timer anywhere pointing at them. Nothing else in the tree
-    scans for those rows; before this sweep they stayed RUNNING forever.
-
-    Recovery is DEAD_LETTER, never re-publish. The crashed job may have run
-    an arbitrary prefix of its processor's side effects, and re-publishing
-    would re-run that prefix; dead-lettering instead routes the job into the
-    machinery that already exists for jobs needing human or agent judgement
-    (DLQ tab, LLM triage, saga compensation, Tier-1 replay). ADR 0019
-    records the revisit trigger.
-
-    Three exclusions, all load-bearing:
-
-      * the **lease** — `jobs.heartbeat_at`, renewed by
-        `_renew_running_leases_loop` in whichever replica is executing the
-        job (WO-R2-28). A job whose lease was renewed within
-        `_RUNNING_LEASE_TTL_SECONDS` is someone's live work and is skipped.
-        This is the only one of the three that works across replicas, and
-        its absence was the finding: `in_flight_job_ids` lives in one
-        process's memory, so replica A read every job replica B was
-        executing as an orphan and dead-lettered it — firing a real
-        `job.dlq` for a job that was running fine. A leader gate would not
-        have fixed that, only chosen which replica did it.
-        `heartbeat_at IS NULL` reads as stale, because a crash before the
-        first check-in is exactly what this sweep exists to reclaim.
-      * `dispatcher.in_flight_job_ids` — this process's own live work,
-        excluded for `_IN_FLIGHT_EXCLUSION_GRACE_SECONDS` past the threshold
-        rather than forever. Reaping a job out from under its own processor
-        fires a spurious `job.dlq` and is then overwritten by that
-        processor's own terminal write, so the exclusion has to cover the
-        deadline breach and the dead-letter write it triggers. It must not
-        cover more than that: an unconditional exclusion (ADR 0019 as
-        originally written) made a hung local job the one state nothing in
-        the tree could reclaim, which is half of WO-R2-07.
-
-        It is kept alongside the lease rather than replaced by it: it needs
-        no database round-trip and it still answers correctly when the
-        renewal loop itself is the thing that is wedged. The two agree in
-        the ordinary case, and where they disagree the local set is the
-        more conservative answer for our own rows.
-      * the age cutoff, which is compared **in SQL**. `started_at` is
-        TIMESTAMP WITH TIME ZONE but SQLite hands back naive datetimes, so
-        aware-vs-naive Python math raises TypeError (the same trap
-        documented at `repositories/job.py:91-95`). The cutoff is computed
-        once as an aware datetime and pushed into the WHERE clause.
-
-    Each survivor is settled in its OWN session and transaction, mirroring
-    `_promote_dlq_replay_loop`'s per-item isolation: one row that fails to
-    recover must not roll back the recoveries beside it (the E1-03
-    antipattern).
-
-    The recovery write is a compare-and-set against the `started_at` and
-    `heartbeat_at` this pass observed during its scan (`guard=` on
-    `JobRepository.update_status`). Between the scan and the write — two
-    separate transactions, with per-row Redis and Postgres work in between —
-    the executing replica can renew its lease, or the job can settle and be
-    replayed into a fresh RUNNING attempt. Re-reading the row is not enough
-    to see that: the check and the write have to be one statement. On a
-    refusal the row is left alone and the next pass re-evaluates it.
-
-    Returns the number of jobs dead-lettered.
+    Offsets commit at dispatch, so a hard crash leaves RUNNING rows nothing will
+    redeliver. Recovery is DEAD_LETTER, never re-publish: the job may have run an
+    arbitrary prefix of its side effects. Three load-bearing exclusions — the
+    cross-replica lease `jobs.heartbeat_at` (WO-R2-28; NULL reads as stale),
+    `dispatcher.in_flight_job_ids` for only `_IN_FLIGHT_EXCLUSION_GRACE_SECONDS` past
+    the threshold (WO-R2-07), and an age cutoff in SQL because SQLite hands back naive
+    datetimes. Each survivor settles in its OWN transaction (E1-03), with the write a
+    compare-and-set (`guard=`) against what the scan saw (ADR 0023). Returns the
+    number of jobs dead-lettered.
     """
     now_scan = datetime.now(UTC)
     cutoff = now_scan - timedelta(seconds=threshold_seconds)
     lease_cutoff = now_scan - timedelta(seconds=_RUNNING_LEASE_TTL_SECONDS)
 
-    # Scan in its own read-only session; the recoveries below each open
-    # their own. `started_at IS NOT NULL` is belt-and-braces — the RUNNING
-    # transition always sets it, but a hand-seeded or legacy row without it
-    # must be skipped rather than crash the loop on a NULL comparison.
+    # Scan in its own read-only session; the recoveries below each open their own.
+    # `started_at IS NOT NULL` skips legacy or hand-seeded rows rather than
+    # crashing the loop on a NULL comparison.
     async with session_factory() as session:
         rows = (
             await session.execute(
@@ -1483,10 +1126,9 @@ async def _sweep_stale_running_once(
                     Job.status == JobStatus.RUNNING,
                     Job.started_at.is_not(None),
                     Job.started_at < cutoff,
-                    # The cross-replica exclusion (WO-R2-28). In SQL for the
-                    # same reason the age cutoff is: it decides which rows
-                    # are candidates at all, and doing it in Python would
-                    # spend the 100-row page on jobs that are plainly alive.
+                    # The cross-replica exclusion (WO-R2-28), in SQL for the same
+                    # reason the age cutoff is: in Python it would spend the page
+                    # on jobs that are plainly alive.
                     or_(
                         Job.heartbeat_at.is_(None),
                         Job.heartbeat_at < lease_cutoff,
@@ -1501,24 +1143,18 @@ async def _sweep_stale_running_once(
     for row in rows:
         job_id_str = str(row.id)
 
-        # `row.started_at` came back naive on SQLite and aware on Postgres;
-        # normalise before subtracting so the observability fields below
-        # can't raise. The recovery decision itself was already made in SQL.
+        # Naive on SQLite, aware on Postgres: normalise before subtracting so the
+        # observability fields below can't raise. The decision was made in SQL.
         started_at = row.started_at
         if started_at.tzinfo is None:
             started_at = started_at.replace(tzinfo=UTC)
         stale_seconds = (now - started_at).total_seconds()
 
-        # The in-flight exclusion is no longer permanent (WO-R2-07, amending
-        # ADR 0019 §3). It existed because the sweep could not tell a
-        # legitimately-slow local job from a stuck one, so it had to assume
-        # slow — which made a hung local job the single state no sweep could
-        # ever reclaim. `job_execution_timeout_seconds` now draws that line
-        # for us: a job of ours still RUNNING this far past the threshold is
-        # one whose own deadline should already have fired, so it is stuck.
-        # Inside the grace the exclusion still holds, which is what keeps the
-        # sweep off a job whose deadline just fired and whose dead-letter
-        # write is still in flight.
+        # The in-flight exclusion is no longer permanent (WO-R2-07, amending ADR 0019
+        # §3): a job of ours this far past the threshold is one whose own
+        # `job_execution_timeout_seconds` should have fired, so it is stuck, not slow.
+        # Inside the grace it still holds, keeping the sweep off a job whose
+        # dead-letter write is in flight.
         in_flight = job_id_str in dispatcher.in_flight_job_ids
         if in_flight and stale_seconds < (
             threshold_seconds + _IN_FLIGHT_EXCLUSION_GRACE_SECONDS
@@ -1535,26 +1171,13 @@ async def _sweep_stale_running_once(
             async with session_factory() as session:
                 async with session.begin():
                     repo = JobRepository(session)
-                    # retry_count is deliberately NOT touched. Replay resets
-                    # it on purpose; a crash recovery is not a replay, and
-                    # zeroing it here would erase the attempt history triage
-                    # and the DLQ tab reason about.
-                    # The `job.dlq` outbox row lands in this same transaction,
-                    # written by `update_status` from the row it just wrote.
-                    # It carries the full `DLQ_EVENT_KEYS` set, not just the
-                    # schema's required fields: this event fans out to triage,
-                    # the saga coordinator and the event log exactly like a
-                    # `_run_job` dead-letter, and a key the producer omits
-                    # degrades those consumers silently.
-                    #
-                    # `guard` makes it a compare-and-set against what the
-                    # scan saw. The scan and this write are different
-                    # transactions, so between them the executing replica
-                    # may have renewed its lease (the row is alive after
-                    # all) or the job may have settled and been replayed
-                    # into a new RUNNING attempt (`started_at` moved). A
-                    # re-read cannot close that gap — only doing the check
-                    # and the write in one statement can.
+                    # retry_count is deliberately NOT touched: a crash recovery is
+                    # not a replay, and zeroing it erases the attempt history the
+                    # DLQ tab reasons about. `update_status` writes the `job.dlq`
+                    # row here with the full `DLQ_EVENT_KEYS` set. `guard` makes it
+                    # a compare-and-set against what the scan saw; between the two
+                    # transactions the lease may have been renewed or the job
+                    # replayed, and only one statement closes that gap.
                     settled = await repo.update_status(
                         row.id,
                         JobStatus.DEAD_LETTER,
@@ -1568,9 +1191,8 @@ async def _sweep_stale_running_once(
                         ),
                     )
                     if settled is None:
-                        # Refused: the row moved under us. Someone else owns
-                        # its outcome — leave it, and let the next pass
-                        # re-evaluate from a fresh scan.
+                        # Refused: the row moved under us, so someone else owns
+                        # its outcome. Leave it for the next pass's fresh scan.
                         logger.info(
                             "stale RUNNING recovery refused — row changed "
                             "under the sweep",
@@ -1586,10 +1208,9 @@ async def _sweep_stale_running_once(
                         job_id=row.id,
                         extra_data={
                             "error": error,
-                            # Distinguished so replay tooling and triage can
-                            # tell a crash orphan (nobody was running it)
-                            # from a local job that outlived its deadline
-                            # (something was, and stopped responding).
+                            # Distinguished so replay tooling and triage can tell
+                            # a crash orphan (nobody was running it) from a local
+                            # job that outlived its deadline.
                             "reason": (
                                 "stuck_local_job"
                                 if in_flight
@@ -1638,38 +1259,18 @@ async def _renew_running_leases_once(
 ) -> int:
     """One check-in on behalf of the jobs this process is executing (WO-R2-28).
 
-    The counterpart to `_sweep_stale_running_once`: that one reads the lease,
-    this one writes it. Together they replace "is this job in *my* in-flight
-    set?" — a question only the process holding the set can answer — with "has
-    *anyone* checked in on this job lately?", which every replica can answer
-    from the same row. Without it, a second replica read every job the first
-    was executing as a crash orphan and dead-lettered it, `job.dlq` and all.
-
-    Snapshot the id set before awaiting: it is mutated by `handle_message` and
-    `_run_and_release` on the same event loop, and iterating it across an await
-    would risk "set changed size during iteration". A job that finishes during
-    the write is renewed harmlessly — the status predicate in
-    `renew_running_leases` drops anything no longer RUNNING.
-
-    The renewal deliberately does not cover a job past
-    `threshold_seconds + _IN_FLIGHT_EXCLUSION_GRACE_SECONDS`. A worker that
-    hangs still runs this loop, so an unconditional renewal would let it
-    defend its own stuck job forever — re-creating, through the lease, the
-    single unreclaimable state WO-R2-07 removed. Past that age the check-ins
-    stop, the lease lapses, and the job is reclaimable by this replica or any
-    other. The bound is the same one the in-flight exclusion uses, so the two
-    mechanisms lapse together rather than leaving a window where one defends
-    a job the other has given up on.
-
-    Returns the number of leases renewed.
+    The write side of the lease `_sweep_stale_running_once` reads: it replaces "is this
+    job in *my* in-flight set?" with "has *anyone* checked in lately?", which every
+    replica can answer. The id set is snapshotted before awaiting because the same
+    event loop mutates it. Renewal stops past the bound the in-flight exclusion uses,
+    so a hung worker cannot defend its own stuck job forever. Returns leases renewed.
     """
     job_ids: list[uuid.UUID] = []
     for job_id_str in list(dispatcher.in_flight_job_ids):
         try:
             job_ids.append(uuid.UUID(job_id_str))
         except ValueError:
-            # A malformed id never reached a real row, so it has no lease to
-            # renew. `handle_message` accepts whatever the message carried.
+            # A malformed id never reached a real row, so it has no lease.
             continue
     if not job_ids:
         return 0
@@ -1688,14 +1289,10 @@ async def _renew_running_leases_loop(
     session_factory: async_sessionmaker[AsyncSession],
     dispatcher: JobDispatcherConsumer,
 ) -> None:
-    """Keep this worker's RUNNING jobs vouched for — see
-    `_renew_running_leases_once` for what the lease is and why it stops.
+    """Keep this worker's RUNNING jobs vouched for — see `_renew_running_leases_once`.
 
-    Failure posture matches every other loop here: log and keep turning. A
-    missed check-in is not immediately harmful, because the TTL spans six
-    intervals; a *sustained* failure lets the lease lapse, which degrades to
-    exactly the pre-fix behaviour (the sweep falls back on the age threshold
-    and the local in-flight set) rather than to anything worse.
+    Log and keep turning: the TTL spans six intervals, and a sustained failure only
+    degrades the sweep back to the age threshold plus the local in-flight set.
     """
     settings = get_settings()
     while True:
@@ -1719,13 +1316,10 @@ async def _stale_running_sweep_loop(
     dispatcher: JobDispatcherConsumer,
 ) -> None:
     """Crash-recovery sweep for jobs stranded in RUNNING — see
-    `_sweep_stale_running_once` for what it recovers and why it
-    dead-letters rather than re-publishes (ADR 0019).
+    `_sweep_stale_running_once` (ADR 0019).
 
-    Orderly shutdown does not need this loop: `worker_loop`'s
-    CancelledError path awaits `dispatcher.in_flight` before returning, so
-    a graceful stop settles its own jobs. This is for hard crashes only,
-    which is why the threshold is generous rather than responsive.
+    Hard crashes only: an orderly stop settles its own jobs via `worker_loop`'s
+    CancelledError path, which is why the threshold is generous, not responsive.
     """
     settings = get_settings()
     while True:
@@ -1748,33 +1342,17 @@ async def _promote_dlq_replay_once(
     session_factory: async_sessionmaker[AsyncSession],
     redis: Any,
 ) -> None:
-    """One pass of scheduled-DLQ-replay promotion: claim the due entries
-    and fire each one.
+    """One pass of scheduled-DLQ-replay promotion: claim the due entries and fire
+    each one.
 
-    Each claimed entry hits `JobService.replay_job`, which writes the
-    canonical `job.replayed` audit row and republishes via the outbox —
-    so the eventual execution is indistinguishable from an immediate
-    replay, aside from the paired `job.replay_scheduled` row written at
-    scheduling time.
-
-    A due entry whose DAG is paused is re-scheduled (E1-08) instead of
-    fired, keeping the remediation alive until the pause lifts.
-
-    Claim/ack, not pop (R2-21). `claim_ready` moves due members into
-    `jobs:dlq_replay_inflight` rather than deleting them, and every
-    outcome this pass can *observe* — fired, deferred, or failed — acks
-    the claim. Failure still does not re-enqueue: the operator sees the
-    `job.replay_scheduled` row with no matching `job.replayed` row and
-    re-issues, and auto-retrying would mask a permanent problem like
-    "job was deleted". What the ack does buy is the case this pass
-    cannot observe: a worker killed mid-replay never reaches the ack, so
-    the claim lapses and a later tick recovers the entry instead of
-    losing it. `CancelledError` (the shutdown signal) is a
-    BaseException, so it bypasses the `except Exception` and its ack by
-    construction.
+    Each entry hits `JobService.replay_job`, so the execution is indistinguishable
+    from an immediate replay; a paused DAG re-schedules instead of firing (E1-08).
+    Claim/ack, not pop (R2-21): `claim_ready` moves due members into
+    `jobs:dlq_replay_inflight` and every observable outcome acks, so only a worker
+    killed mid-replay leaves a claim for a later tick. Failure still does not
+    re-enqueue — auto-retrying would mask "job was deleted".
     """
-    # Local imports keep the module-level graph flat and match the
-    # style of other supporting loops in this file.
+    # Local imports keep the module-level graph flat.
     from app.repositories.job_dependency import JobDependencyRepository
     from app.services.job import JobService
 
@@ -1784,13 +1362,9 @@ async def _promote_dlq_replay_once(
             held_by: uuid.UUID | None = None
             async with session_factory() as session:
                 async with session.begin():
-                    # E1-08: probe the pause BEFORE the replay
-                    # rather than letting `replay_job`'s JobError
-                    # be the mechanism. This loop deliberately does
-                    # not re-enqueue a failure, so a refusal here
-                    # would silently discard the `wait_and_replay`
-                    # remediation the operator (or the agent)
-                    # scheduled.
+                    # E1-08: probe the pause BEFORE the replay. This loop
+                    # does not re-enqueue a failure, so letting `replay_job`
+                    # refuse would silently discard the scheduled remediation.
                     held_by = await find_blocking_pause(
                         redis, JobDependencyRepository(session), job_id
                     )
@@ -1802,25 +1376,19 @@ async def _promote_dlq_replay_once(
                             redis,
                             dep_repo=JobDependencyRepository(session),
                         )
-                        # Scheduled DLQ replays only come from SA
-                        # callers today (Tier-1 tools). If we grow a
-                        # human path we'd carry principal_type in
-                        # the ZSET member; for now, assume SA.
+                        # Scheduled replays only come from SA callers
+                        # (Tier-1 tools) today; a human path would need
+                        # principal_type in the ZSET member.
                         await service.replay_job(
                             job_id=job_id,
                             tenant_id=tenant_id,
                             principal_type="service_account",
                             principal_id=principal_id,
                         )
-                # This loop owns its own transaction boundary, so it
-                # drains the post-commit queue itself — the `get_db`
-                # dependency does it for the API and MCP processes but
-                # never runs here (R2-23). Inside the session block and
-                # before the ack: the commit has landed, so the cache
-                # invalidation is safe to publish, and doing it here
-                # keeps it on the same success path the ack acknowledges.
-                # `run_post_commit` cannot raise, so it cannot turn a
-                # committed replay into a logged "fire failed".
+                # This loop owns its own transaction boundary, so it drains the
+                # post-commit queue itself — `get_db` never runs here (R2-23).
+                # After the commit and before the ack; `run_post_commit` cannot
+                # raise, so it cannot turn a committed replay into a "fire failed".
                 await run_post_commit(session)
             if held_by is not None:
                 await dlq_replay_scheduler.schedule_replay(
@@ -1857,10 +1425,9 @@ async def _promote_dlq_replay_once(
                 },
             )
 
-        # Reached on success, on a paused-DAG deferral (the entry is
-        # armed again on the scheduled set, so holding the claim too
-        # would replay it twice) and on a logged failure. Skipped only
-        # when the worker is going down mid-item — the reclaim case.
+        # Reached on success, on a paused-DAG deferral (the entry is re-armed on
+        # the scheduled set, so holding the claim too would replay it twice) and
+        # on a logged failure. Skipped only when the worker dies mid-item.
         await dlq_replay_scheduler.ack_replay(
             redis,
             tenant_id=tenant_id,
@@ -1873,15 +1440,11 @@ async def _promote_dlq_replay_loop(
     session_factory: async_sessionmaker[AsyncSession],
     redis: Any,
 ) -> None:
-    """
-    Fire operator-scheduled DLQ replays whose delay window has elapsed.
+    """Fire operator-scheduled DLQ replays whose delay window has elapsed.
 
-    Distinct from `_promote_delayed_loop` (which handles the retry-cycle
-    ZSET `jobs:delayed`). This one drains `jobs:dlq_replay_delayed` —
-    entries the agent's Tier-1 tools scheduled via
-    `replay_dlq_by_ids(delay_seconds=…)` or
-    `replay_dlq_by_category(delay_seconds=…)`. See
-    `_promote_dlq_replay_once` for the per-pass semantics.
+    Drains `jobs:dlq_replay_delayed` (Tier-1 `replay_dlq_by_ids` /
+    `replay_dlq_by_category`), not the retry-cycle `jobs:delayed`. Per-pass
+    semantics in `_promote_dlq_replay_once`.
     """
     while True:
         try:
@@ -1900,9 +1463,8 @@ async def _promote_dlq_replay_loop(
 OUTBOX_RELAY_INTERVAL = 1.0  # seconds between outbox polls
 OUTBOX_RELAY_BATCH = 100
 
-#: How often the relay reports queue health. The tick runs once a second;
-#: CloudWatch does not need that, and only the leader emits so the gauge
-#: stays one series rather than one per replica.
+#: How often the relay reports queue health — the tick runs once a second and
+#: CloudWatch does not need that. Only the leader emits, so it stays one series.
 _OUTBOX_GAUGE_INTERVAL = 60.0
 _last_outbox_gauge_at: float = 0.0
 
@@ -1912,11 +1474,9 @@ async def _emit_outbox_gauges(
 ) -> None:
     """Publish outbox depth + oldest-row age, at most once a minute.
 
-    `QueueDepth` cannot cover this. It measures the Redis delayed set, which
-    is untouched by a relay stall — the outbox can stop delivering entirely
-    while every existing dashboard reads green. These two gauges are the
-    only signal that would notice, so their emission failing must not take
-    the tick down with it.
+    `QueueDepth` measures the Redis delayed set, which a relay stall leaves green,
+    so these two are the only signal that notices — and their failure must never
+    take the tick down with it.
     """
     global _last_outbox_gauge_at
     now = time.monotonic()
@@ -1934,10 +1494,8 @@ async def _emit_outbox_gauges(
     except Exception as exc:
         logger.warning("outbox gauge emission failed", extra={"error": str(exc)})
 
-#: Zero-argument factory returning the leader gate's async context
-#: manager. Injected by the tests — the SQLite tiers have no advisory
-#: locks, so the real gate is a no-op there and the interesting states
-#: (leader / not leader) can only be exercised by substitution.
+#: Zero-argument factory for the leader gate's async context manager. Injected by
+#: tests: SQLite has no advisory locks, so leader/not-leader needs substitution.
 LeaderGate = Callable[[], AbstractAsyncContextManager[bool]]
 
 
@@ -1945,52 +1503,26 @@ async def _outbox_relay_tick(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     """
-    One pass of the transactional outbox relay:
+    One pass of the transactional outbox relay: fetch up to OUTBOX_RELAY_BATCH
+    unpublished rows, publish each, then mark the results in a second transaction.
 
-      1. Read up to OUTBOX_RELAY_BATCH unpublished rows in one transaction.
-      2. For each row, attempt to publish to Kafka.
-      3. Mark successfully-published rows in a second transaction.
-      4. Rows whose publish failed transiently stay unpublished and are
-         retried next tick; rows that can never publish are dead-lettered.
-
-    The caller holds the relay leader lock for the whole of this. That is
-    load-bearing and cannot be replaced by locking the rows in step 1:
-    step 1's transaction commits before a single publish happens, so any
-    `FOR UPDATE` taken there is already released by step 2 (ADR 0020).
-
-    Step 4 is why the row-level try/except is not enough on its own. It
-    gives per-row *isolation* — one bad payload cannot abort the batch —
-    but isolation without an exit means the bad row is fetched again next
-    tick, forever. The fetch window is a fixed OUTBOX_RELAY_BATCH oldest
-    rows, so a permanently unpublishable row does not degrade throughput
-    gradually: it consumes one of exactly 100 slots until 100 of them are
-    consumed, and then delivery stops completely, for every tenant, with no
-    error rate to notice it by. Two exits, per ADR 0001 Decision item 3:
-
-      * `SchemaValidationError` — deterministic. The same payload will fail
-        the same way on every future tick, so retrying is pure cost.
-        Dead-letter on the first attempt.
-      * anything else `outbox_max_attempts` times over — the backstop for
-        failures we cannot classify (a record the broker refuses as
-        oversize, a topic that does not exist). Generous by default,
-        because a broker outage fails every row in the batch and this must
-        not turn a blip into a quarantined backlog.
-
-    Dead-lettering keeps the row and its payload; see `mark_failed`.
+    The caller holds the relay leader lock throughout; locking rows in the fetch cannot
+    replace it, because that transaction commits before any publish (ADR 0020). Two
+    dead-letter exits stop one unpublishable row consuming an oldest-row slot until
+    delivery stops for every tenant with no error rate to notice it by (ADR 0001 item
+    3): `SchemaValidationError` on the first attempt, anything else after
+    `outbox_max_attempts`. `mark_failed` keeps the row and its payload.
     """
     async with session_factory() as session:
         async with session.begin():
             repo = OutboxRepository(session)
             events = await repo.fetch_unpublished(limit=OUTBOX_RELAY_BATCH)
 
-    # "A pass ran." Recorded here — inside the tick, after the fetch that
-    # proves the queue was reachable — rather than in the loop around it,
-    # because the loop keeps turning when the relay is skipping its work and a
-    # stamp written up there would report that state as healthy. It is written
-    # whether or not there was anything to deliver, which is the whole point:
-    # an idle relay and a stopped one both publish nothing, and this is the
-    # only thing that tells a reader in another process which one it is
-    # (ADR 0028). Never fatal — see `record_relay_tick`.
+    # "A pass ran." Inside the tick, after the fetch that proves the queue was
+    # reachable, because the loop keeps turning while the relay skips its work.
+    # Written whether or not anything was delivered: it is the only thing telling a
+    # reader in another process an idle relay from a stopped one (ADR 0028). Never
+    # fatal — see `record_relay_tick`.
     await record_relay_tick()
 
     await _emit_outbox_gauges(session_factory)
@@ -2075,19 +1607,12 @@ async def _outbox_relay_loop(
     session_factory: async_sessionmaker[AsyncSession],
     leader_gate: LeaderGate | None = None,
 ) -> None:
-    """
-    Transactional outbox relay — single-writer across replicas (E1-15).
+    """Transactional outbox relay — single-writer across replicas (E1-15).
 
-    `worker_loop` runs in every API replica's lifespan, so without a gate
-    every rolling-deploy overlap publishes the entire unpublished backlog
-    twice: duplicate lifecycle events into audit, `job_events` and the SSE
-    bridge. Each tick therefore runs only if this process wins a Postgres
-    advisory lock; the loser sleeps the same interval and tries again, so
-    leadership follows whoever is up rather than being pinned to a task.
-
-    Second line of defense, not replaced by this: the `job_events` unique
-    constraint and WO-P4-03's atomic claim still dedupe on the consumer
-    side. See ADR 0020.
+    `worker_loop` runs in every API replica's lifespan, so without the Postgres
+    advisory lock a rolling-deploy overlap republishes the whole backlog; the loser
+    just sleeps and retries, so leadership follows whoever is up. The `job_events`
+    unique constraint and WO-P4-03's atomic claim still dedupe downstream (ADR 0020).
     """
     gate: LeaderGate = leader_gate or (
         lambda: advisory_leader_lock(session_factory, OUTBOX_RELAY_LOCK_KEY)
@@ -2096,13 +1621,9 @@ async def _outbox_relay_loop(
         try:
             async with gate() as is_leader:
                 if is_leader:
-                    # INSIDE the gate, not in front of it. Checking first
-                    # would make a paused replica stop contending for
-                    # leadership, handing it to another replica — the pause
-                    # would still hold there, because the key is global, but
-                    # leadership would have moved for a reason that has
-                    # nothing to do with leadership. Here the gate behaves
-                    # identically whether the loop is paused or not.
+                    # INSIDE the gate, not in front of it: checking first would
+                    # make a paused replica stop contending for leadership, moving
+                    # it for a reason that has nothing to do with leadership.
                     if not await loop_is_paused(ControlLoopName.OUTBOX_RELAY):
                         await _outbox_relay_tick(session_factory)
                 else:
@@ -2118,39 +1639,23 @@ async def _outbox_relay_loop(
 BACKPRESSURE_LAG_KEY = "kafka:consumer_lag:worker-dispatcher"
 BACKPRESSURE_LAG_TTL = 90  # seconds — must exceed metrics loop interval (60s)
 
-# The same number, with the time it was measured, kept for the last few
-# passes. `BACKPRESSURE_LAG_KEY` is one undated integer overwritten every
-# ~60s: a reader could see the current lag and nothing else, so "lag is
-# climbing" was unverifiable from the platform — three reads inside one
-# minute return the one value the loop last wrote, which reads as "flat"
-# and is really "not re-measured yet" (WO-R3-254).
-#
-# Deliberately a SECOND key. The value key's shape and meaning are fixed
-# by `check_backpressure` (and by every other reader of it), so the
-# history is written beside it rather than into it.
-#
-# JSON list, newest first: [{"lag": int, "measured_at": ISO-8601 UTC}].
-# One string rather than a Redis list so every reader that already has
-# GET has the history too, and so one SET replaces the whole window.
-# Same TTL as the value, refreshed on every write: the pair is
-# fresh-or-absent together, and a stopped loop takes both with it
-# instead of leaving a history nothing is extending.
+# The same number with its measurement time, kept for the last few passes:
+# `BACKPRESSURE_LAG_KEY` is one undated integer overwritten every ~60s, so a climbing
+# lag was unverifiable (WO-R3-254). A SECOND key, because `check_backpressure` fixes
+# the value key's shape. JSON list, newest first:
+# [{"lag": int, "measured_at": ISO-8601 UTC}], same TTL so the pair is fresh together.
 LAG_SAMPLES_KEY = f"{BACKPRESSURE_LAG_KEY}:samples"
-# Five at ~60s apart is ~5 minutes of trend — enough to see a climb, small
-# enough that the whole window is one short value. Mirrored by the reader
-# (`app/mcp/tools/consumer_lag.py`); `test_consumer_lag_history.py` pins
-# the pair together.
+# Five at ~60s apart is ~5 minutes of trend. Mirrored by the reader
+# (`app/mcp/tools/consumer_lag.py`); `test_consumer_lag_history.py` pins the pair.
 LAG_SAMPLES_KEEP = 5
 
 
 async def _record_lag_sample(redis: Any, lag: int) -> None:
     """Prepend one timestamped measurement to the capped sample window.
 
-    Read-modify-write on purpose: the window is a diagnostic aid, not a
-    correctness input, so a lost race between two worker replicas costs
-    one sample and nothing else. Anything already stored that is not a
-    JSON list is replaced rather than parsed around — a malformed window
-    is not evidence of anything and must not stop the loop recording.
+    Read-modify-write on purpose: the window is a diagnostic aid, not a correctness
+    input, so a lost race costs one sample. Anything stored that is not a JSON list
+    is replaced rather than parsed around.
     """
     measured_at = datetime.now(UTC).isoformat()
     samples: list[Any] = []
@@ -2174,9 +1679,8 @@ async def _record_lag_sample(redis: Any, lag: int) -> None:
 async def _digest_loop(session_factory: async_sessionmaker[AsyncSession]) -> None:
     """Periodic incident-summary digest worker.
 
-    Runs forever, sleeping `llm_digest_interval_hours` between batches.
-    When the feature flag is off, the body short-circuits and we still
-    sleep so the loop doesn't busy-wait.
+    Sleeps `llm_digest_interval_hours` between batches, including when the feature
+    flag is off, so the loop never busy-waits.
     """
     from app.services import incident_digest
 
@@ -2185,10 +1689,9 @@ async def _digest_loop(session_factory: async_sessionmaker[AsyncSession]) -> Non
             settings = get_settings()
             interval_seconds = max(60, settings.llm_digest_interval_hours * 3600)
             await asyncio.sleep(interval_seconds)
-            # After the sleep, because that is where the work is. Note the
-            # consequence the tool reports rather than hides: this interval is
-            # hours, so a pause shorter than it expires before a tick ever
-            # reads the key (`control_loop_pause.tick_interval_seconds`).
+            # After the sleep, where the work is. The interval is hours, so a
+            # shorter pause expires before a tick ever reads the key
+            # (`control_loop_pause.tick_interval_seconds`).
             if await loop_is_paused(ControlLoopName.DIGEST):
                 continue
             if not incident_digest.is_enabled():
@@ -2215,24 +1718,11 @@ async def _slo_evaluation_loop(
 ) -> None:
     """Evaluate the SLOs on a schedule and alert on a fast burn (WO-R2-29).
 
-    `services/slo.compute_all` had exactly one caller before this — a
-    read-only admin endpoint — so the objectives were only ever computed when
-    a human asked, and no real platform condition created an Alert. The alert
-    webhook is the incident commander's production trigger, and its only
-    producer was a chaos tool: the commander could be woken by a human
-    pretending there was an incident, and by nothing else.
-
-    Deliberately NOT leader-gated, for the same reason as the dispatcher
-    sweeps (ADR 0020 applies to the outbox relay, not to everything): the
-    de-duplication is a unique constraint on `(tenant_id, dedup_key)`, so a
-    second replica evaluating the same window loses the insert and stops.
-    Concurrent evaluation costs redundant aggregate queries, not duplicate
-    alerts — and unlike a gate, that guarantee also holds across a
-    leader handover.
-
-    The interval is read every pass rather than captured once, matching
-    `_digest_loop`: 0 disables evaluation without a redeploy, for
-    deployments that alert from CloudWatch alone and want no second producer.
+    Before this, `services/slo.compute_all` had one caller — a read-only admin
+    endpoint — so the alert webhook's only producer was a chaos tool. Deliberately NOT
+    leader-gated (ADR 0020 is about the relay): the unique constraint on `(tenant_id,
+    dedup_key)` makes a second replica lose the insert, and it holds across a handover
+    where a gate would not. The interval is read every pass, so 0 disables evaluation.
     """
     from app.services import slo
 
@@ -2240,8 +1730,7 @@ async def _slo_evaluation_loop(
         try:
             interval = get_settings().slo_evaluation_interval_seconds
             if interval <= 0:
-                # Disabled. Still sleep, so the loop doesn't busy-wait, and
-                # still re-read the setting on the next pass.
+                # Disabled: still sleep, and still re-read the setting next pass.
                 await asyncio.sleep(_SLO_DISABLED_RECHECK_SECONDS)
                 continue
             await asyncio.sleep(interval)
@@ -2264,17 +1753,9 @@ async def _idempotency_reaper_loop(
 ) -> None:
     """Delete expired idempotency records every hour.
 
-    Closes the "no reaper means expired records accumulate" negative
-    consequence in [ADR 0010](docs/ADR/0010-idempotency-record-lifecycle.md).
-    Lookups already treat expired records as absent so this is a
-    housekeeping loop, not a correctness one — but at ~10²–10³
-    records/tenant/day the table would grow without bound and every
-    lookup would scan more rows than necessary.
-
-    The interval mirrors the record TTL cadence (24h). Running hourly
-    means a record expires at t+24h, gets reaped no later than t+25h.
-    That's a bounded 1h window of "expired but still in the table",
-    which lookups handle via the `expires_at < now()` check.
+    Closes ADR 0010's "no reaper means expired records accumulate" consequence.
+    Housekeeping, not correctness — lookups already treat expired records as absent
+    via `expires_at < now()`, so the hourly cadence only bounds table growth.
     """
     from app.repositories.idempotency import IdempotencyRepository
 
@@ -2299,20 +1780,17 @@ async def _idempotency_reaper_loop(
             )
 
 
-#: Seconds between metrics passes. Was an inline literal; named so
-#: `BACKPRESSURE_LAG_TTL`'s "must exceed the metrics loop interval" comment
-#: has something to point at, and so `control_loop_pause` can mirror it.
+#: Seconds between metrics passes. Named so `BACKPRESSURE_LAG_TTL`'s "must exceed
+#: the metrics loop interval" has something to point at.
 _METRICS_LOOP_INTERVAL = 60.0
 
 
 async def _metrics_loop(redis: Any, consumer: JobDispatcherConsumer) -> None:
     """Emit queue/in-flight/consumer-lag gauges every ~60s.
 
-    Lag is also cached in Redis so the API can read it cheaply for the
-    backpressure check (no per-request Kafka query), and each measurement
-    is appended to a short timestamped window so a reader can tell a
-    climbing lag from a flat one without being able to wait a minute
-    itself (`LAG_SAMPLES_KEY`).
+    Lag is also cached in Redis for the backpressure check (no per-request Kafka
+    query), and each measurement is appended to `LAG_SAMPLES_KEY` so a reader can
+    tell a climbing lag from a flat one without waiting a minute itself.
     """
     while True:
         try:
@@ -2323,21 +1801,15 @@ async def _metrics_loop(redis: Any, consumer: JobDispatcherConsumer) -> None:
             lag = await consumer.consumer_lag()
             await metrics.emit_gauge("QueueDepth", float(delayed))
             await metrics.emit_gauge("InFlightJobs", float(len(consumer.in_flight)))
-            # `lag is None` means the consumer is in an unknown state
-            # (not started, no assignment, or Kafka query errored). Do
-            # NOT emit a fabricated 0 — the reader (`check_backpressure`
-            # and `get_consumer_lag`) would treat that as "healthy" and
-            # mask a real problem. The previous cache entry TTLs out and
-            # backpressure fails open on absence. See ADR-referenced
-            # discussion of "unknown is not healthy" (Practice 9).
+            # `lag is None` means unknown (not started, no assignment, query
+            # errored). Do NOT emit a fabricated 0 — `check_backpressure` and
+            # `get_consumer_lag` would read it as healthy. The previous cache
+            # entry TTLs out and backpressure fails open on absence.
             if lag is not None:
                 await metrics.emit_gauge("ConsumerLag", float(lag))
                 await redis.set(BACKPRESSURE_LAG_KEY, lag, ex=BACKPRESSURE_LAG_TTL)
-                # Value first, history second: backpressure's key is the
-                # one with a caller waiting on it. The history is best
-                # effort — if it fails, the reading is still correct and
-                # still cached, it just has no recorded time, which the
-                # reader reports honestly rather than guessing.
+                # Value first, history second: backpressure's key is the one with
+                # a caller waiting on it, and the history is best effort.
                 try:
                     await _record_lag_sample(redis, lag)
                 except Exception as exc:
@@ -2379,30 +1851,15 @@ async def _restart_consumer(consumer: BaseKafkaConsumer) -> None:
 
 
 async def _supervise_consumer(consumer: BaseKafkaConsumer) -> None:
-    """Own one consumer's whole lifecycle: the first start(), then run()
-    across chaos kills and crashes.
+    """Own one consumer's whole lifecycle: the first start(), then run() across
+    chaos kills and crashes.
 
-    Fills the gap three docstrings referenced but nothing implemented:
-    `kill_consumer` makes run() exit and `restart_consumer_group` only
-    deletes the Redis kill key — without a supervisor, a killed consumer
-    stayed dead until the worker process restarted, so live remediation
-    evals could never observe recovery.
-
-    Boot: the consumer arrives unstarted. Starting it here (through the same
-    backoff helper the crash path uses) means a transient Kafka/DNS error at
-    boot is retried instead of silently dropping that consumer group for the
-    life of the process. The guard sits BEFORE the loop on purpose — inside
-    it, an orderly stop() (which leaves is_running False) would resurrect the
-    consumer during shutdown.
-
-    run() outcomes:
-      * raises                 -> log, backoff, stop/start, re-enter.
-      * returns, chaos_killed  -> poll until the kill key is observed absent
-        (restart_consumer_group or TTL expiry), then stop/start for a
-        fresh AIOKafkaConsumer and re-enter run(). A failed lookup is NOT
-        an absent key: the consumer stays down until Redis answers.
-      * returns otherwise      -> stop() was called (orderly shutdown) or
-        run() swallowed a cancellation during teardown; supervision ends.
+    `kill_consumer` makes run() exit and `restart_consumer_group` only deletes the
+    Redis kill key, so without this a killed consumer stayed dead until the process
+    restarted. The boot start() uses the crash path's backoff helper, guarded BEFORE
+    the loop so an orderly stop() cannot resurrect it. run(): raises -> backoff and
+    restart; `chaos_killed` -> poll until the kill key is observed absent (a failed
+    lookup is not absent), then restart; otherwise -> supervision ends.
     """
     if not consumer.is_running:
         # Boot (or a start() that never took). stop() on a never-started
@@ -2428,10 +1885,9 @@ async def _supervise_consumer(consumer: BaseKafkaConsumer) -> None:
                 "consumer killed by chaos; supervisor waiting for kill key",
                 extra={"group_id": consumer.group_id},
             )
-            # Fail CLOSED: only an observed-absent key releases the consumer.
-            # A lookup error means "unknown", and unknown must not read as
-            # "cleared" — the chaos hook that killed this consumer can be the
-            # same one saturating Redis. One warning per 2s poll is the cost.
+            # Fail CLOSED: only an observed-absent key releases the consumer. A
+            # lookup error is "unknown", and unknown must not read as "cleared" —
+            # the hook that killed this consumer may be saturating Redis.
             while True:
                 try:
                     if not await _check_chaos_kill_strict(consumer.group_id):
@@ -2458,61 +1914,13 @@ async def worker_loop(
     session_factory: async_sessionmaker[AsyncSession],
     redis: Any,
 ) -> None:
-    """
-    Start the Kafka consumers and the supporting background loops.
+    """Start the 8 Kafka consumers (each its own group) and the 11 background loops.
 
-    Every consumer is handed to `_supervise_consumer` UNSTARTED — the
-    supervisor owns start() (ADR 0009 amendment). worker_loop therefore never
-    drops a consumer group because its first start() hit a transient
-    Kafka/DNS error; the supervisor retries with capped backoff until it
-    sticks. The corollary is that a permanently unreachable broker leaves all
-    8 supervisors retrying rather than disabling the worker.
-
-    Concurrent tasks that make up the worker — 8 Kafka consumers + 11 loops:
-
-      Kafka consumers (each its own group, so failure of one doesn't
-      affect the others):
-        1. dispatcher.run()       — consumes `job.submitted`, spawns _run_job.
-        2. audit.run()            — consumes lifecycle events, writes audit rows.
-        3. sse.run()              — consumes lifecycle events, bridges to Redis pub/sub.
-        4. event_log.run()        — appends every lifecycle event to `job_events`.
-        5. read_model.run()       — projects per-tenant/per-user status sets in Redis.
-        6. dep_resolver.run()     — promotes WAITING children to PENDING on parent completion,
-                                    unless the child or an ancestor carries a `dag:paused:*` flag.
-        7. saga.run()             — settles sagas; enqueues compensation on DLQ.
-        8. triage.run()           — Phase 10: LLM classification of dead-lettered jobs.
-
-      Background loops:
-        1. _promote_delayed_loop      — re-publishes delayed retries via outbox.
-        2. _promote_dlq_replay_loop   — fires operator-scheduled DLQ replays.
-        3. _resume_unblocked_waiting_loop — promotes WAITING children once their DAG
-                                        pause lifts; backstops missed promotions.
-        4. _requeue_stale_pending_loop — backstops the delayed-retry pipeline:
-                                        re-publishes PENDING jobs with no
-                                        `jobs:delayed` timer left (crash windows).
-        5. _outbox_relay_loop         — publishes outbox rows to Kafka.
-        6. _metrics_loop              — emits gauges + cached lag for backpressure.
-        7. _digest_loop               — Phase 10: per-tenant LLM digests (opt-in).
-        8. _idempotency_reaper_loop   — hourly DELETE of expired idempotency records
-                                        (ADR 0010's "no reaper" follow-up).
-        9. _stale_running_sweep_loop  — dead-letters RUNNING jobs orphaned by a
-                                        hard worker crash (ADR 0019).
-       10. _renew_running_leases_loop — checks in on this worker's RUNNING jobs
-                                        so another replica's sweep can tell
-                                        them apart from crash orphans
-                                        (WO-R2-28, ADR 0023).
-       11. _slo_evaluation_loop      — computes the SLOs on an interval and
-                                        raises a de-duplicated Alert on a
-                                        fast burn — the alert webhook's only
-                                        non-chaos producer (WO-R2-29).
-
-    Each of those eleven loops reads `chaos:pause:<loop>` once per iteration and
-    skips its work while the key is set — one closed enum, one key pattern, one
-    check per loop (`workers/control_loop_pause.py`, ADR 0027). Registered only
-    under `CHAOS_ENABLED=true`; otherwise the check is an in-process boolean and
-    never a Redis round-trip. The eight consumer groups are NOT in that enum:
-    `kill_consumer` has stopped any consumer group by its group id since Wave 1.
-
+    Consumers are handed to `_supervise_consumer` UNSTARTED — it owns start() (ADR
+    0009 amendment) — so a transient boot error is retried with capped backoff instead
+    of dropping that group for the process's life. Each loop reads `chaos:pause:<loop>`
+    once per iteration and skips its work while set (`control_loop_pause.py`, ADR
+    0027); the consumer groups are NOT in that enum, `kill_consumer` stops those.
     Cancel signal: cancel all, wait for in-flight jobs, stop all consumers.
     """
     dispatcher = JobDispatcherConsumer(session_factory, redis)

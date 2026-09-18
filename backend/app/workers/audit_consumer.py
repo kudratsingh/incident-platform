@@ -1,19 +1,9 @@
 """
-Audit consumer — writes audit_log rows in response to Kafka lifecycle events.
+Audit consumer — writes `event.<name>` audit_log rows off Kafka lifecycle events. Deliberately
+**additive**: the API and worker still write audit rows inline, atomic with the state change.
 
-This is intentionally **additive** for now: the API and worker still write
-transactional audit rows inline (so the audit trail stays atomic with the
-state change). This consumer writes a second class of rows tagged
-`event.<name>` to demonstrate Kafka-driven consumer-group fan-out and to
-provide a self-contained event-sourced view of job lifecycle. In a later
-phase the inline writes can be removed once Kafka delivery is trusted.
-
-Idempotency under at-least-once delivery: every event.* row carries its
-Kafka coordinates, and audit_logs has UNIQUE (kafka_topic, kafka_partition,
-kafka_offset). On redelivery the INSERT fails the constraint, we swallow
-the IntegrityError, and the offset commits — same pattern as
-EventLogConsumer. Inline audit writers leave the coords NULL and are
-unaffected (NULLs never collide under UNIQUE).
+Idempotency: `audit_logs.uq_audit_logs_kafka_coord` makes a redelivery's INSERT fail, the
+IntegrityError is swallowed and the offset commits. Inline writers leave the coords NULL.
 """
 
 import uuid
@@ -73,8 +63,7 @@ class AuditConsumer(BaseKafkaConsumer):
             )
             return
 
-        # Dead-letter messages carry event="job.failed" with dead_lettered=True.
-        # Surface that distinction in the audit label.
+        # Dead-letters arrive as job.failed + dead_lettered=True.
         action: str
         if event_name == "job.failed" and value.get("dead_lettered") is True:
             action = "event.job.dead_letter"
@@ -103,9 +92,7 @@ class AuditConsumer(BaseKafkaConsumer):
             if k not in ("event", "tenant_id", "job_id", "user_id")
         }
 
-        # The IntegrityError from uq_audit_logs_kafka_coord surfaces on the
-        # transaction exit (commit), not on the .log() await — the except
-        # must wrap both context managers.
+        # uq_audit_logs_kafka_coord raises on commit, so `except` must wrap both managers.
         try:
             async with self.session_factory() as session:
                 async with session.begin():

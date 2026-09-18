@@ -1,67 +1,9 @@
 """
-CQRS read-model projector.
-
-Maintains denormalized job-status views in Redis so admin queries don't have
-to scan the jobs table. The write path is the normalized Postgres `jobs`
-table; the read path is these projected views.
-
-Why a per-job-id membership structure rather than a bare counter: at-least-once
-Kafka delivery means counters can over-count under redelivery. A structure
-keyed by job_id is idempotent — re-adding the same id is a no-op.
-
-Set-idempotency only covers redelivery of the SAME event. Cross-event
-reordering or redelivery (a job.progress consumed after that job's
-job.completed) would demote a terminal job back to 'running' — permanently,
-because no further event arrives to correct it. handle_message therefore
-guards: non-terminal transitions are ignored for any job already projected
-into a terminal view (completed / dead_letter). Terminal→terminal
-transitions are exempt so a DLQ replay's eventual job.completed still
-applies. Replay tradeoff: after an admin/agent replays a dead-lettered
-job, the projection holds it in dead_letter (the replay's live 'running'
-phase is ignored) until the next terminal event lands, then self-corrects.
-
-Keys:
-  jobs:tenant:{tenant_id}:status:{status}          — per-tenant ZSET of job_ids
-  jobs:tenant:{tenant_id}:status:{status}:evicted  — count trimmed out of it
-  jobs:user:{user_id}:status:{status}              — per-user ZSET of job_ids
-  jobs:user:{user_id}:status:{status}:evicted      — count trimmed out of it
-
-**Bounded by construction (WO-R2-56).** These were unbounded SETs: every
-terminal job_id stayed a member forever, on a Redis whose production
-parameter group (`maxmemory-policy noeviction`) cannot reclaim a key that
-carries no TTL. A busy tenant's `completed` view grew without limit and
-nothing — not the projector, not a reaper, not the eval reset — ever gave
-memory back. Two changes bound it:
-
-  * The membership structure is a ZSET scored by projection time, trimmed to
-    the `READ_MODEL_WINDOW` most recent ids after every write. ZSET rather
-    than SET purely for the trim: SPOP evicts a *random* member, which can
-    drop a just-projected terminal id and re-open the reordering hole the
-    guard above exists to close. ZREMRANGEBYRANK evicts the oldest, which are
-    exactly the ids no further event can arrive for.
-  * Every key carries `READ_MODEL_TTL_SECONDS`, refreshed on each write. That
-    is the reaper: a tenant or user that stops submitting work stops holding
-    memory a week later, and — because the key now has a TTL at all — a
-    `volatile-*` policy can evict it under pressure instead of OOMing.
-
-Counts stay whole across the trim: what ZREMRANGEBYRANK removes is added to
-the sibling `:evicted` counter, so a status count is `ZCARD + evicted`. The
-counter is monotonic, so a *trimmed* id that later changes status leaves the
-old status over-counted by one — bounded by the number of ids ever trimmed,
-and corrected by `rebuild_read_model` below. Ids inside the window (every id
-that can still receive an event) transition exactly as before.
-
-**Rebuild path.** The projection is derived state, and Redis can lose it —
-eviction, a restart without persistence, `saturate_redis` inducing memory
-pressure, or a trim that dropped more than we'd like. `rebuild_read_model`
-recomputes every key from the `jobs` table, which is the source of truth, and
-the eval reset runs it so a scenario never starts against a projection that a
-previous scenario's chaos emptied.
-
-Tenant scoping: keys include `tenant_id` so a tenant admin's overview
-cannot leak counts from sibling tenants. The pre-tenancy `jobs:status:*`
-global key is gone; cross-tenant "platform" aggregation, if ever needed,
-would sum across the per-tenant keys at read time.
+CQRS read-model projector: denormalized job-status views in Redis so admin queries never
+aggregate the `jobs` table. Keys are `jobs:tenant:{tenant_id}:status:{status}` and
+`jobs:user:{user_id}:status:{status}`, each with a sibling `:evicted` counter, so a status count
+is `ZCARD + evicted`. Bounded by construction (WO-R2-56): ZSETs scored by projection time,
+trimmed oldest-first to `READ_MODEL_WINDOW`, every key carrying `READ_MODEL_TTL_SECONDS`.
 """
 
 import time
@@ -84,16 +26,8 @@ logger = get_logger(__name__)
 # projector doesn't need to import the SQLAlchemy enum module.
 _TRACKED_STATUSES = ("running", "completed", "failed", "dead_letter", "cancelled")
 
-# Statuses that end a job's lifecycle. Once a job sits in one of these views,
-# only another terminal event may move it (see the handle_message guard).
-# 'failed' is NOT terminal — the retry cycle legitimately moves failed jobs
-# back to running.
-#
-# 'cancelled' joined both tuples with WO-R2-113. Tracked, because `_move`
-# only ZREMs an id from the statuses it knows about: an untracked `cancelled`
-# would have left the id in its `running` set while adding it to a set nothing
-# reads. Terminal, because Kafka redelivers — a `job.progress` still in flight
-# when the saga rolled back would otherwise drag the id back to `running`.
+# Once a job sits in one of these views only another terminal event may move it. 'failed' is NOT
+# terminal — the retry cycle moves failed jobs back to running. 'cancelled' joined at WO-R2-113.
 _TERMINAL_STATUSES = ("completed", "dead_letter", "cancelled")
 
 # Map Kafka event → new status. job.submitted intentionally doesn't change a
@@ -105,11 +39,8 @@ _EVENT_TO_STATUS: dict[str, str] = {
     "job.cancelled": "cancelled",
 }
 
-# How many job_ids one (scope, status) key retains. The window has to comfortably
-# outlive Kafka retention — an id can only be moved by an event, and an event
-# older than retention cannot be redelivered — so the trim never evicts an id a
-# late event could still refer to. 10k per key × 4 statuses × 2 scopes is a few
-# MB per active tenant, and the `:evicted` counters keep the counts whole.
+# How many job_ids one (scope, status) key retains. Must comfortably outlive Kafka retention, so
+# the trim never evicts an id a late event could still refer to.
 READ_MODEL_WINDOW = 10_000
 
 # Refreshed on every write, so an active key never expires and an abandoned one
@@ -135,13 +66,10 @@ def _is_wrongtype(exc: ResponseError) -> bool:
 
 
 async def _zcall(redis: Redis, op: str, key: str, *args: Any) -> Any:
-    """Run a ZSET command, migrating a pre-WO-R2-56 SET key out of the way.
+    """Run a ZSET command, dropping a pre-WO-R2-56 SET key that WRONGTYPEs.
 
-    Deployments that ran the SET-based projector leave `jobs:*:status:*` keys
-    of the wrong type behind, and every ZSET command against one fails with
-    WRONGTYPE. Dropping the key turns that into a projection that is merely
-    incomplete (and `rebuild_read_model` makes it whole again) rather than a
-    consumer that raises on every message and never commits an offset.
+    An incomplete projection (which `rebuild_read_model` repairs) beats a consumer that raises on
+    every message and never commits an offset.
     """
     fn = getattr(redis, op)
     try:
@@ -257,12 +185,8 @@ class ReadModelProjector(BaseKafkaConsumer):
                 return
             new_status = mapped
 
-        # Terminal-state guard (cross-event reordering / redelivery): once a
-        # job is projected into a terminal view, a late or redelivered
-        # non-terminal event must not drag it back. Terminal→terminal stays
-        # allowed so a DLQ replay's job.completed still lands. Checking the
-        # tenant keys alone suffices — tenant and user keys are always
-        # written together in _move.
+        # Terminal-state guard: a late non-terminal event must not drag a finished job back, but
+        # terminal→terminal stays allowed so a DLQ replay's job.completed lands.
         if new_status not in _TERMINAL_STATUSES:
             tid = str(tenant_id)
             jid = str(job_id)
@@ -287,13 +211,8 @@ class ReadModelProjector(BaseKafkaConsumer):
 
 
 async def read_global_stats(redis: Redis, tenant_id: str) -> dict[str, int]:
-    """Status → count for one tenant (denormalized).
-
-    Naming is historical — the function used to return cross-tenant
-    counts, but post-Phase-12 it returns one tenant's view. Callers pass
-    the effective tenant_id (their own or, for platform admins, the
-    overridden one).
-    """
+    """Status → count for one tenant. The name is historical; callers pass the effective
+    tenant_id."""
     out: dict[str, int] = {}
     for st in _TRACKED_STATUSES:
         out[st] = await _member_count(redis, _tenant_key(tenant_id, st))
@@ -314,12 +233,8 @@ async def read_user_stats(redis: Redis, user_id: str) -> dict[str, int]:
 
 
 def _score_for(moment: datetime | None) -> float:
-    """Projection score for a rebuilt member: when the row last moved.
-
-    Preserves the recency order the live projector maintains, so a rebuilt key
-    trims in the same order a grown one would, and a live event arriving after
-    the rebuild (scored `time.time()`) sorts above every rebuilt member.
-    """
+    """Projection score for a rebuilt member: when the row last moved, so a rebuilt key trims like
+    a grown one and later live events sort above it."""
     if moment is None:
         return 0.0
     if moment.tzinfo is None:
@@ -392,27 +307,10 @@ async def rebuild_read_model(
     *,
     tenant_id: uuid.UUID | str | None = None,
 ) -> dict[str, int]:
-    """Recompute every read-model key from the `jobs` table.
+    """Recompute every read-model key from the `jobs` table — the projection's only repair path.
 
-    The projection is derived state with no self-healing path of its own: an
-    id only moves when an event mentions it, so anything Redis loses — an
-    eviction, a restart, a `saturate_redis` run against a `volatile-*` policy,
-    a flush — stays lost, and the admin overview silently under-reports
-    forever. This is the correction, and it is what makes both the trim above
-    and the chaos tool safe: the worst case is recoverable by design.
-
-    Counts come from a GROUP BY (exact, whatever the table's size); membership
-    comes from a windowed query, so a rebuilt key holds the same
-    `READ_MODEL_WINDOW` most-recent ids the live projector would have kept,
-    with the remainder credited to its `:evicted` counter.
-
-    Not atomic against a running projector: an event landing mid-rebuild can
-    be overwritten by it. That is acceptable for the two callers (the eval
-    reset, and an operator repairing a known-broken projection) and the drift
-    is one event, self-correcting on the job's next event.
-
-    Pass `tenant_id` to rebuild a single tenant, leaving other tenants' keys
-    untouched; omit it to rebuild the whole projection.
+    Exact GROUP BY counts, `READ_MODEL_WINDOW`-windowed membership (the rest credited to
+    `:evicted`), and NOT atomic against a running projector. `tenant_id` scopes it to one tenant.
     """
     scope = uuid.UUID(str(tenant_id)) if tenant_id is not None else None
 

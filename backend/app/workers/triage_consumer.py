@@ -1,32 +1,9 @@
 """
-LLM triage consumer.
-
-Subscribes to `job.dlq` and asks Claude to analyse each dead-lettered job.
-The result is persisted to `job_triages` (one row per job_id, unique).
-
-Failure modes (ADR 0005 — every LLM feature fails open):
-  - LLM_TRIAGE_ENABLED=false → log + return (no-op). Tests run here.
-  - 429 / 5xx from Anthropic → raise, so the offset isn't committed and the
-    message is redelivered once the upstream recovers. This is the ONE case
-    that blocks, because the same request later is likely to succeed.
-  - Anything else — a refusal, a max_tokens truncation, a Pydantic
-    validation failure, a timeout, a 4xx (bad model id, oversized payload,
-    revoked key), a missing ANTHROPIC_API_KEY → log a WARNING, write no
-    triage row, and COMMIT the offset. The admin still sees the job in the
-    DLQ with its raw `error_message`; that is the documented fallback.
-
-Why the fallback is not "retry until it works": the base consumer seeks back
-to the failed offset and refetches on the next poll, with no attempt counter
-and no DLQ-of-the-DLQ anywhere in the class. A deterministic failure
-therefore redelivers about once a second forever, and every one of those
-deliveries is a full, billed model call with adaptive thinking. One poison
-message would head-of-line-block its `job.dlq` partition and spend without
-bound — which is exactly what ADR 0005 rejects when it rules out
-block-and-retry.
-
-Idempotency: handled at the repository layer via UNIQUE (job_id). Redelivery
-of the same DLQ event will overwrite the row with the latest analysis, which
-is fine.
+LLM triage consumer: asks Claude to analyse each `job.dlq` event and writes `job_triages` (UNIQUE
+job_id, so a redelivery overwrites). Fails open per ADR 0005, and `LLM_TRIAGE_ENABLED=false` is a
+no-op. A 429/5xx from Anthropic raises so the offset is not committed and Kafka redelivers — the
+ONE blocking case. Everything else logs a WARNING, writes no row and COMMITS: with no attempt
+counter and no DLQ-of-the-DLQ, a deterministic failure would redeliver a billed call ~1/s forever.
 """
 
 import uuid
@@ -45,14 +22,8 @@ logger = get_logger(__name__)
 
 
 def _attempt_ceiling(value: dict[str, Any]) -> int:
-    """The job's total run budget off a `job.dlq` event.
-
-    `max_attempts` since WO-R2-172; `max_retries` is the same integer under
-    the name this topic shipped with and is still produced for one release.
-    Preferring the new name and falling back keeps an event that was already
-    in the topic when the rollout happened out of the `0` that used to make
-    triage ask the model to explain "retry 3 of 0".
-    """
+    """The job's run budget off a `job.dlq` event: `max_attempts` since WO-R2-172, falling back to
+    the old `max_retries` so an in-flight event is not the `0` behind "retry 3 of 0"."""
     raw = value.get("max_attempts")
     if raw is None:
         raw = value.get("max_retries", 0)
@@ -63,13 +34,8 @@ def _attempt_ceiling(value: dict[str, Any]) -> int:
 
 
 def _is_transient(status_code: int) -> bool:
-    """Is this status worth redelivering the message for?
-
-    429 and 5xx are the upstream saying "not right now" — the same request
-    later is likely to succeed. Every other non-2xx is a property of the
-    request itself, and `APIStatusError` covers those too: the previous code
-    re-raised on all of them while its comment claimed "5xx / 529".
-    """
+    """Is this status worth redelivering the message for? 429 and 5xx are the upstream saying "not
+    right now"; every other non-2xx is a property of the request."""
     return status_code == 429 or status_code >= 500
 
 
@@ -138,10 +104,8 @@ class LlmTriageConsumer(BaseKafkaConsumer):
             return
         except anthropic.APIStatusError as exc:
             if _is_transient(exc.status_code):
-                # The upstream is briefly unavailable, not this message being
-                # bad. Raising means no commit, so Kafka redelivers once the
-                # API recovers — the one carve-out from ADR 0005's fail-open
-                # rule, and the only one.
+                # The upstream, not this message: no commit, so Kafka redelivers (ADR 0005's only
+                # carve-out).
                 logger.warning(
                     "triage Anthropic API error — will retry",
                     extra={"job_id": str(job_id), "status": exc.status_code},
@@ -161,14 +125,8 @@ class LlmTriageConsumer(BaseKafkaConsumer):
             )
             return
         except Exception as exc:
-            # ADR 0005's stated fallback for DLQ triage: write no triage row
-            # and let the admin work from the job's raw error_message — the
-            # pre-Phase-10 experience. Returning commits the offset, which is
-            # the whole point: a refusal, a max_tokens truncation, a Pydantic
-            # validation failure or a timeout is a property of THIS message,
-            # and re-delivering it just repeats a billed call at ~1/s forever.
-            # `CancelledError` is a BaseException and is deliberately not
-            # caught here — worker shutdown must still unwind.
+            # ADR 0005's fallback: no triage row, and the admin works from the raw error_message.
+            # Returning commits the offset, which is the point — this failure is THIS message's.
             logger.warning(
                 "triage failed — no triage row written",
                 extra={
@@ -179,10 +137,7 @@ class LlmTriageConsumer(BaseKafkaConsumer):
             )
             return
 
-        # The coarse category the DLQ tools filter on, derived from the same
-        # analysis (R2-24). None when triage cannot support a claim — see
-        # `remediation_hint_for`; NULL is what the tools already read as
-        # "unknown, not replay-safe".
+        # The coarse category the DLQ tools filter on (R2-24). None reads as "not replay-safe".
         hint = triage_service.remediation_hint_for(analysis)
 
         async with self.session_factory() as session:
@@ -198,12 +153,8 @@ class LlmTriageConsumer(BaseKafkaConsumer):
                     model_used=model_used,
                     usage=usage,
                 )
-                # Same transaction as the triage row, deliberately: the
-                # analysis and the category derived from it are one fact,
-                # and a crash between them would leave the DLQ tools
-                # filtering on a category with no analysis behind it (or
-                # the reverse — an analysis the agent's categorised-replay
-                # path cannot see).
+                # Same transaction as the triage row deliberately: the analysis and the category
+                # derived from it are one fact.
                 hint_written = (
                     await JobRepository(session).set_remediation_hint_if_unset(
                         job_id=job_id, tenant_id=tenant_id, hint=hint

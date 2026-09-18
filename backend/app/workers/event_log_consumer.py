@@ -1,13 +1,6 @@
 """
-Event log consumer — appends every Kafka lifecycle event into the
-`job_events` table. This is the event-sourcing store: replaying the rows
-for a job_id in recorded_at order reconstructs its full state history.
-
-Idempotency under at-least-once delivery:
-  - The table has UNIQUE (kafka_topic, kafka_partition, kafka_offset).
-  - On redelivery the INSERT fails the constraint, we swallow the
-    IntegrityError, and the consumer commits the offset as success.
-  - This keeps the log clean without any application-level dedup state.
+Event log consumer — appends every Kafka lifecycle event to `job_events`, replayed in
+`recorded_at` order. UNIQUE (kafka_topic, kafka_partition, kafka_offset) dedupes a redelivery.
 """
 
 import uuid
