@@ -180,6 +180,7 @@ jobs:
               "test_outbox_dead_letter",
               "test_outbox_stall",
               "test_resolver_stall",
+              "test_stranded_chain",
           }
 
           try:
