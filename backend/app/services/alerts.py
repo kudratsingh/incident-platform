@@ -1,45 +1,11 @@
 """
 Alerts — create, commit, then push via HMAC-signed webhook.
 
-**Delivery happens after the commit (WO-R2-70).** The POST used to be
-awaited from inside the caller's still-open transaction, which made the
-webhook an announcement about a row nobody else could see yet: any
-rollback afterwards — a later statement failing, a request erroring out,
-the dedup `IntegrityError` landing on a sibling write — erased the alert
-while the commander had already been told it existed and had already
-started acting on an `alert_id` that would never resolve. The emission is
-therefore registered on the session's post-commit queue
-(`utils/post_commit.py`, the same mechanism cache invalidation uses) and
-runs only once the transaction is durable. On rollback the queue dies
-with the session and nothing is delivered, which is exactly right.
-
-Whoever owns `session.begin()` owns the drain: `get_db` does it for the
-API and MCP surfaces, and the SLO evaluation loop does it for itself.
-
-Signing:
-  - Body is `json.dumps(payload, sort_keys=True, separators=(",", ":"))`
-    so both sides produce byte-identical strings.
-  - `X-Alert-Timestamp: <unix ms>` and `X-Alert-Nonce: <hex>` identify
-    the delivery.
-  - The signed material is **`{timestamp}.{nonce}.{body}`**, not the body
-    alone, and `X-Alert-Signature: sha256=<hex hmac>` carries the result.
-
-That composition is the fix for the second half of WO-R2-70. Signing only
-the body left the timestamp unauthenticated, so the replay rejection this
-docstring promised consumers was defeated by editing one header: capture a
-delivery, restamp `X-Alert-Timestamp` to now, and the signature still
-verifies because it never covered the header. A receiver's skew check is
-only as good as what the signature binds. The nonce gives the receiver a
-second, stronger option than skew alone — remembering nonces for the
-length of its accepted window makes a replay detectable even inside it.
-
-Receivers should: recompute the HMAC over `{timestamp}.{nonce}.{body}`,
-compare in constant time, reject a timestamp outside their skew window,
-and reject a nonce they have already seen inside it.
-
-Fail-open policy: webhook errors are logged but never bubble. The
-persisted row is the source of truth — a receiver missing a delivery
-can catch up by polling `list_active_alerts`.
+**Delivery happens after the commit (WO-R2-70)**, on the session's post-commit queue, so a
+rollback delivers nothing and whoever owns `session.begin()` owns the drain. The signature
+covers `{timestamp}.{nonce}.{body}`, not the body alone, which left `X-Alert-Timestamp`
+forgeable. Webhook errors never bubble — the row is the truth, pollable by
+`list_active_alerts`.
 """
 
 import hashlib
@@ -88,19 +54,9 @@ class AlertService:
     ) -> Alert:
         """Persist an alert and push it to the webhook.
 
-        `dedup_key` is optional and, when given, is enforced by the unique
-        constraint on `(tenant_id, dedup_key)`: a second alert with the same
-        key raises `IntegrityError` out of the flush inside `create` — before
-        the webhook fires, which is the ordering that matters, since a
-        suppressed alert must not still be delivered.
-
-        The conflict is deliberately raised rather than swallowed here. A
-        producer that de-duplicates has to decide what a conflict *means* to
-        it (for the SLO loop it means "this window is already alerted, carry
-        on"), and a service that quietly returned someone else's row would
-        make that decision invisible at the call site. Callers that pass a
-        key are expected to catch it; callers that pass none cannot hit it,
-        because NULL keys do not collide.
+        `dedup_key`, when given, is enforced by the unique constraint on `(tenant_id,
+        dedup_key)`: a second alert raises `IntegrityError` out of the flush, before the
+        webhook fires. Raised, not swallowed — the producer decides what a conflict means.
         """
         if severity not in ALLOWED_SEVERITIES:
             raise AlertValidationError(
@@ -128,21 +84,15 @@ class AlertService:
                 "source": source,
             },
         )
-        # Deliver after the commit, never before it (see the module
-        # docstring). The payload is snapshotted here, while the row's
-        # attributes are loaded and the transaction is still open, so the
-        # hook closes over plain data and never touches an ORM instance on
-        # a session that may since have been closed or expired.
+        # Deliver after the commit (see the module docstring). The payload is
+        # snapshotted now so the hook closes over data, not an ORM instance.
         payload = _webhook_payload(alert)
         queued = register_post_commit(
             self.alert_repo.session, partial(deliver_webhook, payload)
         )
         if not queued:
-            # No post-commit queue on this session — the session stand-ins
-            # the unit suites pass to services. Emitting inline preserves
-            # the old behaviour for them rather than silently dropping the
-            # delivery, which would make an absent webhook look like a
-            # passing test. A real AsyncSession always has one.
+            # No post-commit queue — a unit-suite session stand-in. Emit inline
+            # rather than drop it, or an absent webhook looks like a pass.
             logger.debug(
                 "alert webhook emitted inline — session has no post-commit queue",
                 extra={"alert_id": str(alert.id)},
@@ -168,11 +118,8 @@ def _webhook_payload(alert: Alert) -> dict[str, Any]:
 def signed_material(timestamp: str, nonce: str, body: bytes) -> bytes:
     """The exact bytes the signature covers: `{timestamp}.{nonce}.{body}`.
 
-    One function so the sender, the tests and the receiving side cannot
-    each compose it slightly differently — a signature scheme where the
-    two ends disagree about what is being signed is a signature scheme
-    that verifies nothing. The separators are unambiguous: both prefixes
-    are fixed-alphabet (digits, hex) and contain no `.` themselves.
+    One function so sender, tests and receiver cannot compose it differently; both
+    prefixes are fixed-alphabet and contain no `.`.
     """
     return f"{timestamp}.{nonce}.".encode() + body
 
@@ -180,10 +127,8 @@ def signed_material(timestamp: str, nonce: str, body: bytes) -> bytes:
 def sign_delivery(secret: str, timestamp: str, nonce: str, body: bytes) -> str:
     """HMAC-SHA256 over the timestamp, nonce and body we POST.
 
-    Replaces the old `sign_body`, which covered the body alone and left
-    `X-Alert-Timestamp` outside the signature — so the replay window the
-    module promises was defeated by restamping one header (WO-R2-70).
-    Exposed for tests and for the agent-side verifier.
+    Replaces `sign_body`, which covered the body alone and left `X-Alert-Timestamp`
+    restampable (WO-R2-70). Exposed for tests and the agent-side verifier.
     """
     digest = hmac.new(
         secret.encode(), signed_material(timestamp, nonce, body), hashlib.sha256
@@ -192,12 +137,9 @@ def sign_delivery(secret: str, timestamp: str, nonce: str, body: bytes) -> str:
 
 
 async def deliver_webhook(payload: dict[str, Any]) -> None:
-    """Push one alert to the configured webhook, if any. Never raises —
-    delivery failures are the receiver's problem (they can poll).
+    """Push one alert to the configured webhook, if any. Never raises.
 
-    Runs from the post-commit queue, which swallows and logs exceptions;
-    raising here would be caught there anyway, and the alert row is
-    already durable by the time this is reached.
+    Runs from the post-commit queue, which swallows and logs; the row is already durable.
     """
     settings = get_settings()
     url = settings.alert_webhook_url

@@ -1,17 +1,9 @@
 """
 Saga service — composes a multi-step workflow as a chain of dependent jobs.
 
-A saga is just a Saga row plus N Job rows that share its `saga_id`. Each
-step depends on the previous via the job dependency DAG, so the existing
-DependencyResolver drives the per-step transitions; SagaCoordinator
-(see app/workers/saga_coordinator.py) handles overall saga state and
-compensation.
-
-Compensation policy:
-  - When any step in a saga fails terminally (dead-letter), SagaCoordinator
-    cancels remaining waiting steps and publishes one `{type}.compensate`
-    job per already-completed step, in reverse order. The application
-    must register compensation processors for those job types.
+A Saga row plus N Job rows sharing its `saga_id`, each depending on the previous, so
+DependencyResolver drives the steps and SagaCoordinator owns compensation: one
+`{type}.compensate` job per completed step, in reverse order (processors are the app's).
 """
 
 import uuid
@@ -69,11 +61,8 @@ class SagaService:
         )
 
         prev_id: uuid.UUID | None = None
-        # `saga_step_index` is the saga's declaration order written down.
-        # It cannot be recovered later: every step below is inserted in one
-        # transaction, so they all share a `created_at` and the ordering the
-        # rollback needs would be a total tie (WO-R2-58). This loop is the
-        # only writer.
+        # `saga_step_index` is declaration order written down: every step below is
+        # inserted in one transaction, so `created_at` is a total tie (WO-R2-58).
         for index, step in enumerate(steps):
             job = await self.job_service.create_job(
                 user_id=user_id,

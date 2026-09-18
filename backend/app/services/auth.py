@@ -54,9 +54,6 @@ class AuthService:
         """Sign someone up, either founding a brand-new tenant or joining the
         shared default one. Any other tenant needs an invitation."""
         # Registration never takes a caller-supplied role (X-01 / F1-04).
-        # Everyone starts as a plain user; the single, bounded exception is
-        # the founder branch below, which is decided here — not by the
-        # request — when a brand-new tenant is created.
         role = "user"
         existing = await self.user_repo.get_by_email(email)
         if existing:
@@ -64,34 +61,19 @@ class AuthService:
 
         tenant = await self.tenant_repo.get_by_slug(tenant_slug)
         if tenant is None and new_tenant_name:
-            # Self-service tenant creation: register-time bootstrap.
-            # The registering user becomes the tenant's admin so there's
-            # always at least one operator. This deliberately does NOT
-            # set is_platform_admin — that's reserved for the cross-tenant
-            # operator role and is only granted by an existing platform admin.
+            # Self-service bootstrap: the registrant becomes the tenant's admin
+            # so there is always an operator. Deliberately NOT is_platform_admin.
             tenant = await self.tenant_repo.create(
                 slug=tenant_slug, name=new_tenant_name, is_active=True
             )
             role = "admin"
         elif tenant is not None and tenant_slug != DEFAULT_TENANT_SLUG:
-            # WO-R2-25 / ADR 0024. This endpoint is unauthenticated, and
-            # `tenant_slug` is a free-form string from the request body, so
-            # before this branch existed anyone could name any tenant they
-            # liked and be enrolled into it. No auth, no invite, no domain
-            # check — the founder branch above only fires when the slug is
-            # *free*, so naming a slug that already existed was precisely the
-            # path that joined someone else's tenant.
-            #
-            # Public self-enrolment is therefore allowed into exactly two
-            # places: a brand-new tenant (the founder branch above, where
-            # there is nobody to harm) and the shared default tenant (which
-            # is open by design — it is the demo/self-serve pool). Joining
-            # any *other* existing tenant now requires an authenticated admin
-            # of that tenant to do it, via `AuthService.add_tenant_member`.
-            #
-            # 403 rather than 404: the caller is being refused, not told the
-            # tenant is missing. ADR 0024 records why that (small) disclosure
-            # is accepted rather than papered over with a lie.
+            # WO-R2-25 / ADR 0024: this endpoint is unauthenticated and
+            # `tenant_slug` is free-form, so naming an existing slug used to
+            # enrol the caller into someone else's tenant. Public self-enrolment
+            # is now the founder branch or the default tenant only; anything else
+            # goes through `add_tenant_member`. 403 not 404 — the caller is being
+            # refused, and ADR 0024 accepts that small disclosure.
             raise AuthorizationError(
                 f"Registration into tenant {tenant_slug!r} requires an "
                 "invitation from one of its administrators"
@@ -105,11 +87,8 @@ class AuthService:
             role=role,
             tenant_id=tenant.id,
         )
-        # RLS context for the audit write below. Registration is
-        # unauthenticated, so nothing has set `app.tenant_id` on this
-        # transaction — before WO-R2-129 the INSERT was carried by the
-        # policy's bootstrap branch, i.e. written with no isolation at
-        # all. The tenant is known here; name it.
+        # RLS context for the audit write below — registration is unauthenticated,
+        # so nothing set `app.tenant_id` and the INSERT was unisolated (WO-R2-129).
         await declare_tenant_scope(self.audit_repo.session, tenant.id)
         await self.audit_repo.log(
             "user.registered",
@@ -135,33 +114,10 @@ class AuthService:
     ) -> User:
         """Enrol a user into the admin's own tenant (WO-R2-25, ADR 0024).
 
-        The authenticated counterpart to `register`, and the reason closing
-        public self-enrolment is not a functional regression: without it a
-        founder could create a tenant and then never add a single colleague
-        to it, because the only enrolment path in the system was the one this
-        order shuts.
-
-        Two properties do the security work, and both are about where the
-        inputs come from rather than what they contain:
-
-        * `tenant_id` is read off the **authenticated admin**, never off the
-          request. There is deliberately no tenant field to supply, so this
-          endpoint cannot be pointed at a tenant the caller does not
-          administer — the defect being fixed was exactly a tenant identifier
-          that the caller got to choose.
-        * `role` is hard-coded to `user`, exactly as in `register`. An admin
-          may grow their own tenant; they may not mint a second admin here,
-          and no request body can ask for one (X-01 / F1-04).
-
-        The audit row names both parties: `user_id` is the admin who acted,
-        because that is the accountable identity, and `resource_id` is the
-        account created. A row that recorded only the new user would say a
-        stranger appeared and not who let them in.
-
-        This is admin provisioning with a chosen initial password, not a real
-        invite: no token, no email round-trip, no expiry. ADR 0024 records
-        that as the deliberate interim, and why a half-built invite flow
-        would have been worse than an honest small one.
+        The authenticated counterpart to `register`. `tenant_id` is read off the
+        authenticated admin — there is deliberately no tenant field to supply — and `role`
+        is hard-coded to `user` (X-01 / F1-04). The audit row names the admin as `user_id`
+        and the new account as `resource_id`. Chosen initial password, not a real invite.
         """
         existing = await self.user_repo.get_by_email(email)
         if existing:

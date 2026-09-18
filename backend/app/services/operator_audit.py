@@ -1,24 +1,10 @@
 """
 Operator audit — the immutable trail of every machine-principal action.
 
-Every MCP tool call goes through `record_tool_invocation()` (or one of the
-sibling helpers) so the audit row shape is uniform: `action` is always
-`agent.tool_invoked`, `extra_data` carries `tool_name`, `arguments`,
-`scope_used`, `latency_ms`, `outcome` — the schema locked in Step 0.
-
-The helpers accept a `Principal` from `app.dependencies` so the caller
-doesn't have to plumb principal_type / principal_id manually. Human
-callers can also invoke `record_tool_invocation` (nothing enforces
-service-account-only at this layer), but in practice only MCP handlers
-will — humans go through the regular admin API paths whose audit shape
-is different.
-
-This module also owns the *read* side of that stream's visibility rule:
-`hidden_audit_action_prefixes` below, which the MCP read tools apply so
-the machine principal that runs the lab cannot be told about the lab by
-its own audit log. It lives beside the action names on purpose — the
-writer and the reader of one stream should not learn its name from two
-different files.
+Every MCP tool call goes through `record_tool_invocation()`, so the row shape is uniform:
+`action` is `agent.tool_invoked`, `extra_data` carries `tool_name`, `arguments`,
+`scope_used`, `latency_ms`, `outcome` (Step 0 schema). `hidden_audit_action_prefixes` — the
+read side of the same stream — lives here so writer and reader share one file.
 """
 
 from typing import Any
@@ -40,11 +26,8 @@ TOOL_INVOKED_ACTION = "agent.tool_invoked"
 CHAOS_TOOL_INVOKED_ACTION = "chaos.tool_invoked"
 CHAOS_TOOL_DENIED_ACTION = "chaos.tool_denied"
 
-# The stream prefix both of those share. Spelled out rather than sliced
-# off one of them, and pinned to both by
-# `tests/unit/test_operator_audit.py::test_chaos_actions_share_the_chaos_prefix`
-# — the prefix is what the read filter matches on, so it must not be able
-# to drift away from the actions it is supposed to cover.
+# The stream prefix both share, spelled out and pinned to both by
+# `tests/unit/test_operator_audit.py::test_chaos_actions_share_the_chaos_prefix`.
 CHAOS_ACTION_PREFIX = "chaos."
 
 # Outcome values recorded on tool invocation rows. Kept as a fixed set so
@@ -57,26 +40,9 @@ OUTCOME_UNAUTHORIZED = "unauthorized"
 def hidden_audit_action_prefixes(principal: Principal) -> tuple[str, ...]:
     """Audit-action prefixes `principal` must not be shown, ever.
 
-    One entry today: the `chaos.` stream is visible only to a principal
-    that holds `chaos:invoke`. The rule is keyed on the scope rather than
-    on a principal name so it needs no allowlist and no configuration —
-    whoever may fire the lab may read the lab, and nobody else can tell
-    from a read that the lab exists.
-
-    Why this is a read rule and not a write rule: the rows are ground
-    truth for grading and operators need them (ADR 0012's invisibility is
-    about the agent under test, not about the audit trail), so nothing is
-    withheld from a human on the admin Audit tab — only from a machine
-    principal whose whole task is to investigate a fault it must not know
-    was injected. Two tokens make that separable at all: the agent's
-    holds the read + action scopes, the evaluator's holds `chaos:invoke`
-    (`scripts/seed_incident_commander.py` mints both).
-
-    Callers pass the result to `AuditRepository.list_logs`'s
-    `exclude_action_prefixes`, so the exclusion lands in SQL and `total`
-    counts what the caller may see. Filtering in Python would leave
-    `total` reporting rows that never arrive, which is a smaller version
-    of the same leak: a count is a fact about the hidden rows.
+    One entry: the `chaos.` stream, visible only to a principal holding `chaos:invoke`
+    (ADR 0012). Callers pass it to `list_logs`'s `exclude_action_prefixes`, so it lands in
+    SQL and `total` counts only what the caller may see — a count is a fact about the rows.
     """
     if Scope.CHAOS_INVOKE.value in principal.scopes:
         return ()
@@ -112,22 +78,11 @@ async def record_tool_invocation(
     is_chaos: bool = False,
     denied_by: str | None = None,
 ) -> bool:
-    """Write an `agent.tool_invoked` row for a single MCP tool call.
-    Returns whether the row was staged.
+    """Write an `agent.tool_invoked` row for one MCP tool call; returns whether it staged.
 
-    When `is_chaos=True` the action is `chaos.tool_invoked` (or
-    `chaos.tool_denied` if `denied_by` is set), so chaos activity
-    filters cleanly on the admin Audit tab as a separate stream from
-    general agent traffic — see ADR 0008.
-
-    Never raises — the savepoint below means a failed insert costs the
-    audit row and nothing else, so the caller still holds a usable
-    session and can decide what a missing row is worth. That decision is
-    the caller's, not this helper's: `app.mcp.handlers` treats `False` as
-    fatal to the request, because an action that took effect with no
-    record of it is the failure R2-51 is about. A caller that would
-    rather degrade than fail may ignore the return value — but say so at
-    the call site.
+    `is_chaos=True` uses `chaos.tool_invoked` (or `chaos.tool_denied` with `denied_by`) so
+    chaos filters as its own stream (ADR 0008). Never raises — the savepoint costs only the
+    audit row, and the caller decides: `app.mcp.handlers` treats `False` as fatal (R2-51).
     """
     extra: dict[str, Any] = {
         "tool_name": tool_name,
@@ -149,10 +104,8 @@ async def record_tool_invocation(
         action = TOOL_INVOKED_ACTION
 
     try:
-        # SAVEPOINT: a failing audit insert (FK drift, constraint bug —
-        # the replay_job/#70 class) rolls back only the audit row. The
-        # tool's own writes and the caller's response are unaffected,
-        # which is what the "never raises" contract above requires.
+        # SAVEPOINT: a failing audit insert rolls back only the audit row, so the
+        # tool's own writes and the response survive — the "never raises" contract.
         async with audit_repo.session.begin_nested():
             await audit_repo.log(
                 action,

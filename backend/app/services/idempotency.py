@@ -1,32 +1,10 @@
 """
 Idempotency policy for Tier 1 actions.
 
-The key is *claimed before the action runs*, not recorded after it
-(R2-27). The old shape looked the key up and inserted it after
-execution, both in the same READ COMMITTED transaction with nothing in
-between, so two concurrent calls on one key both missed the cache and
-both executed; the loser then died on `uq_idempotency_scope` with its
-side effect already landed. Claiming first closes that window instead of
-repairing it afterwards.
-
-Three operations:
-  - `acquire(principal, tool_name, key, arguments, ttl)` → an
-    `Acquired` (this caller owns the key and must execute), a
-    `Replay` (someone already answered for this key — send theirs), or
-    `IdempotencyKeyReusedError` when the key is held for different
-    arguments or a different tool.
-  - `complete(claim, response)` — attach this call's response to the
-    claim, making it replayable.
-  - `release(claim)` — drop an unfinished claim so a retry can
-    re-execute. Every path that does not complete must release: the MCP
-    envelope deliberately commits the request transaction on a tool
-    error so the audit row survives, and a claim left behind would
-    commit with it and wedge the key for its whole TTL.
-
-`lookup` remains for reading a key without taking it.
-
-Argument hashing uses canonical JSON (sorted keys, tight separators)
-so the same dict serializes identically across calls.
+The key is *claimed before the action runs*, not recorded after it (R2-27) — the old
+lookup-then-insert let two concurrent calls both execute. `acquire` returns a `Claim` or a
+`Replay`, `complete` makes the claim replayable, `release` drops an unfinished one; every
+path that does not complete MUST release, or the key wedges for its whole TTL.
 """
 
 import hashlib
@@ -43,9 +21,7 @@ from app.repositories.idempotency import IdempotencyRepository
 
 
 class IdempotencyKeyReusedError(AppError):
-    """Same key + different arguments than the original call. The
-    caller should either send a fresh key or send the exact same
-    arguments as before."""
+    """Same key, different arguments or tool than the original call."""
 
     status_code = 409
     error_code = "idempotency_key_reused"
@@ -75,31 +51,19 @@ class Replay:
 
 
 class IdempotencyKeyInFlightError(AppError):
-    """The key is held by a claim that has no response yet: another call
-    is executing it right now.
+    """The key is held by a claim with no response yet — another call is executing it.
 
-    Reachable only if a claim outlived the transaction that took it —
-    a release that could not be written, say — because claim and response
-    otherwise commit together. Retryable, unlike
-    `IdempotencyKeyReusedError`, so it gets its own code rather than
-    borrowing that one's."""
+    Retryable, unlike `IdempotencyKeyReusedError`, hence its own code."""
 
     status_code = 409
     error_code = "idempotency_key_in_flight"
 
 
 def _hash_arguments(arguments: dict[str, Any]) -> str:
-    """Canonical-JSON SHA-256. Sorted keys + tight separators so the
-    same dict hashes the same regardless of insertion order or
-    whitespace.
+    """Canonical-JSON SHA-256: sorted keys + tight separators, so order cannot change it.
 
-    Published cross-repo contract — the commander's contract snapshot
-    matrix pins these bytes. Any change to what this function hashes
-    (input dict shape) or how (sort_keys, separators, default=,
-    algorithm) is a coordinated version-sync, not a refactor. Full
-    normalization table + coordination rule in
-    docs/ADR/0010-idempotency-record-lifecycle.md § "Arguments-hash
-    contract (cross-repo)".
+    Cross-repo contract — the commander's snapshot pins these bytes, so changing the input
+    shape, `sort_keys`, `separators`, `default=` or the algorithm is a version-sync (ADR 0010).
     """
     body = json.dumps(
         arguments, sort_keys=True, separators=(",", ":"), default=str
@@ -142,11 +106,8 @@ class IdempotencyService:
         if record is None:
             return None
         if _is_expired(record):
-            # Evict rather than read past it. Treating the row as absent
-            # while the UNIQUE index went on holding it was the whole of
-            # finding #2: the caller re-executed and its insert then
-            # collided with a record the lookup had just told it was not
-            # there — after the action had taken effect.
+            # Evict rather than read past it — treating the row as absent while
+            # the UNIQUE index held it was finding #2 (collide after effect).
             await self.repo.delete_by_id(record_id=record.id)
             return None
 
@@ -178,17 +139,9 @@ class IdempotencyService:
     ) -> Claim | Replay:
         """Take the key, or find out who already has it.
 
-        Returns a `Claim` when this caller won and must execute, or a
-        `Replay` carrying the answer already recorded for the key.
-        Raises `IdempotencyKeyReusedError` when the key is held for
-        different arguments or a different tool, and
-        `IdempotencyKeyInFlightError` when it is held by a claim with no
-        response yet.
-
-        At most one retry. An expired holder is evicted and the claim
-        re-attempted; if that second attempt also loses, another caller
-        took the key in between and owns it, so we defer to them rather
-        than spinning.
+        A `Claim` means this caller won and must execute; a `Replay` carries the answer
+        already recorded. Raises `IdempotencyKeyReusedError` (different arguments/tool) or
+        `IdempotencyKeyInFlightError` (claim, no response). At most one retry, then defer.
         """
         expires_at = (
             datetime.now(UTC) + ttl if ttl is not None else None
@@ -250,9 +203,9 @@ class IdempotencyService:
         response: dict[str, Any],
         ttl: timedelta | None = None,
     ) -> None:
-        """Attach this call's response to its claim, making it
-        replayable. An UPDATE by id on a row we own, so unlike the
-        insert-after-execution it replaces, it cannot lose a race."""
+        """Attach this call's response to its claim, making it replayable.
+
+        An UPDATE by id on a row we own, so it cannot lose a race."""
         expires_at = (
             datetime.now(UTC) + ttl if ttl is not None else None
         )

@@ -1,13 +1,8 @@
 """
 Service-account and token lifecycle: create, mint, revoke, verify.
 
-The plaintext of a bearer token is generated here, returned to the caller
-exactly once, and never persisted. What we store is the SHA-256 hex hash;
-verification hashes the presented token and looks it up.
-
-Token format is `sa_` + 43 URL-safe base64 chars (256 bits of entropy from
-`secrets.token_urlsafe(32)`). The `sa_` prefix is how the auth dependency
-distinguishes machine tokens from human JWTs without decoding.
+Only the SHA-256 hex hash is stored; the plaintext is returned once and never persisted.
+The `sa_` prefix (+ `secrets.token_urlsafe(32)`) is how auth routes machine vs JWT.
 """
 
 import hashlib
@@ -42,9 +37,7 @@ def _hash_token(plaintext: str) -> str:
 
 
 def looks_like_service_account_token(value: str) -> bool:
-    """Cheap prefix check used by the auth dependency to route between JWT
-    verification and DB lookup. Does not validate the token — that's the
-    verifier's job."""
+    """Cheap prefix check the auth dependency uses to route JWT vs DB lookup."""
     return value.startswith(TOKEN_PREFIX)
 
 
@@ -119,13 +112,9 @@ class ServiceAccountService:
         scopes: list[str],
         updated_by_user_id: uuid.UUID | None,
     ) -> ServiceAccount:
-        """Replace the account's scope set. Existing tokens keep the
-        scopes they were minted with (tokens are immutable and carry
-        their own scope subset). The agent picks up the new set on the
-        next `mint_token` call.
+        """Replace the account's scope set; minted tokens keep their own subset.
 
-        Idempotent: a call that changes nothing skips the audit row so
-        re-running seed scripts doesn't flood the audit log."""
+        Idempotent: a no-change call skips the audit row, so re-seeding stays quiet."""
         try:
             validate_scopes(scopes)
         except ValueError as exc:
@@ -138,11 +127,8 @@ class ServiceAccountService:
 
         service_account.scopes = after
         await self.sa_repo.session.flush()
-        # `updated_at` is populated server-side via `onupdate=func.now()`.
-        # Refresh so the row's Python view matches the DB before we
-        # hand the object to Pydantic; otherwise `.updated_at` triggers
-        # an async lazy-load in the sync Pydantic path and raises
-        # MissingGreenlet.
+        # `updated_at` is server-side (`onupdate=func.now()`); refresh, or the
+        # sync Pydantic path lazy-loads it and raises MissingGreenlet.
         await self.sa_repo.session.refresh(service_account)
         await self.audit_repo.log(
             "service_account.scopes_updated",
@@ -285,9 +271,7 @@ class ServiceAccountService:
             raise AuthenticationError("Invalid token")
         if token.revoked_at is not None:
             raise AuthenticationError("Token has been revoked")
-        # DateTime(timezone=True) round-trips as aware on Postgres but naive on
-        # SQLite (which has no tz support). Coerce naive to UTC so the
-        # comparison below never raises TypeError on the tests.
+        # SQLite has no tz support; coerce naive to UTC before comparing.
         if token.expires_at is not None:
             expires_at = token.expires_at
             if expires_at.tzinfo is None:

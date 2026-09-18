@@ -1,57 +1,11 @@
 """
-Service Level Objectives + error-budget tracking.
+Service Level Objectives + error-budget tracking, computed from the jobs table.
 
-Two demonstrable SLOs derived directly from the jobs table — no external
-metrics backend needed for the read path. CloudWatch alarms for the same
-objectives are defined in infra/cloudwatch.tf and fire independently.
-
-SLO model
-=========
-Each SLO has:
-  - id          stable identifier used by runbooks and alarms
-  - target      e.g. 0.99 (99% success rate, or 99% of dispatches within 30s)
-  - window      rolling lookback in hours over which `current` is computed
-  - runbook_id  pointer into the runbook system for diagnosis steps
-
-Error budget
-============
-For a success-rate SLO:
-    budget_used     = failed / total
-    budget_allowed  = 1 - target
-    budget_remaining_pct = (1 - budget_used / budget_allowed) * 100
-
-For a latency SLO, "failed" means dispatches above the p95 threshold:
-    budget_used     = (#above_threshold) / total
-    budget_remaining_pct = (1 - budget_used / (1 - target)) * 100
-
-Burn rate
-=========
-Burn rate = current_failure_rate / (1 - target). 1.0× means we'll consume
-the entire budget over exactly the SLO window; 14.4× means we'd burn the
-30-day budget in 2 hours and is the canonical fast-burn alert threshold.
-
-Evaluation and alerting
-=======================
-`run_evaluation` is the scheduled entry point: it computes every objective
-and creates an `Alert` row — and therefore a webhook delivery — when one is
-in fast burn. `_slo_evaluation_loop` in `workers/dispatcher.py` calls it on
-an interval.
-
-Before this existed, `compute_all` had exactly one caller (a read-only admin
-endpoint), so nothing evaluated the objectives on a schedule and no real
-platform condition ever produced an alert. The alert webhook is the incident
-commander's production trigger and its only producer was a chaos tool, which
-meant the commander could only ever be woken by a human pretending.
-
-De-duplication is by `Alert.dedup_key`, which carries a time bucket, under a
-unique constraint — see `_fast_burn_dedup_key`.
-
-What is measured
-================
-Every objective is computed over rows the platform itself dispatched. Rows a
-lab script wrote straight into the table in a terminal state are excluded from
-both halves of every fraction — see `_LAB_FIXTURE_PAYLOAD_MARKERS`, which is
-what lets the eval world run with evaluation switched ON (WO-R2-132).
+budget_remaining_pct = (1 - (failed/total) / (1 - target)) * 100; burn_rate = failure_rate
+/ (1 - target), so 14.4× is the fast-burn threshold and matches infra/cloudwatch.tf.
+`run_evaluation` is the scheduled entry point (`_slo_evaluation_loop`): one critical Alert
+per fast-burning objective, deduped by `Alert.dedup_key`. Cancelled jobs and declared lab
+fixtures are in neither half of any fraction (WO-R2-132).
 """
 
 import uuid
@@ -74,11 +28,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 logger = get_logger(__name__)
 
-# Burn rate at which we page rather than merely record. Matches the two
-# fast-burn alarms in `infra/cloudwatch.tf` for these same objectives; the
-# CloudWatch side and this one must agree, or an operator reading the
-# dashboard and an agent reading the alert reach different conclusions about
-# the same platform.
+# Burn rate at which we page rather than record. Must match the two fast-burn
+# alarms in `infra/cloudwatch.tf` or dashboard and alert disagree.
 FAST_BURN_THRESHOLD = 14.4
 
 
@@ -129,28 +80,11 @@ SLOS: list[SLODefinition] = [
 ]
 
 
-# The denominator of the dispatch-latency objective: statuses that mean the
-# job left PENDING and therefore has a dispatch outcome to measure.
-#
-# An allowlist, not the `!= WAITING AND != PENDING` pair it replaces, and the
-# difference is the whole of finding 2. That pair admitted CANCELLED, whose
-# rows never left PENDING at all — they were cancelled *while* WAITING — so
-# every one of them arrived here with `started_at IS NULL` and was counted as
-# a dispatch miss. Two mechanisms produce them in bulk: the saga coordinator
-# cancelling the remaining steps of a rolling-back saga, and
-# `JobRepository.cascade_cancel_blocked_children` cancelling the WAITING
-# descendants of a stranded parent (R2-09). A six-step saga rollback therefore
-# burnt six dispatches' worth of error budget, and a wide DAG cascade could
-# trip the 14.4× fast-burn alarm on its own, while nothing had been slow.
-#
-# A cancellation is a deliberate decision not to dispatch. It is neither a
-# success nor a failure of dispatch latency, so it belongs in neither half of
-# the fraction — the completion-rate objective already takes the same view
-# ("Cancelled jobs are excluded from the denominator").
-#
-# Being an allowlist also means a status added later is excluded until someone
-# decides it belongs, which is the safe direction: the failure mode of the old
-# form was a new status silently becoming a dispatch failure.
+# The dispatch-latency denominator: statuses meaning the job left PENDING and so has a
+# dispatch outcome. An allowlist, not the `!= WAITING AND != PENDING` pair it replaces
+# (finding 2) — that pair admitted CANCELLED rows, which never left PENDING, so a saga
+# rollback or a `cascade_cancel_blocked_children` fan-out (R2-09) burnt budget while
+# nothing was slow. Allowlisting also keeps a status added later out until someone decides.
 _DISPATCHED_STATUSES = (
     JobStatus.RUNNING,
     JobStatus.COMPLETED,
@@ -159,60 +93,23 @@ _DISPATCHED_STATUSES = (
 )
 
 
-# Payload keys a lab writer stamps on a row it wrote directly into the table
-# in the state it wanted, and the whole of WO-R2-132.
-#
-#   * `eval_fixture`   — `scripts/seed_eval_fixtures.py`, the standing eval
-#     world: 4 dead-lettered jobs, 2 failed, 1 completed and 2 waiting.
-#   * `seeded_fixture` — a scenario's own scaffolding, written by the chaos
-#     hooks (`app/mcp/tools/chaos/seed_dlq_messages.py` owns the constant;
-#     `create_stuck_dag`, `create_bad_data_job`, `poison_message` and
-#     `create_mislabeled_dlq_job` import it). `reset_eval_state` DELETEs
-#     exactly these rows, which is what makes the name a contract rather
-#     than a convention.
-#
-# None of those rows was ever dispatched, ran, failed or completed. They were
-# INSERTed in a terminal state to give a read tool something to read, so they
-# are not evidence about anything this platform did — and counting them is
-# measuring the seeder. That is the same judgement `_DISPATCHED_STATUSES`
-# makes about cancellations, one step earlier in the row's life: a row with no
-# dispatch outcome belongs in neither half of the fraction.
-#
-# Concretely, before this exclusion the eval world was a 14.4x fast burn by
-# construction. 4 of its 5 terminal jobs are dead-lettered, so the completion
-# objective read 20% against a 99% target — an 80x burn — and the evaluator
-# raised a critical alert within one interval of every fresh boot, re-firing
-# hourly on `_fast_burn_dedup_key`'s bucket. The eval world's answer was to
-# switch the evaluator off (`SLO_EVALUATION_INTERVAL_SECONDS=0`), which also
-# switched off the only non-chaos alert producer the agent under test has.
-#
-# Unconditional, with no setting to turn it off: nothing outside the lab
-# writes these markers. The chaos hooks are `CHAOS_ENABLED`-gated and the seed
-# script refuses any target `settings` does not name (`scripts/eval_safety.py`),
-# so in a real deployment the predicate matches nothing and costs one index-less
-# boolean per row in the window. Residual risk is a caller who writes the exact
-# top-level marker into a real job's payload by hand; that row drops out of an
-# objective, which is the mild end of the same risk `_delete_seeded_dlq_fixtures`
-# already carries (it DELETEs such a row).
+# Payload keys a lab writer stamps on a row it INSERTed in a terminal state, and the whole
+# of WO-R2-132: `eval_fixture` from `scripts/seed_eval_fixtures.py`, `seeded_fixture` from
+# the chaos hooks (`reset_eval_state` DELETEs exactly those rows). Such a row is evidence
+# about the seeder, not the platform — and before this exclusion the eval world was a
+# 14.4x fast burn by construction (4 of its 5 terminal jobs dead-lettered, 20% against a
+# 99% target), so the only fix was switching the evaluator off. Unconditional, with no
+# setting: nothing outside the lab writes these markers.
 _LAB_FIXTURE_PAYLOAD_MARKERS = ("eval_fixture", "seeded_fixture")
 
 
 def _not_a_lab_fixture(session: AsyncSession) -> TextClause:
     """`True` for every row that is NOT declared lab scaffolding.
 
-    Dialect-branched for the same reason `_delete_seeded_dlq_fixtures` is:
-    the predicate has no portable spelling. `PortableJSON` renders as JSONB
-    on Postgres, so containment is available there and is the safe test —
-    it matches a *top-level* key holding boolean `true` and nothing else,
-    where `(payload ->> 'eval_fixture')::boolean` would raise on a hostile
-    value like `{"eval_fixture": "banana"}` and take the evaluation pass
-    down with it. SQLite (the unit harness) spells the same test
-    `json_extract(payload, '$.eval_fixture') = 1`.
-
-    `COALESCE` around each arm is load-bearing. `payload` is nullable and
-    both spellings return NULL for a NULL payload, so a bare `NOT (...)`
-    would be NULL rather than true and would silently drop every job that
-    carries no payload at all — most of them — out of the denominator.
+    Dialect-branched because the predicate has no portable spelling: JSONB containment on
+    Postgres (safe against a hostile `{"eval_fixture": "banana"}`), `json_extract(...) = 1`
+    on SQLite. `COALESCE` per arm is load-bearing — `payload` is nullable, and NULL would
+    drop every payload-less job out of the denominator.
     """
     if session.get_bind().dialect.name == "postgresql":
         arms = [
@@ -232,12 +129,8 @@ def _dispatched_in_window(
 ) -> tuple[Any, ...]:
     """The dispatch-latency denominator, as WHERE clauses.
 
-    One definition for both computation paths. `_compute_latency_slo` takes
-    the SQL path on Postgres and falls back to `_compute_latency_slo_python`
-    on engines without `EXTRACT(EPOCH FROM ...)` — which is every engine the
-    unit suite runs on. A denominator written out twice would therefore have
-    production on one copy and the tests on the other, and could drift
-    indefinitely without a single test turning red.
+    One definition for both paths — `_compute_latency_slo` (SQL) and
+    `_compute_latency_slo_python` (the unit suite). Written twice it would drift untested.
     """
     return (
         Job.created_at >= since,
@@ -248,8 +141,7 @@ def _dispatched_in_window(
 
 @dataclass(frozen=True, slots=True)
 class SLOState:
-    """How one objective is doing right now: the counts behind it, the budget
-    left and how fast it is burning."""
+    """How one objective is doing now: its counts, the budget left and the burn rate."""
 
     definition: SLODefinition
     total: int
@@ -342,26 +234,14 @@ async def _compute_latency_slo(
     """
     Failure = dispatch latency exceeded the threshold OR the job never started.
 
-    Counts only the statuses in `_DISPATCHED_STATUSES` — jobs that have left
-    PENDING and so have a dispatch outcome to measure. Jobs still queued do
-    not drag the metric down, and neither do cancellations, which never left
-    PENDING to begin with (see the comment on that tuple).
-
-    Within that set `started_at IS NULL` is a genuine dispatch miss: the job
-    reached a terminal state without anything ever claiming it, which is
-    exactly what "we failed to dispatch it" means. Outside that set the same
-    NULL means "not dispatched *yet*", or "deliberately never dispatched",
-    which is why the denominator and not the numerator is where this is fixed.
-
-    Declared lab fixtures are out of the denominator too — they were never
-    dispatched at all, by anything (`_LAB_FIXTURE_PAYLOAD_MARKERS`).
+    Counts only `_DISPATCHED_STATUSES`, so queued and cancelled jobs stay out of the
+    denominator; within that set `started_at IS NULL` is a genuine dispatch miss. Declared
+    lab fixtures are out too (`_LAB_FIXTURE_PAYLOAD_MARKERS`).
     """
     assert slo.latency_threshold_seconds is not None
     since = datetime.now(UTC) - timedelta(hours=slo.window_hours)
 
-    # Latency in seconds: started_at - created_at. Postgres has EXTRACT(EPOCH FROM ...)
-    # but SQLAlchemy's func.extract works on both Postgres and SQLite via the
-    # `julianday` fallback below. We keep it dialect-portable for the test DB.
+    # Latency in seconds, with the Python fallback below where `extract` is unsupported.
     latency_s = func.extract("epoch", Job.started_at - Job.created_at)
 
     total_expr = func.count().label("total")
@@ -415,26 +295,11 @@ async def _compute_latency_slo_python(
 
 
 def _fast_burn_dedup_key(slo_id: str, window_seconds: float, now: datetime) -> str:
-    """The de-duplication identity of one fast-burn alert.
+    """The de-duplication identity of one fast-burn alert: a sustained burn is one condition.
 
-    A sustained burn is one condition, not one condition per tick. With a 5
-    minute evaluation interval and no de-duplication, an hour of burning would
-    mint twelve alerts and twelve webhook deliveries for a single incident —
-    which is how an alerting channel becomes something people mute.
-
-    The key carries a **time bucket** (`floor(now / window)`) rather than being
-    a bare `slo:x:fast_burn` looked up against `fired_at > now - window`. That
-    lookup would be a check-then-act race: `worker_loop` runs in every API
-    replica, so two replicas evaluating the same tick would both find nothing
-    and both insert. Bucketing turns the window into part of the identity, so
-    the unique constraint on `(tenant_id, dedup_key)` settles the race in the
-    database — one replica inserts, the other gets an IntegrityError and knows
-    the alert exists.
-
-    The cost is that windows are wall-clock aligned rather than
-    since-last-alert: a burn that starts just before a boundary can alert
-    twice in quick succession, once for each bucket. That is a bounded and
-    visible cost, where a lost race is an unbounded and invisible one.
+    The key carries a time bucket (`floor(now / window)`) rather than a lookup against
+    `fired_at`, because `worker_loop` runs in every replica and check-then-act would let two
+    both insert; the unique constraint on `(tenant_id, dedup_key)` settles it in the DB.
     """
     bucket = int(now.timestamp() // window_seconds)
     return f"slo:{slo_id}:fast_burn:{bucket}"
@@ -443,13 +308,8 @@ def _fast_burn_dedup_key(slo_id: str, window_seconds: float, now: datetime) -> s
 def is_fast_burning(state: SLOState) -> bool:
     """Whether this objective is burning fast enough to be worth waking someone.
 
-    `total == 0` cannot reach here: `_state` reports an idle objective as
-    healthy with `burn_rate == 0.0`, so an empty platform stays quiet instead
-    of paging about a promise nothing has tested.
-
-    An unreachable target (`target == 1.0`) yields `inf`, which compares above
-    the threshold — correct, since any failure at all has exhausted that
-    budget.
+    `_state` reports an idle objective as healthy at burn 0.0, so an empty platform stays
+    quiet; an unreachable `target == 1.0` yields `inf`, correctly above the threshold.
     """
     return state.burn_rate >= FAST_BURN_THRESHOLD
 
@@ -472,17 +332,9 @@ async def _raise_fast_burn_alert(
 ) -> Alert | None:
     """Create one fast-burn alert, or None if this window already has one.
 
-    Its own session and transaction, per objective: one objective's alert
-    failing to write must not roll back another's, and a de-duplication
-    conflict must not poison a transaction anything else is sharing.
-
-    The tenant is the platform tenant because these objectives are computed
-    platform-wide — `compute_all` has no tenant filter, and the CloudWatch
-    alarms for the same objectives are equally platform-scoped. Attributing a
-    platform-wide burn to one customer's tenant would be a lie in whichever
-    direction it landed. Per-tenant objectives would be a different (and
-    larger) feature: different definitions, different targets, and a fan-out
-    of alerts; noted in docs/ROADMAP.md rather than half-built here.
+    Its own session per objective, so one objective's write failure or dedup conflict cannot
+    roll back or poison another's. The tenant is the platform tenant because `compute_all`
+    has no tenant filter — pinning a platform-wide burn on one customer would be a lie.
     """
     dedup_key = _fast_burn_dedup_key(
         state.definition.id, dedup_window_seconds, datetime.now(UTC)
@@ -516,14 +368,9 @@ async def _raise_fast_burn_alert(
                     dedup_key=dedup_key,
                 )
             # This loop owns `session.begin()`, so it owns the drain: the
-            # alert's webhook is queued rather than POSTed inside the
-            # transaction (WO-R2-70), and nothing else here would run it.
-            # It sits after the block on purpose — a de-duplication
-            # conflict raises out of the flush above, the block unwinds,
-            # and the queue dies with the session, so a suppressed alert
-            # is not delivered. That is the ordering this function's
-            # dedup_key exists to produce, now enforced structurally
-            # rather than by which statement happens to come first.
+            # webhook is queued, not POSTed inside the transaction (WO-R2-70).
+            # After the block on purpose — a dedup conflict unwinds it, so a
+            # suppressed alert is never delivered.
             await run_post_commit(session)
             return alert
     except IntegrityError:
@@ -541,14 +388,8 @@ async def run_evaluation(
 ) -> list[uuid.UUID]:
     """Compute every objective and alert on the ones in fast burn.
 
-    The scheduled counterpart to the admin endpoint's read: same computation,
-    but it can act on the answer. Returns the ids of the alerts created, which
-    is what the loop logs and what the tests assert on.
-
-    Computation and alerting use separate sessions on purpose. The read is one
-    short transaction over `jobs`; holding it open across alert writes — each
-    of which makes an outbound webhook call — would pin a connection for the
-    webhook timeout on every burn.
+    Returns the ids of the alerts created. Separate sessions for read and alert, so an
+    outbound webhook call cannot pin the `jobs` read's connection.
     """
     settings = get_settings()
     async with session_factory() as session:
