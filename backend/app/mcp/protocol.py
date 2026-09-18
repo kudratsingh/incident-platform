@@ -1,15 +1,8 @@
 """
-JSON-RPC 2.0 + MCP method envelopes.
+JSON-RPC 2.0 + MCP envelopes for `initialize`, `tools/list` and `tools/call`.
 
-Only the subset the incident-commander agent needs today:
-  - `initialize` — client capabilities handshake
-  - `tools/list` — enumerate registered tools
-  - `tools/call` — invoke a tool by name
-
-Everything is Pydantic so FastAPI parses inbound requests and validates
-outbound responses without additional plumbing. Errors follow the
-JSON-RPC error-object shape; a mapping from `AppError` → JSON-RPC error
-lives in `handlers.py`.
+All Pydantic, so FastAPI does the parsing and validation. The `AppError` →
+JSON-RPC error mapping lives in `handlers.py`.
 """
 
 from typing import Any, Literal
@@ -20,10 +13,8 @@ from pydantic import BaseModel, ConfigDict, Field
 # JSON-RPC 2.0 envelopes
 # ---------------------------------------------------------------------------
 
-# The MCP spec uses standard JSON-RPC error codes for protocol errors and
-# reserves the -32000..-32099 range for server-defined errors. We use those
-# for scope + authz failures so clients can distinguish protocol issues
-# from application-level rejections without string-matching messages.
+# -32000..-32099 is the spec's server-defined range; scope + authz use it so clients
+# can tell them from protocol errors.
 JSONRPC_PARSE_ERROR = -32700
 JSONRPC_INVALID_REQUEST = -32600
 JSONRPC_METHOD_NOT_FOUND = -32601
@@ -31,10 +22,8 @@ JSONRPC_INVALID_PARAMS = -32602
 JSONRPC_INTERNAL_ERROR = -32603
 MCP_UNAUTHORIZED = -32001
 MCP_FORBIDDEN = -32002
-# Per-principal rate limit exceeded (WO-R2-30). Its own code rather
-# than folding into JSONRPC_INVALID_REQUEST: the request was well
-# formed and the right answer is to back off and retry, which a
-# client can only decide if it can tell this case apart.
+# Per-principal rate limit exceeded (WO-R2-30): its own code so a client can tell
+# back-off-and-retry from a bad request.
 MCP_RATE_LIMITED = -32003
 MCP_TOOL_NOT_FOUND = -32010
 MCP_TOOL_ERROR = -32011
@@ -56,8 +45,7 @@ class JsonRpcError(BaseModel):
 
 
 class JsonRpcResponse(BaseModel):
-    """Outbound JSON-RPC 2.0 response envelope. Exactly one of `result`
-    or `error` is set."""
+    """Outbound envelope; one of `result`/`error`."""
 
     model_config = ConfigDict(populate_by_name=True)
 
@@ -73,12 +61,7 @@ class JsonRpcResponse(BaseModel):
 
 
 class InitializeParams(BaseModel):
-    """Client capabilities handshake — we accept anything and echo back
-    our supported protocol version. Kept intentionally loose; the agent
-    can iterate its client shape without needing our schema to move.
-
-    Field names are the MCP-spec camelCase — required on the wire.
-    """
+    """Client handshake; deliberately loose. Field names are MCP-spec camelCase."""
 
     model_config = ConfigDict(extra="allow")
 
@@ -98,35 +81,8 @@ class InitializeResult(BaseModel):
 
 
 class ToolInfo(BaseModel):
-    """One entry in `tools/list`. `inputSchema` is a JSON Schema object;
-    we generate it from each tool's Pydantic input model at registration
-    time (see `registry.py`).
-
-    `outputSchema` is a platform extension (v0.4.8) not standardized by
-    the MCP spec: it's the JSON Schema of each tool's declared output
-    model. Clients that don't know about it will ignore it; clients that
-    do (the commander's contract-snapshot job) can diff the actual
-    platform-advertised output shape against their pinned snapshot
-    without treating the local registry as a source-of-truth proxy.
-
-    `required_scope` and `is_idempotent` are platform extensions too
-    (WO-R2-32), and they exist for the same reason `outputSchema` does:
-    the commander's contract snapshot can only catch a change it can
-    see. Both were registry-only, so re-scoping a tool or silently
-    dropping its idempotency was invisible to the snapshot diff and
-    could not be caught by the contract test.
-
-    `is_idempotent` is the one that bites. It is what makes a Tier-1
-    recovery re-invoke return the cached response verbatim; if it is
-    dropped, the retry actually re-runs, returns a *different* payload,
-    and verification reads that as a spurious escalation — a failure
-    that surfaces far from its cause. Advertising it makes the drop a
-    snapshot diff instead.
-
-    Both are snake_case, unlike `inputSchema`/`outputSchema`. The
-    camelCase convention belongs to the MCP spec's own fields; these
-    mirror `ToolDefinition`'s attribute names, which is what the
-    commander's `_tool_view` reads on the other side."""
+    """One `tools/list` entry; `outputSchema`, `required_scope`, `is_idempotent`
+    are platform extensions the commander's contract snapshot pins."""
 
     name: str
     description: str
@@ -166,9 +122,7 @@ class ToolCallParams(BaseModel):
 
 
 class ToolCallContent(BaseModel):
-    """Single content block in a tool-call response. We only emit `text`
-    content today; the field is future-proofed for `image` / `resource`
-    per the MCP content-type union."""
+    """Single content block in a tool-call response; only `text` is emitted today."""
 
     type: Literal["text"] = "text"
     text: str

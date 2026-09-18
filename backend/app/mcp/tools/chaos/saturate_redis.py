@@ -1,33 +1,10 @@
-"""
-`saturate_redis` — write N synthetic keys of size M bytes to Redis.
+"""`saturate_redis` — write N keys of M bytes under `chaos:sat:{run_id}:{i}`.
 
-Real effect: memory pressure. Depending on the target Redis's
-`maxmemory-policy` this may trigger key eviction — meaning the
-platform's rate-limit counters, backpressure cache, and CQRS
-read-model keys can start disappearing. The agent's job is to notice
-the resulting anomalies, not to prevent them.
-
-Every key *this tool writes* carries a short TTL (`ttl_seconds`, default
-60), so its own footprint self-cleans without operator action. That is
-not the same as "no permanent damage", which is what this docstring used
-to claim (WO-R2-56): the TTL bounds what we wrote, not what the eviction
-we induced destroyed. Rate-limit counters and the backpressure cache
-rebuild themselves from the next request; the CQRS read-model keys are
-derived state that only moves when a Kafka event mentions a job, so
-anything evicted out of them stays missing. Repair is
-`read_model.rebuild_read_model` (also run by the eval reset) — recovery
-is a deliberate step, not an automatic one.
-
-Total footprint is bounded on the *product* (`MAX_TOTAL_BYTES`), not just
-on each dimension: `num_keys` and `value_bytes` each looked reasonable at
-their individual maxima while multiplying out to ~100 GB, which is not
-memory pressure but an OOM of the shared Redis every scenario depends on.
-
-Keys are namespaced under `chaos:sat:{run_id}:{i}` — the `run_id`
-lets the agent inspect + optionally clear its own footprint without
-touching other traffic.
-
-Requires `chaos:invoke`. Registered only when `CHAOS_ENABLED=true`.
+Real effect: memory pressure, possibly evicting platform keys. The TTL bounds
+only what this tool wrote, not what the eviction destroyed (WO-R2-56) — evicted
+CQRS read-model keys need `read_model.rebuild_read_model`, while rate limits and
+the backpressure cache rebuild themselves. `MAX_TOTAL_BYTES` caps the product,
+not each dimension; `chaos:invoke` gates the tool.
 """
 
 import uuid
@@ -41,11 +18,8 @@ from pydantic_core import PydanticCustomError
 
 logger = get_logger(__name__)
 
-# Ceiling on num_keys × value_bytes. 256 MiB is enough to move `used_memory`
-# and trip eviction on a lab Redis — which is the whole point of the tool —
-# while staying far below the memory of the smallest instance we run, so the
-# induced pressure is an anomaly the agent can notice rather than an OOM that
-# takes the stack down with it.
+# Ceiling on num_keys × value_bytes: enough to trip eviction on a lab Redis,
+# far below the smallest instance's memory, so it is pressure and not an OOM.
 MAX_TOTAL_BYTES = 256 * 1024 * 1024
 
 
@@ -78,12 +52,9 @@ class SaturateRedisInput(BaseModel):
     def _bound_total_footprint(self) -> Self:
         total = self.num_keys * self.value_bytes
         if total > MAX_TOTAL_BYTES:
-            # PydanticCustomError, not a bare ValueError: the MCP handler
-            # returns `exc.errors()` as the invalid-params payload and
-            # json-encodes it, and pydantic puts the raised *exception object*
-            # in `ctx` for a plain ValueError — which is not serializable, so
-            # the refusal would leave as a 500 instead of the invalid-params
-            # this is. A custom error's ctx is the dict passed here.
+            # PydanticCustomError, not a bare ValueError: the handler
+            # json-encodes `exc.errors()`, and a ValueError's unserializable
+            # `ctx` would turn this invalid-params refusal into a 500.
             raise PydanticCustomError(
                 "footprint_too_large",
                 "num_keys × value_bytes = {total} bytes exceeds the "

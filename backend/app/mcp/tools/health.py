@@ -1,15 +1,8 @@
 """
 `get_redis_health` / `get_postgres_health` — cheap health signals.
 
-Both **fail open** on error: the tool never raises; instead the
-`ok` flag is `false` and `error` carries the exception message. The
-agent should treat `ok=false` as strong evidence rather than as an
-unavailable tool — a red result *is* the useful signal.
-
-Failing open is a claim about this tool's own result, never about the
-caller's transaction: the Postgres probe runs inside a SAVEPOINT so an
-`ok=false` answer leaves the request able to keep writing (R2-59).
-
+Both fail open: never raise, set `ok=false`, message in `error`. The Postgres probe
+sits in a SAVEPOINT, so `ok=false` leaves the caller's transaction writable (R2-59).
 Both `telemetry:read`.
 """
 
@@ -112,17 +105,12 @@ async def get_postgres_health(
     dialect = "unknown"
     healthy: PostgresHealthOutput | None = None
 
-    # SAVEPOINT around the probe. `ok=false` is a report, not a licence to
-    # leave the session wrecked: on Postgres a failed statement aborts the
-    # whole transaction, so before R2-59 a health probe that came back
-    # unhealthy also took down every write that ran after it in the same
-    # request — including the envelope's own audit row for this call.
-    # Rolling back to the savepoint keeps the transaction usable, which is
-    # what makes a degraded answer survivable rather than contagious.
+    # SAVEPOINT around the probe: `ok=false` is a report, not a licence to leave the
+    # session wrecked. Before R2-59 an unhealthy probe aborted the Postgres
+    # transaction, taking this call's own audit row with it.
     #
-    # `catch=Exception` preserves this probe's original surface: it is a
-    # health check, and "the driver raised something we did not classify"
-    # is itself the answer it exists to give.
+    # `catch=Exception` is deliberate: an unclassified driver error is itself the
+    # answer a health check gives.
     async with degrade_on_db_error(
         ctx.db, what="postgres health probe", catch=Exception
     ) as probe:

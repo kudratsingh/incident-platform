@@ -1,45 +1,9 @@
 """
-`get_consumer_lag` — read the Redis-cached Kafka consumer lag.
-
-Reads `kafka:consumer_lag:{group}` from Redis. The key convention
-matches what the metrics loop writes for the platform's own
-`worker-dispatcher` group; the eval seed script populates the same
-key shape for the synthetic groups scenarios probe against.
-
-Any group name is accepted. Unknown groups return `lag: null` rather
-than erroring — the agent's LLM decides what "unknown" means for the
-scenario at hand (defensive, matches the tool's original semantics).
-
-Two things this tool is careful to say out loud (R2-17), because its
-only consumer is an agent that cannot read `docs/REDIS.md`:
-
-  - **Unknown is not zero.** `lag: 0` means measured-and-drained;
-    `lag: null` means could-not-determine. They lead to opposite
-    conclusions, so `lag_known` carries the distinction as its own
-    boolean rather than leaving it implicit in a null. This is the same
-    stance the dispatcher takes when it declines to emit a fabricated 0
-    for the `ConsumerLag` metric, and that the CloudWatch backlog alarm
-    documents as absent-datapoints-are-not-healthy.
-  - **Only one group is live.** The FRESHNESS contract (~60s refresh,
-    90s TTL) is true of `worker-dispatcher` alone. The other seven
-    advertised groups are static fixtures written by
-    `scripts/seed_eval_fixtures.py` and refreshed by nothing, so their
-    value does not move while a fault runs. `source` says which kind of
-    group answered, so "watch the lag grow" is never inferred for a
-    group whose number cannot grow.
-  - **A reading carries its time, and the last few readings with it**
-    (WO-R3-254). The metrics loop writes one undated integer every ~60s;
-    an agent that cannot sleep cannot watch it move, and three reads
-    inside 25 seconds returning the same cached number read as "the lag
-    is not moving" when they really meant "not re-measured yet". That
-    misreading cost a live run. So `measured_at` / `age_seconds` say
-    when the returned number was measured, and `recent_samples` returns
-    the metrics loop's short recorded window — the trend is available
-    from ONE call, which is the only way this caller can get it. None of
-    it is ever invented: no measurement time, no `measured_at`; no
-    recorded window, no samples.
-
-Requires `telemetry:read`.
+`get_consumer_lag` — the Redis-cached Kafka consumer lag from `kafka:consumer_lag:`.
+Unknown groups return `lag: null`. Three things the description says out loud, since
+the agent cannot read this file: unknown is not zero (`lag_known`), only
+`worker-dispatcher`'s number moves (`source`), and one call carries the trend via
+`measured_at` + `recent_samples` (R2-17, WO-R3-254). Requires `telemetry:read`.
 """
 
 import json
@@ -53,9 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 logger = get_logger(__name__)
 
-# Prefix must match what the metrics loop (`_metrics_loop` in
-# `app/workers/dispatcher.py`) and the eval seed script both use.
-# Kept as a module constant so any three call sites stay aligned.
+# Must match `_metrics_loop` in `app/workers/dispatcher.py` and the seed script.
 _CONSUMER_LAG_KEY_PREFIX = "kafka:consumer_lag:"
 
 
@@ -63,13 +25,9 @@ def _redis_key(group: str) -> str:
     return f"{_CONSUMER_LAG_KEY_PREFIX}{group}"
 
 
-# Where the metrics loop records its short window of timestamped
-# measurements, beside the value key rather than inside it — the value
-# key's shape is fixed by `check_backpressure`. Mirror of
-# `app/workers/dispatcher.py:LAG_SAMPLES_KEY` and `LAG_SAMPLES_KEEP`,
-# duplicated here for the same reason the prefix above is: the MCP
-# process must not import the worker package. Kept honest by
-# `backend/tests/unit/test_consumer_lag_history.py`.
+# The metrics loop's timestamped window, beside the value key because
+# `check_backpressure` fixes that shape. Mirrors `dispatcher.py:LAG_SAMPLES_KEY` /
+# `LAG_SAMPLES_KEEP` — no worker imports here.
 _LAG_SAMPLES_SUFFIX = ":samples"
 _LAG_SAMPLES_KEEP = 5
 
@@ -87,22 +45,13 @@ def _parse_lag(raw: Any) -> int | None:
         return None
 
 
-# The single group whose lag is genuinely refreshed: the metrics loop
-# writes it every ~60s with a 90s TTL, so it is fresh-or-absent and it
-# moves while a fault is running.
+# The one group genuinely refreshed: every ~60s, 90s TTL, so its number moves.
 LIVE_REFRESHED_GROUP = "worker-dispatcher"
 
-# Groups whose lag is a recorded constant: written once by
-# `seed_eval_fixtures._seed_consumer_lag` (durably, since R2-17) and
-# re-anchored by the reset. Nothing refreshes them, so the value does
-# not move. Mirror of that script's `_CONSUMER_LAGS` keys.
-#
-# Named for what the WIRE calls them ("static"), not for what they are
-# internally, so the two vocabularies cannot drift: ADR 0012 rule 1
-# bans lab words from the non-chaos tool surface, and
-# `test_no_lab_vocabulary_on_non_chaos_tool_surface` enforces it. The
-# operational truth an agent needs is "this number does not move",
-# which is sayable without naming the lab.
+# Groups whose lag is a recorded constant, from
+# `seed_eval_fixtures._seed_consumer_lag`. Nothing refreshes them, so the value
+# does not move. Named "static" for what the WIRE calls them: ADR 0012 rule 1 bans
+# lab words here, and `test_no_lab_vocabulary_on_non_chaos_tool_surface` guards it.
 STATIC_LAG_GROUPS = (
     "billing-consumer",
     "orders-consumer",
@@ -113,10 +62,8 @@ STATIC_LAG_GROUPS = (
     "healthy-consumer",
 )
 
-# Groups the eval seed script populates. Advertised in the input
-# description so `tools/list` gives the agent a concrete menu.
-# Passing a name outside this list is still allowed — it just returns
-# `lag: null` if there's no Redis value for that key.
+# Advertised in the input description so `tools/list` gives a menu.
+# A name outside it is allowed; it returns `lag: null`.
 SEEDED_CONSUMER_GROUPS = (LIVE_REFRESHED_GROUP,) + STATIC_LAG_GROUPS
 
 LagSource = Literal["live", "static", "unrecognized"]
@@ -217,13 +164,9 @@ class GetConsumerLagOutput(BaseModel):
 def _parse_samples(raw: Any) -> list[LagSample]:
     """Decode the recorded window, dropping anything unreadable.
 
-    A window that will not parse is reported as no window at all: an
-    empty list already means "no history recorded", and the caller is
-    told that an empty list is never evidence of a steady lag. Partial
-    decoding beats none — one corrupt entry must not hide four good
-    measurements — and the result is re-sorted newest-first rather than
-    trusting the stored order, because that order is what the
-    description promises.
+    Partial decoding beats none — one corrupt entry must not hide four good
+    measurements — and the result is re-sorted newest-first, as the description
+    promises.
     """
     if raw is None:
         return []
@@ -258,9 +201,7 @@ def _parse_measured_at(value: Any) -> datetime | None:
         parsed = datetime.fromisoformat(value)
     except ValueError:
         return None
-    # A naive stamp can only come from a writer that dropped the offset;
-    # the platform's clock is UTC everywhere, so read it as UTC rather
-    # than discarding an otherwise good measurement.
+    # A naive stamp means a writer dropped the offset; the clock is UTC everywhere.
     return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
 
 
@@ -346,13 +287,9 @@ async def get_consumer_lag(
     if source == "live":
         samples = _parse_samples(await ctx.redis.get(_samples_key(inp.consumer_group)))
 
-    # The newest sample dates the current reading only if it IS the
-    # current reading. The loop writes the value then the window, so a
-    # read landing between the two sees a number whose time has not been
-    # recorded yet — and any other writer of the value key is in the same
-    # position. Reporting the older sample's time as this number's would
-    # be a fabricated measurement, which is the one thing this tool must
-    # never do; an unknown time is reported as unknown.
+    # The newest sample dates the current reading only if it IS that reading. The
+    # loop writes the value then the window, so a read between the two sees a
+    # number with no recorded time — reported unknown, never guessed.
     measured_at = (
         samples[0].measured_at
         if samples and lag is not None and samples[0].lag == lag
@@ -367,9 +304,7 @@ async def get_consumer_lag(
     return GetConsumerLagOutput(
         consumer_group=inp.consumer_group,
         lag=lag,
-        # Derived from the read, not from the group name: a tracked
-        # group with a missing fixture is just as unknown as an
-        # untracked one, and `source` is what tells those apart.
+        # From the read, not the group name; `source` tells those apart.
         lag_known=lag is not None,
         source=source,
         cache_key=key,

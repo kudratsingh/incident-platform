@@ -1,32 +1,11 @@
 """
 `pause_dag` — pause promotion of children in a job dependency DAG.
 
-Mechanism: Redis key `dag:paused:<root_id>` with a TTL. Every path
-that dispatches work checks the key first; if any ancestor (or the
-job itself) is paused, the work is held. Enforced at six points —
-the DependencyResolver's promotion, the resume sweep, delayed-retry
-promotion, `JobService.replay_job`, the scheduled DLQ-replay loop,
-and `_run_job`'s pre-claim re-check — plus a create-time hold that
-starts a new job `WAITING` when its parents' chain is paused. See
-ADR 0011 and its 2026-08-09 amendment for the table and the
-refuse-vs-defer split.
-
-Work already `RUNNING` is not recalled: pause stops dispatch, not
-work in flight.
-
-Real effect self-cleans on TTL: `_resume_unblocked_waiting_loop`
-promotes any child left behind once the flag is gone, so a pause is
-temporary rather than terminal. Verify with `get_dag_state.paused`.
-
-`actions:execute` + idempotent.
-
-Compensator pairing (ADR 0008 amendment): this is the stabilization
-half of the `create_stuck_dag` chaos hook — pausing the manufactured
-chain's root reads back through `get_dag_state` as `paused=true` with
-descendants held in `waiting`, and the TTL self-clean means the pause
-can never outlive the incident. Observability test:
-`test_pause_dag_is_observable_on_the_manufactured_chain` in
-`tests/api/test_mcp_chaos_stuck_dag.py`.
+Sets Redis `dag:paused:<root_id>` with a TTL, checked at six dispatch points plus a
+create-time hold (ADR 0011 and its 2026-08-09 amendment have the table and the
+refuse-vs-defer split). Work already `RUNNING` is not recalled, and
+`_resume_unblocked_waiting_loop` promotes held children once the TTL lapses, so a
+pause is temporary. Verify with `get_dag_state.paused`. `actions:execute` + idempotent.
 """
 
 import uuid
@@ -92,8 +71,7 @@ class PauseDagOutput(BaseModel):
     is_idempotent=True,
 )
 async def pause_dag(inp: PauseDagInput, ctx: ToolContext) -> PauseDagOutput:
-    # Confirm the root exists + is in the caller's tenant. Same-shape
-    # NotFoundError whether the row is missing or in a sibling tenant.
+    # Same-shape NotFoundError whether the row is missing or in a sibling tenant.
     job_repo = JobRepository(ctx.db)
     root = await job_repo.get_by_id(inp.root_job_id)
     if root is None or root.tenant_id != ctx.principal.tenant_id:

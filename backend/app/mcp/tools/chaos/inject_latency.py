@@ -1,17 +1,8 @@
-"""
-`inject_latency` — slow down one Kafka consumer group.
+"""`inject_latency` — slow down one Kafka consumer group.
 
-Mechanism: Redis key `chaos:latency:<group_id>` holds an integer
-number of milliseconds. `BaseKafkaConsumer.run()` reads it at the top
-of every poll iteration and sleeps for the requested amount before
-calling `getmany`. Effect self-cleans when the key TTL expires.
-
-Companion to `kill_consumer` — `kill` stops the consumer completely,
-`inject_latency` degrades it. Useful for practicing "the platform is
-slow" scenarios where the agent has to distinguish real degradation
-from full failure.
-
-Requires `chaos:invoke`. Registered only when `CHAOS_ENABLED=true`.
+`chaos:latency:<group_id>` holds a millisecond count `BaseKafkaConsumer.run()`
+sleeps for before each `getmany`; self-cleans on TTL. Degrades a group where
+`kill_consumer` stops it. Requires `chaos:invoke` and `CHAOS_ENABLED=true`.
 """
 
 from app.core.logging import get_logger

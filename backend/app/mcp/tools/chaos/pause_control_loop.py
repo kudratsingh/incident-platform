@@ -1,34 +1,9 @@
-"""
-`pause_control_loop` — stop one background loop in the worker, with a TTL.
+"""`pause_control_loop` — stop one of the worker's eleven background loops.
 
-Mechanism: set a Redis key `chaos:pause:<loop>`. Each of the eleven loops
-`dispatcher.worker_loop` starts reads its own key once per iteration and skips
-that iteration's work while the key is set (`app/workers/control_loop_pause.py`
-holds the enum, the key helper and the check; ADR 0027 holds the reasoning).
-Teardown is the TTL — nothing has to be called to undo it — and
-`scripts/reset_eval_state.py` sweeps `chaos:*` between scenarios as a backstop.
-
-Sibling, not a replacement, of `kill_consumer`. That one stops a **Kafka
-consumer group**, addressed by an open string group id, with the check in
-`BaseKafkaConsumer`. This one stops a **background loop**, addressed by a
-closed enum, with the check in each loop. The enum is the safety boundary: a
-member exists only if the matching loop really reads its key, which
-`tests/unit/test_pause_control_loop.py` asserts against `worker_loop` by
-walking the AST. A loop_name outside the enum is refused by Pydantic before the
-handler runs — JSON-RPC invalid params, not a key nothing reads.
-
-Why one hook over eleven: the mechanism is identical for every loop, so eleven
-tools would be eleven descriptions to keep true and eleven names in
-`tools/list` for one idea.
-
-The contrast this exists for (plan 01 §7.1): pausing `outbox_relay` produces
-"jobs accepted but not executing" with the *opposite* evidence to a killed
-dispatcher consumer — the outbox backlog grows while `worker-dispatcher`
-consumer lag stays flat, because nothing is reaching Kafka to fall behind on.
-
-Requires `chaos:invoke`. Registered only when `CHAOS_ENABLED=true` (see
-`app/mcp/chaos.py`). Blast radius `single_loop`: the process, its eight
-consumer groups and the other ten loops keep running.
+Sets `chaos:pause:<loop>`, which each loop reads once per iteration before
+skipping its work (`app/workers/control_loop_pause.py`, ADR 0027); teardown is
+the TTL plus the reset's `chaos:*` sweep. Unlike `kill_consumer`'s open group
+id, `loop_name` is a closed enum, pinned by `test_pause_control_loop.py`.
 """
 
 from app.mcp.chaos import BlastRadius, chaos_tool

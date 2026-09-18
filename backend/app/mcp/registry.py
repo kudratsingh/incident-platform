@@ -1,14 +1,9 @@
 """
 Tool registry — decorator-based, module-level.
 
-Every tool is a coroutine that takes a Pydantic input model + a
-`ToolContext` (session, redis, principal) and returns a Pydantic
-output model. The decorator captures the tool's name, description,
-required scope, and JSON Schema derived from the input model.
-
-Registration is side-effect-driven: `app/mcp/tools/__init__.py`
-imports every tool module and the decorators fire at import time,
-populating `_REGISTRY`. The MCP handlers then read from it.
+A tool is a coroutine taking a Pydantic input model plus a `ToolContext` and
+returning a Pydantic output model. Importing `app/mcp/tools` fires the decorators
+at import time and fills `_REGISTRY`.
 """
 
 from collections.abc import Awaitable, Callable
@@ -24,11 +19,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 @dataclass(frozen=True)
 class ToolContext:
-    """Everything a tool handler needs at call time. Kept as a dataclass
-    so tools can accept it by keyword and only touch what they use.
-
-    The MCP handler builds one per invocation from the request's DB
-    session, Redis client, and authenticated principal — no globals."""
+    """Everything a tool handler needs at call time; built per invocation, no
+    globals."""
 
     db: AsyncSession
     redis: Redis
@@ -46,31 +38,20 @@ class ToolDefinition:
     input_model: type[BaseModel]
     output_model: type[BaseModel]
     handler: ToolHandler
-    # Chaos tools use a distinct audit action (`chaos.tool_invoked` vs
-    # `agent.tool_invoked`) and are only registered when
-    # `settings.chaos_enabled=True`. The dispatch layer reads this flag
-    # to route the audit row into the chaos stream.
+    # Audit row goes to `chaos.tool_invoked`, not `agent.tool_invoked`.
+    # Set only when `settings.chaos_enabled=True`.
     is_chaos: bool = False
-    # Tier 1 action tools require an `idempotency_key` argument. The
-    # dispatch layer looks it up before invoking the handler; a repeat
-    # call with the same (tenant, principal, key) returns the cached
-    # response verbatim rather than re-running the tool.
+    # Tier 1 actions take an `idempotency_key`; a repeat on the same
+    # (tenant, principal, key) returns the cached response.
     is_idempotent: bool = False
 
     def input_json_schema(self) -> dict[str, Any]:
-        """JSON Schema for the input model, emitted verbatim in
-        `tools/list`. Pydantic renders `$defs` etc. cleanly, so MCP
-        clients get the same schema Pydantic uses for validation."""
+        """JSON Schema for the input model, emitted verbatim in `tools/list`."""
         return self.input_model.model_json_schema()
 
     def output_json_schema(self) -> dict[str, Any]:
-        """JSON Schema for the output model, emitted verbatim in
-        `tools/list` alongside `inputSchema` since v0.4.8. Not
-        standardized by the MCP spec — extension field — but clients
-        that ignore unknown keys (the commander's contract-snapshot
-        job among them) can now diff live-platform-outputs against
-        their pinned snapshot without needing the registry as a
-        source-of-truth proxy. Closes the loop FIX_PLAN #25 opened."""
+        """JSON Schema for the output model, emitted in `tools/list` alongside
+        `inputSchema` since v0.4.8. A platform extension, not in the MCP spec."""
         return self.output_model.model_json_schema()
 
 
@@ -87,14 +68,8 @@ def tool[InputT: BaseModel, OutputT: BaseModel](
     is_chaos: bool = False,
     is_idempotent: bool = False,
 ) -> Callable[[ToolHandler], ToolHandler]:
-    """Decorator: register `func` as a tool.
-
-    Duplicate names raise at import time so a collision surfaces on the
-    first test run rather than at first invocation. Tools that don't
-    require a scope pass `required_scope=None` (e.g. protocol-level
-    handlers like `initialize`, which don't go through this registry
-    anyway — this escape hatch is for future no-scope tools like a
-    health probe)."""
+    """Register `func` as a tool. Duplicate names raise at import time, so a
+    collision surfaces on the first test run rather than at first call."""
 
     def _decorator(func: ToolHandler) -> ToolHandler:
         if name in _REGISTRY:

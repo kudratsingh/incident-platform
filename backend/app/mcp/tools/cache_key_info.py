@@ -1,80 +1,8 @@
 """
-`get_cache_key_info` — inspect one cache key's existence, TTL and shape.
-
-The observability gap this closes: the platform's cache namespaces are
-written by the read-through job cache, the metrics loop, and the
-`create_stale_cache` chaos hook, but no read tool could see any of
-those keys — `get_redis_health` deliberately reports aggregate stats
-only, and `get_consumer_lag` reads exactly one key family. A caller
-diagnosing a stale-cache condition had no way to confirm the key even
-existed before firing `invalidate_cache_key`, nor to confirm the
-delete afterwards. This tool is the missing read half of that
-remediation loop.
-
-Deliberately NOT an arbitrary-Redis-read primitive:
-
-  - Exact key only — no patterns, no SCAN, no enumeration. ADR 0012's
-    posture stays intact (`get_redis_health` "does not enumerate
-    keys"); a caller must already know the key it wants to inspect.
-  - Namespace allowlist — the same prefixes `invalidate_cache_key` may
-    delete (mirror of its `_ALLOWED_PREFIXES`; the subset relations are
-    asserted in `tests/unit/test_cache_key_allowlist.py`). Everything
-    outside — rate-limit counters, queue ZSETs, read-model projections,
-    progress snapshots, pause flags — is refused before any Redis call.
-  - Shape only, never the value — `cache:job:{tenant}:{job_id}` payloads
-    are tenant data. Existence / TTL / type / size, and the record check
-    below, answer the operational question without exposing them.
-
-Shape alone could not answer that question, which is what WO-R3-267
-closes. An alert naming a stale key put the caller in front of
-`exists / type / ttl_seconds / size` and nothing else, and those four
-read the same for a current entry and a stale one: both are strings
-with a TTL, differing only in byte count. `get_redis_health` adds a
-Redis-WIDE miss ratio, which is not about this key. So the platform was
-asserting staleness it could not show, and two live runs on identical
-readings split on whether to act.
-
-The evidence added is the one fact the platform can measure about any
-entry in these namespaces without a second system: **every one of them
-is a copy of job records Postgres holds, so the platform can ask
-whether those records are still there.** `records_referenced` is how
-many job records the entry is meant to name — the items in its stored
-list, or the single job its key names — and `records_found` is how many
-of those the database currently holds for the caller's tenant, looked
-up at call time. A healthy hot-set entry names three jobs and finds
-three; an entry written before the records it points at changed names
-three and finds none. Neither number is ever invented: an entry whose
-value names nothing lookupable reports `null` for both, which is not
-zero.
-
-Three candidates were considered and dropped, recorded here so the next
-reader does not re-derive them:
-
-  - **`written_at` / `age_seconds` from the cache writers.** No writer
-    in these namespaces records a write time, and age is not staleness
-    without something to compare it against — the healthy hot-set entry
-    is written at boot and is hours old on a long-lived stack, while a
-    freshly written stale one is seconds old. Age would have read
-    backwards.
-  - **`source_newer` from the cached row's own `updated_at`.** The
-    natural version stamp for `cache:job:` entries, except that
-    `JobResponse` — the shape `JobCache` serialises — carries
-    `created_at` / `started_at` / `completed_at` and **no**
-    `updated_at`. The platform cannot compare what it never cached, and
-    adding the column to a REST response model to make a cache tool
-    work is the tail wagging the dog.
-  - **Redis `OBJECT IDLETIME` / `FREQ`.** Idle time is time since last
-    *access*, and this tool's own `STRLEN` is an access — the first
-    call would reset the signal the second call reads. It also measures
-    reads, not writes, so a freshly written stale entry looks newer than
-    a long-lived healthy one. Wrong direction, self-destroying.
-  - Tenant-scoped (R2-54) — withholding the payload was not enough on its
-    own. Existence, TTL and size of another tenant's cached job is an
-    existence oracle over their jobs, so the tenant segment of the key
-    now has to be the calling principal's. See
-    `app/mcp/tools/_cache_scope.py`; the same check guards
-    `invalidate_cache_key`.
-
+`get_cache_key_info` — existence, TTL, shape and record references for one cache key.
+The read half of `invalidate_cache_key`: exact key only, namespace allowlist,
+tenant-scoped (R2-54), never the value. `records_referenced` / `records_found` are
+the staleness evidence (WO-R3-267): null, never zero, when unreadable.
 Requires `telemetry:read`.
 """
 
@@ -93,15 +21,9 @@ from pydantic import BaseModel, ConfigDict, Field
 
 logger = get_logger(__name__)
 
-# Mirror of `invalidate_cache_key._ALLOWED_PREFIXES` — observe-what-you-
-# can-delete symmetry. Kept as a separate literal rather than an import
-# because both tuples are BAKED VERBATIM into their tools' schemas and
-# descriptions, so a change to either is deliberate contract drift that
-# must show up in that file's own diff. The mirrors cannot drift
-# silently: `tests/unit/test_cache_key_allowlist.py` asserts the
-# compensator's allowlist (and, transitively, everything the
-# `create_stale_cache` chaos hook can write) stays a subset of this
-# tuple.
+# Mirror of `invalidate_cache_key._ALLOWED_PREFIXES` — observe what you can delete.
+# A separate literal, not an import: both tuples are BAKED VERBATIM into their
+# tools' schemas. `tests/unit/test_cache_key_allowlist.py` keeps the mirror honest.
 _READABLE_PREFIXES = (
     "cache:",
     "jobs:cache:",
@@ -109,9 +31,7 @@ _READABLE_PREFIXES = (
     "read_model:",
 )
 
-# Redis TYPE name → the size command that fits it. STRLEN counts bytes;
-# the rest count elements. An unknown type name (a future Redis type)
-# reports `size: null` rather than guessing.
+# Redis TYPE → size command; an unknown type reports `size: null`, not a guess.
 _SIZE_COMMANDS = {
     "string": "strlen",
     "list": "llen",
@@ -121,12 +41,9 @@ _SIZE_COMMANDS = {
     "stream": "xlen",
 }
 
-# Most references the record check will resolve in one call. Beyond it the
-# tool declines rather than checking a prefix and reporting the count as
-# though it covered everything — a partial answer the caller could not tell
-# from a whole one is the failure mode CLAUDE.md's "never promise
-# completeness you cap" rule exists for, and here declining costs nothing:
-# the largest list any writer of these namespaces produces is 100 entries.
+# Most references the record check resolves in one call. Beyond it the tool declines
+# rather than report a partial count as a whole one; the largest list any writer of
+# these namespaces produces is 100 entries.
 _MAX_REFERENCES_CHECKED = 500
 
 
@@ -234,11 +151,8 @@ async def get_cache_key_info(
             f"Key {inp.key!r} is not under a readable namespace. "
             f"Allowed: {list(_READABLE_PREFIXES)}"
         )
-    # Shape-only was never the whole answer (R2-54): existence, TTL and
-    # size of `cache:job:{tenant}:{job}` are an existence oracle over
-    # another tenant's jobs even with the payload withheld. Refused
-    # before any Redis call, so the refusal cannot vary with what is
-    # actually there.
+    # Shape alone was never enough (R2-54): existence, TTL and size are an
+    # existence oracle. Refused before any Redis call.
     assert_key_in_tenant(
         inp.key, tenant_id=ctx.principal.tenant_id, error=CacheKeyInfoError
     )
@@ -277,28 +191,16 @@ async def resolve_record_references(
 ) -> tuple[int | None, int | None]:
     """`(records_referenced, records_found)` for an existing key.
 
-    Public because the boot-time-consistency test in
-    `tests/unit/test_eval_reset.py` asks this exact question of the
-    hot-set entry the reset re-populates: the reading a caller gets
-    after a reset has to be the healthy one, and asserting that through
-    the real resolver is the only version of the assertion that cannot
-    drift from the tool.
-
-    Both halves are null together. Either the platform knows what
-    records this entry refers to and can count them, or it says nothing
-    — there is no half-answer, and a count that quietly covered part of
-    the entry would be worse than none.
+    Public because `tests/unit/test_eval_reset.py` asks this same question of the
+    hot-set entry the reset re-populates. Both halves are null together — there is
+    no half-answer.
     """
     names = await _referenced_names(key, type_name, ctx)
     if names is None:
         return None, None
 
-    # A name that is not a record id is still a reference the entry
-    # makes — it is counted in `records_referenced` and simply resolves
-    # to nothing. Dropping it instead would make an entry full of
-    # unresolvable names indistinguishable from one that names no
-    # records at all, which is the difference the caller is asking
-    # about.
+    # An unparseable name is still a reference: counted in `records_referenced`
+    # and resolving to nothing. Dropping it hides what the caller is asking.
     parsed: list[uuid.UUID] = []
     for name in names:
         try:
@@ -312,9 +214,7 @@ async def resolve_record_references(
             parsed, ctx.principal.tenant_id
         )
     if probe.failed:
-        # The count exists, but the half that gives it meaning does not.
-        # Reporting the references alone would invite the reading
-        # "referenced, therefore missing"; both go null.
+        # The half that gives the count meaning is missing; both go null.
         return None, None
 
     return len(names), sum(1 for job_id in parsed if job_id in present)
@@ -325,19 +225,9 @@ async def _referenced_names(
 ) -> list[str] | None:
     """What this entry says it is a copy of, or `None` if unreadable.
 
-    Two shapes, in this order:
-
-      - The key names one record. `cache:job:{tenant}:{job_id}` is the
-        platform's read-through per-job cache, so the key alone answers
-        the question and the payload — tenant data — is never read.
-      - The value lists them. A JSON array of scalars under any of the
-        readable prefixes is a cached list of record ids; each item is
-        one reference. Read internally to be counted, never returned.
-
-    Anything else — a counter, a Redis collection type, a JSON object, a
-    value that will not parse — is `None`: the platform does not know
-    what the entry refers to, and guessing would be the fabrication this
-    tool exists to avoid.
+    Two shapes: `cache:job:{tenant}:{job_id}` names one record in the key itself
+    (the payload is never read), or a JSON array of scalars lists record ids.
+    Anything else is `None` — guessing would be the fabrication this tool avoids.
     """
     from_key = job_segment(key)
     if from_key is not None:
@@ -369,9 +259,7 @@ async def _referenced_names(
 
 
 def _as_str(v: Any) -> str | None:
-    """TYPE returns `str` under `decode_responses=True` (production
-    client) and `bytes` from a raw client — accept both, like the other
-    tools' byte-safety."""
+    """TYPE returns `str` under `decode_responses=True` and `bytes` otherwise."""
     if isinstance(v, bytes):
         return v.decode()
     if isinstance(v, str):

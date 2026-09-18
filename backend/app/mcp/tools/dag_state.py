@@ -1,17 +1,8 @@
 """
-`get_dag_state` — the job dependency graph around one job.
-
-Traverses `job_dependencies` outward from the seed job (parents +
-children, one hop each direction — enough to explain "why is this
-stuck?"). Nodes carry status so the agent can immediately see which
-upstream/downstream jobs are the interesting ones.
-
-Also reports DAG pause state, which is how `pause_dag` is verified:
-`paused` is the seed's own flag, `paused_by` names the ancestor whose
-flag is holding the seed back (they differ when a pause was applied
-further up the chain).
-
-Requires `incidents:read`. Tenant-scoped through `JobRepository`.
+`get_dag_state` — the dependency graph around one job: one hop of parents and
+children out of `job_dependencies`, with each node's status. Also reports pause
+state, which is how `pause_dag` is verified — `paused` is the seed's own flag,
+`paused_by` the ancestor holding it back. Needs `incidents:read`.
 """
 
 import uuid
@@ -44,20 +35,15 @@ class DagNode(BaseModel):
 
 
 class DagEdge(BaseModel):
-    """`from_id` depends on `to_id` — the parent has to finish before
-    the child can start. Direction matches the schema
-    (`job_dependencies.child_job_id → parent_job_id`)."""
+    """`from_id` depends on `to_id` — the parent finishes before the child starts."""
 
     from_id: str
     to_id: str
 
 
 class GetDagStateOutput(BaseModel):
-    # Explicit title only. The property name stays `seed_id` — renaming it
-    # would be a breaking output-contract change — but Pydantic's derived
-    # title ("Seed Id") is serialized into `outputSchema` and reads as lab
-    # vocabulary on the wire. Titling it after the graph sense keeps the
-    # ADR 0012 screen strict with no allowlist.
+    # Title only — `seed_id` stays (renaming breaks the contract), but Pydantic's
+    # derived "Seed Id" reads as lab vocabulary in `outputSchema` (ADR 0012).
     seed_id: str = Field(title="Root Job Id")
     nodes: list[DagNode]
     edges: list[DagEdge]
@@ -115,9 +101,7 @@ async def get_dag_state(
     parent_ids = await dep_repo.parents(seed.id)
     child_ids = await dep_repo.children_of(seed.id)
 
-    # One SELECT round-trip per node is fine at this scale — the DAG
-    # around any single job is bounded (a saga is a chain; ad-hoc deps
-    # are rare and shallow).
+    # One SELECT per node is fine — the DAG around a job is bounded.
     nodes: dict[str, DagNode] = {}
 
     async def _load(job_id: uuid.UUID) -> None:

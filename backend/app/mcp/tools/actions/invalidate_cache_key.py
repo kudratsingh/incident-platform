@@ -1,23 +1,11 @@
 """
 `invalidate_cache_key` — delete one Redis key.
 
-Two guardrails, and both are load-bearing.
-
-*Namespace*: only keys under the allowlisted prefixes below can be
-deleted. An unrestricted DEL against a shared Redis is an
-availability-affecting action; scoping the tool to cache-y prefixes
-keeps it safe by construction. Adding a new prefix is a code change and
-a PR review.
-
-*Tenant* (R2-54): the allowlist says a key is a platform cache
-namespace, not that it is *yours*. `cache:job:{tenant}:{job_id}` is
-deliberately deletable — force-refreshing a stale job read is what this
-tool is for — so without a tenant check a service account in one tenant
-could evict another tenant's cached reads. The tenant segment comes from
-the authenticated principal; see `app/mcp/tools/_cache_scope.py`, shared
-with `get_cache_key_info` so the two cannot drift.
-
-`actions:execute` + idempotent.
+Two load-bearing guardrails. *Namespace*: only the allowlisted prefixes below, since
+an unrestricted DEL on a shared Redis affects availability. *Tenant* (R2-54): the
+allowlist never said the key was *yours*, so the tenant segment comes from the
+authenticated principal (`app/mcp/tools/_cache_scope.py`, shared with
+`get_cache_key_info`). `actions:execute` + idempotent.
 """
 
 from app.core.exceptions import AppError
@@ -29,33 +17,18 @@ from pydantic import BaseModel, ConfigDict, Field
 
 logger = get_logger(__name__)
 
-# Prefixes the tool is allowed to delete. Anything else is refused
-# with a validation error before the Redis call runs.
-#
-# The tuple is BAKED VERBATIM into the tool's inputSchema (see the `key`
-# field description below) and therefore into the commander's pinned
-# contract snapshot. Editing it is contract drift — if a platform key
-# needs to become reachable, rename the KEY under `cache:` instead (that
-# is what `cache:job:{tenant}:{job_id}` is, E2-02).
+# Prefixes the tool may delete; anything else is refused before the Redis call.
+# BAKED VERBATIM into the inputSchema and the commander's pinned snapshot, so
+# editing it is contract drift (E2-02).
 _ALLOWED_PREFIXES = (
-    # Real read-through caches. Covers the per-job read cache
-    # (`cache:job:{tenant_id}:{job_id}`, app/utils/cache.py) and the
-    # eval hot_set fixture.
+    # Read-through caches: the per-job cache and the eval hot_set fixture.
     "cache:",
-    # Synthetic fixture namespace: nothing in the platform writes it.
-    # Reachable only via the `create_stale_cache` chaos hook, whose
-    # mirror list (chaos/create_stale_cache.py::_ALLOWED_PREFIXES) must
-    # stay a SUBSET of this tuple so the compensator can always clear
-    # what the hook wrote (asserted in tests/unit/test_cache_key_allowlist.py).
+    # Synthetic; only the `create_stale_cache` chaos hook writes it, and its mirror
+    # must stay a SUBSET of this tuple (tests/unit/test_cache_key_allowlist.py).
     "jobs:cache:",
     "kafka:consumer_lag:",  # metrics-loop cache; safe to force refresh
-    # Also synthetic (same chaos-hook-only reachability). It does NOT
-    # match any key the platform writes: the real CQRS read-model sets
-    # are `jobs:tenant:*` / `jobs:user:*`, and they are projections, not
-    # caches — ReadModelProjector only moves ids on lifecycle events, so
-    # a deleted set never fully repopulates and admin stats silently
-    # undercount. Do not add those prefixes here; repairing a projection
-    # needs a rebuild tool, not DEL.
+    # Also synthetic. Do NOT add the real CQRS sets (`jobs:tenant:*` / `jobs:user:*`)
+    # — they are projections, so a deleted set never repopulates and stats undercount.
     "read_model:",
 )
 
@@ -108,11 +81,8 @@ async def invalidate_cache_key(
             f"Key {inp.key!r} is not under an allowlisted prefix. "
             f"Allowed: {list(_ALLOWED_PREFIXES)}"
         )
-    # Second gate, and the one that makes the first sufficient: the
-    # allowlist says this is a platform cache namespace, this says the
-    # entry is the caller's. `cache:job:{tenant}:{job}` is deliberately
-    # deletable, so without it one tenant's service account could evict
-    # another tenant's cached reads (R2-54).
+    # Second gate, what makes the first sufficient: the allowlist says this is a
+    # platform cache namespace, this says the entry is the caller's (R2-54).
     assert_key_in_tenant(
         inp.key,
         tenant_id=ctx.principal.tenant_id,

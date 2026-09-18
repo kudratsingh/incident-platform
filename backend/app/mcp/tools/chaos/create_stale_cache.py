@@ -1,26 +1,9 @@
-"""
-`create_stale_cache` — populate a Redis cache key with obviously-fake
-stale content so the `remediate_stale_cache_success` scenario has a
-pre-condition to observe + invalidate on the live evaluation path.
+"""`create_stale_cache` — put obviously-fake stale content in a Redis cache key
+so `remediate_stale_cache_success` has a condition to observe and invalidate.
 
-Boot-time seeding of the same key lives in
-`scripts/seed_eval_fixtures.py::_seed_hot_set` — that's what makes the
-scenario winnable on a fresh compose stack. This chaos hook is the
-per-scenario counterpart, invoked from the commander's `chaos_setup`
-hook so each scenario declaratively owns its own pre-condition (see
-commander PR #54 for the scenario-side hook shape).
-
-Compensator: `invalidate_cache_key` (Tier-1 action) — the scenario's
-success path IS the compensation call. Round-trip test:
-`test_create_stale_cache_round_trip_with_invalidate_cache_key`
-in `tests/api/test_mcp_wave2_chaos_hooks.py`.
-
-Every write is bounded by TTL (default 600s / 10 minutes, max 1 hour)
-so a forgotten cleanup self-clears without operator action. Doesn't
-touch Kafka or Postgres — pure Redis.
-
-Chaos-only surface: gated behind `CHAOS_ENABLED=true` + `chaos:invoke`
-scope + `environment_wide` blast radius label. See ADR 0008 gating.
+Boot seeding of the same key is `seed_eval_fixtures.py::_seed_hot_set`; this is
+the per-scenario counterpart. The compensator is `invalidate_cache_key` — the
+scenario's success path IS the cleanup. TTL-bounded; pure Redis; ADR 0008 gated.
 """
 
 import json
@@ -34,35 +17,19 @@ from pydantic import BaseModel, ConfigDict, Field
 
 logger = get_logger(__name__)
 
-# The scenario's canonical hot_set key. Boot-time seeding writes the
-# same key from `scripts/seed_eval_fixtures.py`; keeping the constants
-# aligned across the two files is a review-time check (both cite this
-# ADR/hook pair, so any future rename shows up in both).
+# The scenario's canonical hot_set key, also written by
+# `scripts/seed_eval_fixtures.py` — keep the two aligned.
 _DEFAULT_HOT_SET_KEY = "cache:jobs:worker-dispatcher:hot_set"
 
-# Must be under one of `invalidate_cache_key`'s allowlisted prefixes so
-# the compensator can actually clear anything this hook writes. Mirror
-# of `backend/app/mcp/tools/actions/invalidate_cache_key.py::_ALLOWED_PREFIXES`.
+# Mirrors `invalidate_cache_key`'s allowlist so the compensator can
+# clear anything this hook writes.
 _ALLOWED_PREFIXES = ("cache:", "jobs:cache:", "read_model:")
 
-# Carved back out of `cache:` above (R2-20). The allowlist is inherited
-# from the *compensator*, and the compensator is deliberately allowed to
-# reach the live per-job read cache — an agent force-refreshing a stale
-# job read needs exactly that. Write access is the asymmetric half: this
-# hook's payload is a JSON array of fabricated IDs, and
-# `cache:job:{tenant}:{job}` is read through `JobResponse.model_validate`
-# on the `GET /jobs/{id}` hot path. A hook aimed at a fixture key could
-# therefore break a real user-facing read for the whole TTL, in a
-# namespace the reset did not sweep.
-#
-# Deny-inside-allow rather than a narrower allowlist: the subset
-# invariants in `tests/unit/test_cache_key_allowlist.py` are stated over
-# `_ALLOWED_PREFIXES`, and they should keep meaning "the compensator can
-# undo anything we write". Kept as a literal for the same reason the
-# other tuples are (it is baked into the tool's schema text), with
-# `test_chaos_hook_cannot_write_the_live_job_read_cache` importing
-# `JobCache._key` so a rename breaks the test instead of silently
-# unguarding the namespace.
+# Carved back out of `cache:` (R2-20): `cache:job:{tenant}:{job}` is the live
+# per-job read cache behind `GET /jobs/{id}`, which this hook's JSON array
+# would break for the whole TTL. Deny-inside-allow keeps the subset invariants
+# in `test_cache_key_allowlist.py` meaningful;
+# `test_chaos_hook_cannot_write_the_live_job_read_cache` imports `JobCache._key`.
 _FORBIDDEN_PREFIXES = ("cache:job:",)
 
 
@@ -77,10 +44,8 @@ def _key_admitted(key: str) -> bool:
 
 class CreateStaleCacheError(AppError):
     status_code = 400
-    # One refusal code for both halves of `_key_admitted`, matching the
-    # precedent `get_cache_key_info` sets against `invalidate_cache_key`:
-    # it is the same "this key is not yours to touch" decision, so a
-    # caller can handle it uniformly. The message says which half fired.
+    # One code for both halves of `_key_admitted`; the message says which
+    # half fired.
     error_code = "stale_cache_key_forbidden"
 
 

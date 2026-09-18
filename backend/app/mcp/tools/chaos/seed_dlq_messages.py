@@ -1,34 +1,10 @@
-"""
-`seed_dlq_messages` — create N DLQ rows with declared types and hints.
+"""`seed_dlq_messages` — create N DLQ rows with declared types and hints.
 
-Platform half of commander ADR 0010 (scenario-owned DLQ fixtures). The
-standing 4-row fixture pool was an attractive nuisance: always present,
-always plausible, never the scenario's subject. Three campaign runs in
-one night pivoted onto it when their real subject was absent. The fix
-is that a scenario needing DLQ content *declares* it, the same way
-chaos faults are already declared.
-
-Why this lives under chaos rather than as a plain seed helper: it
-writes `dead_letter` rows into a live database. That is fault
-injection whatever we call it, so it inherits the triple gate from
-[ADR 0008](../../../../docs/ADR/0008-chaos-gating.md) —
-`CHAOS_ENABLED` + `chaos:invoke` + blast-radius check — and can
-therefore never fire in production.
-
-Rows are tagged `payload.seeded_fixture = true` so the reset sweep can
-DELETE them rather than cancel them: they are explicitly ephemeral
-scaffolding declared by a scenario, and leaving thousands of `cancelled`
-rows behind across eval runs would be litter, not history.
-
-This paragraph used to add "chaos rows created by `create_bad_data_job`
-are *cancelled* on sweep because they may be attached to a real user and
-read as that user's history". That stopped being true in v0.6.2, when
-that hook gained a deterministic, scenario-pinned id (WO-R2-158) and
-became a declared fixture like these — it now writes the same marker and
-is DELETEd by the same sweep. The disposal rule turns on whether a row was
-*declared*, not on who happens to own it: `create_stuck_dag` has always
-tagged the marker while resolving its owner through `_fixture_owner`
-below, which prefers a real user in the tenant.
+Platform half of commander ADR 0010: a scenario declares the DLQ content it is
+graded against instead of pivoting onto a standing pool. Writing `dead_letter`
+rows into a live database is fault injection, so it lives under chaos and
+inherits ADR 0008's triple gate. Rows carry `payload.seeded_fixture = true`, so
+the reset sweep DELETEs them rather than leaving `cancelled` litter.
 """
 
 import uuid
@@ -47,49 +23,29 @@ from sqlalchemy import select
 
 logger = get_logger(__name__)
 
-# Marker the reset sweep DELETEs on. Written by every hook that creates a
-# *declared* fixture — this one, `create_stuck_dag`, `create_bad_data_job`
-# — and imported from here by all of them so there is one spelling.
-# `chaos_fixture` is a different key with a different job: provenance ("which
-# hook wrote this row"), not disposal. Every hook that writes a DLQ row with a
-# scenario-pinnable id carries both — `seed_dlq_messages`, `create_stuck_dag`,
-# `create_bad_data_job`, and since v0.6.3 `poison_message` and
-# `create_mislabeled_dlq_job`. `poison_message` used to be the counter-example
-# here (provenance only, so cancelled rather than deleted); it gained a
-# declared `fixture_name` with WO-R2-166 and moved into the DELETE sweep with
-# it. See the module docstring for why declaration is the line.
+# Marker the reset sweep DELETEs on, imported from here by every hook that
+# writes a declared fixture so there is one spelling. `chaos_fixture` is a
+# different key: provenance ("which hook wrote this"), not disposal.
 SEEDED_FIXTURE_MARKER = "seeded_fixture"
 
-# Canned error strings per hint used to be a dict right here, and it
-# paired `replay_safe` with a SchemaValidationError. A missing required
-# field is permanent, so an agent that read the row correctly refused to
-# replay it — and the scenario graded that refusal as a failure
-# (WO-R2-146, live run efdc3b2a9864). The hint was the only truth in the
-# lab and nothing on the wire said so.
-#
-# The strings now come from `app.lab.dlq_failure_stories`, one table
-# shared with the sibling hooks and with `scripts/seed_eval_fixtures.py`,
-# whose pairings are checked by `tests/unit/test_dlq_text_coherence.py`.
+# Error strings come from `app.lab.dlq_failure_stories`, one table shared with
+# the sibling hooks and the seed script, whose pairings
+# `tests/unit/test_dlq_text_coherence.py` checks. They used to be a dict here
+# that paired `replay_safe` with a permanent fault (WO-R2-146, efdc3b2a9864).
 
 
 class SeedDlqHintError(AppError):
     """An unknown `remediation_hint` reached the handler body.
 
-    The `Literal` on the input model should make this unreachable over
-    MCP — it exists so a *direct* Python caller (the seed script, a
-    test) still gets a typed refusal rather than the bare `ValueError`
-    the handler used to render as `-32603 internal tool error` with an
-    `mcp tool crashed` log line (R2-16)."""
+    Unreachable behind the input `Literal`; it exists so a direct caller
+    gets a typed refusal, not R2-16's `-32603`."""
 
     status_code = 400
     error_code = "unknown_remediation_hint"
 
 
-# Spelled out rather than derived from `RemediationHint`, because these
-# strings are baked verbatim into the tool's inputSchema — the agent
-# reads them there and nowhere else, so a change must be visible in this
-# file's diff. `test_seed_dlq_hint_literal_matches_the_enum` fails if the
-# enum ever gains or loses a member.
+# Spelled out, not derived from `RemediationHint`: these strings are baked into
+# the inputSchema. `test_seed_dlq_hint_literal_matches_the_enum` guards drift.
 _HINT_VALUES = Literal["replay_safe", "wait_and_replay", "human_required"]
 
 
@@ -191,11 +147,8 @@ async def seed_dlq_messages(
 
 
 def _validated_hint(raw: str) -> str:
-    """Reject an unknown hint loudly rather than writing a row the
-    agent's category filters would silently never match.
-
-    Defence in depth behind the input model's `Literal` — see
-    `SeedDlqHintError` for why the exception type matters."""
+    """Reject an unknown hint rather than write a row no filter matches.
+    `SeedDlqHintError` says why the type matters."""
     try:
         return RemediationHint(raw).value
     except ValueError:
@@ -206,13 +159,8 @@ def _validated_hint(raw: str) -> str:
 
 
 async def _fixture_owner(ctx: ToolContext, tenant_id: uuid.UUID) -> User:
-    """Any real user in the caller's tenant satisfies the Job FK.
-
-    Deliberately reuses `create_bad_data_job`'s chaos-owner fallback
-    rather than duplicating it, so both hooks lazy-create the same
-    recognisable user on an unseeded tenant and the existing
-    chaos-owner cleanup reaches both.
-    """
+    """Any real user in the caller's tenant satisfies the Job FK; reuses
+    `create_bad_data_job`'s chaos-owner fallback so one cleanup covers both."""
     from app.mcp.tools.chaos.create_bad_data_job import _ensure_chaos_owner
 
     user = (
