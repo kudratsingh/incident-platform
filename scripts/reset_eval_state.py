@@ -23,6 +23,33 @@ What gets cleared/reset:
      (`search_traces(since_hours=...)` and friends) don't watch the
      seeded world go stale as the stack ages. Only stable() fixture
      rows are shifted; relative spacing between them is preserved.
+
+     **What this step does NOT restore: the seeded DAG trio's statuses.**
+     `dag-parent-job` (completed) → `dag-seed-job` (waiting) →
+     `dag-child-job` (waiting) is seeded as a three-node DAG, and it is
+     **drained on first boot**: the parent is `completed`, so the
+     dependency resolver — or the resume sweep, within ~10 s — promotes
+     both children and they run to `completed` long before any scenario
+     probes them. The re-anchor above then re-stamps their four timestamp
+     columns from `_dag_specs()`, whose `run_seconds` is `None` for those
+     two rows, so it writes NULL `started_at`/`completed_at` onto rows
+     that are by then `completed`. That mismatch is known and left alone;
+     no tool output reads those two columns for these rows.
+
+     Restoring the statuses here is the tempting repair and it is wrong:
+     this reset clears `chaos:*` in step 1 *before* it gets here, and the
+     resume sweep ticks every 10 s, so a row put back to `WAITING` behind
+     a `COMPLETED` parent **races the resume sweep** that is about to
+     promote it again — the outcome would depend on where in that window
+     the reset landed. **A stranded chain comes from the chaos hook
+     instead:** `create_stuck_dag(root_status="completed")` writes
+     upstream/root `completed` with the descendants `waiting` and no
+     dead-letter row, and its rows are disposed of by step 4. Held
+     stranded by `kill_consumer('dependency-resolver')` plus
+     `pause_control_loop('resume_unblocked_waiting')` — see
+     [ADR 0029](../docs/ADR/0029-stranded-chain-and-lab-pause-are-manufactured.md)
+     and ADR 0027's 2026-09-17 amendment. Pinned by
+     `backend/tests/unit/test_stranded_chain_and_lab_pause.py`.
   3. **Tier-1 action residue** — pending delayed-replay timers on the
      `jobs:dlq_replay_delayed` ZSET, and any `dag:paused:*` flag. Both
      are effects the *agent* left behind rather than chaos state, and
@@ -33,6 +60,18 @@ What gets cleared/reset:
      (`kafka:consumer_lag:worker-dispatcher:samples`) goes with them: it
      is not the agent's residue but it bleeds the same way, showing the
      next run a lag trend measured during the previous one.
+
+     **One `dag:paused:*` flag is now the lab's, not the agent's.** The
+     `pause_dag_chaos` hook (WO-R3-275, ADR 0029) writes the same key
+     `pause_dag` writes, deliberately — a pause a scenario sets has to
+     read back through `get_dag_state` exactly as an operator's would, so
+     it cannot wear a `chaos:` name and cannot be reached by the
+     `chaos:*` scan in step 1. `_clear_dag_pauses` is therefore the
+     teardown for that hook as well as for the agent's own pauses, and
+     `dag_pauses_cleared` in the summary counts both without
+     distinguishing them. A leftover pause after a run is no longer
+     evidence that the agent acted; check the `chaos.tool_invoked` audit
+     stream for that.
   4. **Declared fixtures and non-fixture DLQ rows** — two disposal
      classes, deliberately different (ADR 0012 rule 2). A row a scenario
      *declared* for itself carries the top-level `seeded_fixture` payload

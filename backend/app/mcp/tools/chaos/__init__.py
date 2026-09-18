@@ -16,6 +16,7 @@ from app.mcp.tools.chaos import (  # noqa: F401
     inject_latency,
     kill_consumer,
     pause_control_loop,
+    pause_dag_chaos,
     poison_message,
     saturate_redis,
     seed_dlq_messages,
