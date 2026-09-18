@@ -256,3 +256,18 @@ belongs to a packet that asks for one. Recorded as a follow-up.
 - **Keep the three consumer groups in the enum as aliases for `kill_consumer`.**
   Rejected: two key patterns for one effect, and the reset would have to sweep
   both. The refusal is the better teacher.
+
+## Amendment, 2026-09-17 — owner decision O-23: retain all eleven members
+
+The enum remains at eleven members. A member's presence means the platform has
+one verified, bounded pause mechanism for that loop; it does not commit the
+evaluation corpus to a scenario for every member. Scenarios are added only for
+loops with a contrast family. The first families are outbox relay, dependency
+resolver, saga coordinator, and read model; unused members remain available
+until a later family needs one.
+
+Dependency resolver, saga coordinator, and read model are consumer groups, so
+their scenarios stop them with `kill_consumer`. Where a family also needs a
+background-loop absence, it combines that stop with the appropriate
+`pause_control_loop` pause, including the resume sweep for a stranded `WAITING`
+child. This keeps the runtime kinds and their teardown keys explicit.

@@ -16,6 +16,7 @@ An archive listed as *transcript only* means the raw session data is on disk und
 
 | Date | Archive | What this session established |
 |---|---|---|
+| 2026-09-17 | — | **WO-R3-272:** ADR 0027 records owner decision O-23: retain the verified eleven-member pause enum while adding scenarios only for contrast families; consumer-group families use `kill_consumer` with a loop pause where needed. |
 | 2026-08-08 → 08-10 | *transcript only* | **The audit.** Platform's half of 129 defects across both repos. `AUDIT_REPORT.md` at the workspace root. |
 | 2026-08-10 → 08-12 | *transcript only* | **The fix campaign and v0.5.0.** Platform work orders merged, tag cut, image published. Tool surface went 26 → 27 tools; the rebless diff was verified to the leaf as exactly 10 scalar deltas and zero structural changes. |
 | 2026-08-12 | *transcript only* | **ECS deploy gated** (PR #96). The deploy job now requires `master` + `push` + `vars.ENABLE_ECS_DEPLOY == 'true'`, so a fork or a stray branch cannot reach the cluster. |
