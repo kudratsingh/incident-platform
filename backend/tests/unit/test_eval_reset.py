@@ -373,11 +373,12 @@ def test_every_chaos_key_helper_lives_under_the_chaos_namespace() -> None:
     from app.workers.async_tasks import downstream_flag_key
     from app.workers.control_loop_pause import pause_key_for
     from app.workers.db_pool_hold import hold_key
+    from app.workers.db_slow_query import slow_query_key
     from app.workers.kafka_consumer import kill_key_for, latency_key_for
 
-    # The last two take no argument — one key each, which is what makes a repeat call replace the
-    # state rather than stack a second one (ADR 0031).
-    for nullary in (hold_key, downstream_flag_key):
+    # The last three take no argument — one key each, which is what makes a repeat call replace the
+    # state rather than stack a second one (ADR 0031, ADR 0034).
+    for nullary in (hold_key, downstream_flag_key, slow_query_key):
         assert fnmatch.fnmatch(nullary(), "chaos:*"), (
             f"{nullary.__name__} produces a key outside chaos:* — either move "
             "it back under that namespace or add a pattern for it"

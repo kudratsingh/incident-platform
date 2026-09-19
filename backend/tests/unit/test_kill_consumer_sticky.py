@@ -563,13 +563,14 @@ def test_the_shape_deltas_are_exactly_these(chaos_registered: None) -> None:
 def test_the_chaos_surface_does_not_grow(
     whole_chaos_surface_registered: None,
 ) -> None:
-    """A flag, not a fourteenth-plus tool: `tools/list` gains no name, so the tool-level rebless
-    delta for this packet is empty and the whole delta is field-level."""
+    """A flag, not another tool: `tools/list` gains no name, so the tool-level rebless delta for
+    this packet is empty and the whole delta is field-level. The chaos half moved to 15 after it,
+    with WO-R3-218's `slow_db_queries`."""
     chaos_names = {
         t.name for t in list_tools() if t.required_scope == Scope.CHAOS_INVOKE
     }
     assert "kill_consumer" in chaos_names
-    assert len(chaos_names) == 14, sorted(chaos_names)
+    assert len(chaos_names) == 15, sorted(chaos_names)
     assert not [n for n in {t.name for t in list_tools()} if "sticky" in n]
 
 
