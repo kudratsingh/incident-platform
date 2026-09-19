@@ -1,17 +1,4 @@
-"""The Locust load suite must only submit job types the API accepts.
-
-``_JOB_TYPES`` in backend/tests/load/locustfile.py is derived from
-``app.models.enums.JobType``; this test pins the two together so the list
-can never again drift from the enum (three of four hardcoded entries once
-failed validation with 422 on every submission, voiding the load numbers).
-
-The locustfile is loaded via ``importlib.util.spec_from_file_location`` in
-a child interpreter rather than in-process: importing ``locust`` runs
-gevent's ``monkey.patch_all()``, which would irreversibly patch
-socket/ssl/threading in this pytest process and destabilise the
-asyncio-based API tests that run later in the suite. The child also
-mirrors real usage — ``locust -f`` loads the file in a fresh interpreter.
-"""
+"""The Locust load suite must only submit job types the API accepts."""
 
 import json
 import subprocess

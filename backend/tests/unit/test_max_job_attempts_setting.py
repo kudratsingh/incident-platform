@@ -57,12 +57,7 @@ def test_setting_is_read_from_the_environment(attempts_of) -> None:  # type: ign
 def test_directly_inserted_job_takes_the_ceiling_from_the_setting(
     attempts_of,  # type: ignore[no-untyped-def]
 ) -> None:
-    """The `jobs.max_attempts` column default used to be a hardcoded 3.
-
-    This covers every writer that does not go through `JobService` — the
-    chaos hooks, the eval seeds, the saga steps — so the knob governs
-    them too rather than only the REST creation path.
-    """
+    """The `jobs.max_attempts` column default used to be a hardcoded 3."""
     attempts_of(1)
     job = Job(
         tenant_id=uuid.uuid4(),
@@ -82,10 +77,7 @@ def test_directly_inserted_job_takes_the_ceiling_from_the_setting(
 async def test_create_job_takes_the_ceiling_from_the_setting(
     attempts_of,  # type: ignore[no-untyped-def]
 ) -> None:
-    """`JobService.create_job` had its own `max_retries: int = 3`.
-
-    An explicit argument still wins — the saga coordinator sets a
-    per-step ceiling — but the default now comes from the setting."""
+    """`JobService.create_job` had its own `max_retries: int = 3`."""
     from tests.unit.test_job_service import _make_service
 
     attempts_of(2)
@@ -113,19 +105,13 @@ async def test_create_job_takes_the_ceiling_from_the_setting(
 async def test_ceiling_of_one_dead_letters_on_the_first_failure(
     attempts_of,  # type: ignore[no-untyped-def]
 ) -> None:
-    """The operator-visible end of the knob.
-
-    With the ceiling at 1 the dispatcher must dead-letter the first time
-    a job fails, instead of scheduling a delayed retry — one run, no
-    retries. At HEAD before WO-R2-76 the row carried 3 no matter what the
-    environment said, so this job would have been retried twice more."""
+    """The operator-visible end of the knob."""
     from app.models.job import _default_max_attempts
     from tests.unit.test_dispatcher import _make_job, _make_session_factory
 
     attempts_of(1)
     # Deliberately not the literal 1: the ceiling comes from the same
     # resolver a real INSERT uses, so this closes the chain from the
-    # environment variable through to the dispatcher's decision.
     job = _make_job(
         type=JobType.BULK_API_SYNC,
         retry_count=0,
@@ -153,11 +139,7 @@ async def test_ceiling_of_one_dead_letters_on_the_first_failure(
 
 
 def test_the_ceiling_has_exactly_one_source(attempts_of) -> None:  # type: ignore[no-untyped-def]
-    """No second literal may drift away from the setting.
-
-    The two former duplicates both resolve through `Settings`, so moving
-    the knob moves them together — which is the property the three
-    scattered `3`s could not offer."""
+    """No second literal may drift away from the setting."""
     from app.models.job import _default_max_attempts
     from app.services import job as job_service
 
@@ -170,15 +152,8 @@ def test_the_ceiling_has_exactly_one_source(attempts_of) -> None:  # type: ignor
         assert Job.__table__.c.max_attempts.default.arg(None) == value
 
 
-# ---------------------------------------------------------------------------
 # WO-R2-172: the deprecated `MAX_JOB_RETRIES` alias
-# ---------------------------------------------------------------------------
-#
 # `Settings` is constructed directly here rather than through
-# `get_settings()` + monkeypatched env, because what is under test is how
-# the model resolves two names — and `Settings(...)` records exactly which
-# fields the caller (or the environment) actually set, which is the signal
-# the validator reads. Both paths reach the same validator.
 
 
 def test_new_name_alone_is_the_plain_case() -> None:
@@ -187,12 +162,7 @@ def test_new_name_alone_is_the_plain_case() -> None:
 
 
 def test_old_name_alone_still_sets_the_ceiling() -> None:
-    """A deployment that set `MAX_JOB_RETRIES=5` must keep five runs.
-
-    Dropping the alias silently would revert it to the default 3 on the
-    release that renamed the knob — the one failure a rename must not
-    cause, because it changes behaviour while claiming not to.
-    """
+    """A deployment that set `MAX_JOB_RETRIES=5` must keep five runs."""
     settings = Settings(max_job_retries=5)
     assert settings.max_job_attempts == 5
 
@@ -231,12 +201,7 @@ def test_both_names_set_to_the_same_value_is_allowed() -> None:
 
 
 def test_both_names_set_and_disagreeing_refuses_to_start() -> None:
-    """There is no defensible winner, so the process must not pick one.
-
-    Choosing either value runs every job a different number of times than
-    half the configuration asked for, and the operator finds out from a
-    dead-letter rather than from a message.
-    """
+    """There is no defensible winner, so the process must not pick one."""
     with pytest.raises(ValueError) as exc:
         Settings(max_job_attempts=5, max_job_retries=3)
     message = str(exc.value)
@@ -248,12 +213,7 @@ def test_both_names_set_and_disagreeing_refuses_to_start() -> None:
 def test_the_alias_reaches_the_column_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """End to end through the environment, the way an operator sets it.
-
-    The alias is only worth having if it reaches the place the ceiling is
-    actually stamped — otherwise it is a setting nothing reads, which is
-    the exact shape of the WO-R2-76 bug this file opened with.
-    """
+    """End to end through the environment, the way an operator sets it."""
     from app.models.job import _default_max_attempts
 
     get_settings.cache_clear()

@@ -1,19 +1,4 @@
-"""
-Unit tests for BaseKafkaConsumer's offset-commit discipline (E1-01).
-
-First-ever unit tests for the base consumer — the absence of this file is
-why E1-01 (argument-less commit() committing every assigned partition's
-fetch position) survived. The contract under test:
-
-  - every commit names an explicit ``{TopicPartition: offset + 1}`` for
-    exactly the processed message's partition — never the argument-less
-    ``commit()`` that snapshots all-partition fetch positions
-  - a handler failure commits nothing, seeks back to the failed offset, and
-    abandons the REST of that partition's batch; other partitions continue
-  - poison pills (schema-invalid) are committed past, per-partition
-  - a failed seek-back (partition reassigned during a rebalance) is
-    swallowed with a warning — the consume loop survives the race
-"""
+"""Unit tests for BaseKafkaConsumer's offset-commit discipline (E1-01)."""
 
 from __future__ import annotations
 
@@ -35,18 +20,7 @@ SYNTHETIC_TOPIC = "test.topic"
 
 @pytest.fixture(autouse=True)
 def register_synthetic_topic(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Give `test.topic` a permissive schema for the duration of each test.
-
-    This module is about commit and seek discipline, not about validation:
-    the payloads are `{"n": offset}` and the point is which offsets get
-    committed. It used to work because `validate()` silently no-opped for any
-    unregistered topic, which is precisely the behaviour WO-R2-62 removed —
-    an unmapped topic now raises, and `_process_one` would treat every record
-    here as a poison pill and commit past it, testing nothing.
-
-    Registering the topic explicitly says that out loud. The poison-pill tests
-    below still patch `validate_schema` to raise, so the path stays covered.
-    """
+    """Give `test.topic` a permissive schema for the duration of each test."""
     monkeypatch.setitem(
         schema_registry._VALIDATORS,
         SYNTHETIC_TOPIC,

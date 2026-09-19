@@ -1,11 +1,4 @@
-"""Unit tests for the advisory-lock leader gate (`app.core.leader_lock`).
-
-These pin the *contract* — one connection for the lock's whole lifetime,
-release on the way out, never hand a possibly-locked connection back to
-the pool. They cannot prove mutual exclusion: SQLite has no advisory
-locks and the unit tier is one process. That proof is
-`backend/tests/integration/test_outbox_relay_concurrency.py`.
-"""
+"""Unit tests for the advisory-lock leader gate (`app.core.leader_lock`)."""
 
 from types import SimpleNamespace
 from typing import Any
@@ -51,12 +44,7 @@ class _FakeConn:
 
 
 class _FakeEngine:
-    """Postgres-shaped engine that mints a fresh connection per connect().
-
-    Minting a new object each time is the point: if the gate ever checked
-    out a second connection to release on, `conns` would have two entries
-    and the "same connection" assertion below would catch it.
-    """
+    """Postgres-shaped engine that mints a fresh connection per connect()."""
 
     def __init__(self, acquired: bool = True, release_error: Exception | None = None) -> None:
         self.dialect = SimpleNamespace(name="postgresql")
@@ -88,9 +76,7 @@ def pg_gate(monkeypatch: pytest.MonkeyPatch):  # type: ignore[no-untyped-def]
     return _make
 
 
-# ---------------------------------------------------------------------------
 # The connection-scoping contract — THE trap this module exists to contain
-# ---------------------------------------------------------------------------
 
 
 async def test_acquire_and_release_run_on_one_pinned_connection(pg_gate: Any) -> None:
@@ -163,9 +149,7 @@ async def test_failed_release_invalidates_instead_of_pooling_the_connection(
     assert engine.conns[0].invalidated == 1
 
 
-# ---------------------------------------------------------------------------
 # Engine resolution + the non-Postgres no-op
-# ---------------------------------------------------------------------------
 
 
 @pytest_asyncio.fixture

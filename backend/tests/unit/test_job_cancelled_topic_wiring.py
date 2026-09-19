@@ -1,17 +1,4 @@
-"""`job.cancelled` is wired end to end: setting, schema, and four consumers.
-
-CANCELLED was the only terminal status with no lifecycle event (WO-R2-113).
-The consequence was not that "an event was missing" in the abstract — it was
-that every consumer of the terminal lifecycle went on believing the previous
-state forever: the CQRS read model kept the id in its `running` set, the event
-log had no row to show on the timeline, the SSE stream never closed, and the
-audit trail recorded a job that simply stopped.
-
-These tests pin the wiring rather than the behaviour (each consumer's own
-suite pins that): a topic nobody subscribes to is exactly as silent as no
-topic at all, and the subscription list is the one part of the chain that no
-behavioural test exercises — `handle_message` is always called directly.
-"""
+"""`job.cancelled` is wired end to end: setting, schema, and four consumers."""
 
 import json
 from pathlib import Path
@@ -69,15 +56,7 @@ def test_the_cancelled_schema_allows_additional_properties() -> None:
     "missing", ["event", "tenant_id", "job_id", "user_id", "job_type", "reason"]
 )
 def test_the_required_fields_are_required(missing: str) -> None:
-    """Each field, removed on its own from an otherwise complete payload.
-
-    Matched on the field name rather than on the exception type, to the
-    standard #191 set: `validate` raises `UnknownTopicError` — a
-    `SchemaValidationError` subclass — for a topic with no schema at all, so
-    a bare `pytest.raises` here passed before the topic existed and would go
-    on passing if the schema file were deleted tomorrow. The name in the
-    message is what ties the assertion to the field it claims to be about.
-    """
+    """Each field, removed on its own from an otherwise complete payload."""
     payload = _cancelled_payload()
     del payload[missing]
     with pytest.raises(schema_registry.SchemaValidationError, match=missing):
