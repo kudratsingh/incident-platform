@@ -200,6 +200,17 @@ export interface PlatformPhaseReading {
   metricKnown: boolean
 }
 
+/**
+ * When the lab last injected a fault, by the platform's own clock.
+ *
+ * Exported because the page needs it BEFORE it can decide whether a breach has
+ * been observed — the breach latch is per-fault, so a second take in one session
+ * starts clean rather than inheriting the first take's recovery.
+ */
+export function newestFaultAt(audit: AuditLog[]): string | null {
+  return newest(audit.filter(isLabRow))?.created_at ?? null
+}
+
 export function platformPhase(input: PlatformPhaseInput): PlatformPhaseReading {
   const { audit, metricKnown, metricInsideThreshold, metricBreachedSinceFault } = input
   const fault = newest(audit.filter(isLabRow))

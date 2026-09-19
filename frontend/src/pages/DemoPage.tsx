@@ -51,6 +51,7 @@ import {
   derivePhase,
   dlqDecision,
   isDemoMode,
+  newestFaultAt,
   phaseTimeline,
   toolCall,
 } from '../utils/demoPhase'
@@ -1134,22 +1135,19 @@ export default function DemoPage() {
   const metricValue = mode === 'consumer_outage' ? lagValue : dlqDepth
   const metricInside =
     metricValue !== null ? metricValue <= metric.threshold : false
-  // Recovery needs a breach to have happened first — the reading is inside its
-  // threshold both before the fault lands and after it is fixed. Latched here
-  // rather than computed from timestamps, and reset whenever a NEW fault row
-  // appears, so a second take in the same session starts clean.
-  const phaseNoRun = useMemo(
-    () =>
-      derivePhase({
-        run: null,
-        audit: auditRows,
-        metricKnown,
-        metricInsideThreshold: false,
-        metricBreachedSinceFault: false,
-      }),
-    [auditRows, metricKnown],
-  )
-  const faultAt = phaseNoRun.platform.faultAt
+  // Recovery needs a breach to have happened FIRST. The reading is inside its
+  // threshold both before the fault lands and after it is fixed, so "inside the
+  // bar" on its own would flash `recovered` during the seconds between injecting
+  // the fault and it becoming visible — a lie about the one moment the recording
+  // exists for (docs/DEMO.md spells this out).
+  //
+  // Latched rather than derived from timestamps, because the samples are the
+  // browser's and the fault time is the platform's. Reset whenever a NEW fault
+  // row appears, so a second take in one session does not inherit the first
+  // take's recovery. Mutating the ref during render is safe here: the update is
+  // idempotent, schedules nothing, and the render that flips it already reads
+  // the flipped value.
+  const faultAt = useMemo(() => newestFaultAt(auditRows), [auditRows])
   const breach = useRef<{ faultAt: string | null; seen: boolean }>({
     faultAt: null,
     seen: false,

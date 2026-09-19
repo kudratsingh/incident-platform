@@ -275,6 +275,11 @@ services:
       dockerfile: Dockerfile
     ports:
       - "3000:80"
+    environment:
+      # This compose file's backend service is `app`; the console image's
+      # default is `api`, which is what the commander's demo compose calls it.
+      # One image, two stacks, one variable (frontend/nginx.conf.template).
+      API_UPSTREAM: http://app:8000
     depends_on:
       - app
 
