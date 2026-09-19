@@ -93,9 +93,7 @@ async def test_get_discards_a_payload_that_is_not_json() -> None:
     assert await JobCache.get(redis, _JOB_ID, _TENANT_ID) is None
 
 
-# ---------------------------------------------------------------------------
 # invalidate — the post-commit tombstone (R2-23)
-# ---------------------------------------------------------------------------
 
 
 async def test_set_refuses_to_overwrite_an_occupied_slot() -> None:
