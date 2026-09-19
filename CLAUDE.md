@@ -252,7 +252,9 @@ Notably **not** granted, to either principal: `actions:propose`. Tier-2 actions 
 
 ### Frontend
 - **React + Vite + TypeScript + Tailwind**
-- Nine pages: `LoginPage`, `RegisterPage`, `DashboardPage` (job list + create form), `JobDetailPage` (live SSE progress + Kafka event timeline), `AdminPage` (overview / jobs / DLQ / runbooks / users / tenants / digests / audit tabs), `AdminTenantDetailPage` (per-tenant drill-down), `SagasPage` / `SagaNewPage` / `SagaDetailPage` (multi-step workflow management).
+- Ten pages: `LoginPage`, `RegisterPage`, `DashboardPage` (job list + create form), `JobDetailPage` (live SSE progress + Kafka event timeline), `AdminPage` (overview / jobs / DLQ / runbooks / users / tenants / digests / audit tabs), `AdminTenantDetailPage` (per-tenant drill-down), `SagasPage` / `SagaNewPage` / `SagaDetailPage` (multi-step workflow management), `DemoPage` (`/demo`, support+ — the live-demo screen; see [`docs/DEMO.md`](docs/DEMO.md)).
+- Three live-data patterns, and they are not interchangeable: `useJobStream` (SSE, one job), `useAsyncData` (one load, with the loading/error/empty states a list page must not confuse), and `usePolling` (`useAsyncData` on a timer — the /demo panels at 2s and the Audit tab at 5s). A polled panel keys its skeleton off `loading && data === null`, because `loading` goes true on every tick.
+- The console also ships as its own image, `ghcr.io/<owner>/incident-platform-console`, published by `release.yml` on the same version as the backend. Its nginx config is a template whose `/api/` upstream is `${API_UPSTREAM}` (default `http://api:8000`), so one image serves this repo's compose (service `app`) and the commander's demo compose (service `api`).
 - Shared components: `Layout`, `StatusBadge`, `ProgressBar`, `TraceId`, `Toast`, `JobForm`, `ProtectedRoute`, `ErrorBoundary`, `Skeleton`.
 
 ### Infrastructure
@@ -828,7 +830,9 @@ Deferred until the incident-commander agent is wired up and driving eval scenari
 │
 ├── frontend/
 │   ├── Dockerfile                  # Node build → Nginx
-│   ├── nginx.conf                  # SPA serving, no proxy (ALB handles /api/)
+│   ├── nginx.conf.template         # SPA serving + /api/ proxy to ${API_UPSTREAM}
+│   │                               # (rendered at container start; the ALB
+│   │                               # handles /api/ in prod, so it is inert there)
 │   ├── package.json
 │   ├── tsconfig.json
 │   ├── vite.config.ts
@@ -845,11 +849,12 @@ Deferred until the incident-commander agent is wired up and driving eval scenari
 │       │   ├── AdminTenantDetailPage.tsx  # per-tenant drill-down (platform admin)
 │       │   ├── SagasPage.tsx
 │       │   ├── SagaNewPage.tsx
-│       │   └── SagaDetailPage.tsx
+│       │   ├── SagaDetailPage.tsx
+│       │   └── DemoPage.tsx        # the live-demo screen (support+); docs/DEMO.md
 │       ├── components/             # Layout, StatusBadge, ProgressBar, Toast, TraceId, JobForm, …
-│       ├── hooks/                  # useAuth, useJobStream (SSE)
+│       ├── hooks/                  # useAuth, useJobStream (SSE), useAsyncData, usePolling
 │       ├── api/                    # client.ts, auth.ts, jobs.ts, sagas.ts, admin.ts
-│       └── utils/                  # tokens, format (status colors, job-type labels)
+│       └── utils/                  # tokens, format (status colors, job-type labels), demoPhase
 │
 ├── infra/                          # Terraform — full AWS stack
 │   ├── main.tf                     # provider, backend config

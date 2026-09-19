@@ -1,11 +1,15 @@
 import { api } from './client'
 import type {
+  AgentRun,
   AuditLog,
+  CircuitBreakersResponse,
+  ConsumerLagResponse,
   IncidentDigest,
   Job,
   JobTimeline,
   JobTriage,
   PaginatedResponse,
+  PlatformAlert,
   Runbook,
   SLOState,
   SystemStats,
@@ -19,6 +23,14 @@ export interface AdminJobListParams extends JobListParams {
   user_id?: string
   tenant_id?: string
 }
+
+/**
+ * How many rows the demo page asks for in one page.
+ *
+ * `/admin/agent-runs` and `/admin/alerts` are both `PaginatedResponse`, so they
+ * page like every other list here rather than answering with everything.
+ */
+const DEMO_PAGE_SIZE = 50
 
 export const adminApi = {
   listJobs: (params: AdminJobListParams = {}) => {
@@ -110,22 +122,72 @@ export const adminApi = {
     body: { rate_limit_per_minute?: number; quota_jobs_per_month?: number },
   ) => api.patch<Tenant>(`/admin/tenants/${id}`, body),
 
-  listAuditLogs: (
-    params: {
-      page?: number
-      job_id?: string
-      user_id?: string
-      action?: string
-      principal_type?: 'user' | 'service_account'
-    } = {},
-  ) => {
+  listAuditLogs: (params: AuditListParams = {}) => {
     const qs = new URLSearchParams()
     if (params.page) qs.set('page', String(params.page))
+    if (params.page_size) qs.set('page_size', String(params.page_size))
     if (params.job_id) qs.set('job_id', params.job_id)
     if (params.user_id) qs.set('user_id', params.user_id)
     if (params.action) qs.set('action', params.action)
+    // A whole stream (`agent.`, `chaos.`, `job.`), where `action` is one row's
+    // exact name. Added to the endpoint by WO-R3-313.
+    if (params.action_prefix) qs.set('action_prefix', params.action_prefix)
     if (params.principal_type) qs.set('principal_type', params.principal_type)
     const q = qs.toString()
     return api.get<PaginatedResponse<AuditLog>>(`/audit/logs${q ? `?${q}` : ''}`)
   },
+
+  // ── operator-only readings behind the /demo page (WO-R3-312) ──────────────
+
+  /**
+   * The agent runs the commander has reported (ADR 0035), newest first.
+   *
+   * `active=true` narrows to runs nobody has closed — the console's own query
+   * while a demo is running. The agent's principal cannot read any of this:
+   * there is no MCP tool for `agent_runs`, deliberately.
+   */
+  listAgentRuns: (params: { alert_id?: string; active?: boolean } = {}) => {
+    const qs = new URLSearchParams()
+    qs.set('page_size', String(DEMO_PAGE_SIZE))
+    if (params.alert_id) qs.set('alert_id', params.alert_id)
+    if (params.active !== undefined) qs.set('active', String(params.active))
+    return api.get<PaginatedResponse<AgentRun>>(`/admin/agent-runs?${qs.toString()}`)
+  },
+
+  getAgentRun: (id: string) => api.get<AgentRun>(`/admin/agent-runs/${id}`),
+
+  /**
+   * Every consumer group's lag in one reading.
+   *
+   * The whole response, not just `groups`: `live_group` names the one group
+   * whose number actually moves, and the others are recorded constants that a
+   * console should not present as live measurements.
+   */
+  consumerLag: () => api.get<ConsumerLagResponse>('/admin/consumer-lag'),
+
+  /**
+   * Breaker state as published in Redis (ADR 0030).
+   *
+   * The whole response, not just `breakers`: a breaker with no record is ABSENT
+   * from the list rather than reported closed, and an empty list with
+   * `unknown_reason` set is a different finding from an empty list without it.
+   * Returning the array alone would throw that distinction away.
+   */
+  circuitBreakers: () => api.get<CircuitBreakersResponse>('/admin/circuit-breakers'),
+
+  /** `active=true` is the agent's `list_active_alerts` view; omit it to see resolved ones too. */
+  listAlerts: (active = true) =>
+    api.get<PaginatedResponse<PlatformAlert>>(
+      `/admin/alerts?active=${String(active)}&page_size=${DEMO_PAGE_SIZE}`,
+    ),
+}
+
+export interface AuditListParams {
+  page?: number
+  page_size?: number
+  job_id?: string
+  user_id?: string
+  action?: string
+  action_prefix?: string
+  principal_type?: 'user' | 'service_account'
 }

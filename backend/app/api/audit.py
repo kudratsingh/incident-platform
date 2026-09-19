@@ -31,6 +31,7 @@ async def list_audit_logs(
         user_id=params.user_id,
         job_id=params.job_id,
         action=params.action,
+        action_prefix=params.action_prefix,
         principal_type=params.principal_type,
         tenant_id=effective_tenant,
     )

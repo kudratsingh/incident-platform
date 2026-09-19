@@ -81,6 +81,35 @@ export interface Job {
   created_at: string
   started_at: string | null
   completed_at: string | null
+
+  // ── Dead-letter detail (WO-R3-312, additive) ──────────────────────────────
+  // These five are populated for dead-lettered jobs and absent everywhere else,
+  // so they are optional here rather than nullable-required: a `Job` built from
+  // an older response, or from a non-DLQ list, simply does not carry them, and
+  // a required field would have made every existing caller wrong.
+  //
+  // `null` means "not known", never "no". A row with `remediation_hint: null`
+  // has not been categorised — it is emphatically NOT replay-safe (the
+  // platform's triage is off by default, so organic dead-letters stay null).
+  /** Coarse routing class set by triage or by a fence. See RemediationHint. */
+  remediation_hint?: string | null
+  /** When the job entered the DLQ — distinct from `completed_at`. */
+  dead_lettered_at?: string | null
+  /** Set when someone declared this row unreplayable. */
+  fenced_at?: string | null
+  /** Who fenced it (a principal name), not why. */
+  fenced_by?: string | null
+  /** The LLM triage row for this job, when one exists. */
+  triage?: JobTriageSummary | null
+}
+
+/** The part of a `job_triages` row the DLQ views need. */
+export interface JobTriageSummary {
+  root_cause_category: string | null
+  summary: string
+  suggested_fix?: string | null
+  is_retryable?: boolean | null
+  confidence?: number | null
 }
 
 export interface Saga {
@@ -231,6 +260,204 @@ export interface ProgressEvent {
   // wire. Absent on events published outside the consumer.
   source?: string
   sequence?: number | null
+}
+
+// ---------------------------------------------------------------------------
+// The agent's own run, as the platform records it (WO-R3-312, ADR 0035).
+//
+// The commander writes these over two `[commander: telemetry]` MCP tools; the
+// platform stores them; human operators read them here. The agent's own
+// principal cannot read any of it — the console is the only reader, which is
+// the whole point of ADR 0035.
+// ---------------------------------------------------------------------------
+
+/**
+ * The nine states, which are the commander's own `IncidentState` values —
+ * character for character, with no mapping layer on either side of the wire.
+ *
+ * That is deliberate (platform `AgentRunState`): a state the responder reaches
+ * cannot be lost in translation on its way to this console, and a member added
+ * in one repository and not the other is a refusal at the wire rather than a
+ * silently dropped state. Only `resolved` / `escalated` / `failed` close a run.
+ *
+ * The console still renders an unrecognised value verbatim rather than guessing
+ * a station for it, because this list can only ever be one release behind.
+ */
+export type AgentRunState =
+  | 'triage'
+  | 'investigating'
+  | 'planning'
+  | 'awaiting_approval'
+  | 'remediating'
+  | 'verifying'
+  | 'resolved'
+  | 'escalated'
+  | 'failed'
+
+/** One append-only entry of `phase_history`. */
+export interface AgentRunPhase {
+  state: AgentRunState
+  at: string
+}
+
+export interface AgentRunHypothesis {
+  name: string
+  category: string
+  confidence: number
+}
+
+export interface AgentRunStep {
+  kind: 'read' | 'action'
+  tool: string
+  at: string
+}
+
+/** One cause the run named (ADR 0065's slot shape). */
+export interface AgentBriefingSlot {
+  category: string
+  name: string
+  confidence: number
+  addressed: boolean
+}
+
+/**
+ * Primary / secondary / unresolved-extra, ADR 0065.
+ *
+ * `unresolved_extra` is the remainder: every cause the run still asserts and
+ * took no action on. A briefing card that dropped it would let the run look
+ * complete when it is not.
+ */
+export interface AgentBriefingSlots {
+  primary: AgentBriefingSlot | null
+  secondary: AgentBriefingSlot[]
+  unresolved_extra: AgentBriefingSlot[]
+}
+
+export interface AgentBriefingAction {
+  tool: string
+  arguments: Record<string, unknown>
+}
+
+/** The commander's `EscalationBriefing` dump, plus the writer's prose. */
+export interface AgentBriefing {
+  incident_id: string
+  final_state: string
+  alert_summary: string
+  escalation_reason?: string
+  attempted_action?: AgentBriefingAction | null
+  incidents?: AgentBriefingSlots
+  findings?: string
+  recommendation?: string
+  /** Present only when the run was enriched (live); null on a canned run. */
+  prose?: string | null
+}
+
+export interface AgentRun {
+  id: string
+  tenant_id: string
+  alert_id: string | null
+  /** The principal that wrote every report in this run. Always present. */
+  service_account_id: string
+  /**
+   * The responder's own short name for the run.
+   *
+   * The MCP write side calls this field `run_label`, because ADR 0012's registry
+   * screen bans the lab's word for it from a non-chaos tool's `tools/list`
+   * surface. It lands in `agent_runs.scenario` and reaches the console under
+   * that name — one wire name, two spellings, on purpose.
+   */
+  scenario: string | null
+  state: AgentRunState
+  phase_history: AgentRunPhase[]
+  current_hypothesis: AgentRunHypothesis | null
+  last_step: AgentRunStep | null
+  briefing: AgentBriefing | null
+  started_at: string
+  updated_at: string
+  finished_at: string | null
+  /** Computed server-side: `finished_at === null`. One fact, not two. */
+  active: boolean
+}
+
+// ---------------------------------------------------------------------------
+// Operator-only readings that used to exist only as MCP tools (WO-R3-312).
+// ---------------------------------------------------------------------------
+
+export interface LagSample {
+  lag: number
+  measured_at: string
+}
+
+/**
+ * One consumer group's lag.
+ *
+ * `lag_known: false` with `lag: null` is a real answer and must render as
+ * unknown-with-a-reason. Rendering it as 0 is the bug ADR 0030 is about: an
+ * absent reading is not a healthy one — hence `lag_unknown_reason`, which is
+ * null exactly when `lag_known` is true so a blank cell always has an
+ * explanation beside it.
+ *
+ * `recent_samples` arrives **newest first**, which any chart has to reverse.
+ * It is empty both for a group nothing measures and before the first window is
+ * recorded: an empty list is missing history, not a flat line.
+ */
+export interface ConsumerLagReading {
+  consumer_group: string
+  lag: number | null
+  lag_known: boolean
+  source: 'live' | 'static' | 'unrecognized'
+  lag_unknown_reason: string | null
+  measured_at: string | null
+  age_seconds: number | null
+  recent_samples: LagSample[]
+}
+
+export interface ConsumerLagResponse {
+  measured_at: string
+  groups: ConsumerLagReading[]
+  total: number
+  /** The one group whose number actually moves; the rest are recorded constants. */
+  live_group: string
+}
+
+export interface CircuitBreakerReading {
+  name: string
+  state: string
+  failure_count: number
+  failure_threshold: number
+  recovery_timeout_s: number
+  last_state_change_at: string | null
+  seconds_since_state_change: number | null
+  last_failure_at: string | null
+  last_failure_reason_class: string | null
+  recorded_at: string
+  /** Not a heartbeat: a large age on a closed breaker means nothing called it. */
+  reported_age_s: number
+}
+
+export interface CircuitBreakersResponse {
+  measured_at: string
+  breakers: CircuitBreakerReading[]
+  total: number
+  /**
+   * Set when the platform could say nothing at all. An empty list with this set
+   * is not the same finding as an empty list without it — so the console has to
+   * carry the whole response, not just the array.
+   */
+  unknown_reason: string | null
+}
+
+export interface PlatformAlert {
+  id: string
+  tenant_id: string
+  severity: string
+  source: string
+  title: string
+  description: string | null
+  fired_at: string
+  /** Null while the alert is active. */
+  resolved_at: string | null
+  extra_data: Record<string, unknown> | null
 }
 
 export interface JobCreateRequest {

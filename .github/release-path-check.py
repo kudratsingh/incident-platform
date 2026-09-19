@@ -21,6 +21,11 @@ REPO = Path(__file__).resolve().parent.parent
 WORKFLOW = REPO / ".github/workflows/release.yml"
 OWNER = "kudratsingh"
 IMAGE = f"ghcr.io/{OWNER}/incident-platform"
+# The console ships beside the backend on the same version (WO-R3-313). Its tags
+# are derived from the backend's rather than branched separately, and these
+# checks are what hold that derivation in place — a console that moved :latest
+# on a dispatch, or landed on a different version, is the drift they catch.
+CONSOLE_IMAGE = f"{IMAGE}-console"
 
 # `${{ }}` expressions the script may contain, and their value here; anything else aborts.
 KNOWN_EXPRESSIONS = {"${{ github.repository_owner }}": OWNER}
@@ -126,6 +131,12 @@ def main() -> int:
         out.get("tags") == f"{IMAGE}:v1.2.3,{IMAGE}:latest",
         str(out),
     )
+    check(
+        "publishes the console on the same version, with :latest",
+        out.get("console_tags")
+        == f"{CONSOLE_IMAGE}:v1.2.3,{CONSOLE_IMAGE}:latest",
+        str(out),
+    )
 
     # ---- THE regression: dispatch launched from a tag ref ---------------
     print("\nworkflow_dispatch from a tag ref, with a version input:")
@@ -148,6 +159,11 @@ def main() -> int:
         str(out),
     )
     check("tags only the input version", out.get("tags") == f"{IMAGE}:v0.4.0-rc1")
+    check(
+        "the console follows, and does NOT move :latest either",
+        out.get("console_tags") == f"{CONSOLE_IMAGE}:v0.4.0-rc1",
+        str(out),
+    )
 
     print("\nworkflow_dispatch from a tag ref, with NO version input:")
     rc, out, log = run_case(
@@ -189,6 +205,11 @@ def main() -> int:
     )
     check("plain branch dispatch still builds a SHA tag", rc == 0, log)
     check("and does not move :latest", ":latest" not in out.get("tags", ""))
+    check(
+        "the console gets the same SHA tag and no :latest",
+        out.get("console_tags") == f"{CONSOLE_IMAGE}:sha-abc1234",
+        str(out),
+    )
 
     # ---- the release path validates its tag too -------------------------
     print("\npush of a tag matching v* but not vX.Y.Z:")
@@ -211,6 +232,14 @@ def main() -> int:
     check(
         "the release path is gated on the event name",
         '"${GITHUB_EVENT_NAME}" == "push"' in script,
+    )
+    check(
+        "the console's tags are derived from the backend's, not branched again",
+        'CONSOLE_TAGS="${CONSOLE_IMAGE}:${VERSION}"' in script,
+    )
+    check(
+        "a dispatch refuses an already-published console tag too",
+        '"${CONSOLE_IMAGE}:${INPUT_VERSION}"' in script,
     )
 
     print()

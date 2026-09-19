@@ -1,0 +1,81 @@
+# The console's nginx config, as a TEMPLATE.
+#
+# `${API_UPSTREAM}` is substituted at container start by the nginx image's own
+# entrypoint (`/docker-entrypoint.d/20-envsubst-on-templates.sh` renders every
+# `/etc/nginx/templates/*.template` into `/etc/nginx/conf.d/`). It became a
+# template for one reason: this one image now has to serve two compose files
+# whose backend service has a different NAME.
+#
+#   platform  docker-compose.yml    service `app`  → API_UPSTREAM=http://app:8000
+#   demo      demo/compose.yml      service `api`  → API_UPSTREAM=http://api:8000
+#
+# The default is `http://api:8000` so the demo stack needs no override at all
+# and the platform compose states its own. Only `${API_UPSTREAM}` is
+# substituted: `$uri`, `$host` and friends are nginx variables, not environment
+# variables, so envsubst leaves them alone — which is why the list of variables
+# the entrypoint substitutes is derived from the environment and not from the
+# `$` signs in this file.
+#
+# If the substitution ever fails to run, nothing is written to conf.d and this
+# container serves 404 for everything. That is deliberate: a console that
+# cannot reach its API should be obviously broken, not quietly pointed at the
+# wrong host.
+
+server {
+    listen 80;
+    server_name _;
+
+    root /usr/share/nginx/html;
+    index index.html;
+
+    # /api/* → backend. In production (ECS) the ALB routes /api/*
+    # BEFORE it reaches this nginx container, so this block is a no-op
+    # in prod. In local docker-compose — and in the demo stack — both
+    # services sit behind the same browser origin, so nginx has to forward.
+    #
+    # The upstream is held in a VARIABLE on purpose (WO-R2-65). With a
+    # literal `proxy_pass http://app:8000`, nginx resolves the name once at
+    # configuration load and refuses to start if it does not resolve — and
+    # in ECS there is no `app` DNS name, so the container that was supposed
+    # to be "a no-op in prod" failed to boot instead. A variable defers
+    # resolution to request time, which makes the block genuinely inert
+    # where it is unused and still correct where it is used. That property is
+    # what makes the env-configurable upstream safe as well: a value naming a
+    # host that does not exist costs nothing until a request arrives.
+    #
+    # 127.0.0.11 is Docker's embedded DNS, which is what serves both compose
+    # networks. In ECS nothing reaches this block, so a resolver that cannot
+    # answer there costs nothing; what matters is that nginx now starts.
+    location /api/ {
+        resolver 127.0.0.11 ipv6=off valid=10s;
+        set $backend_upstream ${API_UPSTREAM};
+
+        # No URI part, as before: nginx passes the request URI through
+        # unchanged, so /api/v1/x still arrives as /api/v1/x.
+        proxy_pass $backend_upstream;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # SSE support — the /jobs/{id}/stream endpoint keeps the
+        # connection open and pushes events over time. Disable
+        # buffering so events flush immediately to the browser.
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 24h;
+    }
+
+    # SPA fallback — serve index.html for all unmatched routes. /demo is one of
+    # them, so a recording that reloads the page keeps its `?mode=`.
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    # Cache static assets aggressively (Vite fingerprints them)
+    location ~* \.(js|css|woff2?|png|svg|ico)$ {
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+    }
+}

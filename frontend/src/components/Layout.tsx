@@ -38,8 +38,12 @@ export default function Layout({ children }: { children: React.ReactNode }) {
           <nav className="flex items-center gap-1 ml-4">
             {navLink('/jobs', 'Jobs')}
             {navLink('/sagas', 'Sagas')}
-            {(user?.role === 'admin' || user?.role === 'support') &&
-              navLink('/admin', 'Admin')}
+            {(user?.role === 'admin' || user?.role === 'support') && (
+              <>
+                {navLink('/admin', 'Admin')}
+                {navLink('/demo', 'Demo')}
+              </>
+            )}
           </nav>
           <div className="ml-auto flex items-center gap-3">
             {user?.tenant_slug && (

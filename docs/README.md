@@ -12,6 +12,7 @@ One line per document, so you can find the right one without opening five.
 | [DATA_MODEL.md](DATA_MODEL.md) | Every Postgres table, column, index, foreign key and constraint, each with a one-line *why* |
 | [KAFKA.md](KAFKA.md) | The topic catalog, the partition-key strategy, schema-evolution rules, and the consumer-group catalog with failure isolation |
 | [REDIS.md](REDIS.md) | Every Redis key pattern — who writes it, who reads it, its TTL, and what degrades when Redis is gone |
+| [DEMO.md](DEMO.md) | The `/demo` page: what each panel shows, where every number comes from, how the phase strip keeps the agent's word and the platform's reading apart, and what the two principals can and cannot see |
 
 ## Decisions
 
