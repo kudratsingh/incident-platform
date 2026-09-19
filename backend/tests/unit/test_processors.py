@@ -23,9 +23,7 @@ from app.workers.cpu_processors import (
 )
 from app.workers.thread_adapters import process_csv_upload
 
-# ---------------------------------------------------------------------------
 # Helpers
-# ---------------------------------------------------------------------------
 
 
 def _collect_publishes() -> tuple[list[tuple[int, str]], AsyncMock]:
@@ -38,9 +36,7 @@ def _collect_publishes() -> tuple[list[tuple[int, str]], AsyncMock]:
     return log, _publish  # type: ignore[return-value]
 
 
-# ---------------------------------------------------------------------------
 # async_tasks
-# ---------------------------------------------------------------------------
 
 
 async def test_bulk_api_sync_returns_summary() -> None:
@@ -62,9 +58,7 @@ async def test_bulk_api_sync_publishes_incremental_progress() -> None:
     assert pcts == sorted(pcts)
 
 
-# ---------------------------------------------------------------------------
 # thread_adapters
-# ---------------------------------------------------------------------------
 
 
 async def test_csv_upload_returns_row_count() -> None:
@@ -106,9 +100,7 @@ async def test_csv_upload_event_count_is_bounded_not_the_chunk_count(
     assert log[-1][0] == 100
 
 
-# ---------------------------------------------------------------------------
 # cpu_processors — pure functions (no executor, run synchronously in tests)
-# ---------------------------------------------------------------------------
 
 
 def test_analyze_document_returns_word_count() -> None:
@@ -162,13 +154,8 @@ async def test_report_gen_async_wrapper() -> None:
     assert len(log) >= 2
 
 
-# ---------------------------------------------------------------------------
 # Defensive clamps (WO-P4-04 / E1-05)
-#
 # Request validation does not cover replays: JobService.replay_job republishes
-# the stored payload, so rows created before the bounds existed still reach
-# these functions. The clamps are the last line of defence.
-# ---------------------------------------------------------------------------
 
 
 async def test_bulk_api_sync_clamps_endpoint_count() -> None:
@@ -225,18 +212,7 @@ def test_analyze_document_clamps_page_count_floor() -> None:
 
 
 def test_analyze_document_clamps_page_count_ceiling() -> None:
-    """The bound this function exists for, and the one that was untested.
-
-    `page_count` is the loop count for per-page CPU work in a pool
-    subprocess, so an unclamped value from a replayed payload is
-    unbounded process-pool time. The test that claimed to pin the
-    ceiling only ever passed `page_count=-5`, exercising the `max(0, …)`
-    floor; `MAX_PAGE_COUNT` itself was never asserted (R2-64).
-
-    Patched out to nothing so the assertion is about the clamp rather
-    than about sitting through `MAX_PAGE_COUNT * 0.05s` of simulated
-    work — which is also why the old test could not have covered this.
-    """
+    """The bound this function exists for, and the one that was untested."""
     with patch.object(cpu_processors.time, "sleep", lambda _s: None):
         result = _analyze_document({"page_count": 5000})
 
@@ -260,9 +236,7 @@ async def test_csv_upload_zero_chunk_size_does_not_raise() -> None:
     assert result["total_rows"] == 2
 
 
-# ---------------------------------------------------------------------------
 # Process pool hardening (WO-P4-04 / E1-09)
-# ---------------------------------------------------------------------------
 
 
 def test_get_pool_uses_spawn_context_and_is_a_singleton() -> None:
@@ -317,17 +291,8 @@ async def test_broken_process_pool_in_report_gen_resets_pool() -> None:
         _reset_pool()
 
 
-# ---------------------------------------------------------------------------
 # Concurrent pool resets (WO-R2-64)
-#
 # `_reset_pool` used to unconditionally drop whatever pool was current.
-# When several CPU jobs failed on the same broken pool — the normal case,
-# since a dead child breaks the pool for everyone at once — the first
-# reset rebuilt it and the second tore the *replacement* down, taking
-# any freshly submitted future with it (`cancel_futures=True`). The
-# generation counter makes a reset apply only to the pool the caller
-# actually observed as broken.
-# ---------------------------------------------------------------------------
 
 
 class _FakePool:
@@ -354,11 +319,7 @@ def fake_pools() -> Any:
 
 
 def test_stale_reset_spares_a_rebuilt_pool(fake_pools: Any) -> None:
-    """The exact interleaving that used to cancel live work.
-
-    Two jobs fail on pool P1. The first reset drops it; an unrelated job
-    then rebuilds as P2 and submits work. The second failing job's reset
-    still refers to P1 — it must be a no-op, not a teardown of P2."""
+    """The exact interleaving that used to cancel live work."""
     p1, generation = _get_pool()
 
     _reset_pool(generation)  # first failure, against the pool it saw

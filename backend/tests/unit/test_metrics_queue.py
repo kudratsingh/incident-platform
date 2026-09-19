@@ -1,17 +1,4 @@
-"""The cardinality guards and the bounded emit queue in `app.core.metrics`.
-
-Two separate findings live in this module, and these tests keep them apart:
-
-  * **Cardinality** — CloudWatch bills per distinct dimension *combination*, so
-    an unbounded dimension value is an unbounded bill. Guarded by a declared
-    allow-list, backstopped by a hard cap for anything nobody declared.
-  * **Call rate** — `PutMetricData` throttling is driven by how many calls you
-    make, not how much each carries. Guarded by folding a flush window into
-    one call.
-
-The former is about what goes *in* a datum, the latter about how datums leave
-the process; a fix for one is not a fix for the other.
-"""
+"""The cardinality guards and the bounded emit queue in `app.core.metrics`."""
 
 import asyncio
 import time
@@ -24,12 +11,7 @@ from app.core import metrics
 
 @pytest.fixture(autouse=True)
 def _isolated_metrics_state(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """Reset the module globals around every test.
-
-    `metrics` keeps allow-lists, the seen-value cap and the queue at module
-    level — one emitter per process is the point — so tests must not inherit
-    each other's state.
-    """
+    """Reset the module globals around every test."""
     monkeypatch.setattr(metrics, "_is_production", lambda: True)
     metrics.reset_cardinality_state()
     monkeypatch.setattr(metrics, "_queue", None)
@@ -43,17 +25,11 @@ def _dims(datum: metrics._Datum) -> dict[str, str]:
     return dict(datum.dimensions)
 
 
-# ---------------------------------------------------------------------------
 # Cardinality: the allow-list
-# ---------------------------------------------------------------------------
 
 
 def test_allow_list_rejects_a_value_outside_it() -> None:
-    """A declared dimension takes declared values or `other` — nothing else.
-
-    This is what stops a future caller passing a raw URL back into the Path
-    dimension and silently reintroducing the finding.
-    """
+    """A declared dimension takes declared values or `other` — nothing else."""
     metrics.register_dimension_values("Path", {"/jobs/{job_id}", "unmatched"})
 
     clean = metrics._sanitise_dimensions({"Path": "/jobs/{job_id}"})
@@ -74,18 +50,11 @@ def test_allow_list_is_additive_across_registrations() -> None:
     assert metrics._sanitise_dimensions({"Path": "/b"})["Path"] == "/b"
 
 
-# ---------------------------------------------------------------------------
 # Cardinality: the hard cap for undeclared dimensions
-# ---------------------------------------------------------------------------
 
 
 def test_hard_cap_buckets_values_past_the_ceiling() -> None:
-    """An undeclared dimension is bounded anyway.
-
-    Without this, forgetting to call `register_dimension_values` is enough to
-    reintroduce an unbounded bill. The worst case has to be a bounded set plus
-    an `other` bucket, not unbounded.
-    """
+    """An undeclared dimension is bounded anyway."""
     for i in range(metrics.MAX_DIMENSION_VALUES):
         value = f"tenant-{i}"
         assert metrics._sanitise_dimensions({"Tenant": value})["Tenant"] == value
@@ -108,18 +77,11 @@ def test_cap_is_per_dimension_not_global() -> None:
     assert metrics._sanitise_dimensions({"StatusCode": "200"})["StatusCode"] == "200"
 
 
-# ---------------------------------------------------------------------------
 # The bounded queue
-# ---------------------------------------------------------------------------
 
 
 async def test_queue_drops_on_overflow_instead_of_growing() -> None:
-    """Overflow is a drop, not backpressure and not growth.
-
-    The shape this replaced retained a task handle per in-flight emit, so a
-    slow CloudWatch grew memory without bound. Dropping keeps the ceiling
-    fixed; blocking would put CloudWatch latency back on the request.
-    """
+    """Overflow is a drop, not backpressure and not growth."""
     queue: asyncio.Queue[metrics._Datum] = asyncio.Queue(maxsize=3)
     metrics._queue = queue
 
@@ -153,12 +115,7 @@ async def test_emit_without_a_running_emitter_drops_rather_than_leaks() -> None:
 async def test_emit_does_not_wait_on_a_slow_put(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The real 'emission does not block the request' guarantee.
-
-    Not 'the emit is backgrounded' — `emit_gauge` performs no I/O at all, so
-    there is no CloudWatch latency for a request to inherit. Pinned by making
-    the delivery path pathologically slow and showing emit is unaffected.
-    """
+    """The real 'emission does not block the request' guarantee."""
     def _glacial(_metric_data: list[dict[str, Any]]) -> None:
         time.sleep(30)  # would be catastrophic on the request path
 
@@ -175,17 +132,11 @@ async def test_emit_does_not_wait_on_a_slow_put(
     assert elapsed < 1.0, f"500 emits took {elapsed:.2f}s — emit is doing I/O"
 
 
-# ---------------------------------------------------------------------------
 # Aggregation — the call-rate half of the finding
-# ---------------------------------------------------------------------------
 
 
 def test_aggregate_folds_samples_into_one_statistic_set() -> None:
-    """N samples of one (metric, unit, dimensions) become one datum.
-
-    CloudWatch reconstructs Average/Sum/Min/Max/SampleCount from a
-    StatisticSet, so nothing an operator can read is lost.
-    """
+    """N samples of one (metric, unit, dimensions) become one datum."""
     dims = (("Path", "/jobs/{job_id}"), ("StatusCode", "200"))
     batch = [
         metrics._Datum("RequestLatency", value, "Milliseconds", dims)
@@ -211,11 +162,7 @@ def test_aggregate_folds_samples_into_one_statistic_set() -> None:
 
 
 def test_aggregate_keeps_distinct_combinations_apart() -> None:
-    """Folding must not merge different routes or different statuses.
-
-    A fix that collapsed everything into one datum would pass the test above
-    and destroy the metric.
-    """
+    """Folding must not merge different routes or different statuses."""
     batch = [
         metrics._Datum("RequestLatency", 10.0, "Milliseconds", (("Path", "/a"),)),
         metrics._Datum("RequestLatency", 20.0, "Milliseconds", (("Path", "/b"),)),
@@ -236,19 +183,13 @@ def test_aggregate_keeps_distinct_combinations_apart() -> None:
     assert folded[("QueueDepth", "/a")]["SampleCount"] == 1.0
 
 
-# ---------------------------------------------------------------------------
 # Flushing
-# ---------------------------------------------------------------------------
 
 
 async def test_flush_makes_one_call_for_a_whole_window(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The call-rate fix, end to end: many requests, one PutMetricData.
-
-    One call per request was the worst possible ratio against a limit that
-    counts calls.
-    """
+    """The call-rate fix, end to end: many requests, one PutMetricData."""
     calls: list[list[dict[str, Any]]] = []
     monkeypatch.setattr(metrics, "_put", lambda data: calls.append(data))
 
@@ -268,12 +209,7 @@ async def test_flush_makes_one_call_for_a_whole_window(
 async def test_flush_chunks_only_when_distinct_datums_exceed_the_call_limit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """`MAX_DATUMS_PER_CALL` bounds datums per API call, post-aggregation.
-
-    Applying it to the drain instead would throttle the consumer to a fixed
-    number of samples per window while the producer runs at request rate — a
-    busy service would sit permanently at the queue ceiling and drop.
-    """
+    """`MAX_DATUMS_PER_CALL` bounds datums per API call, post-aggregation."""
     calls: list[list[dict[str, Any]]] = []
     monkeypatch.setattr(metrics, "_put", lambda data: calls.append(data))
 
@@ -321,11 +257,7 @@ async def test_stop_flushes_the_final_window(monkeypatch: pytest.MonkeyPatch) ->
 
 
 async def test_sanitisation_happens_at_enqueue_not_at_flush() -> None:
-    """The unbounded value must never reach the queue.
-
-    Sanitising at flush time would let a scanner fill the bounded queue with
-    junk dimensions and push real datums out.
-    """
+    """The unbounded value must never reach the queue."""
     metrics.register_dimension_values("Path", {"/jobs/{job_id}"})
     queue: asyncio.Queue[metrics._Datum] = asyncio.Queue(maxsize=10)
     metrics._queue = queue

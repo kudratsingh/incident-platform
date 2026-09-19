@@ -1,8 +1,4 @@
-"""Unit tests for the startup schema-drift check.
-
-Real alembic head vs. mocked DB revision. Keeps the check honest
-without needing an actual Postgres.
-"""
+"""Unit tests for the startup schema-drift check."""
 
 import os
 from unittest.mock import AsyncMock, MagicMock, patch

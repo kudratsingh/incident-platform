@@ -72,7 +72,6 @@ def chaos_registered() -> Iterator[None]:
         _restore_for_tests(snapshot)
         # Reload once more under the real (disabled) settings so the module
         # objects left in `sys.modules` match the registry the next test
-        # sees.
         for module in modules:
             importlib.reload(module)
 
@@ -92,9 +91,7 @@ def _field_description(tool_name: str, field: str) -> str:
     return str(described)
 
 
-# --------------------------------------------------------------------------
 # poison_message — says what it produces, and that it is not replay-safe
-# --------------------------------------------------------------------------
 
 
 def test_poison_message_says_the_row_is_not_replay_safe(
@@ -187,9 +184,7 @@ def test_poison_message_output_field_repeats_the_not_replay_safe_claim(
     assert "Never `replay_safe`" in hint
 
 
-# --------------------------------------------------------------------------
 # create_mislabeled_dlq_job — says, in plain words, that the row is a lie
-# --------------------------------------------------------------------------
 
 
 def test_mislabel_hook_says_the_hint_and_text_contradict_each_other(
@@ -264,9 +259,7 @@ def test_mislabel_hook_output_says_the_hint_is_the_wrong_one(
     assert "not a configurable field" in hint
 
 
-# --------------------------------------------------------------------------
 # create_bad_data_job — no longer calls poison_message a replay_safe producer
-# --------------------------------------------------------------------------
 
 
 def test_create_bad_data_job_no_longer_miscasts_its_sibling() -> None:
@@ -298,9 +291,7 @@ def test_create_bad_data_job_no_longer_miscasts_its_sibling() -> None:
         importlib.reload(chaos_pkg.create_bad_data_job)  # type: ignore[attr-defined]
 
 
-# --------------------------------------------------------------------------
 # The deltas, enumerated — this change adds a tool and moves two schemas
-# --------------------------------------------------------------------------
 
 
 def test_the_shape_deltas_are_exactly_these(chaos_registered: None) -> None:

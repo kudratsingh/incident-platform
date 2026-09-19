@@ -8,9 +8,7 @@ from app.repositories.outbox import OutboxRepository
 from app.workers import dispatcher
 from app.workers.schema_registry import SchemaValidationError
 
-# ---------------------------------------------------------------------------
 # OutboxRepository
-# ---------------------------------------------------------------------------
 
 
 async def test_repo_add_creates_row() -> None:
@@ -95,9 +93,7 @@ async def test_repo_fetch_unpublished_excludes_rows_past_the_cap() -> None:
     assert "attempts <" in sql
 
 
-# ---------------------------------------------------------------------------
 # _outbox_relay_loop
-# ---------------------------------------------------------------------------
 
 
 def _session_factory_with(events: list[MagicMock]) -> tuple[MagicMock, MagicMock]:
@@ -133,7 +129,6 @@ def _outbox_row(
     row.payload = payload or {"job_id": str(uuid.uuid4())}
     # A real int, not an auto-created MagicMock attribute: the relay does
     # arithmetic and a comparison on this to decide whether the row has
-    # reached the attempt cap.
     row.attempts = attempts
     return row
 
@@ -201,15 +196,8 @@ async def test_relay_sleeps_when_outbox_is_empty() -> None:
     repo.mark_published.assert_not_awaited()
 
 
-# ---------------------------------------------------------------------------
 # Single-writer leader gate (E1-15 / ADR 0020)
-#
 # `worker_loop` runs in every API replica's lifespan, so two relays overlap
-# on every rolling deploy. The gate is what stops the second one from
-# republishing the whole backlog. SQLite has no advisory locks, so the real
-# gate is a no-op here and leadership is injected instead — mutual exclusion
-# itself is proved in tests/integration/test_outbox_relay_concurrency.py.
-# ---------------------------------------------------------------------------
 
 
 class _FakeGate:
@@ -254,7 +242,6 @@ async def test_relay_skips_the_whole_tick_when_not_leader() -> None:
     repo.increment_attempts.assert_not_awaited()
     # Leadership is re-probed per tick, and the lock is given back each
     # time — a relay that grabbed it and kept it would never let a
-    # surviving replica take over after a deploy.
     assert (gate.entered, gate.exited) == (2, 2)
 
 
@@ -297,9 +284,7 @@ async def test_relay_releases_leadership_when_a_tick_raises() -> None:
     assert gate.exited == gate.entered == 2
 
 
-# ---------------------------------------------------------------------------
 # JobService writes outbox row alongside the job row
-# ---------------------------------------------------------------------------
 
 
 async def test_job_service_create_writes_outbox() -> None:
@@ -346,14 +331,8 @@ async def test_job_service_create_writes_outbox() -> None:
     assert kwargs["payload"]["job_id"] == str(job.id)
 
 
-# ---------------------------------------------------------------------------
 # Dead-lettering (WO-R2-05)
-#
 # ADR 0001 Decision item 3 has always specified this behaviour and the code
-# has never had it: `increment_attempts` bumped a counter that nothing read,
-# so a row that could never publish was retried every tick forever while
-# holding one of the relay's fixed 100 fetch slots.
-# ---------------------------------------------------------------------------
 
 
 async def test_relay_dead_letters_a_schema_invalid_row_immediately() -> None:

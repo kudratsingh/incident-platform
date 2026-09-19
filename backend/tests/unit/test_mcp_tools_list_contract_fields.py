@@ -1,22 +1,4 @@
-"""`tools/list` advertises required_scope and is_idempotent (WO-R2-32).
-
-Both fields were registry-only, so `tools/list` described a tool's shape
-(`inputSchema`/`outputSchema`) but not its *contract*. A change to either —
-re-scoping a tool, or silently dropping its idempotency — was invisible to
-the commander's contract snapshot and therefore uncatchable by the contract
-test. `is_idempotent` is the one that bites: it is what makes a Tier-1
-recovery re-invoke return the cached response, so a silent drop turns the
-retry into a real second execution returning a different payload, which
-verification reads as a spurious escalation.
-
-The point of the change is the diff, so the tests are about the diff. The
-snapshot helper here mirrors what the commander's `_tool_view` pins; the
-commander half lands with the re-pin and rebless order, not here.
-
-`handle_tools_list` is exercised directly rather than over HTTP because its
-return value *is* the wire payload — it hands back an already-`model_dump`ed
-result — so this covers serialization without coupling to auth fixtures.
-"""
+"""`tools/list` advertises required_scope and is_idempotent (WO-R2-32)."""
 
 import dataclasses
 import json
@@ -45,12 +27,7 @@ def _tools_list_payload() -> list[dict[str, Any]]:
 
 
 def _contract_snapshot() -> dict[str, dict[str, Any]]:
-    """What the commander pins, reduced to the fields under test.
-
-    Deliberately built from the `tools/list` *response* rather than from the
-    registry: pinning the registry would make the test pass even if the
-    handler never advertised the fields, which is the exact bug.
-    """
+    """What the commander pins, reduced to the fields under test."""
     return {
         t["name"]: {f: t.get(f) for f in CONTRACT_FIELDS}
         for t in _tools_list_payload()
@@ -75,9 +52,7 @@ def _override(name: str, **changes: Any) -> None:
     _restore_for_tests(snap)
 
 
-# ---------------------------------------------------------------------------
 # The fields are advertised, for every tool, with the registry's values
-# ---------------------------------------------------------------------------
 
 
 def test_every_tool_advertises_both_contract_fields() -> None:
@@ -106,13 +81,7 @@ def test_advertised_values_match_the_registry() -> None:
 
 
 def test_the_advertised_set_is_not_degenerate() -> None:
-    """Anti-vacuity guard.
-
-    A handler that emitted the keys but never populated them would still
-    satisfy "the key exists". At least one real tool is idempotent and at
-    least one carries a scope, so if either group comes back empty the
-    fields are being defaulted rather than read.
-    """
+    """Anti-vacuity guard."""
     tools = _tools_list_payload()
     assert any(t["is_idempotent"] for t in tools)
     assert any(t["required_scope"] is not None for t in tools)
@@ -134,20 +103,13 @@ def test_payload_is_json_serializable() -> None:
     json.dumps(_tools_list_payload())
 
 
-# ---------------------------------------------------------------------------
 # The point of the change: a contract change is now a snapshot diff
-# ---------------------------------------------------------------------------
 
 
 def test_flipping_is_idempotent_produces_a_snapshot_diff(
     restore_registry: None,
 ) -> None:
-    """The assertion the work order is actually about.
-
-    Red before: both snapshots are identical, because `tools/list` never
-    mentioned `is_idempotent` — a tool silently losing its idempotency
-    guarantee produced no diff for the contract test to catch.
-    """
+    """The assertion the work order is actually about."""
     before = _contract_snapshot()
     target = next(t["name"] for t in _tools_list_payload() if t["is_idempotent"])
 
@@ -200,9 +162,7 @@ def test_dropping_a_scope_entirely_produces_a_snapshot_diff(
     assert "required_scope" in _contract_snapshot()[target]
 
 
-# ---------------------------------------------------------------------------
 # Additive-only: the pre-existing surface is untouched
-# ---------------------------------------------------------------------------
 
 
 def test_change_is_additive_only() -> None:

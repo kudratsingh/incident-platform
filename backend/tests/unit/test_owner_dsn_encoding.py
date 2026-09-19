@@ -1,17 +1,4 @@
-"""A generated password must survive being put in a DSN (WO-R2-65).
-
-`random_password.db` may contain `%`, `#`, `?`, `:`, `@` and `/` — its
-`override_special` set says so — and every one of those means something
-inside a URL. SQLAlchemy percent-DECODES the password while parsing, so the
-owner DSN handed the database a different secret than RDS was created with,
-for some passwords, on the path that migrates the schema. The failure is an
-authentication error with no plausible cause, appearing only after a
-password rotation happens to produce one of the unlucky strings.
-
-The composition is Terraform's, so these tests do two things: demonstrate the
-property on the Python side that consumes the URL, and assert the Terraform
-still spells it that way.
-"""
+"""A generated password must survive being put in a DSN (WO-R2-65)."""
 
 from __future__ import annotations
 

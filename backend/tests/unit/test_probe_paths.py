@@ -1,18 +1,4 @@
-"""The deployment probes must point at routes that exist, and at the right ones.
-
-Three probes, three different questions (WO-R2-65):
-
-  * ALB target group  -> `/healthz`        "can this task serve HTTP?"
-  * ECS container     -> `/healthz/worker` "is this task worth keeping?"
-  * operators         -> `/api/v1/health`  everything, and nothing automatic
-                                            acts on it
-
-Both infrastructure probes used to curl the deep check, which made a Redis
-outage deregister every target and recycle every task. The paths live in
-Terraform and the routes live in FastAPI, so nothing but a test keeps the two
-halves agreeing — a renamed route would otherwise fail every health check in
-production and pass every test here.
-"""
+"""The deployment probes must point at routes that exist, and at the right ones."""
 
 from __future__ import annotations
 
@@ -30,11 +16,7 @@ DEEP_CHECK_PATH = "/api/v1/health"
 
 
 def _infra(name: str) -> str:
-    """The file's configuration, with `#` comment lines stripped.
-
-    The comments explain at length which endpoint each probe must *not* use,
-    so a naive substring search over the raw text would match the reasoning
-    rather than the setting."""
+    """The file's configuration, with `#` comment lines stripped."""
     text = (_REPO_ROOT / "infra" / name).read_text(encoding="utf-8")
     return "\n".join(
         line for line in text.splitlines() if not line.lstrip().startswith("#")
