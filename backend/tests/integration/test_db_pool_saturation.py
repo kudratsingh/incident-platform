@@ -237,12 +237,17 @@ async def test_a_loops_unit_of_work_still_completes_while_the_pool_is_held(
             db_pool_hold.clamp_to_pool(db_pool_hold.MAX_HELD_CONNECTIONS, _CAPACITY),
             factory,
         )
+        # Two transactions, the way `test_outbox_stall.py` seeds: there is no ORM relationship
+        # between these two mappers, so a single flush does not order the parent's INSERT before
+        # the child's and the outbox row hits the tenant FK first.
         tenant_id = uuid.uuid4()
         async with factory() as session:
             async with session.begin():
                 session.add(
                     Tenant(id=tenant_id, slug=f"t-{tenant_id.hex[:8]}", name="held")
                 )
+        async with factory() as session:
+            async with session.begin():
                 session.add(
                     OutboxEvent(
                         id=uuid.uuid4(),
