@@ -185,6 +185,7 @@ jobs:
               "test_downstream_latency",
               "test_breaker_visibility",
               "test_postgres_health_pg",
+              "test_sticky_kill_survives_restart",
           }
 
           try:

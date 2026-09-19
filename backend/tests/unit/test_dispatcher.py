@@ -598,8 +598,12 @@ class _FakeSupervisedConsumer:
 
 
 class _FlakyRedis:
-    """Redis client whose GET raises for the first `failures` calls, then
-    reports the key as absent."""
+    """Redis client whose lookup raises for the first `failures` calls, then
+    reports the keys as absent.
+
+    The kill check reads the flag and the sticky marker in one MGET (ADR 0032), so `get_calls`
+    counts lookups either way — the assertion below is about how many times the supervisor looked,
+    not which command it used."""
 
     def __init__(self, failures: int) -> None:
         self.get_calls = 0
@@ -610,6 +614,12 @@ class _FlakyRedis:
         if self.get_calls <= self._failures:
             raise ConnectionError("redis saturated")
         return None
+
+    async def mget(self, keys: list[str]) -> list[None]:
+        self.get_calls += 1
+        if self.get_calls <= self._failures:
+            raise ConnectionError("redis saturated")
+        return [None for _ in keys]
 
 
 async def test_supervise_consumer_retries_failed_boot_start() -> None:
