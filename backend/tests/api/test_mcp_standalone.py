@@ -1,13 +1,5 @@
-"""End-to-end tests for the standalone MCP process — full JSON-RPC
-round-trip against the real dispatch layer.
-
-Covers PR-3's test bar:
-  - initialize handshake works unauthenticated
-  - tools/list unauthenticated → 401 (via MCP_UNAUTHORIZED)
-  - tools/call unauthenticated → 401
-  - tools/call wrong scope → 403 (via MCP_FORBIDDEN)
-  - tools/call happy path returns real value + writes an audit row
-"""
+"""End-to-end tests for the standalone MCP process — full JSON-RPC round-trip against the
+real dispatch layer."""
 
 from __future__ import annotations
 
@@ -35,8 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 
 class _RedisStub:
-    """Minimal Redis stub — only implements the ops the MCP surface hits.
-    Keeps tests deterministic without spinning up real Redis."""
+    """Minimal Redis stub — only implements the ops the MCP surface hits."""
 
     def __init__(self, values: dict[str, bytes | str] | None = None) -> None:
         self._store: dict[str, bytes | str] = dict(values or {})
@@ -50,8 +41,7 @@ async def mcp_client(  # type: ignore[no-untyped-def]
     db_session: AsyncSession,
     default_tenant,
 ):
-    """Yields (client, redis_stub). Same pattern for every test —
-    stateful cache injection is done by mutating `redis_stub._store`."""
+    """Yields (client, redis_stub)."""
 
     app = create_mcp_app()
     redis_stub = _RedisStub()
@@ -102,8 +92,6 @@ def _rpc(method: str, params: dict[str, Any] | None = None, id: str = "1") -> di
 
 
 # ---------------------------------------------------------------------------
-# initialize
-# ---------------------------------------------------------------------------
 
 
 async def test_initialize_works_without_auth(mcp_client) -> None:  # type: ignore[no-untyped-def]
@@ -133,8 +121,6 @@ async def test_initialize_accepts_client_info(mcp_client) -> None:  # type: igno
     assert "result" in resp.json()
 
 
-# ---------------------------------------------------------------------------
-# tools/list
 # ---------------------------------------------------------------------------
 
 
@@ -170,12 +156,10 @@ async def test_tools_list_includes_output_schema_per_tool(
     db_session: AsyncSession,
     default_tenant,
 ) -> None:
-    """v0.4.8 extension (FIX_PLAN #25 optional): every tool advertises
-    its outputSchema alongside inputSchema so the commander's
-    contract-snapshot job can diff live-platform-advertised output
-    shapes without relying on its local registry as the source of
-    truth. Extension field — MCP-compliant clients that don't know
-    about it will ignore it."""
+    """v0.4.8 extension (FIX_PLAN #25 optional): every tool advertises its outputSchema
+    alongside inputSchema so the commander's contract-snapshot job can diff
+    live-platform-advertised output shapes without relying on its local registry as the
+    source of truth."""
     ac, _ = mcp_client
     token = await _mint_token(
         db_session, default_tenant, [Scope.TELEMETRY_READ.value]
@@ -191,8 +175,6 @@ async def test_tools_list_includes_output_schema_per_tool(
     assert tools, "expected at least one tool registered"
 
     # Every advertised tool must include outputSchema as a JSON Schema
-    # object. Empty {} is not acceptable — every tool has a declared
-    # output model, so the schema must be populated.
     for tool in tools:
         assert "outputSchema" in tool, f"{tool['name']} missing outputSchema"
         assert isinstance(tool["outputSchema"], dict), tool["name"]
@@ -214,8 +196,6 @@ async def test_tools_list_includes_output_schema_per_tool(
     assert "recent_samples" in props
 
 
-# ---------------------------------------------------------------------------
-# tools/call
 # ---------------------------------------------------------------------------
 
 
@@ -295,14 +275,7 @@ async def test_tools_call_lag_carries_its_measurement_time_and_recent_samples(
     db_session: AsyncSession,
     default_tenant,
 ) -> None:
-    """WO-R3-254 — the wire shape, end to end.
-
-    The caller cannot let time pass, so a bare number made "is the lag
-    climbing?" unanswerable: three reads inside one refresh window return
-    the one value the loop last wrote. The response now carries when that
-    value was measured and the short window of measurements before it, so
-    the trend comes out of a single call.
-    """
+    """WO-R3-254 — the wire shape, end to end."""
     ac, redis_stub = mcp_client
     measured_at = datetime.now(UTC)
     redis_stub._store[BACKPRESSURE_LAG_KEY] = "290"
@@ -342,10 +315,8 @@ async def test_tools_call_lag_without_recorded_samples_says_so(
     db_session: AsyncSession,
     default_tenant,
 ) -> None:
-    """Value present, nothing recorded — the state for the first minute
-    after a worker restart, and right after an eval reset. The number is
-    real and is returned; the time it was measured is unknown and is
-    reported as unknown rather than guessed."""
+    """Value present, nothing recorded — the state for the first minute after a worker
+    restart, and right after an eval reset."""
     ac, redis_stub = mcp_client
     redis_stub._store[BACKPRESSURE_LAG_KEY] = "29"
     token = await _mint_token(

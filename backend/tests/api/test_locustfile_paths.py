@@ -26,6 +26,8 @@ print(json.dumps({
     "prefix": module.API_PREFIX,
     "routes": {name: list(pair) for name, pair in module.ROUTES.items()},
     # The URLs the tasks actually build, not just the templates they
+    # were declared with — so a `url()` that dropped the prefix on the
+    # way out would still be caught.
     "urls": {name: module.url(name, job_id="00000000-0000-0000-0000-000000000000")
              for name in module.ROUTES},
 }))
