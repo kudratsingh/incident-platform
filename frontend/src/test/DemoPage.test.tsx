@@ -219,6 +219,8 @@ describe('DemoPage — the three panels and the strip', () => {
     expect(screen.getByRole('heading', { name: /audit timeline/i })).toBeTruthy()
     // The strip itself, named so the recording has a landmark.
     expect(screen.getByRole('list', { name: /phase/i })).toBeTruthy()
+    // And the nav can get here: a page nobody can reach is not a demo.
+    expect(screen.getByRole('link', { name: 'Demo' })).toBeTruthy()
   })
 
   it('starts in consumer_outage and reads the mode from the URL', async () => {
