@@ -1,23 +1,4 @@
-"""The `tools/list` delta for WO-R3-267 is exactly one tool, exactly two fields.
-
-Every change to an MCP tool's wire surface costs a platform release plus a
-commander re-pin and rebless, so the ledger in `CLAUDE.md` records each one
-field by field. This file is that ledger's executable half for the
-`get_cache_key_info` record check: it pins what the delta *is*, so a later
-edit that widens it has to come here and say so.
-
-Three claims, each one a thing the rebless would otherwise discover:
-
-  - The output gains `records_referenced` and `records_found`, and nothing
-    else moves — same five fields as before, same names, same order.
-  - The input is untouched. The record check needs no argument; it is a
-    property of the key already being inspected, and an optional flag would
-    have let the caller ask for a reading the platform then has to explain
-    the absence of.
-  - No other tool grows these fields, and no `$defs` entry appears. Two
-    scalars serialize inline, unlike `get_consumer_lag`'s `recent_samples`
-    (WO-R3-254), whose `LagSample` entry was its own line in the ledger.
-"""
+"""The `tools/list` delta for WO-R3-267 is exactly one tool, exactly two fields."""
 
 from __future__ import annotations
 
