@@ -7,6 +7,7 @@ from app.mcp.tools import (  # noqa: F401
     actions,
     cache_key_info,
     chaos,
+    circuit_breakers,
     consumer_lag,
     dag_state,
     deploy_history,
@@ -16,6 +17,7 @@ from app.mcp.tools import (  # noqa: F401
     list_audit_events,
     list_dlq_messages,
     outbox_status,
+    slo_status,
     traces,
 )
 

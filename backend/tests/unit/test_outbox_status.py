@@ -47,6 +47,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 # tool cannot ride in on this one's count.
 READ_TIER_AFTER = [
     "get_cache_key_info",
+    "get_circuit_breakers",
     "get_consumer_lag",
     "get_dag_state",
     "get_deploy_history",
@@ -54,6 +55,7 @@ READ_TIER_AFTER = [
     "get_outbox_status",
     "get_postgres_health",
     "get_redis_health",
+    "get_slo_status",
     "get_trace",
     "list_active_alerts",
     "list_audit_events",
@@ -484,14 +486,16 @@ def test_the_mirrored_tick_interval_matches_the_relay() -> None:
 
 def test_the_read_tier_gained_exactly_this_tool() -> None:
     """A tool-surface delta is a contract delta: 20 non-chaos tools before this order, 21 after, and
-    with `CHAOS_ENABLED=true` the number the commander pins moves 31 → 32."""
+    with `CHAOS_ENABLED=true` the number the commander pins moves 31 → 32. The two counts below
+    moved again with WO-R3-217's `get_circuit_breakers` / `get_slo_status` (21 → 23, 33 → 35), which
+    is what this list is for: an addition edits it deliberately rather than sliding a number."""
     read = sorted(
         t.name
         for t in list_tools()
         if t.required_scope in {Scope.TELEMETRY_READ, Scope.INCIDENTS_READ}
     )
     assert read == READ_TIER_AFTER
-    assert len(list_tools()) == 21
+    assert len(list_tools()) == 23
 
 
 def test_the_tool_declares_the_telemetry_read_scope() -> None:

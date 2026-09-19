@@ -18,6 +18,7 @@ from typing import Any
 
 from app.config import get_settings
 from app.core import metrics
+from app.core.circuit_breaker import record_registered_breakers
 from app.core.leader_lock import OUTBOX_RELAY_LOCK_KEY, advisory_leader_lock
 from app.core.logging import get_logger, job_id_var, trace_id_var
 from app.core.outbox_heartbeat import record_relay_tick
@@ -1978,6 +1979,11 @@ async def worker_loop(
         tasks.append(
             asyncio.create_task(db_pool_hold.hold_db_pool(session_factory, redis))
         )
+
+    # After the loops are running, never before them: a breaker that has never failed
+    # should be readable from another process rather than absent until its first failure
+    # (ADR 0030), but a diagnostic write must not stand between boot and the first tick.
+    await record_registered_breakers(redis)
 
     try:
         await asyncio.gather(*tasks)

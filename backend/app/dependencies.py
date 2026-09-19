@@ -5,8 +5,10 @@ paths set `app.tenant_id` for Postgres row-level security.
 import uuid
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
+from typing import Any
 
 from app.config import get_settings
+from app.core.db_pool_stats import CountingQueuePool
 from app.core.exceptions import AuthenticationError, AuthorizationError
 from app.core.logging import tenant_id_var, user_id_var
 from app.core.redis import get_redis as _get_redis
@@ -38,10 +40,25 @@ from sqlalchemy.ext.asyncio import (
 )
 
 _settings = get_settings()
+
+
+def _pool_kwargs(database_url: str) -> dict[str, Any]:
+    """The counting pool for a real database; SQLite keeps whichever pool it picks.
+
+    `CountingQueuePool` adds the checkout-timeout counter `get_postgres_health` reports and
+    changes nothing else (ADR 0030). SQLite is excluded because its dialect chooses a pool
+    kind for a reason, and a queue in front of a file would be that choice overruled.
+    """
+    if database_url.startswith("sqlite"):
+        return {}
+    return {"poolclass": CountingQueuePool}
+
+
 _engine = create_async_engine(
     _settings.database_url,
     echo=_settings.debug,
     pool_pre_ping=True,
+    **_pool_kwargs(_settings.database_url),
 )
 SQLAlchemyInstrumentor().instrument(engine=_engine.sync_engine)
 _async_session = async_sessionmaker(_engine, expire_on_commit=False)
