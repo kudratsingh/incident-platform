@@ -42,6 +42,7 @@ export type DemoPhase =
   | 'fault_injected'
   | 'agent_investigating'
   | 'agent_planning'
+  | 'awaiting_approval'
   | 'agent_remediating'
   | 'verifying'
   | 'recovered'
@@ -49,6 +50,13 @@ export type DemoPhase =
 
 /**
  * The stations, in render order.
+ *
+ * `awaiting_approval` gets a station of its own even though the approvals
+ * subsystem is unbuilt and no run reaches it today. The nine reportable states
+ * are the commander's own `IncidentState` values with no mapping layer, so this
+ * one WILL arrive the moment Tier-2 approvals ship — and a state with nowhere to
+ * land is a state that silently reads as something else. An empty station on
+ * screen is the cheaper mistake.
  *
  * `escalated` is deliberately absent: it shares the last slot with `recovered`
  * (they are the two terminals, not two steps), and the strip labels that slot
@@ -59,6 +67,7 @@ export const PHASE_STRIP: readonly DemoPhase[] = [
   'fault_injected',
   'agent_investigating',
   'agent_planning',
+  'awaiting_approval',
   'agent_remediating',
   'verifying',
   'recovered',
@@ -69,6 +78,7 @@ export const PHASE_LABELS: Record<DemoPhase, string> = {
   fault_injected: 'fault injected',
   agent_investigating: 'agent investigating',
   agent_planning: 'agent planning',
+  awaiting_approval: 'awaiting approval',
   agent_remediating: 'agent remediating',
   verifying: 'verifying',
   recovered: 'recovered',
@@ -147,19 +157,22 @@ export interface AgentPhaseReading {
 }
 
 /**
- * Two run states have no station of their own, and both are handled by naming
- * the station AND keeping the run's word:
+ * The nine reportable states onto eight stations.
  *
- *  - `triaging` shares `agent investigating` (triage is the first read);
+ * Two states share a station, and both keep their own word in the agent card:
+ *
+ *  - `triage` shares `agent investigating` — triage IS the first read, and a
+ *    station for it would be lit for a second or two at most;
  *  - `failed` shares `escalated` — the strip's terminal pair is recovered |
- *    escalated, and a failed run is the not-recovered one. The agent card still
- *    shows `failed`, because "the run broke" and "the agent handed over" are
- *    different things to a human watching.
+ *    escalated, and a failed run is the not-recovered one. "The run broke" and
+ *    "the agent handed over" are different things to a human watching, which is
+ *    why the card shows `failed` while the strip lights the terminal.
  */
 const STATE_TO_PHASE: Record<AgentRunState, DemoPhase> = {
-  triaging: 'agent_investigating',
+  triage: 'agent_investigating',
   investigating: 'agent_investigating',
   planning: 'agent_planning',
+  awaiting_approval: 'awaiting_approval',
   remediating: 'agent_remediating',
   verifying: 'verifying',
   resolved: 'recovered',

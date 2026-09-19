@@ -1,9 +1,9 @@
-import { api, AppError } from './client'
+import { api } from './client'
 import type {
   AgentRun,
   AuditLog,
-  CircuitBreakerReading,
-  ConsumerLagReading,
+  CircuitBreakersResponse,
+  ConsumerLagResponse,
   IncidentDigest,
   Job,
   JobTimeline,
@@ -25,33 +25,12 @@ export interface AdminJobListParams extends JobListParams {
 }
 
 /**
- * Pull a list out of whichever envelope an endpoint uses.
+ * How many rows the demo page asks for in one page.
  *
- * The admin surface is not consistent about this and never has been: `/admin/
- * runbooks` answers `{items, count}`, `/admin/slos` answers `{slos}`, `/admin/
- * jobs` answers a full `PaginatedResponse`. Rather than guess once per endpoint
- * and be wrong, each caller below names the keys it will accept.
- *
- * It **throws** on a shape it does not recognise instead of returning `[]`. An
- * unrecognised envelope is a contract mismatch between this console and the
- * backend it is talking to, and the one thing it must not do is render as "no
- * rows" — that is the failure mode `useAsyncData` exists to prevent, arriving
- * one layer lower down.
+ * `/admin/agent-runs` and `/admin/alerts` are both `PaginatedResponse`, so they
+ * page like every other list here rather than answering with everything.
  */
-function listFrom<T>(body: unknown, keys: readonly string[], what: string): T[] {
-  if (Array.isArray(body)) return body as T[]
-  if (body !== null && typeof body === 'object') {
-    for (const key of keys) {
-      const value = (body as Record<string, unknown>)[key]
-      if (Array.isArray(value)) return value as T[]
-    }
-  }
-  throw new AppError(
-    `The ${what} endpoint answered a shape this console does not recognise ` +
-      `(expected a bare array or one of: ${keys.join(', ')}).`,
-    'unexpected_response_shape',
-  )
-}
+const DEMO_PAGE_SIZE = 50
 
 export const adminApi = {
   listJobs: (params: AdminJobListParams = {}) => {
@@ -161,38 +140,46 @@ export const adminApi = {
   // ── operator-only readings behind the /demo page (WO-R3-312) ──────────────
 
   /**
-   * The agent runs the commander has reported (ADR 0035).
+   * The agent runs the commander has reported (ADR 0035), newest first.
    *
-   * `active` asks for runs that have not finished. The agent's own principal
-   * cannot read this at all — there is no MCP tool for it, deliberately.
+   * `active=true` narrows to runs nobody has closed — the console's own query
+   * while a demo is running. The agent's principal cannot read any of this:
+   * there is no MCP tool for `agent_runs`, deliberately.
    */
-  listAgentRuns: async (params: { alert_id?: string; active?: boolean } = {}) => {
+  listAgentRuns: (params: { alert_id?: string; active?: boolean } = {}) => {
     const qs = new URLSearchParams()
+    qs.set('page_size', String(DEMO_PAGE_SIZE))
     if (params.alert_id) qs.set('alert_id', params.alert_id)
     if (params.active !== undefined) qs.set('active', String(params.active))
-    const q = qs.toString()
-    const body = await api.get<unknown>(`/admin/agent-runs${q ? `?${q}` : ''}`)
-    return listFrom<AgentRun>(body, ['items', 'runs'], 'agent-runs')
+    return api.get<PaginatedResponse<AgentRun>>(`/admin/agent-runs?${qs.toString()}`)
   },
 
   getAgentRun: (id: string) => api.get<AgentRun>(`/admin/agent-runs/${id}`),
 
-  /** Every consumer group's lag, with `lag_known` so an absent reading stays absent. */
-  consumerLag: async () => {
-    const body = await api.get<unknown>('/admin/consumer-lag')
-    return listFrom<ConsumerLagReading>(body, ['groups', 'items'], 'consumer-lag')
-  },
+  /**
+   * Every consumer group's lag in one reading.
+   *
+   * The whole response, not just `groups`: `live_group` names the one group
+   * whose number actually moves, and the others are recorded constants that a
+   * console should not present as live measurements.
+   */
+  consumerLag: () => api.get<ConsumerLagResponse>('/admin/consumer-lag'),
 
-  /** Breaker state as published in Redis (ADR 0030). A breaker with no record is ABSENT from this list, never reported closed. */
-  circuitBreakers: async () => {
-    const body = await api.get<unknown>('/admin/circuit-breakers')
-    return listFrom<CircuitBreakerReading>(body, ['breakers', 'items'], 'circuit-breakers')
-  },
+  /**
+   * Breaker state as published in Redis (ADR 0030).
+   *
+   * The whole response, not just `breakers`: a breaker with no record is ABSENT
+   * from the list rather than reported closed, and an empty list with
+   * `unknown_reason` set is a different finding from an empty list without it.
+   * Returning the array alone would throw that distinction away.
+   */
+  circuitBreakers: () => api.get<CircuitBreakersResponse>('/admin/circuit-breakers'),
 
-  listAlerts: async (active = true) => {
-    const body = await api.get<unknown>(`/admin/alerts?active=${String(active)}`)
-    return listFrom<PlatformAlert>(body, ['alerts', 'items'], 'alerts')
-  },
+  /** `active=true` is the agent's `list_active_alerts` view; omit it to see resolved ones too. */
+  listAlerts: (active = true) =>
+    api.get<PaginatedResponse<PlatformAlert>>(
+      `/admin/alerts?active=${String(active)}&page_size=${DEMO_PAGE_SIZE}`,
+    ),
 }
 
 export interface AuditListParams {

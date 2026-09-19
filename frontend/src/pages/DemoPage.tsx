@@ -468,8 +468,16 @@ function DlqMiniTable({
                   <td className="py-1.5 pr-2 font-mono text-gray-400">
                     {job.triage?.root_cause_category ?? 'none'}
                   </td>
-                  <td className="py-1.5 pr-2 font-mono text-gray-400">
-                    {job.fenced_at ? (job.fenced_by ?? 'yes') : 'no'}
+                  {/* `fenced_by` is `{principal_type}:{id}`, so the id is shown
+                      truncated with the whole value in the title — and a null
+                      `fenced_at` with a `human_required` hint means triage wrote
+                      the hint, not an operator, which is why this column reads
+                      the timestamp rather than the hint. */}
+                  <td
+                    className="py-1.5 pr-2 font-mono text-gray-400 break-all"
+                    title={job.fenced_by ?? undefined}
+                  >
+                    {job.fenced_at ? (job.fenced_by?.slice(0, 24) ?? 'yes') : 'no'}
                   </td>
                   <td className="py-1.5">
                     <span
@@ -1043,10 +1051,12 @@ export default function DemoPage() {
   const runs = usePolling(loadRuns, POLL_MS, {
     errorMessage: 'Could not read the agent’s run.',
   })
-  // Newest active run. More than one would mean two incidents at once, which
-  // the demo does not stage; the newest is the one on camera.
+  // Newest active run. The endpoint already answers newest first; the sort is
+  // here because "newest" is the only thing that makes this a single-run panel,
+  // and more than one active run would mean two incidents at once — which the
+  // demo does not stage, but which must not silently pick an arbitrary one.
   const run: AgentRun | null = useMemo(() => {
-    const items = runs.data ?? []
+    const items = runs.data?.items ?? []
     return items.length === 0
       ? null
       : [...items].sort((a, b) => (a.started_at < b.started_at ? 1 : -1))[0]
@@ -1056,10 +1066,18 @@ export default function DemoPage() {
   const lag = usePolling(loadLag, POLL_MS, {
     errorMessage: 'Could not read consumer lag.',
   })
-  const dispatcher = useMemo(
-    () => (lag.data ?? []).find((g) => g.consumer_group === DISPATCHER_GROUP) ?? null,
-    [lag.data],
-  )
+  // The scenario is about `worker-dispatcher`. `live_group` is the fallback
+  // rather than the first choice: it names the one group whose number moves, so
+  // it is the right answer if the group were ever renamed, and the wrong one to
+  // prefer while the named group is present.
+  const dispatcher = useMemo(() => {
+    const groups = lag.data?.groups ?? []
+    return (
+      groups.find((g) => g.consumer_group === DISPATCHER_GROUP) ??
+      groups.find((g) => g.consumer_group === lag.data?.live_group) ??
+      null
+    )
+  }, [lag.data])
 
   const loadDlqStats = useCallback(() => adminApi.dlqStats(), [])
   const dlq = usePolling(loadDlqStats, POLL_MS, {
@@ -1119,12 +1137,14 @@ export default function DemoPage() {
 
   // ── the metric this mode is about ───────────────────────────────────────
   const lagValue = dispatcher?.lag_known ? (dispatcher.lag ?? null) : null
+  // `recent_samples` arrives NEWEST FIRST, which a left-to-right chart has to
+  // reverse: fed in as given, the first sample is the most recent one and the
+  // series' own span goes negative.
   const lagSeed = useMemo(
     () =>
-      (dispatcher?.recent_samples ?? []).map((s) => ({
-        t: new Date(s.measured_at).getTime(),
-        v: s.lag,
-      })),
+      (dispatcher?.recent_samples ?? [])
+        .map((s) => ({ t: new Date(s.measured_at).getTime(), v: s.lag }))
+        .sort((a, b) => a.t - b.t),
     [dispatcher?.recent_samples],
   )
   const lagSeries = useSeries(lag.data, lagValue, lagSeed)
@@ -1168,8 +1188,12 @@ export default function DemoPage() {
   })
 
   const briefing = run?.briefing ?? null
-  const activeAlert = (alerts.data ?? [])[0] ?? null
-  const openBreakers = (breakers.data ?? []).filter((b) => b.state !== 'closed')
+  const activeAlert = (alerts.data?.items ?? [])[0] ?? null
+  const openBreakers = (breakers.data?.breakers ?? []).filter((b) => b.state !== 'closed')
+  // An empty list with a reason is a different finding from an empty list
+  // without one: the first says the platform could tell you nothing, the second
+  // says nothing is open.
+  const breakersUnknownReason = breakers.data?.unknown_reason ?? null
 
   return (
     <Layout>
@@ -1223,7 +1247,7 @@ export default function DemoPage() {
             unknownReason={
               dispatcher === null
                 ? 'no reading for this group yet'
-                : (dispatcher.unknown_reason ?? null)
+                : dispatcher.lag_unknown_reason
             }
             threshold={MODE_METRICS.consumer_outage.threshold}
             rationale={MODE_METRICS.consumer_outage.rationale}
@@ -1273,6 +1297,12 @@ export default function DemoPage() {
             )}
             {breakers.error !== null ? (
               <p className="text-amber-300/80">{breakers.error}</p>
+            ) : breakersUnknownReason !== null ? (
+              // The platform could say nothing. Not the same as "nothing is
+              // open", and the difference is the whole reason this field exists.
+              <p className="text-amber-300/80">
+                Breaker state unknown — {breakersUnknownReason}
+              </p>
             ) : (
               <p className="text-gray-400">
                 {/* A breaker with no published record is ABSENT from this list,

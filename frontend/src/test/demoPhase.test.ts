@@ -84,6 +84,7 @@ function run(state: AgentRunState, history: AgentRunState[] = []): AgentRun {
     started_at: '2026-09-19T10:01:00Z',
     updated_at: '2026-09-19T10:05:00Z',
     finished_at: null,
+    active: true,
   }
 }
 
@@ -93,9 +94,10 @@ describe('agentPhase — the agent’s own word', () => {
   })
 
   it.each([
-    ['triaging', 'agent_investigating'],
+    ['triage', 'agent_investigating'],
     ['investigating', 'agent_investigating'],
     ['planning', 'agent_planning'],
+    ['awaiting_approval', 'awaiting_approval'],
     ['remediating', 'agent_remediating'],
     ['verifying', 'verifying'],
     ['resolved', 'recovered'],
@@ -112,7 +114,7 @@ describe('agentPhase — the agent’s own word', () => {
   })
 
   it('carries the run’s own state word even where the station is coarser', () => {
-    expect(agentPhase(run('triaging'))!.state).toBe('triaging')
+    expect(agentPhase(run('triage'))!.state).toBe('triage')
     expect(agentPhase(run('failed'))!.state).toBe('failed')
   })
 })
@@ -261,10 +263,15 @@ describe('derivePhase — the two sources side by side', () => {
   })
 
   it('walks the whole strip as a run progresses', () => {
+    // All nine reportable states, in the order a run walks them. These are the
+    // commander's own IncidentState values character for character — there is
+    // no mapping layer on either side of the wire, which is what makes an
+    // unhandled member a bug rather than a fallback.
     const order: AgentRunState[] = [
-      'triaging',
+      'triage',
       'investigating',
       'planning',
+      'awaiting_approval',
       'remediating',
       'verifying',
       'resolved',
@@ -274,6 +281,7 @@ describe('derivePhase — the two sources side by side', () => {
       'agent_investigating',
       'agent_investigating',
       'agent_planning',
+      'awaiting_approval',
       'agent_remediating',
       'verifying',
       'recovered',
@@ -286,7 +294,7 @@ describe('phaseTimeline — durations from the append-only history', () => {
     const r: AgentRun = {
       ...run('planning'),
       phase_history: [
-        { state: 'triaging', at: '2026-09-19T10:00:00Z' },
+        { state: 'triage', at: '2026-09-19T10:00:00Z' },
         { state: 'investigating', at: '2026-09-19T10:00:30Z' },
         { state: 'planning', at: '2026-09-19T10:01:30Z' },
       ],
@@ -309,7 +317,7 @@ describe('phaseTimeline — durations from the append-only history', () => {
   })
 
   it('is empty for a run with no history yet', () => {
-    expect(phaseTimeline({ ...run('triaging'), phase_history: [] })).toEqual([])
+    expect(phaseTimeline({ ...run('triage'), phase_history: [] })).toEqual([])
   })
 })
 

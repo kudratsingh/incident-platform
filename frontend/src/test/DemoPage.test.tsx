@@ -134,7 +134,7 @@ function agentRun(overrides: Partial<AgentRun> = {}): AgentRun {
     scenario: 'remediate_consumer_lag_success',
     state: 'investigating',
     phase_history: [
-      { state: 'triaging', at: '2026-09-19T10:01:00Z' },
+      { state: 'triage', at: '2026-09-19T10:01:00Z' },
       { state: 'investigating', at: '2026-09-19T10:01:20Z' },
     ],
     current_hypothesis: null,
@@ -143,6 +143,7 @@ function agentRun(overrides: Partial<AgentRun> = {}): AgentRun {
     started_at: '2026-09-19T10:01:00Z',
     updated_at: '2026-09-19T10:02:00Z',
     finished_at: null,
+    active: true,
     ...overrides,
   }
 }
@@ -156,17 +157,35 @@ interface Fixture {
   dlqTotal?: number
 }
 
+function page<T>(items: T[], pageSize = 50) {
+  return { items, total: items.length, page: 1, page_size: pageSize, has_next: false }
+}
+
 function stub(f: Fixture = {}) {
-  listAgentRuns.mockResolvedValue(f.runs ?? [])
-  consumerLag.mockResolvedValue([
-    {
-      consumer_group: 'worker-dispatcher',
-      lag: f.lagKnown === false ? null : (f.lag ?? 0),
-      lag_known: f.lagKnown !== false,
-      unknown_reason: f.lagKnown === false ? 'no lag reading cached' : null,
-      measured_at: '2026-09-19T10:02:00Z',
-    },
-  ])
+  listAgentRuns.mockResolvedValue(page(f.runs ?? []))
+  consumerLag.mockResolvedValue({
+    measured_at: '2026-09-19T10:02:00Z',
+    total: 1,
+    live_group: 'worker-dispatcher',
+    groups: [
+      {
+        consumer_group: 'worker-dispatcher',
+        lag: f.lagKnown === false ? null : (f.lag ?? 0),
+        lag_known: f.lagKnown !== false,
+        source: 'live',
+        lag_unknown_reason: f.lagKnown === false ? 'no lag reading cached' : null,
+        measured_at: '2026-09-19T10:02:00Z',
+        age_seconds: 3,
+        // Newest first, as the endpoint promises — the page has to reverse it.
+        // Timestamps are relative to now because the page drops samples older
+        // than its five-minute window, which a fixed 2026 timestamp would be.
+        recent_samples: [
+          { lag: f.lag ?? 0, measured_at: new Date(Date.now() - 10_000).toISOString() },
+          { lag: 0, measured_at: new Date(Date.now() - 70_000).toISOString() },
+        ],
+      },
+    ],
+  })
   dlqStats.mockResolvedValue({ total: f.dlqTotal ?? 0, by_type: {} })
   listJobs.mockResolvedValue({
     items: f.jobs ?? [],
@@ -182,10 +201,16 @@ function stub(f: Fixture = {}) {
     page_size: 100,
     has_next: false,
   })
-  // The two side readings the "platform readings" strip shows. Empty is the
-  // healthy answer for both.
-  vi.mocked(adminApi.circuitBreakers).mockResolvedValue([])
-  vi.mocked(adminApi.listAlerts).mockResolvedValue([])
+  // The two side readings the "platform readings" strip shows. An empty breaker
+  // list WITHOUT `unknown_reason` is the healthy answer; with it set it means
+  // the platform could say nothing, which the panel must not conflate.
+  vi.mocked(adminApi.circuitBreakers).mockResolvedValue({
+    measured_at: '2026-09-19T10:02:00Z',
+    breakers: [],
+    total: 0,
+    unknown_reason: null,
+  })
+  vi.mocked(adminApi.listAlerts).mockResolvedValue(page([]))
 }
 
 function renderDemo(search = '') {
@@ -284,6 +309,43 @@ describe('DemoPage — absent readings stay absent', () => {
     renderDemo()
     expect(await screen.findByText(/no fault injected yet/i)).toBeTruthy()
   })
+
+  it('tells an unknowable breaker listing apart from an empty one', async () => {
+    // Both answers are an empty array. Only one of them means "nothing is
+    // open"; the other means the platform could tell you nothing, and
+    // rendering them the same way is the ADR 0030 mistake one layer up.
+    stub()
+    renderDemo()
+    expect(await screen.findByText(/no breaker open among those publishing state/i)).toBeTruthy()
+
+    vi.mocked(adminApi.circuitBreakers).mockResolvedValue({
+      measured_at: '2026-09-19T10:02:00Z',
+      breakers: [],
+      total: 0,
+      unknown_reason: 'the breaker state store is unreachable',
+    })
+    renderDemo()
+    expect(
+      await screen.findByText(/breaker state unknown — the breaker state store is unreachable/i),
+    ).toBeTruthy()
+  })
+
+  it('reads the lag sparkline’s seed samples oldest-first', async () => {
+    // `recent_samples` arrives NEWEST first. Fed in as given, the series' own
+    // span goes negative and every point lands off the left edge — so assert
+    // the rendered polyline advances left to right.
+    stub({ lag: 40 })
+    renderDemo()
+    const panel = await screen.findByTestId('metric-lag')
+    await waitFor(() => expect(panel.querySelector('polyline')).toBeTruthy())
+    const points = panel.querySelector('polyline')!.getAttribute('points')!
+    const xs = points.split(' ').map((p) => Number(p.split(',')[0]))
+    expect(xs.length).toBeGreaterThan(1)
+    expect(xs[0]).toBe(0)
+    for (let i = 1; i < xs.length; i += 1) {
+      expect(xs[i]).toBeGreaterThanOrEqual(xs[i - 1])
+    }
+  })
 })
 
 describe('DemoPage — the agent card', () => {
@@ -320,8 +382,8 @@ describe('DemoPage — the agent card', () => {
     stub({ runs: [agentRun()], audit: [FAULT_ROW] })
     renderDemo()
     const card = await screen.findByTestId('agent-card')
-    expect(within(card).getByText(/triaging/i)).toBeTruthy()
-    // triaging → investigating took 20s.
+    expect(within(card).getByText(/triage/i)).toBeTruthy()
+    // triage → investigating took 20s.
     expect(within(card).getByText(/20\.0s/)).toBeTruthy()
   })
 })
@@ -445,7 +507,8 @@ describe('DemoPage — the DLQ mini-table', () => {
     id: '55555555-5555-5555-5555-555555555555',
     remediation_hint: 'human_required',
     fenced_at: '2026-09-19T09:57:00Z',
-    fenced_by: 'incident-commander',
+    // The real shape: `{principal_type}:{id}`, not a friendly name.
+    fenced_by: 'service_account:99999999-9999-9999-9999-999999999999',
   })
 
   it('renders hint, triage class and fence state per row', async () => {
@@ -455,8 +518,9 @@ describe('DemoPage — the DLQ mini-table', () => {
     expect(within(table).getByText(/replay_safe/)).toBeTruthy()
     expect(within(table).getByText(/validation_error/)).toBeTruthy()
     expect(within(table).getByText(/human_required/)).toBeTruthy()
-    // The fenced row says who fenced it.
-    expect(within(table).getByText(/incident-commander/)).toBeTruthy()
+    // The fenced row says who fenced it, id truncated with the whole value in
+    // the title.
+    expect(within(table).getByText(/service_account:/)).toBeTruthy()
   })
 
   it('badges each row with what the agent decided about it', async () => {

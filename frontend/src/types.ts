@@ -272,17 +272,22 @@ export interface ProgressEvent {
 // ---------------------------------------------------------------------------
 
 /**
- * The platform's state enum, which is NOT the commander's own.
+ * The nine states, which are the commander's own `IncidentState` values —
+ * character for character, with no mapping layer on either side of the wire.
  *
- * Two deliberate differences, both on the platform's side of the wire:
- * `triaging` where the agent says `triage`, and no `awaiting_approval` (Tier-2
- * approvals are unbuilt, so no run can reach it). The console renders an
- * unrecognised value verbatim rather than guessing a station for it.
+ * That is deliberate (platform `AgentRunState`): a state the responder reaches
+ * cannot be lost in translation on its way to this console, and a member added
+ * in one repository and not the other is a refusal at the wire rather than a
+ * silently dropped state. Only `resolved` / `escalated` / `failed` close a run.
+ *
+ * The console still renders an unrecognised value verbatim rather than guessing
+ * a station for it, because this list can only ever be one release behind.
  */
 export type AgentRunState =
-  | 'triaging'
+  | 'triage'
   | 'investigating'
   | 'planning'
+  | 'awaiting_approval'
   | 'remediating'
   | 'verifying'
   | 'resolved'
@@ -351,7 +356,16 @@ export interface AgentRun {
   id: string
   tenant_id: string
   alert_id: string | null
-  service_account_id: string | null
+  /** The principal that wrote every report in this run. Always present. */
+  service_account_id: string
+  /**
+   * The responder's own short name for the run.
+   *
+   * The MCP write side calls this field `run_label`, because ADR 0012's registry
+   * screen bans the lab's word for it from a non-chaos tool's `tools/list`
+   * surface. It lands in `agent_runs.scenario` and reaches the console under
+   * that name — one wire name, two spellings, on purpose.
+   */
   scenario: string | null
   state: AgentRunState
   phase_history: AgentRunPhase[]
@@ -361,6 +375,8 @@ export interface AgentRun {
   started_at: string
   updated_at: string
   finished_at: string | null
+  /** Computed server-side: `finished_at === null`. One fact, not two. */
+  active: boolean
 }
 
 // ---------------------------------------------------------------------------
@@ -377,35 +393,71 @@ export interface LagSample {
  *
  * `lag_known: false` with `lag: null` is a real answer and must render as
  * unknown-with-a-reason. Rendering it as 0 is the bug ADR 0030 is about: an
- * absent reading is not a healthy one.
+ * absent reading is not a healthy one — hence `lag_unknown_reason`, which is
+ * null exactly when `lag_known` is true so a blank cell always has an
+ * explanation beside it.
+ *
+ * `recent_samples` arrives **newest first**, which any chart has to reverse.
+ * It is empty both for a group nothing measures and before the first window is
+ * recorded: an empty list is missing history, not a flat line.
  */
 export interface ConsumerLagReading {
   consumer_group: string
   lag: number | null
   lag_known: boolean
-  unknown_reason?: string | null
+  source: 'live' | 'static' | 'unrecognized'
+  lag_unknown_reason: string | null
   measured_at: string | null
-  age_seconds?: number | null
-  recent_samples?: LagSample[]
+  age_seconds: number | null
+  recent_samples: LagSample[]
+}
+
+export interface ConsumerLagResponse {
+  measured_at: string
+  groups: ConsumerLagReading[]
+  total: number
+  /** The one group whose number actually moves; the rest are recorded constants. */
+  live_group: string
 }
 
 export interface CircuitBreakerReading {
   name: string
   state: string
-  failure_count?: number
-  failure_threshold?: number
-  last_state_change_at?: string | null
-  last_failure_reason_class?: string | null
+  failure_count: number
+  failure_threshold: number
+  recovery_timeout_s: number
+  last_state_change_at: string | null
+  seconds_since_state_change: number | null
+  last_failure_at: string | null
+  last_failure_reason_class: string | null
+  recorded_at: string
+  /** Not a heartbeat: a large age on a closed breaker means nothing called it. */
+  reported_age_s: number
+}
+
+export interface CircuitBreakersResponse {
+  measured_at: string
+  breakers: CircuitBreakerReading[]
+  total: number
+  /**
+   * Set when the platform could say nothing at all. An empty list with this set
+   * is not the same finding as an empty list without it — so the console has to
+   * carry the whole response, not just the array.
+   */
+  unknown_reason: string | null
 }
 
 export interface PlatformAlert {
   id: string
+  tenant_id: string
   severity: string
   source: string
   title: string
-  description?: string | null
+  description: string | null
   fired_at: string
-  resolved_at?: string | null
+  /** Null while the alert is active. */
+  resolved_at: string | null
+  extra_data: Record<string, unknown> | null
 }
 
 export interface JobCreateRequest {

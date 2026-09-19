@@ -53,12 +53,20 @@ going on camera.
 
 ```
 healthy → fault injected → agent investigating → agent planning
-        → agent remediating → verifying → recovered | escalated
+        → awaiting approval → agent remediating → verifying
+        → recovered | escalated
 ```
 
-Seven stations. The last one is the terminal **pair**, not two steps: it names
+Eight stations. The last one is the terminal **pair**, not two steps: it names
 whichever terminal was actually reached, and shows `recovered | escalated` until
 one is.
+
+`awaiting approval` has a station of its own even though the approvals subsystem
+is unbuilt and no run reaches it today. The nine reportable states are the
+commander's own `IncidentState` values with no mapping layer on either side of
+the wire, so this one arrives the moment Tier-2 approvals ship — and a state with
+nowhere to land is a state that silently reads as something else. An empty
+station on screen is the cheaper mistake.
 
 Each lit station carries up to two markers:
 
@@ -77,21 +85,33 @@ This is the **only** source that can tell investigating from planning from
 remediating, because a plan leaves no mark on the platform at all. The agent
 thinking is invisible from the outside.
 
+All nine states, and the eight stations they land on:
+
 | Run state | Station | Why |
 |---|---|---|
-| `triaging` | agent investigating | triage is the first read; it has no station of its own |
+| `triage` | agent investigating | triage IS the first read; a station for it would be lit for a second or two at most |
 | `investigating` | agent investigating | |
 | `planning` | agent planning | |
+| `awaiting_approval` | awaiting approval | unreachable today; see above |
 | `remediating` | agent remediating | |
 | `verifying` | verifying | |
 | `resolved` | recovered | |
 | `escalated` | escalated | |
 | `failed` | escalated | the terminal pair is recovered \| escalated, and a failed run is the not-recovered one. The agent card still shows `failed` — "the run broke" and "the agent handed over" are different things to the person watching |
 
-The platform's `state` enum is not the commander's: it says `triaging` where the
-agent says `triage`, and it has no `awaiting_approval` (Tier-2 approvals are
-unbuilt, so no run can reach it). An unrecognised value parks on the first agent
-station and the card shows the real word.
+These nine strings are the commander's own `IncidentState` values, character for
+character: the responder maps nothing on its way out and the platform maps
+nothing on its way in, so a state cannot be lost in translation and a member
+added in one repository and not the other is a refusal at the wire rather than a
+silently dropped state. Only `resolved` / `escalated` / `failed` close a run
+(`finished_at`, surfaced as the computed `active`). An unrecognised value — this
+list can only ever be one release behind — parks on the first agent station and
+the card shows the real word.
+
+One field name differs between the two halves on purpose: the MCP write side
+calls the run's short name `run_label`, because ADR 0012's registry screen bans
+the lab's word for it from a non-chaos tool's `tools/list` surface. It lands in
+`agent_runs.scenario` and reaches this console under that name.
 
 ### The platform's reading
 
@@ -151,8 +171,17 @@ thirty seconds.* Where the lag reading does bring `recent_samples`, they backfil
 the line so a page opened mid-run is not starting from nothing.
 
 An unknown lag renders as `unknown` plus the reason the platform gave
-(`unknown_reason`), and the phase strip adds a line saying it cannot confirm
-recovery. It never renders as 0.
+(`lag_unknown_reason`, which is null exactly when `lag_known` is true so a blank
+cell always has an explanation beside it), and the phase strip adds a line saying
+it cannot confirm recovery. It never renders as 0.
+
+Two details of the reading that a chart has to respect. `recent_samples` arrives
+**newest first**, so the seed is reversed before it is drawn — fed in as given,
+the series' own span goes negative and every point lands off the left edge. And
+`live_group` names the one group whose number actually moves; the others are
+recorded constants. The page reads `worker-dispatcher` by name and falls back to
+`live_group`, in that order: the fallback is the right answer if the group were
+ever renamed and the wrong one to prefer while the named group is present.
 
 ### The jobs strip
 
@@ -171,8 +200,12 @@ Rows from `GET /api/v1/admin/jobs?status=dead_letter`. Six columns:
 | Error | `error_message` |
 | Hint | `remediation_hint`, or **`not categorised`** when null |
 | Triage | `triage.root_cause_category`, or `none` |
-| Fenced | `fenced_by` when `fenced_at` is set, else `no` |
+| Fenced | `fenced_by` when `fenced_at` is set, else `no`. The value is `{principal_type}:{id}`, shown truncated with the whole string in the title. It reads the *timestamp*, not the hint, because a null `fenced_at` with a `human_required` hint means triage wrote that hint and no operator fenced anything |
 | Agent decided | derived — see below |
+
+`dead_lettered_at` is computed server-side from `completed_at` and is null for
+any job that is not dead-lettered — one fact rather than two that can disagree,
+and `status` is the reason, so it carries no reason string of its own.
 
 `remediation_hint: null` prints *not categorised* rather than a dash because
 null means "the platform has not classified this row". It is emphatically **not**
@@ -200,9 +233,14 @@ not the agent doing nothing.
 
 A compact line for the active alert (`GET /api/v1/admin/alerts?active=true`,
 newest first) and any breaker not `closed` (`GET /api/v1/admin/circuit-breakers`).
+
 A breaker with no published record is **absent from that list**, never reported
 closed — so "No breaker open among those publishing state" is the honest wording
-and is what the panel says.
+and is what the panel says. The endpoint's `unknown_reason` is the other half of
+that: an empty list *with* it set means the platform could tell you nothing, and
+the panel says so instead. Both answers are an empty array, and only one of them
+means nothing is open, which is why the console carries the whole response rather
+than just the array.
 
 ---
 
