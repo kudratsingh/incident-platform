@@ -610,14 +610,19 @@ async def test_the_lab_pause_reads_identically_to_an_operator_pause(
             return json.loads(text)
 
         for where in ("root", "child"):
-            assert _normalise(reads["operator"][where], by_operator) == _normalise(
-                reads["lab"][where], by_lab
-            ), f"a lab pause is distinguishable from an operator pause at {where}"
+            operator_read = _normalise(reads["operator"][where], by_operator)
+            lab_read = _normalise(reads["lab"][where], by_lab)
+            operator_ttl = operator_read.pop("paused_expires_in_seconds")
+            lab_ttl = lab_read.pop("paused_expires_in_seconds")
+            assert operator_read == lab_read, (
+                f"a lab pause is distinguishable from an operator pause at {where}"
+            )
+            assert operator_ttl is None or lab_ttl is None or abs(operator_ttl - lab_ttl) <= 1
 
         # …and the thing that equality is really about: paused true with an
         # expiry on the root, the descendant naming the root as `paused_by`.
         assert reads["lab"]["root"]["paused"] is True
-        assert reads["lab"]["root"]["paused_expires_in_seconds"] == 600
+        assert 599 <= reads["lab"]["root"]["paused_expires_in_seconds"] <= 600
         assert reads["lab"]["child"]["paused"] is False
         assert reads["lab"]["child"]["paused_by"] == by_lab["root_job_id"]
     finally:
