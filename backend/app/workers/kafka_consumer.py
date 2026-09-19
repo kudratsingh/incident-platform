@@ -8,6 +8,8 @@ commits nothing and seeks back, so the next poll redelivers (at-least-once, made
 
 import asyncio
 import json
+import math
+import time
 from abc import ABC, abstractmethod
 from typing import Any
 
@@ -24,11 +26,23 @@ from app.workers.schema_registry import validate as validate_schema
 logger = get_logger(__name__)
 
 
+# The value the kill flag carries. Shared so the chaos hook and the sticky re-arm below cannot
+# drift apart — anything reading the key treats presence, not content, as the signal.
+KILL_FLAG_VALUE = "killed"
+
+
 def kill_key_for(group_id: str) -> str:
     """Redis key the chaos `kill_consumer` tool sets to shut a specific
     consumer group down. Consumers check this key at the top of every
     poll iteration."""
     return f"chaos:kill:{group_id}"
+
+
+def sticky_kill_key_for(group_id: str) -> str:
+    """Redis key `kill_consumer(sticky=true)` sets beside the kill flag.
+    Its value is the absolute unix deadline the flag may be re-armed until
+    (ADR 0032); its own TTL is the same instant on Redis's clock."""
+    return f"chaos:kill_sticky:{group_id}"
 
 
 def latency_key_for(group_id: str) -> str:
@@ -37,28 +51,71 @@ def latency_key_for(group_id: str) -> str:
     return f"chaos:latency:{group_id}"
 
 
+def _sticky_deadline(raw: Any) -> float | None:
+    """Parse a sticky marker into an absolute unix deadline, or None when unreadable.
+
+    Unreadable fails OPEN — a corrupted value releases the group rather than wedging it for the
+    life of the process."""
+    if raw is None:
+        return None
+    try:
+        deadline = float(raw)
+    except (TypeError, ValueError):
+        return None
+    # NaN and inf parse as floats and would survive every comparison below.
+    return deadline if math.isfinite(deadline) else None
+
+
+async def _rearm_sticky_kill(client: Any, group_id: str, marker: Any) -> bool:
+    """Put the kill flag back for what is LEFT of a sticky kill's window (ADR 0032).
+
+    The window is absolute: the flag is re-armed with `pxat` at the deadline the hook stored, so
+    restarting the group cannot extend it and the marker's own TTL ends it regardless. Writes only
+    under `CHAOS_ENABLED` — the caller's read is unconditional (the strict check's fail-closed
+    contract needs it), the write is gate 1 (ADR 0008).
+    """
+    deadline = _sticky_deadline(marker)
+    if deadline is None or deadline - time.time() <= 0:
+        return False
+    if not get_settings().chaos_enabled:
+        return False
+    await client.set(
+        kill_key_for(group_id), KILL_FLAG_VALUE, pxat=round(deadline * 1000)
+    )
+    return True
+
+
+async def _read_kill_state(client: Any, group_id: str) -> bool:
+    """True when this group is killed: the flag is set, or a sticky window re-arms it.
+
+    One MGET for both keys, so the sticky option costs no extra round trip per poll."""
+    marker_key = sticky_kill_key_for(group_id)
+    flag, marker = await client.mget([kill_key_for(group_id), marker_key])
+    if flag is not None:
+        return True
+    return await _rearm_sticky_kill(client, group_id, marker)
+
+
 async def _check_chaos_kill(group_id: str) -> bool:
-    """True when `chaos:kill:<group>` exists. Fails open, and defers the Redis import."""
+    """True when the group is killed (`chaos:kill:<group>`, or a sticky re-arm). Fails open, and
+    defers the Redis import."""
     try:
         from app.core.redis import get_redis_client
 
-        client = get_redis_client()
-        val = await client.get(kill_key_for(group_id))
-        return val is not None
+        return await _read_kill_state(get_redis_client(), group_id)
     except Exception:
         return False
 
 
 async def _check_chaos_kill_strict(group_id: str) -> bool:
-    """Return True when a `chaos:kill:<group>` key exists in Redis, and RAISE when the lookup fails.
+    """Return True when the group is killed, and RAISE when the lookup fails.
 
     Fails CLOSED, unlike the variant above: for the supervisor's kill window an unknown state must
-    not read as "cleared" and resurrect the consumer mid-measurement. The key's TTL bounds it."""
+    not read as "cleared" and resurrect the consumer mid-measurement. A sticky window re-arms the
+    flag here, which is what makes a Tier-1 restart genuinely fail; the deadline bounds it."""
     from app.core.redis import get_redis_client
 
-    client = get_redis_client()
-    val = await client.get(kill_key_for(group_id))
-    return val is not None
+    return await _read_kill_state(get_redis_client(), group_id)
 
 
 async def _check_chaos_latency(group_id: str) -> int:
