@@ -183,6 +183,8 @@ jobs:
               "test_stranded_chain",
               "test_db_pool_saturation",
               "test_downstream_latency",
+              "test_breaker_visibility",
+              "test_postgres_health_pg",
           }
 
           try:

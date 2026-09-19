@@ -300,6 +300,7 @@ def _read_tools() -> list[ToolDefinition]:
 #: tenant-scoped Redis key the fixture seeded.
 _ARGUMENTS: dict[str, dict[str, Any]] = {
     "get_cache_key_info": {"key": "{cache_key}"},
+    "get_circuit_breakers": {},
     "get_consumer_lag": {"consumer_group": "worker-dispatcher"},
     "get_dag_state": {"job_id": str(_DLQ_JOB_ID)},
     "get_deploy_history": {},
@@ -307,6 +308,7 @@ _ARGUMENTS: dict[str, dict[str, Any]] = {
     "get_outbox_status": {},
     "get_postgres_health": {},
     "get_redis_health": {},
+    "get_slo_status": {},
     "get_trace": {"trace_id": _TRACE_ID},
     "list_active_alerts": {},
     "list_audit_events": {},
@@ -324,7 +326,7 @@ def test_every_read_tool_has_a_call_in_the_argument_table() -> None:
         f"read tools with no entry in _ARGUMENTS: {missing}. Add a sensible "
         "call for each so the response screen below covers it."
     )
-    assert len(_read_tools()) >= 14, "the read surface shrank — check why"
+    assert len(_read_tools()) >= 16, "the read surface shrank — check why"
 
 
 @pytest.mark.parametrize(

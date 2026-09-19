@@ -398,6 +398,21 @@ accordingly:
   sweeps are wasted scans, not duplicate work — and the CAS also holds against Kafka redelivery,
   which no leader gate would see.
 
+And one piece of in-process state is deliberately published out of it: **circuit-breaker state**.
+`app/core/circuit_breaker.py` keeps its registry in a module-level dict, so a breaker exists only
+in the process that registered it — `bulk-api-sync` (`app/workers/async_tasks.py`) in whichever
+process runs the worker loops. The MCP process is a separate boot from the same image
+([ADR 0006](ADR/0006-mcp-server-standalone-process.md)) and would read its own empty registry, so
+each breaker records its state in Redis under `breaker:state:<name>` — on every state change and
+at most once a minute while calls flow, with a 24-hour TTL — and `get_circuit_breakers` reads that
+rather than the dict ([ADR 0030](ADR/0030-breaker-state-is-published-and-a-reading-is-never-invented.md)).
+Same shape as the relay heartbeat in [ADR 0028](ADR/0028-outbox-relay-heartbeat-and-delivery-reading.md):
+the write fails open, and an absent record reads as unknown rather than as a closed breaker.
+The **connection pools are not published this way** and are not shared either — each process sizes
+its own — so `get_postgres_health`'s `pool_*` fields describe the pool of the process that answered
+the call and say so, while its query readings come from `pg_stat_activity` and therefore cover every
+connection to the database whichever process asks.
+
 ### Per-task responsibilities
 
 | Task | Source | Sink | Failure isolation |
