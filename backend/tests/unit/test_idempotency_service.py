@@ -351,9 +351,7 @@ async def test_lookup_evicts_an_expired_record_rather_than_reading_past_it() -> 
     repo.delete_by_id.assert_awaited_once_with(record_id=stale.id)
 
 
-# ---------------------------------------------------------------------------
 # Reaper — ADR 0010 follow-up (v0.4.8)
-# ---------------------------------------------------------------------------
 
 
 async def test_delete_expired_removes_only_records_past_expires_at(

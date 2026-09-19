@@ -1,11 +1,4 @@
-"""Unit tests for app.core.db_url.is_async_url (F1-06).
-
-The two False cases are exactly the sync URLs alembic's env.py used to
-hand create_async_engine, which raised at engine construction before any
-migration ran. The predicate lives in app.core (not env.py) because
-env.py executes the migration runner at import time and cannot be
-imported by tests.
-"""
+"""Unit tests for app.core.db_url.is_async_url (F1-06)."""
 
 from app.core.db_url import is_async_url
 

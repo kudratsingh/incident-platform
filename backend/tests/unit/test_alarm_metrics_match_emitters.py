@@ -1,27 +1,4 @@
-"""Tripwire tests binding every CloudWatch alarm to a metric the code publishes.
-
-Invariant: an alarm that names a metric/dimension pair nothing emits is not a
-weak alarm, it is a *silent* one. With `treat_missing_data = "notBreaching"`
-it sits in OK forever and reads exactly like a healthy system, so the failure
-is invisible until the incident it was meant to catch has already happened.
-Nothing else in the repo can see this: Terraform validates the alarm's syntax,
-never its data source, and the alarm only meets the emitters in a deployed
-account.
-
-Finding R2-14: the job-completion SLO fast-burn alarm queried
-JobDeadLettered/JobCompleted with no dimensions while the dispatcher only ever
-publishes them with a JobType dimension, so the ratio had no data source and
-could never fire. Three more of the same family shipped alongside it (the RDS
-alarm's `.id`-vs-`.identifier` dimension, and one alarm with no
-`treat_missing_data` at all).
-
-What this file can and cannot catch: it cross-checks the *mechanical* contract
-— does this (metric, dimension-keys) tuple exist on the emitter side — which
-covers every fault above. It cannot judge whether a metric that does exist
-*measures the right thing*; the QueueDepth-vs-ConsumerLag half of R2-14 was a
-semantic fault (QueueDepth reads only the Redis delayed-retry set, not the
-Kafka backlog) and is held by review and the runbooks, not by this guard.
-"""
+"""Tripwire tests binding every CloudWatch alarm to a metric the code publishes."""
 
 import re
 from dataclasses import dataclass
@@ -34,9 +11,7 @@ from ._hcl import has_key as _has_key
 from ._hcl import repo_root as _repo_root
 from ._hcl import scalar as _scalar
 
-# ---------------------------------------------------------------------------
 # Alarm side — reads infra/cloudwatch.tf through the shared HCL scanner
-# ---------------------------------------------------------------------------
 
 
 def _dimensions(body: str) -> dict[str, str]:
@@ -149,9 +124,7 @@ def _parse_alarms() -> list[Alarm]:
     return alarms
 
 
-# ---------------------------------------------------------------------------
 # The guards
-# ---------------------------------------------------------------------------
 
 
 def test_the_scanner_actually_found_the_alarms() -> None:
@@ -168,14 +141,7 @@ def test_the_scanner_actually_found_the_alarms() -> None:
 
 
 def test_every_custom_alarm_reads_a_metric_the_code_publishes() -> None:
-    """Each IncidentPlatform alarm must name a (metric, dimension-keys) pair emitted.
-
-    The dimension keys have to match exactly, not merely overlap: CloudWatch
-    treats a dimension set as part of the metric's identity, so an alarm on
-    JobDeadLettered with no dimensions and an emitter publishing
-    JobDeadLettered[JobType] are two different metrics and the alarm's one is
-    always empty (R2-14).
-    """
+    """Each IncidentPlatform alarm must name a (metric, dimension-keys) pair emitted."""
     emitted = _emitted_metrics()
     failures = []
 
@@ -197,13 +163,7 @@ def test_every_custom_alarm_reads_a_metric_the_code_publishes() -> None:
 
 
 def test_every_alarm_declares_treat_missing_data() -> None:
-    """No alarm may inherit the `missing` default.
-
-    The default holds the alarm in whatever state it was last in when the
-    datapoints stop, which is the one behaviour nobody wants from a resource
-    that has gone away entirely: it reads OK because it read OK an hour ago.
-    Declaring it makes the choice deliberate and reviewable per alarm.
-    """
+    """No alarm may inherit the `missing` default."""
     missing = [
         alarm.name
         for alarm in _parse_alarms()
@@ -213,14 +173,7 @@ def test_every_alarm_declares_treat_missing_data() -> None:
 
 
 def test_rds_alarm_uses_the_instance_identifier_not_the_resource_id() -> None:
-    """`aws_db_instance.<x>.id` is the DBI resource id (`db-ABC…`) under AWS provider v5.
-
-    CloudWatch's DBInstanceIdentifier dimension carries the *instance
-    identifier* ("incident-platform"), so an alarm wired to `.id` watches a
-    dimension that never receives a datapoint. The two attributes are both
-    plausible-looking strings, which is exactly why this needs a test and not
-    a comment.
-    """
+    """`aws_db_instance.<x>.id` is the DBI resource id (`db-ABC…`) under AWS provider v5."""
     offenders = []
     for alarm in _parse_alarms():
         for key, value in alarm.dimensions.items():

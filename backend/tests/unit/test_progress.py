@@ -1,23 +1,4 @@
-"""Unit tests for the Redis progress bridge (E1-10) — the publish half.
-
-Redis Pub/Sub is at-most-once. A client that subscribes after the terminal
-event was published receives nothing at all — and because terminal detection
-only ever fired on a *live* message, the stream sat on a silent channel
-forever, holding the SSE connection open with it.
-
-The fix is a retained snapshot: publish() SETs the last event under
-`job:progress:last:{job_id}` **before** publishing it, and the subscriber
-reads that snapshot as its first event (after subscribing, never before) and
-ends immediately when it is terminal. The ordering assertions for the write
-side live here.
-
-The read side moved: subscribing is no longer a per-viewer generator in this
-module but the process-wide fan-out broker in `workers/progress_broker.py`
-(WO-R2-11), and the snapshot/terminal tests moved with it to
-`tests/unit/test_progress_broker.py`.
-
-Every test here fakes Redis; nothing touches a server.
-"""
+"""Unit tests for the Redis progress bridge (E1-10) — the publish half."""
 
 import json
 
@@ -59,17 +40,11 @@ class _FakeRedis:
         self.published.append((channel, payload))
 
 
-# ---------------------------------------------------------------------------
 # publish() / read_last_event() — the retained key itself
-# ---------------------------------------------------------------------------
 
 
 async def test_publish_retains_snapshot_before_publishing() -> None:
-    """SET must precede PUBLISH, with the documented key and 1h TTL.
-
-    Publishing first would leave a window in which a just-subscribed client
-    misses the live event and then finds no snapshot — the exact hang.
-    """
+    """SET must precede PUBLISH, with the documented key and 1h TTL."""
     redis = _FakeRedis()
 
     await publish(
@@ -119,16 +94,8 @@ async def test_read_last_event_round_trips_a_published_event() -> None:
     assert (event.job_id, event.status, event.progress) == (JOB_ID, "running", 55)
 
 
-# ---------------------------------------------------------------------------
 # Snapshot ordering (WO-R2-57)
-#
 # Kafka is at-least-once, so a rebalance or a failed handler redelivers a
-# `job.progress` the job has already moved past. Written unconditionally, that
-# redelivery replaced a terminal snapshot with `running` — and nothing ever
-# corrected it, because no further event is coming for a finished job. Every
-# late subscriber for the snapshot's remaining hour was then told the job was
-# still running and sat on a channel that would never speak again.
-# ---------------------------------------------------------------------------
 
 
 async def _publish_event(
@@ -235,9 +202,7 @@ async def test_events_without_provenance_keep_the_terminal_guard() -> None:
     assert retained.status == "completed"
 
 
-# ---------------------------------------------------------------------------
 # Publish-rate floors (WO-R2-57)
-# ---------------------------------------------------------------------------
 
 
 async def test_rate_limited_bounds_a_million_offers_to_about_a_hundred() -> None:

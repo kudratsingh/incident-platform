@@ -1,16 +1,4 @@
-"""Real-constraint proof for uq_audit_logs_kafka_coord.
-
-Uses the conftest SQLite session — SQLite enforces UNIQUE, so this is a
-genuine constraint test, not a mock. Two properties matter:
-
-1. Two rows with the same (kafka_topic, kafka_partition, kafka_offset)
-   collide — the dedup primitive the AuditConsumer relies on under
-   at-least-once redelivery.
-2. Rows with all-NULL coordinates never collide (NULLs are distinct under
-   UNIQUE in both SQLite and Postgres) — this protects the inline
-   transactional audit writers (API routes, worker, saga coordinator),
-   which carry no Kafka coordinates.
-"""
+"""Real-constraint proof for uq_audit_logs_kafka_coord."""
 
 import pytest
 from app.models.audit import AuditLog

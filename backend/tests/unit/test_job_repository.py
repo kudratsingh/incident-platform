@@ -1,16 +1,4 @@
-"""Unit tests for `JobRepository`.
-
-Focused on the update_status timestamp behavior. Uses monkey-patching of
-`datetime.now` so we can assert on the exact value the repository writes,
-independent of SQLite's tz-stripping behavior (SQLite silently drops
-tzinfo when reading back from a DateTime(timezone=True) column, even
-though it stores it).
-
-The behavior we actually want to lock in is the write: the repository
-must call `datetime.now(UTC)` (aware) and NOT `datetime.utcnow()`
-(naive, deprecated). On real Postgres (`TIMESTAMPTZ`), aware writes
-round-trip as aware; on SQLite we can only assert the intent.
-"""
+"""Unit tests for `JobRepository`."""
 
 import uuid
 from datetime import UTC, datetime

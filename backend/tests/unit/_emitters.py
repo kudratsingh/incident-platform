@@ -1,15 +1,4 @@
-"""What `backend/app` actually publishes to CloudWatch, by static sweep.
-
-Shared by `test_alarm_metrics_match_emitters.py` (does every alarm read a
-metric that exists) and `test_runbook_lint.py` (does every metric an on-call
-engineer is told to open exist). Those two questions have to be answered from
-the same source or the runbooks can name a metric the alarm guard already
-rejected.
-
-Walks the tree rather than importing it: the emit sites are spread over
-request middleware and several worker loops, and only a static sweep sees all
-of them without running any of them.
-"""
+"""What `backend/app` actually publishes to CloudWatch, by static sweep."""
 
 from __future__ import annotations
 

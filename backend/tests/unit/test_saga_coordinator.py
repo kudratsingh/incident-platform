@@ -215,14 +215,7 @@ async def test_cancelled_downstream_is_zero_when_nothing_was_waiting() -> None:
 
 async def test_dlq_with_no_completed_steps_settles_the_saga_on_the_same_tick()\
         -> None:
-    """R2-49: the FIRST step of a fresh saga dead-letters.
-
-    Nothing has completed, so zero `.compensate` jobs are minted — and while
-    settlement was reachable only from a `.compensate` job's terminal event,
-    no such event could ever arrive and the saga pinned at COMPENSATING
-    forever. The rollback is vacuously complete (nothing to undo), so the
-    saga must reach a terminal status with its audit row on this tick.
-    """
+    """R2-49: the FIRST step of a fresh saga dead-letters."""
     factory = _factory()
     coord = SagaCoordinator(factory)
     saga = _saga()

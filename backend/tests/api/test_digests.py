@@ -64,8 +64,7 @@ async def test_generate_digest_round_trips_when_enabled(
     admin_headers: dict[str, str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """When enabled and the LLM returns a valid digest, the endpoint
-    persists + serializes it."""
+    """When enabled and the LLM returns a valid digest, the endpoint persists + serializes it."""
     from datetime import UTC, datetime, timedelta
 
     monkeypatch.setenv("LLM_DIGEST_ENABLED", "true")
@@ -74,7 +73,6 @@ async def test_generate_digest_round_trips_when_enabled(
 
     # Force a non-empty window, then stub the paid call. The route composes
     # the three phases itself (WO-R2-127) rather than calling the combined
-    # `run_digest_for_tenant`, so the stubs go on the parts.
     fake_digest_row = DigestRow(
         id=uuid.uuid4(),
         tenant_id=uuid.UUID("d3fa17de-7a17-de7a-17de-7a17de7a17de"),
@@ -135,19 +133,7 @@ async def test_generate_digest_clamps_hours(
     requested: object,
     expected_hours: int,
 ) -> None:
-    """`hours` is clamped to 1..168, junk falls back to the default.
-
-    The clamp is only observable in the *window* the route hands to the
-    read phase, so this inspects the arguments the stub was actually called
-    with. Stubbing the call and asserting only that it was awaited — which
-    is what this test used to do, with a single unparseable input — passes
-    with the clamp deleted outright.
-
-    The stub moved from `run_digest_for_tenant` to `collect_window_stats`
-    when WO-R2-127 split the route into read / call / write phases; the
-    window is now an argument to the read, and `generate_digest` is the
-    paid call that must not happen at all when the window comes back empty.
-    """
+    """`hours` is clamped to 1..168, junk falls back to the default."""
     from datetime import timedelta
 
     monkeypatch.setenv("LLM_DIGEST_ENABLED", "true")
@@ -181,7 +167,6 @@ async def test_generate_digest_clamps_hours(
     assert payload["window_end"] == window_end.isoformat()
 
     # And an empty window must not reach the paid call at all — the read
-    # phase is what decides that, and it now runs before the round-trip
     # rather than inside the same composed call (WO-R2-127).
     paid.assert_not_awaited()
 
@@ -246,7 +231,6 @@ async def test_cross_tenant_get_denied_without_platform_flag(
 
 # ---------------------------------------------------------------------------
 # WO-R2-127 — the digest write runs under a re-established tenant context
-# ---------------------------------------------------------------------------
 
 
 async def test_generate_digest_reestablishes_rls_context_for_the_write(
@@ -254,26 +238,8 @@ async def test_generate_digest_reestablishes_rls_context_for_the_write(
     admin_headers: dict[str, str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """`app.tenant_id` is a transaction-local GUC, so the INSERT's transaction
-    has to set it for itself.
-
-    R2-63 moved the worker's digest onto read / call / write transactions so
-    the Anthropic round-trip holds no connection; the route kept the composed
-    single-transaction form, which is the residue #183 documented and could
-    not fix. Splitting the route the same way is what creates the hazard this
-    asserts: `get_current_user` set the GUC on the *request's* transaction, and
-    the write phase is not that transaction. An unscoped INSERT is not
-    rejected — every `tenant_isolation` policy's bootstrap branch
-    (`current_setting(...) IS NULL OR ... = ''`) admits it — so the row lands
-    with RLS not standing behind it at all. That silence is the hazard;
-    `tests/integration/test_rls_enforcement.py` proves both halves on a live
-    server.
-
-    Asserted on the call rather than on Postgres behaviour because the unit
-    tier runs on SQLite, where `_set_rls_tenant` is a deliberate no-op;
-    `tests/integration/test_rls_enforcement.py` is where the policy itself is
-    proven against a live server.
-    """
+    """`app.tenant_id` is a transaction-local GUC, so the INSERT's transaction has to set
+    it for itself."""
     from datetime import UTC, datetime, timedelta
 
     monkeypatch.setenv("LLM_DIGEST_ENABLED", "true")
@@ -345,14 +311,7 @@ async def test_generate_digest_does_not_hold_the_read_open_across_the_paid_call(
     admin_headers: dict[str, str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The other half of R2-63, applied to the route.
-
-    The aggregate read and the INSERT are separate transactions with the
-    Anthropic round-trip between them, so a slow model does not pin the
-    digest's connection `idle in transaction`. Pinned by observing that the
-    read and the write are handed different sessions — the property that
-    re-composing them into one would destroy.
-    """
+    """The other half of R2-63, applied to the route."""
     from datetime import UTC, datetime, timedelta
 
     monkeypatch.setenv("LLM_DIGEST_ENABLED", "true")

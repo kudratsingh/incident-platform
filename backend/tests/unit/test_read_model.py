@@ -1,12 +1,4 @@
-"""Unit tests for the CQRS read-model projector — Redis faked in-process.
-
-The fake is a real (tiny) implementation of the handful of commands the
-projector uses, not a call recorder: these tests are about what the
-projection *contains* after a sequence of events — that a terminal job is
-not demoted by a redelivery, that a key stays bounded however many jobs
-flow through it, that the counts survive the trim — and a mock asserting
-that ZADD was called cannot see any of that.
-"""
+"""Unit tests for the CQRS read-model projector — Redis faked in-process."""
 
 import fnmatch
 import uuid
@@ -141,9 +133,7 @@ def _event(name: str, tenant_id: str, job_id: str, user_id: str, **extra: Any) -
     }
 
 
-# ---------------------------------------------------------------------------
 # Projection semantics
-# ---------------------------------------------------------------------------
 
 
 async def test_completed_event_moves_job_into_completed_view() -> None:
@@ -310,7 +300,6 @@ async def test_read_global_stats_returns_counts_per_tenant() -> None:
 
     # `cancelled` joined the tracked set with WO-R2-113: an id the projector
     # does not track is an id `_move` never removes from its old set, so
-    # tracking it is what makes the cancellation event mean anything.
     assert stats == {
         "running": 3,
         "completed": 7,
@@ -328,9 +317,7 @@ async def test_read_user_stats_uses_user_keys() -> None:
     assert (await read_model.read_user_stats(redis, user_id))["running"] == 1  # type: ignore[arg-type]
 
 
-# ---------------------------------------------------------------------------
 # Bounded growth (WO-R2-56)
-# ---------------------------------------------------------------------------
 
 
 async def test_status_view_stays_bounded_across_many_terminal_jobs(
@@ -419,9 +406,7 @@ async def test_legacy_set_key_is_migrated_rather_than_raising() -> None:
     assert key not in redis.sets
 
 
-# ---------------------------------------------------------------------------
 # Rebuild from Postgres (WO-R2-56)
-# ---------------------------------------------------------------------------
 
 
 async def _job_row(

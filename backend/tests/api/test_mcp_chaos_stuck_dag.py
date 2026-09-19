@@ -1,27 +1,4 @@
-"""End-to-end tests for the `create_stuck_dag` chaos hook.
-
-Reuses the CHAOS_ENABLED-true reload trick from
-`test_mcp_wave2_chaos_hooks` so the decorator fires against patched
-settings before `create_mcp_app` mounts the routes.
-
-What has to be proven (the hook exists because the boot-seeded DAG
-auto-completes seconds after boot, so no live probe ever saw a stuck
-chain):
-
-  * gating — invisible when CHAOS_ENABLED=false, `chaos:invoke` required
-  * the manufactured chain is OBSERVABLE through the existing
-    `get_dag_state` read tool (the acceptance criterion)
-  * the chain resists the platform's own promoter — a real
-    `DependencyResolver` fed the upstream parent's `job.completed`
-    promotes nothing
-  * the ADR 0008 round-trip — `replay_dlq_by_ids` on the root genuinely
-    unsticks the chain, and the resolver then drains it step by step
-  * `pause_dag` (the remediation the live scenario grades) is
-    observable against the chain via `get_dag_state`
-  * idempotent repeat vs. drifted-chain refusal
-  * reversibility contract — every row carries the top-level
-    `seeded_fixture` marker the reset sweep DELETEs on
-"""
+"""End-to-end tests for the `create_stuck_dag` chaos hook."""
 
 from __future__ import annotations
 
@@ -94,9 +71,7 @@ class _RedisStub:
 def _mcp_app_with_chaos_enabled(  # type: ignore[no-untyped-def]
     db_session: AsyncSession, redis_stub: _RedisStub
 ):
-    """Fresh MCP app under CHAOS_ENABLED=true. Wipes the registry and
-    reloads only the modules these tests invoke, so the surface stays
-    minimal and collisions with other files' harnesses are impossible."""
+    """Fresh MCP app under CHAOS_ENABLED=true."""
     with patch(
         "app.mcp.standalone.assert_chaos_gate", lambda *a, **kw: None
     ), patch(
@@ -186,8 +161,8 @@ class _NoopTxn:
 
 
 class _TxnlessSession:
-    """Hands the resolver the test's live session but makes `begin()` a
-    no-op — the `db_session` fixture already owns the transaction."""
+    """Hands the resolver the test's live session but makes `begin()` a no-op — the
+    `db_session` fixture already owns the transaction."""
 
     def __init__(self, inner: AsyncSession) -> None:
         self._inner = inner
@@ -242,8 +217,6 @@ async def _job(db_session: AsyncSession, job_id: str) -> Job:
 
 
 # ---------------------------------------------------------------------------
-# Gating
-# ---------------------------------------------------------------------------
 
 
 async def test_create_stuck_dag_not_registered_when_chaos_disabled(
@@ -294,15 +267,13 @@ async def test_create_stuck_dag_missing_chaos_scope_is_forbidden(
 
 
 # ---------------------------------------------------------------------------
-# The stuck chain is real and observable
-# ---------------------------------------------------------------------------
 
 
 async def test_stuck_chain_is_observable_through_get_dag_state(
     db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
 ) -> None:
-    """The acceptance criterion: the fault must read back through the
-    existing read surface, not through anything chaos-only."""
+    """The acceptance criterion: the fault must read back through the existing read
+    surface, not through anything chaos-only."""
     redis_stub = _RedisStub()
     app, teardown = _mcp_app_with_chaos_enabled(db_session, redis_stub)
     try:
@@ -354,11 +325,10 @@ async def test_stuck_chain_is_observable_through_get_dag_state(
 async def test_stuck_chain_resists_the_platforms_own_promoter(
     db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
 ) -> None:
-    """Feed a real DependencyResolver the upstream parent's
-    `job.completed` — exactly the redelivery that used to drain the
-    boot-seeded DAG — and prove it promotes nothing: the root is
-    `dead_letter` (not WAITING, so skipped) and every descendant still
-    has an unmet dependency."""
+    """Feed a real DependencyResolver the upstream parent's `job.completed` — exactly the
+    redelivery that used to drain the boot-seeded DAG — and prove it promotes nothing:
+    the root is `dead_letter` (not WAITING, so skipped) and every descendant still has
+    an unmet dependency."""
     redis_stub = _RedisStub()
     app, teardown = _mcp_app_with_chaos_enabled(db_session, redis_stub)
     try:
@@ -401,15 +371,14 @@ async def test_stuck_chain_resists_the_platforms_own_promoter(
 
 # ---------------------------------------------------------------------------
 # ADR 0008 round-trip: the compensators genuinely work
-# ---------------------------------------------------------------------------
 
 
 async def test_create_stuck_dag_round_trip_with_replay_dlq_by_ids(
     db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
 ) -> None:
-    """The unstick path, end to end through the platform's own
-    machinery: replay the dead-lettered root, complete it the way the
-    dispatcher would, and watch the real resolver drain the chain."""
+    """The unstick path, end to end through the platform's own machinery: replay the
+    dead-lettered root, complete it the way the dispatcher would, and watch the real
+    resolver drain the chain."""
     redis_stub = _RedisStub()
     app, teardown = _mcp_app_with_chaos_enabled(db_session, redis_stub)
     try:
@@ -448,8 +417,6 @@ async def test_create_stuck_dag_round_trip_with_replay_dlq_by_ids(
         assert made["root_job_id"] in await _submitted_outbox_job_ids(db_session)
 
         # Complete each freed job the way the dispatcher would, then let
-        # the real resolver react to its job.completed. The chain drains
-        # one step per completion — promotion is real, not simulated.
         job_repo = JobRepository(db_session)
         resolver = _resolver(db_session, redis_stub)
         chain = [made["root_job_id"], *made["waiting_job_ids"]]
@@ -486,9 +453,9 @@ async def test_create_stuck_dag_round_trip_with_replay_dlq_by_ids(
 async def test_pause_dag_is_observable_on_the_manufactured_chain(
     db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
 ) -> None:
-    """The stabilization the live scenario grades: pause the root, read
-    `paused=true` (with expiry) back through `get_dag_state`, and see a
-    descendant name the root as the ancestor holding it."""
+    """The stabilization the live scenario grades: pause the root, read `paused=true` (with
+    expiry) back through `get_dag_state`, and see a descendant name the root as the
+    ancestor holding it."""
     redis_stub = _RedisStub()
     app, teardown = _mcp_app_with_chaos_enabled(db_session, redis_stub)
     try:
@@ -549,8 +516,6 @@ async def test_pause_dag_is_observable_on_the_manufactured_chain(
 
 
 # ---------------------------------------------------------------------------
-# Idempotent repeat vs. drift
-# ---------------------------------------------------------------------------
 
 
 async def test_create_stuck_dag_repeat_is_idempotent_until_drift(
@@ -598,17 +563,7 @@ async def test_create_stuck_dag_repeat_is_idempotent_until_drift(
 async def test_same_chain_name_in_two_tenants_yields_distinct_chains(
     db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
 ) -> None:
-    """Two tenants asking for the same `chain_name` each get their own
-    chain.
-
-    Ids used to derive from `chain_name` alone, so both tenants computed
-    the *same* uuid5 set. Under RLS the probe could not see the sibling
-    tenant's rows, so the second call fell through to an INSERT that
-    collided on the primary key instead of raising the documented 409;
-    without RLS (this suite runs on SQLite) the probe saw them and the
-    second tenant was refused with `stuck_chain_name_in_use`. Both are
-    wrong for the same reason — the id space was global. Deriving it per
-    tenant makes a cross-tenant collision unrepresentable."""
+    """Two tenants asking for the same `chain_name` each get their own chain."""
     other = Tenant(
         id=uuid.uuid4(),
         slug=f"other-{uuid.uuid4().hex[:8]}",
@@ -656,13 +611,7 @@ async def test_same_chain_name_in_two_tenants_yields_distinct_chains(
 async def test_repeat_with_fewer_waiting_steps_is_not_intact(
     db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
 ) -> None:
-    """A shorter repeat must be refused, not reported intact.
-
-    `_assert_intact` only checked that the rows the *current* call
-    expects are present, so a repeat with a smaller `waiting_steps`
-    returned `created=false` while silently omitting the descendants it
-    did not know about — the caller then reasoned about a three-node
-    chain that is really five nodes long."""
+    """A shorter repeat must be refused, not reported intact."""
     redis_stub = _RedisStub()
     app, teardown = _mcp_app_with_chaos_enabled(db_session, redis_stub)
     try:
@@ -723,17 +672,7 @@ async def test_stuck_root_text_agrees_with_the_declared_hint(
     test_user,  # type: ignore[no-untyped-def]
     hint: str,
 ) -> None:
-    """WO-R2-146, end to end.
-
-    The root is the row the agent reads before deciding whether a replay
-    is safe, and the scenario declares its hint. Live run efdc3b2a9864
-    declared `replay_safe` and got a root whose text said
-    SchemaValidationError — a permanent data fault — so the agent
-    escalated, correctly, on a scenario graded for a replay.
-
-    Asserted through the wire rather than against the table so that a
-    hook which stopped consulting the table fails here.
-    """
+    """WO-R2-146, end to end."""
     redis_stub = _RedisStub()
     app, teardown = _mcp_app_with_chaos_enabled(db_session, redis_stub)
     try:

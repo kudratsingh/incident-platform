@@ -38,7 +38,6 @@ def _make_service() -> tuple[JobService, AsyncMock, AsyncMock, AsyncMock]:
     job_repo = AsyncMock()
     # The idempotency-race guard wraps job_repo.create in
     # `async with session.begin_nested()`. Give the mock a working
-    # savepoint context so the wrapping doesn't break every other test.
     savepoint_ctx = MagicMock()
     savepoint_ctx.__aenter__ = AsyncMock(return_value=None)
     savepoint_ctx.__aexit__ = AsyncMock(return_value=False)
@@ -52,9 +51,7 @@ def _make_service() -> tuple[JobService, AsyncMock, AsyncMock, AsyncMock]:
     return svc, job_repo, audit_repo, outbox_repo
 
 
-# ---------------------------------------------------------------------------
 # create_job
-# ---------------------------------------------------------------------------
 
 
 async def test_create_job_success() -> None:
@@ -171,9 +168,7 @@ async def test_create_job_reraises_integrity_when_refetch_finds_nothing() -> Non
         )
 
 
-# ---------------------------------------------------------------------------
 # get_job
-# ---------------------------------------------------------------------------
 
 
 async def test_get_job_owner_can_access() -> None:
@@ -215,9 +210,7 @@ async def test_get_job_not_found_raises() -> None:
         await svc.get_job(uuid.uuid4(), uuid.uuid4(), UserRole.ADMIN, uuid.uuid4())
 
 
-# ---------------------------------------------------------------------------
 # replay_job
-# ---------------------------------------------------------------------------
 
 
 async def test_replay_failed_job() -> None:
@@ -346,9 +339,7 @@ async def test_replay_invalidates_job_cache() -> None:
     assert kwargs["ex"] > 0  # a tombstone with a TTL, not a bare delete
 
 
-# ---------------------------------------------------------------------------
 # resolve_incident
-# ---------------------------------------------------------------------------
 
 
 async def test_resolve_incident_invalidates_job_cache() -> None:
@@ -366,9 +357,7 @@ async def test_resolve_incident_invalidates_job_cache() -> None:
     )
 
 
-# ---------------------------------------------------------------------------
 # DAG pause enforcement on the replay / create dispatch paths (E1-08)
-# ---------------------------------------------------------------------------
 
 
 async def test_replay_job_refused_while_the_dag_is_paused() -> None:

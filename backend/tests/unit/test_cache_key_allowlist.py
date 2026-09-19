@@ -120,9 +120,7 @@ def test_the_hot_set_fixture_key_stays_chaos_writable() -> None:
     assert _chaos_writable(_DEFAULT_HOT_SET_KEY)
 
 
-# ---------------------------------------------------------------------------
 # R2-54 — the tenant half of the same decision
-# ---------------------------------------------------------------------------
 
 
 def test_the_tenant_segment_is_read_out_of_the_real_job_cache_key() -> None:
@@ -183,9 +181,7 @@ def test_both_cache_tools_share_one_scope_check() -> None:
     )
 
 
-# ---------------------------------------------------------------------------
 # WO-R3-267 — the job half of the same key, read out of the same builder
-# ---------------------------------------------------------------------------
 
 
 def test_the_job_segment_is_read_out_of_the_real_job_cache_key() -> None:

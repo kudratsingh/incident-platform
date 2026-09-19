@@ -1,8 +1,4 @@
-"""Cross-tenant isolation tests.
-
-Verify that with the enforcement in place, a user in tenant A cannot
-read, replay, or get a 4xx leak about a job belonging to tenant B.
-"""
+"""Cross-tenant isolation tests."""
 
 import json
 import uuid
@@ -278,10 +274,8 @@ async def test_cache_hit_does_not_leak_cross_tenant_job(
     other_tenant_user: User,
     admin_headers: dict[str, str],
 ) -> None:
-    """E2-01 regression: a cached tenant-B job must never be served to a
-    privileged tenant-A caller. The cache key is tenant-scoped, so tenant A's
-    lookup misses (`cache:job:{A}:{id}`) and falls through to the tenant-scoped DB
-    path, which 404s."""
+    """E2-01 regression: a cached tenant-B job must never be served to a privileged
+    tenant-A caller."""
     job = Job(
         tenant_id=other_tenant.id,
         user_id=other_tenant_user.id,
@@ -336,8 +330,8 @@ async def test_idempotency_key_reusable_across_tenants(
     auth_headers: dict[str, str],
     other_tenant_headers: dict[str, str],
 ) -> None:
-    """The same idempotency key in two tenants produces two distinct jobs —
-    the unique constraint is scoped per-tenant, not global."""
+    """The same idempotency key in two tenants produces two distinct jobs — the unique
+    constraint is scoped per-tenant, not global."""
     a_resp = await client.post(
         "/api/v1/jobs",
         json={"type": "csv_upload", "idempotency_key": "shared-key"},
@@ -401,8 +395,8 @@ async def test_admin_cannot_get_saga_from_other_tenant(
     tenant_a_saga,  # type: ignore[no-untyped-def]
     other_tenant_admin_headers: dict[str, str],
 ) -> None:
-    """GET /sagas/{id} returned any saga — plus every step job's payload,
-    result and error_message — to any authenticated caller."""
+    """GET /sagas/{id} returned any saga — plus every step job's payload, result and
+    error_message — to any authenticated caller."""
     resp = await client.get(
         f"/api/v1/sagas/{tenant_a_saga.id}", headers=other_tenant_admin_headers
     )
@@ -418,8 +412,8 @@ async def test_user_cannot_get_another_users_saga_in_their_own_tenant(
     tenant_a_saga,  # type: ignore[no-untyped-def]
     default_tenant,  # type: ignore[no-untyped-def]
 ) -> None:
-    """The tenant check is not the whole check: an ordinary user sees only
-    their own sagas, which is what GET /sagas has always claimed."""
+    """The tenant check is not the whole check: an ordinary user sees only their own sagas,
+    which is what GET /sagas has always claimed."""
     other = User(
         tenant_id=default_tenant.id,
         email="neighbour@test.example.com",
@@ -449,8 +443,8 @@ async def test_saga_list_excludes_other_tenants_for_privileged_callers(
     tenant_a_saga,  # type: ignore[no-untyped-def]
     other_tenant_admin_headers: dict[str, str],
 ) -> None:
-    """GET /sagas passed `user_id=None` for admin/support callers with no
-    tenant filter, so a privileged caller listed every tenant's sagas."""
+    """GET /sagas passed `user_id=None` for admin/support callers with no tenant filter, so
+    a privileged caller listed every tenant's sagas."""
     resp = await client.get("/api/v1/sagas", headers=other_tenant_admin_headers)
     assert resp.status_code == 200
     assert str(tenant_a_saga.id) not in {
@@ -463,8 +457,8 @@ async def test_admin_user_stats_rejects_a_user_from_another_tenant(
     test_user: User,
     other_tenant_admin_headers: dict[str, str],
 ) -> None:
-    """GET /admin/users/{id}/stats accepted any user UUID and answered from
-    Redis, where there is no RLS backstop to catch the miss."""
+    """GET /admin/users/{id}/stats accepted any user UUID and answered from Redis, where
+    there is no RLS backstop to catch the miss."""
     resp = await client.get(
         f"/api/v1/admin/users/{test_user.id}/stats",
         headers=other_tenant_admin_headers,

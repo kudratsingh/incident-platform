@@ -1,35 +1,4 @@
-"""A fence describes itself as an action with a verification surface (WO-R2-158).
-
-Tool descriptions are the whole interface — the agent cannot read the
-docstrings, the ADRs or this file, so a description that steers wrong is a
-functional defect (CLAUDE.md, "Tool descriptions — normative"). Three of
-them steered wrong around `mark_dlq_permanent`, and the platform's own
-behaviour agreed with them:
-
-  * `mark_dlq_permanent` called itself "idempotent" and left a caller to
-    conclude that marking an already-`human_required` row does nothing. It
-    genuinely did nothing — no row write, no audit row — so the reading was
-    accurate and the behaviour was the bug. Now every mark writes, and the
-    description says what a re-mark does.
-  * Nothing said how to *verify* a fence. Re-reading `remediation_hint`
-    looks like verification and is not: `human_required` is the same value
-    whether triage classified the row or somebody fenced it, so the hint
-    cannot tell a caller its own call landed. `fenced_at` can, and both
-    descriptions now name it as the surface.
-  * `create_bad_data_job` advertised one shape — a row that arrives already
-    classified — which is the one shape that cannot measure a fence. The
-    hint is now an argument and the description says why the unclassified
-    variant exists.
-
-Pinned as claims rather than as whole-string snapshots, same convention as
-`test_dag_tool_descriptions.py`: a snapshot of a 1500-character description
-fails on every wording change and tells the next reader nothing about which
-sentence mattered.
-
-Rebless note: these strings are pinned by the commander's contract snapshot,
-so they land at the next re-pin, together with the two new `DlqEntry` fields
-and the new `mark_dlq_permanent` output field asserted at the bottom.
-"""
+"""A fence describes itself as an action with a verification surface (WO-R2-158)."""
 
 import importlib
 from collections.abc import Iterator
@@ -73,7 +42,6 @@ def chaos_registered() -> Iterator[None]:
         _restore_for_tests(snapshot)
         # Reload once more under the real (disabled) settings so the
         # module object left in `sys.modules` matches the registry the
-        # next test sees.
         importlib.reload(chaos_pkg.create_bad_data_job)  # type: ignore[attr-defined]
 
 
@@ -92,9 +60,7 @@ def _field_description(tool_name: str, field: str) -> str:
     return str(described)
 
 
-# --------------------------------------------------------------------------
 # mark_dlq_permanent — names its verification surface, and what a re-mark does
-# --------------------------------------------------------------------------
 
 
 def test_mark_dlq_permanent_names_fenced_at_as_the_verification_surface() -> None:
@@ -134,9 +100,7 @@ def test_mark_dlq_permanent_says_which_clock_fenced_at_is_on() -> None:
     assert "platform clock, UTC" in text
 
 
-# --------------------------------------------------------------------------
 # list_dlq_messages — says what the two new fields answer
-# --------------------------------------------------------------------------
 
 
 def test_list_dlq_says_who_classified_the_row() -> None:
@@ -182,9 +146,7 @@ def test_fenced_by_field_states_its_format() -> None:
     assert "{principal_type}:{principal_id}" in described
 
 
-# --------------------------------------------------------------------------
 # create_bad_data_job — says why the unclassified variant exists
-# --------------------------------------------------------------------------
 
 
 def test_create_bad_data_job_says_the_hint_decides_the_shape(chaos_registered: None) -> None:
@@ -235,9 +197,7 @@ def test_create_bad_data_job_field_says_what_a_wrong_error_text_does(
     assert "a replay nothing has authorised" in described
 
 
-# --------------------------------------------------------------------------
 # The shape deltas, enumerated — this change is not description-only
-# --------------------------------------------------------------------------
 
 
 def test_the_output_shape_deltas_are_exactly_these(chaos_registered: None) -> None:

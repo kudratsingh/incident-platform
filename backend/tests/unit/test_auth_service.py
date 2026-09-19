@@ -43,9 +43,7 @@ def _make_service() -> tuple[AuthService, AsyncMock, AsyncMock]:
     return svc, user_repo, audit_repo
 
 
-# ---------------------------------------------------------------------------
 # register
-# ---------------------------------------------------------------------------
 
 
 async def test_register_success() -> None:
@@ -69,9 +67,7 @@ async def test_register_duplicate_email_raises() -> None:
         await svc.register("test@example.com", "password123")
 
 
-# ---------------------------------------------------------------------------
 # login
-# ---------------------------------------------------------------------------
 
 
 async def test_login_success_returns_tokens() -> None:
@@ -110,18 +106,7 @@ async def test_login_inactive_user_raises() -> None:
 
 
 async def test_login_against_unusable_password_hash_raises_auth_error() -> None:
-    """Chaos-lab owner accounts carry a sentinel hash bcrypt cannot parse.
-
-    `bcrypt.checkpw` raises ValueError('Invalid salt') on it, which used to
-    escape login() as a 500 — a 500-vs-401 oracle that fingerprints chaos
-    accounts (D-12). Verification must fail closed so the caller gets the
-    same 401 as any other bad credential.
-
-    Both `is_active` values are covered on purpose: the real chaos owner is
-    inactive, but login() verifies the password BEFORE the is_active check,
-    so an active account with an unparseable hash must fail cleanly too —
-    reordering the checks would not be a fix.
-    """
+    """Chaos-lab owner accounts carry an unparseable sentinel bcrypt hash (D-12)."""
     for is_active in (True, False):
         svc, user_repo, _ = _make_service()
         user_repo.get_by_email.return_value = _make_user(

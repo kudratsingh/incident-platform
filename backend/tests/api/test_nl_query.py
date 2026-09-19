@@ -52,8 +52,8 @@ async def test_enabled_returns_spec_and_items(
     admin_headers: dict[str, str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """When enabled and the LLM returns a valid spec, we surface both the
-    filter spec and the rows."""
+    """When enabled and the LLM returns a valid spec, we surface both the filter spec and
+    the rows."""
     monkeypatch.setenv("LLM_NL_QUERY_ENABLED", "true")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     get_settings.cache_clear()
@@ -84,8 +84,8 @@ async def test_llm_failure_surfaces_as_503(
     admin_headers: dict[str, str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A timeout or network blip from the LLM call shouldn't 500 — return
-    503 so the UI can show 'try again'."""
+    """A timeout or network blip from the LLM call shouldn't 500 — return 503 so the UI can
+    show 'try again'."""
     monkeypatch.setenv("LLM_NL_QUERY_ENABLED", "true")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     get_settings.cache_clear()

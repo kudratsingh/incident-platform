@@ -32,14 +32,11 @@ from httpx import Request, Response
 
 # How long the fake Anthropic client blocks for. Comfortably longer than the
 # 10ms deadline the tests configure, and short enough that a *missing* timeout
-# still finishes the test rather than hanging the suite.
 _SLOW_CALL_SECONDS = 0.5
 _DEADLINE_SECONDS = 0.01
 
 
-# ---------------------------------------------------------------------------
 # Fakes
-# ---------------------------------------------------------------------------
 
 
 def _slow_client() -> MagicMock:
@@ -117,9 +114,7 @@ def _record(value: dict[str, object], offset: int = 7) -> ConsumerRecord:
     )
 
 
-# ---------------------------------------------------------------------------
 # ADR 0005: "times out (configurable per feature; defaults to 10s)"
-# ---------------------------------------------------------------------------
 
 
 async def _assert_abandoned_at_deadline(coro: Any) -> None:
@@ -220,9 +215,7 @@ def test_every_llm_feature_has_a_timeout_setting() -> None:
         assert getattr(settings, field) == 10.0, f"{field} should default to 10s"
 
 
-# ---------------------------------------------------------------------------
 # The uncapped redelivery loop
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -343,9 +336,7 @@ async def test_a_deterministic_api_status_fails_open(status_code: int) -> None:
     repo.upsert.assert_not_awaited()
 
 
-# ---------------------------------------------------------------------------
 # The digest must not hold a DB transaction across the API round-trip
-# ---------------------------------------------------------------------------
 
 
 class _TrackedSession:

@@ -35,20 +35,6 @@ from app.mcp.registry import ToolDefinition, list_tools
 
 # Vocabulary that names the test apparatus rather than the system under
 # test. Case-insensitive, anchored at the start of a word, and tolerant of
-# ordinary English inflection at the end of it.
-#
-# The stems were previously matched with `\b` on both sides, which meant the
-# screen only caught the exact singular: `fixture` was banned and `fixtures`
-# was not, and likewise `scenarios`, `evals`, `seeds`, `seeding`, `harnesses`.
-# Those are the forms a description is *more* likely to use, so the gate let
-# through most of what it was written to stop.
-#
-# The trailing group is deliberately a small closed set rather than a general
-# stemmer: it has to be obvious from reading the pattern which words are
-# banned. Leading `\b` is kept — it is what spares "retrieval" and
-# "reseed"-free ordinary prose — and no suffix in the set can extend a stem
-# into an unrelated word ("evaluate" is not `eval` + a listed suffix, so it
-# still passes, as the test below asserts).
 _LAB_STEMS = ("chaos", "eval", "seed", "fixture", "harness", "scenario")
 _INFLECTIONS = r"(?:e?s|ed|ing)?"
 
@@ -59,14 +45,7 @@ LAB_VOCABULARY = re.compile(
 
 
 def _wire_surface(td: ToolDefinition) -> str:
-    """Every free-text thing `tools/list` serializes for one tool.
-
-    `tools/list` also advertises `is_idempotent` since WO-R2-32. It is
-    excluded deliberately rather than by oversight: a bool has no vocabulary
-    to leak. `required_scope` is included even though it is drawn from a
-    closed 5-member enum today — it is a string on the wire, so if that ever
-    becomes free-form the screen already covers it.
-    """
+    """Every free-text thing `tools/list` serializes for one tool."""
     return "\n".join(
         [
             td.description,
@@ -126,12 +105,7 @@ def test_screen_catches_a_planted_leak() -> None:
     ],
 )
 def test_screen_catches_inflected_forms(leak: str) -> None:
-    """Plurals and participles are the forms a description actually uses.
-
-    Every string here passed the old singular-only screen. `fixtures` is the
-    one named in the finding; the rest are the same fault in the other five
-    stems, and they are parametrised so a regression names the form it lost.
-    """
+    """Plurals and participles are the forms a description actually uses."""
     assert LAB_VOCABULARY.search(leak), f"screen missed lab vocabulary in: {leak!r}"
 
 
@@ -146,15 +120,7 @@ def test_screen_catches_inflected_forms(leak: str) -> None:
     ],
 )
 def test_screen_spares_ordinary_prose(innocent: str) -> None:
-    """The suffix set must not extend a stem into an unrelated word.
-
-    `evaluate`/`evaluation` are the words ADR 0012 calls out as legitimate,
-    and they are the reason the inflection group is a closed set rather than
-    an open `\\w*`. `scenario_id` is the exception that proves the boundary:
-    an underscore is a word character, so the screen does not fire on it —
-    a field *named* that would still leak through its auto-derived title,
-    which is what the registry-level test above is for.
-    """
+    """The suffix set must not extend a stem into an unrelated word."""
     assert LAB_VOCABULARY.search(innocent) is None, (
         f"screen fired on ordinary prose: {innocent!r}"
     )

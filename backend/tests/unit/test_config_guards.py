@@ -1,17 +1,4 @@
-"""Guard-matrix tests for the fail-closed production secret checks on Settings.
-
-Findings covered (WO-P6-01):
-
-- E2-08 — the old ``secret_key`` guard read ``os.getenv("ENVIRONMENT")``
-  instead of the parsed setting, so ``ENVIRONMENT=production`` supplied only
-  via the ``.env`` file (a supported config source) bypassed it and the
-  insecure default JWT key was silently accepted.
-- E2-07 — ``storage_access_key`` / ``storage_secret_key`` shipped the usable
-  default ``minioadmin`` with no production guard at all.
-
-Every construction passes ``_env_file=None`` (or an explicit tmp file) so a
-developer's local ``.env`` cannot make the suite non-hermetic.
-"""
+"""Guard-matrix tests for the fail-closed production secret checks on Settings."""
 
 from pathlib import Path
 
@@ -35,10 +22,8 @@ def _hermetic_process_env(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(var, raising=False)
 
 
-# ---------------------------------------------------------------------------
 # E2-08 — the guard must validate the *parsed* environment, whatever its
 # config source, not os.getenv.
-# ---------------------------------------------------------------------------
 
 
 def test_production_kwarg_with_default_secret_key_is_refused() -> None:
@@ -58,9 +43,7 @@ def test_production_via_env_file_only_is_refused(tmp_path: Path) -> None:
         Settings(_env_file=str(env_file))
 
 
-# ---------------------------------------------------------------------------
 # E2-07 — the weak default MinIO credential must never reach production.
-# ---------------------------------------------------------------------------
 
 
 def test_production_refuses_minioadmin_storage_secret_key() -> None:
@@ -83,9 +66,7 @@ def test_production_refuses_minioadmin_storage_access_key() -> None:
         )
 
 
-# ---------------------------------------------------------------------------
 # Negative space — the shapes that must keep booting.
-# ---------------------------------------------------------------------------
 
 
 def test_production_with_strong_secret_and_iam_storage_boots() -> None:

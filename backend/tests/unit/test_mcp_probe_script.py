@@ -1,22 +1,4 @@
-"""Contract tests for `scripts/mcp_probe.sh` against a stub MCP endpoint.
-
-Two defects pinned here:
-
-  1. The extract path piped the response through
-     `jq -r '.result.content[0].text'` without ever looking at
-     `.error`. A `lag` / `dlq` / `audit` probe against a broken stack
-     printed `null` and exited 0 — the operator's smoke test reported
-     success for a call that failed. `set -euo pipefail` cannot catch
-     this: both curl and jq exit 0 on an application-level JSON-RPC
-     error.
-
-  2. The usage block documented a generic
-     `mcp_probe.sh <tool_name> '<arguments_json>'` form that the case
-     statement's default branch rejected as an unknown preset.
-
-The stub speaks just enough JSON-RPC to drive both paths, so these run
-in the unit tier with no stack, no Docker and no network.
-"""
+"""Contract tests for `scripts/mcp_probe.sh` against a stub MCP endpoint."""
 
 from __future__ import annotations
 

@@ -1,12 +1,4 @@
-"""R2-59 — swallowing a DB error must leave the session usable.
-
-`degrade_on_db_error` is the one place that answers "and then what?" for
-a handler that turns a database failure into a degraded result. These
-tests are written against `AbortingSession` (see `tests/conftest.py`),
-which reproduces Postgres' aborted-transaction rule on SQLite — without
-it the whole failure mode is invisible off Postgres, which is how it
-shipped.
-"""
+"""R2-59 — swallowing a DB error must leave the session usable."""
 
 import pytest
 from app.core.db_degrade import degrade_on_db_error

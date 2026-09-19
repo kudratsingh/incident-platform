@@ -1,33 +1,4 @@
-"""The `chaos.` audit stream is readable only by a principal that may fire it.
-
-WO-R3-187 (owner decision O-4). `list_audit_events` returned
-`chaos.tool_invoked` / `chaos.tool_denied` rows — with `extra_data`
-naming the chaos tool and its arguments — to any `incidents:read`
-principal, which is the agent under test. An agent investigating a
-seeded fault could read who injected it, with what, and when. ADR 0012
-rule 1 screened tool descriptions and schemas; nothing screened a
-response body.
-
-The rule is keyed on `chaos:invoke` (`app.services.operator_audit.
-hidden_audit_action_prefixes`), which is why this work order also splits
-the service-account tokens: the evaluator's token holds `chaos:invoke`
-and still sees everything, the agent's does not hold it and sees nothing
-of the lab. A filter keyed on a principal *name* would have needed an
-allowlist; this one needs nothing but the scope the lab already requires.
-
-Two properties matter beyond "the rows are absent", and both are tested
-here because each has its own way of leaking:
-
-  - `total` must count only the visible rows. A `total` of 12 over an
-    events list of 4 tells the reader four things it may not read exist.
-  - Asking for a withheld stream must return an empty page, never an
-    error. `action_prefix='chaos.'` answering "forbidden" would confirm
-    the stream exists, which is the fact being withheld.
-
-`get_trace` is covered too: it is a second read path into `audit_logs`,
-and the `request_id` of a chaos invocation is exactly the trace an agent
-follows out of a job it is investigating.
-"""
+"""The `chaos.` audit stream is readable only by a principal that may fire it."""
 
 from __future__ import annotations
 
@@ -60,9 +31,6 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
 # The two principals the token split creates. Spelled out rather than
-# imported from the seed script: these are the sets the *platform* has to
-# behave differently for, and a test that read them from the seeder would
-# pass no matter what the seeder did.
 AGENT_SCOPES = [
     Scope.TELEMETRY_READ.value,
     Scope.INCIDENTS_READ.value,
@@ -151,15 +119,7 @@ def _content(body: dict[str, Any]) -> dict[str, Any]:
 async def _seed_chaos_world(
     db_session: AsyncSession, tenant_id: uuid.UUID
 ) -> None:
-    """Three visible rows and three the lab wrote.
-
-    The chaos rows carry the `extra_data` the real code writes
-    (`app.services.operator_audit.record_tool_invocation`) — tool name
-    plus arguments — because that payload, not the action string, is what
-    told an investigating agent which fault had been injected and where.
-    Two of them share `_TRACE_ID` with a visible row, which is how the
-    same leak reaches `get_trace`.
-    """
+    """Three visible rows and three the lab wrote."""
     rows = [
         AuditLog(
             tenant_id=tenant_id,
@@ -249,21 +209,13 @@ def _chaos_rows(payload: dict[str, Any]) -> int:
 
 
 def _assert_total_matches_the_page(payload: dict[str, Any]) -> None:
-    """`total` and the page must agree when nothing was capped.
-
-    Minting the probe token writes its own `service_account.*` rows, so
-    the absolute numbers here are not fixed — but `total` counting more
-    than a full page returned is precisely the disclosure being tested,
-    and that comparison holds whatever else is in the table.
-    """
+    """`total` and the page must agree when nothing was capped."""
     assert payload["total"] == len(payload["events"]), (
         f"total {payload['total']} over a {len(payload['events'])}-row page "
         "reports rows the caller may not read"
     )
 
 
-# ---------------------------------------------------------------------------
-# list_audit_events
 # ---------------------------------------------------------------------------
 
 
@@ -272,12 +224,7 @@ async def test_chaos_principal_sees_the_chaos_stream(
     db_session: AsyncSession,
     default_tenant,  # type: ignore[no-untyped-def]
 ) -> None:
-    """The half that must keep working: the evaluator reads everything.
-
-    The runner seeds and tears down the world and grades safety off these
-    rows, so a filter that hid them from `chaos:invoke` would break the
-    eval instead of the leak.
-    """
+    """The half that must keep working: the evaluator reads everything."""
     await _seed_chaos_world(db_session, default_tenant.id)
     token = await _token(db_session, default_tenant.id, EVALUATOR_SCOPES)
 
@@ -293,9 +240,7 @@ async def test_agent_principal_sees_no_chaos_rows(
     db_session: AsyncSession,
     default_tenant,  # type: ignore[no-untyped-def]
 ) -> None:
-    """THE assertion. An unfiltered read returns the platform's rows and
-    none of the lab's — and `total` counts only what came back, so the
-    absence is not reported as a number."""
+    """THE assertion."""
     await _seed_chaos_world(db_session, default_tenant.id)
     token = await _token(db_session, default_tenant.id, AGENT_SCOPES)
 
@@ -312,11 +257,7 @@ async def test_agent_principal_prefix_filter_returns_an_empty_page(
     db_session: AsyncSession,
     default_tenant,  # type: ignore[no-untyped-def]
 ) -> None:
-    """`action_prefix='chaos.'` is answered, not refused.
-
-    An error would confirm the stream exists. "Nothing matched your
-    filter" is both true and uninformative, which is the point.
-    """
+    """`action_prefix='chaos.'` is answered, not refused."""
     await _seed_chaos_world(db_session, default_tenant.id)
     token = await _token(db_session, default_tenant.id, AGENT_SCOPES)
 
@@ -340,14 +281,7 @@ async def test_agent_principal_exact_action_returns_an_empty_page(
     default_tenant,  # type: ignore[no-untyped-def]
     action: str,
 ) -> None:
-    """The withholding is on the rows, not on the prefix filter.
-
-    Both spellings of "show me the lab" have to come back empty, or the
-    fix is a speed bump: `action='chaos.tool_invoked'` bypasses
-    `action_prefix` entirely (the tool suppresses prefix when `action` is
-    set), so a filter implemented on the argument rather than on the data
-    would leak through this call.
-    """
+    """The withholding is on the rows, not on the prefix filter."""
     await _seed_chaos_world(db_session, default_tenant.id)
     token = await _token(db_session, default_tenant.id, AGENT_SCOPES)
 
@@ -361,9 +295,9 @@ async def test_agent_principal_prefix_filter_on_a_visible_stream_still_works(
     db_session: AsyncSession,
     default_tenant,  # type: ignore[no-untyped-def]
 ) -> None:
-    """The exclusion AND-s with the caller's filter rather than replacing
-    it — `agent.` must still isolate the agent's own stream, which is the
-    crash-reconciliation use case the tool exists for."""
+    """The exclusion AND-s with the caller's filter rather than replacing it — `agent.`
+    must still isolate the agent's own stream, which is the crash-reconciliation use
+    case the tool exists for."""
     await _seed_chaos_world(db_session, default_tenant.id)
     token = await _token(db_session, default_tenant.id, AGENT_SCOPES)
 
@@ -381,9 +315,8 @@ async def test_agent_principal_type_filter_does_not_reopen_the_stream(
     db_session: AsyncSession,
     default_tenant,  # type: ignore[no-untyped-def]
 ) -> None:
-    """Every chaos row is a service-account row, so this filter is the
-    natural way to ask for machine activity — and it must not become a
-    way around the withholding."""
+    """Every chaos row is a service-account row, so this filter is the natural way to ask
+    for machine activity — and it must not become a way around the withholding."""
     await _seed_chaos_world(db_session, default_tenant.id)
     token = await _token(db_session, default_tenant.id, AGENT_SCOPES)
 
@@ -399,8 +332,6 @@ async def test_agent_principal_type_filter_does_not_reopen_the_stream(
     assert payload["total"] == 1
 
 
-# ---------------------------------------------------------------------------
-# get_trace — the second path into audit_logs
 # ---------------------------------------------------------------------------
 
 

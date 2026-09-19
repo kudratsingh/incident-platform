@@ -64,21 +64,11 @@ def test_target_100pct_any_failure_breaches() -> None:
     assert s.burn_rate == float("inf")
 
 
-# ---------------------------------------------------------------------------
 # Lab fixtures are not platform traffic (WO-R2-132)
-#
 # `_LAB_FIXTURE_PAYLOAD_MARKERS` is a SQL predicate, so these run real rows
-# through `compute_all` on the SQLite harness rather than asserting on the
-# string. The Postgres spelling — JSONB containment, which is the one that
-# actually ships — is covered in
-# `backend/tests/integration/test_eval_reset_postgres.py`.
-# ---------------------------------------------------------------------------
 
 # The standing eval world's terminal jobs, in the proportions
 # `scripts/seed_eval_fixtures.py` writes them: 4 dead-lettered DLQ rows and
-# the DAG parent that completed. 4 failed of 5 is 80× the 99% objective's
-# budget — a fast burn by construction, which is what made a freshly booted
-# eval world page about itself within one evaluation interval.
 _EVAL_WORLD = ((JobStatus.COMPLETED, 1), (JobStatus.DEAD_LETTER, 4))
 
 
@@ -140,12 +130,7 @@ async def _latency(session: AsyncSession) -> Any:
 async def test_the_seeded_eval_world_does_not_burn_the_budget(
     db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
 ) -> None:
-    """The WO-R2-132 assertion at the computation level.
-
-    Rows the seed script wrote directly into `dead_letter` are not failures
-    the platform produced, so they are in neither half of the fraction. With
-    nothing else on the stack the objective reads as idle — which is the
-    honest answer for a platform that has dispatched nothing."""
+    """The WO-R2-132 assertion at the computation level."""
     await _seed_world(
         db_session,
         default_tenant.id,
@@ -184,11 +169,7 @@ async def test_a_scenario_declared_fixture_is_excluded_too(
 async def test_the_same_rows_unmarked_still_burn(
     db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
 ) -> None:
-    """The other half: the exclusion must not blind the evaluator.
-
-    Identical rows without a lab marker are real dead-letters and still
-    produce the fast burn — otherwise this change would have closed the only
-    non-chaos alert producer the platform has."""
+    """The other half: the exclusion must not blind the evaluator."""
     await _seed_world(db_session, default_tenant.id, test_user.id, payload={"real": 1})
 
     state = await _completion(db_session)
@@ -202,11 +183,7 @@ async def test_the_same_rows_unmarked_still_burn(
 async def test_a_job_with_no_payload_stays_in_the_denominator(
     db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
 ) -> None:
-    """`payload` is nullable and most rows carry nothing interesting in it.
-
-    Both dialect spellings return NULL for a NULL payload, so a bare
-    `NOT (...)` would be NULL rather than true and would silently empty the
-    denominator. The COALESCE in `_not_a_lab_fixture` is what this pins."""
+    """`payload` is nullable and most rows carry nothing interesting in it."""
     await _seed_world(db_session, default_tenant.id, test_user.id, payload=None)
 
     state = await _completion(db_session)

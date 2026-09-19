@@ -1,17 +1,4 @@
-"""Tripwire against ADRs citing files and directories that do not exist.
-
-ADR 0008 named `backend/app/mcp/chaos_tools/` in both its Reversibility
-section and its Pointers list for two releases. The chaos tools have
-always lived at `backend/app/mcp/tools/chaos/`. A reader following the
-ADR to the code found nothing and had no way to tell whether the
-directory had been deleted or renamed.
-
-The check is deliberately narrow so it stays useful rather than noisy:
-only backtick-quoted tokens containing a `/` whose first segment is a
-real top-level directory of this repo are treated as paths, and each is
-resolved against both the repo root and `backend/` because ADRs use the
-`app/...` spelling that is relative to the backend package.
-"""
+"""Tripwire against ADRs citing files and directories that do not exist."""
 
 from __future__ import annotations
 
@@ -29,7 +16,6 @@ _SEARCH_ROOTS = (_REPO_ROOT, _REPO_ROOT / "backend")
 
 # First segment must be one of these for a backtick token to count as a
 # path at all. Keeps URLs, HTTP routes (`/api/v1/jobs`), Redis keys and
-# `a/b` prose out of the check.
 _PATH_ROOTS = frozenset(
     {
         "backend",
@@ -46,7 +32,6 @@ _PATH_ROOTS = frozenset(
 
 # A trailing segment with a dot is only a file when the dot introduces a
 # suffix we recognise. This is what keeps `app/core/rls_check.assert_rls_posture`
-# — a module-qualified *symbol*, not a path — from being checked as a file.
 _FILE_SUFFIXES = (
     ".py",
     ".ts",

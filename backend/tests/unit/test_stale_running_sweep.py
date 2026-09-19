@@ -1,13 +1,4 @@
-"""Stale-RUNNING crash-recovery sweep (E1-17, ADR 0019).
-
-Real rows on a real (SQLite in-memory) engine rather than the mock-heavy
-`test_dispatcher.py` style: the whole point of the fix is a SQL WHERE clause
-comparing an aware cutoff against a `TIMESTAMP WITH TIME ZONE` column that
-SQLite hands back naive, and a mocked session proves nothing about either.
-
-The engine is module-local so committed rows never leak into the shared
-session-scoped `sqlite_engine` other suites roll back against.
-"""
+"""Stale-RUNNING crash-recovery sweep (E1-17, ADR 0019)."""
 
 import uuid
 from collections.abc import AsyncGenerator
@@ -36,7 +27,6 @@ from sqlalchemy.pool import StaticPool
 THRESHOLD_SECONDS = 900
 # Mixed hex on purpose, same reason `DEFAULT_TENANT_ID` is: an all-digit UUID
 # hex round-trips through SQLite's NUMERIC affinity as a float and blows up
-# the UUID result processor.
 _USER_ID = uuid.UUID("f1e2d3c4-b5a6-4798-8a9b-0c1d2e3f4a5b")
 
 
@@ -125,12 +115,7 @@ async def _job(
 async def test_orphaned_running_job_is_dead_lettered_with_event_and_audit(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """THE assertion that would have caught E1-17.
-
-    A RUNNING row twice as old as the threshold, owned by nobody in this
-    process (empty in-flight set = the owning worker is dead), must not
-    survive one sweep pass as RUNNING.
-    """
+    """THE assertion that would have caught E1-17."""
     job_id = await _seed_running_job(
         session_factory, age_seconds=2 * THRESHOLD_SECONDS
     )
@@ -174,7 +159,6 @@ async def test_orphaned_running_job_is_dead_lettered_with_event_and_audit(
     assert payload["error"]
     # The outbox relay validates on publish; a schema-invalid row would rot
     # in `outbox_events` with `attempts` incrementing and no event fanning
-    # out to triage / the saga coordinator.
     schema_registry.validate("job.dlq", payload)
     # Tracing plumbing must not leak into the event (or the job_events row
     # the event-log consumer appends verbatim).

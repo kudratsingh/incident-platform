@@ -123,8 +123,6 @@ async def test_half_open_admits_only_one_probe(breaker: CircuitBreaker) -> None:
 
     # Task B arrives while the probe is still in flight: it must be rejected,
     # and it must NOT have executed fn(). Driven as a task (rather than awaited
-    # inline) so the unfixed behaviour — B falling through into the gated fn —
-    # fails this test instead of hanging it on the same gate.
     concurrent = asyncio.create_task(breaker.call(_gated))
     await asyncio.sleep(0.05)
     assert calls == 1, "HALF_OPEN admitted a second concurrent probe"
@@ -180,9 +178,6 @@ async def test_half_open_probe_failure_reopens_and_frees_the_probe_slot(
 
     # The probe slot did not leak. Asserted on what a caller can observe —
     # the next expired arrival is admitted and closes the circuit — not on
-    # `_probe_in_flight`, which production writes on every exit path and
-    # never reads: `call()` gates on `_state == HALF_OPEN` alone, so an
-    # assertion on that field cannot fail for the reason it names.
     breaker._opened_at = breaker._opened_at - (breaker.recovery_timeout + 1)  # type: ignore[operator]
     assert await breaker.call(_ok) == "ok"
     assert breaker.state == CircuitState.CLOSED
@@ -191,12 +186,7 @@ async def test_half_open_probe_failure_reopens_and_frees_the_probe_slot(
 async def test_probe_raising_circuit_open_error_does_not_deadlock(
     breaker: CircuitBreaker,
 ) -> None:
-    """A nested breaker's rejection during a probe must not strand HALF_OPEN.
-
-    `except CircuitOpenError: raise` deliberately passes through without
-    counting the rejection as this breaker's own upstream failure, so it
-    bypasses _on_success/_on_failure and must undo the probe itself.
-    """
+    """A nested breaker's rejection during a probe must not strand HALF_OPEN."""
     await _open_and_expire(breaker)
     opened_at_before = breaker._opened_at
 
@@ -213,6 +203,5 @@ async def test_probe_raising_circuit_open_error_does_not_deadlock(
 
     # The observable consequence, and the one this test exists for: the
     # very next caller is admitted rather than stranded behind a
-    # HALF_OPEN the aborted probe never left.
     assert await breaker.call(_ok) == "ok"
     assert breaker.state == CircuitState.CLOSED

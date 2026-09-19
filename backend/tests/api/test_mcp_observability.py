@@ -1,20 +1,4 @@
-"""WO-R2-60 — the agent-facing process has to emit the evidence.
-
-The MCP standalone app ran no observability bootstrap at all: no
-`setup_logging`, so the root logger kept Python's default formatter and
-its WARNING level and every INFO line the surface emitted was dropped;
-no `setup_tracing` and no FastAPI instrumentation, so it exported zero
-spans while `OTLP_ENDPOINT` was configured for it. This is the process
-the campaign's agent talks to — when a live run misbehaves, it is where
-an operator looks first, and there was nothing there.
-
-On the span assertion: the spec asks for a stub OTLP collector. An
-`InMemorySpanExporter` on the live provider is the same assertion without
-a socket — it proves a span was produced and handed to an exporter for
-one `POST /mcp`, which is the part the process controls. What OTLP does
-with it afterwards is `setup_tracing`'s configured endpoint, asserted
-separately below.
-"""
+"""WO-R2-60 — the agent-facing process has to emit the evidence."""
 
 from __future__ import annotations
 
@@ -53,14 +37,7 @@ class _RedisStub:
 
 @pytest.fixture
 def fresh_bootstrap(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """Let the bootstrap run again in this test.
-
-    It is once-per-process by design (re-running `setup_logging` swaps the
-    root handlers under whatever else is going), and by the time the suite
-    reaches here `app.main` has already claimed it. Resetting the flag is
-    how we assert the MCP entrypoint does the work rather than inheriting
-    it from an import that happens to have run first.
-    """
+    """Let the bootstrap run again in this test."""
     original_handlers = list(logging.root.handlers)
     original_level = logging.root.level
     monkeypatch.setattr(observability, "_bootstrapped", False)
@@ -72,9 +49,7 @@ def fresh_bootstrap(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
 def test_bootstrap_installs_the_json_formatter_and_lets_info_through(
     fresh_bootstrap: None,
 ) -> None:
-    """Both halves of the logging finding: the formatter, and the level.
-    An unstructured log is bad; a dropped one is worse, and the default
-    root level of WARNING dropped every INFO this surface emitted."""
+    """Both halves of the logging finding: the formatter, and the level."""
     logging.root.handlers = []
     logging.root.setLevel(logging.CRITICAL)
 
@@ -92,9 +67,9 @@ def test_bootstrap_installs_the_json_formatter_and_lets_info_through(
 def test_bootstrap_emits_a_structured_info_line(
     fresh_bootstrap: None, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Read it off the stream rather than through `caplog`: the bootstrap
-    replaces the root handlers, which removes pytest's capture handler —
-    and going to the real stream is what proves the line is JSON at all."""
+    """Read it off the stream rather than through `caplog`: the bootstrap replaces the root
+    handlers, which removes pytest's capture handler — and going to the real stream is
+    what proves the line is JSON at all."""
     bootstrap_process_observability(service_name=MCP_SERVICE_NAME)
 
     lines = [
@@ -121,13 +96,7 @@ def test_bootstrap_installs_a_tracer_provider(fresh_bootstrap: None) -> None:
 def test_the_standalone_entrypoint_runs_the_bootstrap_at_import(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The finding itself, stated structurally.
-
-    Re-imports the entrypoint with the bootstrap spied so the assertion is
-    about what `app.mcp.standalone` *does*, not about what some other
-    module already did to the process. On master this records nothing:
-    the MCP entrypoint called none of it.
-    """
+    """The finding itself, stated structurally."""
     calls: list[str] = []
 
     def _spy(*, service_name: str, settings: Any = None) -> None:
@@ -148,8 +117,8 @@ def test_the_standalone_entrypoint_runs_the_bootstrap_at_import(
 
 
 def test_the_mcp_process_instruments_all_three_libraries() -> None:
-    """The check that would have caught this: FastAPI, Redis and
-    SQLAlchemy all instrumented in *this* process, not just in the API's."""
+    """The check that would have caught this: FastAPI, Redis and SQLAlchemy all
+    instrumented in *this* process, not just in the API's."""
     app = create_mcp_app()
     live = instrumented_libraries(app)
     assert live == {"fastapi": True, "redis": True, "sqlalchemy": True}, live
@@ -158,13 +127,7 @@ def test_the_mcp_process_instruments_all_three_libraries() -> None:
 async def test_one_mcp_request_produces_a_span(
     db_session: AsyncSession, default_tenant: Any
 ) -> None:
-    """End to end: a real `POST /mcp` yields a server span on the exporter.
-
-    Attaches an in-memory exporter to whatever provider is live rather
-    than installing its own — OTel refuses to override an installed
-    TracerProvider, so a test that set one up would silently be measuring
-    the wrong object.
-    """
+    """End to end: a real `POST /mcp` yields a server span on the exporter."""
     provider = trace.get_tracer_provider()
     if not isinstance(provider, TracerProvider):
         pytest.fail(

@@ -1,12 +1,4 @@
-"""End-to-end MCP tests for Wave 1 PR B — chaos + alerts tools.
-
-Reuses the pattern from test_mcp_standalone.py (Redis stub, minted SA
-token). Focused on the new tools:
-  - `kill_consumer` (chaos, requires chaos:invoke) — only visible when
-    CHAOS_ENABLED=true. Sets the expected Redis kill key.
-  - `list_active_alerts` (incidents:read) — returns rows for the
-    caller's tenant only.
-"""
+"""End-to-end MCP tests for Wave 1 PR B — chaos + alerts tools."""
 
 from __future__ import annotations
 
@@ -35,10 +27,6 @@ class _RedisStub:
     def __init__(self) -> None:
         self._store: dict[str, bytes | str] = {}
         # Expiries, recorded per key. The kill flag's whole safety story is
-        # that it expires — a `set` without a TTL leaves a consumer dead
-        # until someone deletes the key by hand — so the stub has to keep
-        # `ex` for tests to assert on. It used to be dropped on the floor
-        # under a comment claiming it was captured.
         self._ttls: dict[str, int | None] = {}
 
     async def get(self, key: str) -> bytes | str | None:
@@ -53,8 +41,7 @@ class _RedisStub:
 
 
 def _mcp_app_with_chaos_enabled(db_session: AsyncSession, redis_stub: _RedisStub):
-    """Build a fresh MCP app under CHAOS_ENABLED=true so chaos tools
-    register. Patches settings before create_mcp_app runs."""
+    """Build a fresh MCP app under CHAOS_ENABLED=true so chaos tools register."""
     with patch(
         "app.mcp.standalone.assert_chaos_gate", lambda *a, **kw: None
     ), patch(
@@ -125,8 +112,6 @@ def _rpc(method: str, params: dict[str, Any] | None = None, id: str = "1") -> di
     return {"jsonrpc": "2.0", "id": id, "method": method, "params": params or {}}
 
 
-# ---------------------------------------------------------------------------
-# list_active_alerts
 # ---------------------------------------------------------------------------
 
 
@@ -260,8 +245,6 @@ async def test_list_active_alerts_wrong_scope_forbidden(
 
 
 # ---------------------------------------------------------------------------
-# kill_consumer
-# ---------------------------------------------------------------------------
 
 
 async def test_kill_consumer_not_registered_when_chaos_disabled(
@@ -269,8 +252,8 @@ async def test_kill_consumer_not_registered_when_chaos_disabled(
     db_session: AsyncSession,
     default_tenant,
 ) -> None:
-    """The chaos triple-gate — when CHAOS_ENABLED=false, the tool is
-    invisible: tools/list omits it and tools/call returns TOOL_NOT_FOUND."""
+    """The chaos triple-gate — when CHAOS_ENABLED=false, the tool is invisible: tools/list
+    omits it and tools/call returns TOOL_NOT_FOUND."""
     from app.mcp import protocol
 
     ac, _ = mcp_client
@@ -291,8 +274,8 @@ async def test_kill_consumer_not_registered_when_chaos_disabled(
 async def test_kill_consumer_sets_redis_key_when_chaos_enabled(
     db_session: AsyncSession, default_tenant
 ) -> None:
-    """Full round-trip with CHAOS_ENABLED=true: verify the tool
-    registers, requires chaos:invoke, and sets the expected Redis key."""
+    """Full round-trip with CHAOS_ENABLED=true: verify the tool registers, requires
+    chaos:invoke, and sets the expected Redis key."""
     redis_stub = _RedisStub()
     app, teardown = _mcp_app_with_chaos_enabled(db_session, redis_stub)
     try:
@@ -326,8 +309,6 @@ async def test_kill_consumer_sets_redis_key_when_chaos_enabled(
         assert payload["kill_key"] == "chaos:kill:worker-dispatcher"
         assert redis_stub._store["chaos:kill:worker-dispatcher"] == "killed"
         # The requested TTL reached Redis. Without it the flag never
-        # expires and the consumer group stays dead until a human deletes
-        # the key — the opposite of a bounded chaos experiment.
         assert redis_stub._ttls["chaos:kill:worker-dispatcher"] == 30
         assert payload["ttl_seconds"] == 30
     finally:
@@ -337,11 +318,7 @@ async def test_kill_consumer_sets_redis_key_when_chaos_enabled(
 async def test_kill_consumer_default_ttl_reaches_redis(
     db_session: AsyncSession, default_tenant
 ) -> None:
-    """The documented 300s default is what actually gets set, not None.
-
-    `ttl_seconds` defaults in the input model, so a caller that omits it
-    still has to end up with a bounded flag.
-    """
+    """The documented 300s default is what actually gets set, not None."""
     redis_stub = _RedisStub()
     app, teardown = _mcp_app_with_chaos_enabled(db_session, redis_stub)
     try:
@@ -377,8 +354,8 @@ async def test_kill_consumer_default_ttl_reaches_redis(
 async def test_kill_consumer_records_chaos_audit_stream(
     db_session: AsyncSession, default_tenant
 ) -> None:
-    """Chaos activity lands on `chaos.tool_invoked` (not `agent.tool_invoked`)
-    so operators can filter it independently — see ADR 0008."""
+    """Chaos activity lands on `chaos.tool_invoked` (not `agent.tool_invoked`) so operators
+    can filter it independently — see ADR 0008."""
     redis_stub = _RedisStub()
     app, teardown = _mcp_app_with_chaos_enabled(db_session, redis_stub)
     try:
@@ -419,8 +396,8 @@ async def test_kill_consumer_records_chaos_audit_stream(
 async def test_kill_consumer_wrong_scope_records_chaos_denied(
     db_session: AsyncSession, default_tenant
 ) -> None:
-    """Scope refusal on a chaos tool → `chaos.tool_denied`
-    (distinct from `agent.tool_invoked`/`chaos.tool_invoked`)."""
+    """Scope refusal on a chaos tool → `chaos.tool_denied` (distinct from
+    `agent.tool_invoked`/`chaos.tool_invoked`)."""
     from app.mcp import protocol
 
     redis_stub = _RedisStub()

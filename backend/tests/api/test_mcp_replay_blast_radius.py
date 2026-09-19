@@ -1,23 +1,5 @@
-"""`replay_dlq_messages` is the coarse, blind-batch replay tool — these
-pin the blast radius the DLQ safety scenarios assume it has (R2-22).
-
-`replay_dlq_by_category` refuses `human_required` outright, and
-`mark_dlq_permanent` exists precisely to *put* a job in that category so
-automatic replay stops touching it. But `replay_dlq_messages` filtered
-on status and `job_type` only, so the one tool an agent reaches for when
-it wants "replay the DLQ" swept the fenced entries back onto
-`job.submitted` — where they re-fail, because `human_required` means a
-persistent bug, not a transient one.
-
-`replay_dlq_by_ids` has the same gap and is left alone deliberately:
-there the caller names each id, which is a defensible way to say "yes,
-this one". The blind batch is the one that needs the default.
-
-The seeded eval world models exactly this: `scripts/seed_eval_fixtures.py`
-seeds four DLQ rows, three replayable and one `human_required`
-(`stable("dlq-job-csv-parse")`), and a scenario that fires a blind bulk
-replay must leave that fourth row alone.
-"""
+"""`replay_dlq_messages` is the coarse, blind-batch replay tool — these pin the blast
+radius the DLQ safety scenarios assume it has (R2-22)."""
 
 from __future__ import annotations
 
@@ -147,8 +129,7 @@ async def _seed_dlq(
     test_user: Any,
     hints: tuple[str | None, ...],
 ) -> list[uuid.UUID]:
-    """One dead-lettered job per entry in `hints`. `None` models an
-    organically dead-lettered job that triage never categorised."""
+    """One dead-lettered job per entry in `hints`."""
     ids: list[uuid.UUID] = []
     for hint in hints:
         job = Job(
@@ -174,15 +155,13 @@ async def _status(db_session: AsyncSession, job_id: uuid.UUID) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# The fence                                                                    #
-# --------------------------------------------------------------------------- #
 
 
 async def test_blind_bulk_replay_skips_human_required_entries(
     mcp_client, db_session, default_tenant, test_user  # type: ignore[no-untyped-def]
 ) -> None:
-    """RED before: `requested == 3, replayed == 3` — the fenced job went
-    straight back onto `job.submitted` alongside the replayable ones."""
+    """RED before: `requested == 3, replayed == 3` — the fenced job went straight back onto
+    `job.submitted` alongside the replayable ones."""
     safe_id, wait_id, fenced_id = await _seed_dlq(
         db_session,
         default_tenant,
@@ -223,14 +202,7 @@ async def test_blind_bulk_replay_skips_human_required_entries(
 async def test_blind_bulk_replay_still_takes_uncategorised_entries(
     mcp_client, db_session, default_tenant, test_user  # type: ignore[no-untyped-def]
 ) -> None:
-    """The exclusion is `human_required`, not "has a hint".
-
-    A NULL hint means triage has not classified the entry yet, and the
-    blind batch has always been the tool that sweeps those. Excluding
-    them too would be a much larger behaviour change than the finding
-    asks for — and `NOT IN ('human_required')` is NULL for a NULL
-    column, so getting this wrong is the easy way to write the fix.
-    """
+    """The exclusion is `human_required`, not "has a hint"."""
     plain_id, fenced_id = await _seed_dlq(
         db_session,
         default_tenant,
@@ -258,8 +230,8 @@ async def test_blind_bulk_replay_still_takes_uncategorised_entries(
 async def test_blind_bulk_replay_takes_the_fenced_entry_on_explicit_opt_in(
     mcp_client, db_session, default_tenant, test_user  # type: ignore[no-untyped-def]
 ) -> None:
-    """An operator who has reviewed the bug and shipped the fix must
-    still have a bulk path — the default is a default, not a wall."""
+    """An operator who has reviewed the bug and shipped the fix must still have a bulk path
+    — the default is a default, not a wall."""
     safe_id, fenced_id = await _seed_dlq(
         db_session,
         default_tenant,
@@ -296,8 +268,8 @@ async def test_blind_bulk_replay_takes_the_fenced_entry_on_explicit_opt_in(
 async def test_job_type_narrowing_still_applies_to_the_skip_report(
     mcp_client, db_session, default_tenant, test_user  # type: ignore[no-untyped-def]
 ) -> None:
-    """The skip count is scoped by the same filters as the replay, so it
-    can't report work the caller did not ask about."""
+    """The skip count is scoped by the same filters as the replay, so it can't report work
+    the caller did not ask about."""
     (fenced_id,) = await _seed_dlq(
         db_session,
         default_tenant,
@@ -327,11 +299,8 @@ async def test_job_type_narrowing_still_applies_to_the_skip_report(
 
 
 def test_the_tool_description_states_the_fence() -> None:
-    """The agent reads the description and nothing else — a guard it
-    cannot see is a guard it will fight. `replay_dlq_by_category` spells
-    its refusal out; the bulk tool has to as well, including the name of
-    the opt-in so the agent knows an escape hatch exists.
-    """
+    """The agent reads the description and nothing else — a guard it cannot see is a guard
+    it will fight."""
     spec = registry.get_tool("replay_dlq_messages")
     assert spec is not None
     description = spec.description

@@ -1,17 +1,4 @@
-"""Unit tests for the DLQ-replay scheduler ZSET.
-
-Redis is fully mocked. Mirrors the pattern in `test_queue.py` —
-same fixtures, same shape — since this is a sibling module with
-identical Redis semantics.
-
-R2-21 changed the reader half: the destructive `pop_ready` became a
-`claim_ready` / `ack_replay` pair backed by a second sorted set
-(`jobs:dlq_replay_inflight`). A claim that is never acked — because
-the worker died between the claim and the replay — is reclaimed on a
-later tick instead of being lost. The behavioural proof of that round
-trip lives in `tests/api/test_mcp_dlq_categorization.py` against an
-emulated ZSET; the tests here pin the call shapes.
-"""
+"""Unit tests for the DLQ-replay scheduler ZSET."""
 
 import time
 import uuid

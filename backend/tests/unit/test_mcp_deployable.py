@@ -1,16 +1,4 @@
-"""ADR 0006's topology must exist where topology is described (WO-R2-68).
-
-ADR 0006 chose a standalone process for the MCP surface — "a process of its
-own in every deployed environment" — and accepted "compose stanza, ECS
-service, health check, alarms" as the cost. The compose stanza shipped. The
-ECS half did not, for long enough that `infra/` (the only description of
-production this repo has) said the agent-facing surface did not exist there
-while the ADR and ARCHITECTURE.md both said it did.
-
-Prose corrections decay; the repo already learned that once with the phantom
-`msk.tf` (ADR 0018), which is asserted mechanically in CI for the same
-reason. This is that assertion for ADR 0006.
-"""
+"""ADR 0006's topology must exist where topology is described (WO-R2-68)."""
 
 from __future__ import annotations
 
@@ -63,7 +51,6 @@ def test_the_mcp_task_runs_the_standalone_entrypoint() -> None:
     assert "8001" in mcp_block
     # The backend's repository, not one of its own: two images could skew,
     # and a skew means the MCP surface fronting a different commit's service
-    # layer than REST — the drift this topology was chosen to prevent.
     assert "aws_ecr_repository.backend.repository_url" in mcp_block
 
 

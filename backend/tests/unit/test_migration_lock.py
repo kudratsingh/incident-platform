@@ -1,11 +1,4 @@
-"""Unit tests for the alembic migration advisory lock (WO-P7-08 / F2-04).
-
-scripts/entrypoint.sh has always claimed concurrent task startups are safe
-because "alembic uses an advisory lock"; until this change nothing took
-one. These tests pin the helper's contract *and* the fact that env.py
-still calls it — deleting the lock from the migration path cannot be done
-without deleting the module or the call site, and both are asserted here.
-"""
+"""Unit tests for the alembic migration advisory lock (WO-P7-08 / F2-04)."""
 
 from pathlib import Path
 from typing import Any
@@ -109,14 +102,7 @@ def test_release_on_sqlite_executes_nothing() -> None:
 
 
 def test_acquire_leaves_no_open_transaction_on_a_fresh_connection() -> None:
-    """The lock must not leave alembic looking at an "external" transaction.
-
-    MigrationContext snapshots connection.in_transaction() at configure()
-    time; if it sees a transaction it did not start, begin_transaction()
-    becomes a null context and the migration is never committed. Since
-    SQLAlchemy 2.0 autobegins on execute(), acquiring the lock has to
-    commit the transaction it implicitly opened.
-    """
+    """The lock must not leave alembic looking at an "external" transaction."""
     conn = _StubConnection("postgresql")
 
     acquire_migration_lock(conn)  # type: ignore[arg-type]

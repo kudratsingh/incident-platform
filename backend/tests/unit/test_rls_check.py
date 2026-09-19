@@ -188,12 +188,7 @@ async def test_healthy_posture_does_not_log_error() -> None:
 
 
 async def test_noop_on_sqlite_session_factory() -> None:
-    """SQLite has no roles and no RLS — the probe must not even run.
-
-    A real aiosqlite engine with no tables: if the probe SQL executed,
-    the pg_class reference alone would blow up. Production settings on
-    purpose — the dialect check, not the environment, is what gates.
-    """
+    """SQLite has no roles and no RLS — the probe must not even run."""
     engine = create_async_engine(
         "sqlite+aiosqlite://",
         connect_args={"check_same_thread": False},

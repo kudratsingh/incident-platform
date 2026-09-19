@@ -1,32 +1,4 @@
-"""The SSE fan-out broker: one Pub/Sub connection for every open stream.
-
-Before this module, `GET /jobs/{id}/stream` called `redis.pubsub()` per
-viewer and held that subscription — and therefore one connection out of the
-single process-wide 20-connection pool — for the whole life of the generator.
-`worker_loop` runs in the same process on the same pool, so ~20 parked
-dashboards starved the rate limiter, `check_backpressure` and the admin stats
-loops that share those slots (WO-R2-11).
-
-Three things are asserted here, in the order they matter:
-
-  1. **Fan-out** — N viewers of one job, and M jobs, consume exactly ONE
-     Pub/Sub connection. The viewers↔connections relationship is gone, not
-     merely widened.
-  2. **Capacity** — the per-process stream cap refuses the extra viewer with
-     `StreamCapacityError` (503 + Retry-After) instead of letting it queue
-     against a finite pool.
-  3. **Liveness** — an idle timeout and a maximum duration end a stream that
-     nobody is feeding, so a tab parked on a waiting job cannot pin a slot
-     forever.
-
-Plus the fail-open posture the streaming path has always had: a Redis error
-ends the stream (the browser's EventSource reconnects), it never escapes as a
-500 out of the API.
-
-The snapshot/terminal semantics tests moved here with the code they cover —
-`subscribe()` used to live in `workers/progress.py` and is now the broker's
-method; `tests/unit/test_progress.py` keeps `publish`/`read_last_event`.
-"""
+"""The SSE fan-out broker: one Pub/Sub connection for every open stream."""
 
 import asyncio
 import json
@@ -53,12 +25,7 @@ def _message(job_id: str, payload: str) -> dict[str, Any]:
 
 
 class _FakePubSub:
-    """Pub/Sub double: records channel bookkeeping, replays queued messages.
-
-    `get_message` blocks (rather than returning None immediately) when the
-    inbox is empty, so a test that finishes finished because the broker
-    decided to stop — not because the fake ran dry.
-    """
+    """Pub/Sub double: records channel bookkeeping, replays queued messages."""
 
     def __init__(self, owner: "_FakeRedis", messages: Iterable[dict[str, Any]]) -> None:
         self._owner = owner
@@ -138,18 +105,11 @@ async def _drain(gen: AsyncGenerator[ProgressEvent, None]) -> list[ProgressEvent
     return [event async for event in gen]
 
 
-# ---------------------------------------------------------------------------
 # 1. Fan-out — viewers no longer map 1:1 onto connections
-# ---------------------------------------------------------------------------
 
 
 async def test_many_viewers_on_one_job_share_a_single_pubsub_connection() -> None:
-    """THE WO-R2-11 assertion: N viewers, one connection.
-
-    Five dashboards on the same job used to mean five `redis.pubsub()` calls
-    and five held pool slots. The broker opens one shared Pub/Sub and
-    SUBSCRIBEs the channel once.
-    """
+    """THE WO-R2-11 assertion: N viewers, one connection."""
     redis = _FakeRedis()
     broker = _broker(redis)
 
@@ -221,9 +181,7 @@ async def test_last_viewer_leaving_unsubscribes_and_closes_the_connection() -> N
     assert redis.pubsub_obj.closed is True
 
 
-# ---------------------------------------------------------------------------
 # 2. Capacity — the cap refuses rather than exhausting anything
-# ---------------------------------------------------------------------------
 
 
 async def test_stream_beyond_the_cap_is_refused_with_503_and_retry_after() -> None:
@@ -265,9 +223,7 @@ async def test_cap_of_zero_disables_the_limit() -> None:
     assert broker.active_streams == 50
 
 
-# ---------------------------------------------------------------------------
 # 3. Liveness — no stream lives forever
-# ---------------------------------------------------------------------------
 
 
 async def test_idle_stream_ends_at_the_idle_timeout() -> None:
@@ -299,9 +255,7 @@ async def test_busy_stream_still_ends_at_the_maximum_duration() -> None:
     assert all(e.status == "running" for e in events)
 
 
-# ---------------------------------------------------------------------------
 # Snapshot + terminal semantics (moved from test_progress.py with the code)
-# ---------------------------------------------------------------------------
 
 
 async def test_late_subscriber_gets_terminal_snapshot_and_stream_ends() -> None:
@@ -399,9 +353,7 @@ async def test_malformed_live_message_is_discarded_and_the_stream_survives() -> 
     assert [e.status for e in events] == ["completed"]
 
 
-# ---------------------------------------------------------------------------
 # Fail-open — Redis trouble degrades the stream, it never 500s the API
-# ---------------------------------------------------------------------------
 
 
 async def test_snapshot_read_failure_does_not_break_the_stream() -> None:
@@ -417,13 +369,7 @@ async def test_snapshot_read_failure_does_not_break_the_stream() -> None:
 
 
 async def test_reader_failure_closes_open_streams_instead_of_raising() -> None:
-    """Redis goes away mid-stream: every viewer is closed, nobody sees a 500.
-
-    The browser's EventSource reconnects on its own — that is the documented
-    degradation, and it is what the pre-broker code did by letting the
-    generator die. What must NOT happen is the exception escaping into the
-    request path.
-    """
+    """Redis goes away mid-stream: every viewer is closed, nobody sees a 500."""
     redis = _FakeRedis()
     redis.read_error = ConnectionError("redis went away")
     broker = _broker(redis)

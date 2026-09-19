@@ -45,13 +45,7 @@ def test_missing_required_field_raises() -> None:
 
 
 def test_invalid_uuid_format_raises() -> None:
-    """Every required field is present except that `job_id` is malformed.
-
-    `tenant_id` is supplied deliberately: without it the payload is
-    missing a required field, so the call raises whether or not the
-    `format: uuid` check still exists, and deleting that check from
-    job_submitted.schema.json leaves this test green.
-    """
+    """Every required field is present except that `job_id` is malformed."""
     with pytest.raises(SchemaValidationError, match="not-a-uuid"):
         validate_schema(
             "job.submitted",
@@ -81,12 +75,7 @@ def test_wrong_event_const_raises() -> None:
 
 
 def test_progress_percent_out_of_range_raises() -> None:
-    """Complete payload, `percent` past the 0-100 bound.
-
-    `tenant_id` is required by job_progress.schema.json too — omitting it
-    made this raise for the missing field, so removing `maximum: 100`
-    left the test green.
-    """
+    """Complete payload, `percent` past the 0-100 bound."""
     with pytest.raises(SchemaValidationError, match="greater than the maximum"):
         validate_schema(
             "job.progress",
@@ -207,34 +196,18 @@ def test_dlq_rejects_malformed_triage_context() -> None:
 
 
 def test_unknown_topic_raises_instead_of_passing_silently() -> None:
-    """An unmapped topic must fail loudly, not report success by doing nothing.
-
-    This assertion is inverted from what it used to be. The old behaviour —
-    return None for any topic with no schema — meant that the one case the
-    registry exists to catch (a topic shipped before its schema) was the one
-    case it waved through, while every call site logged it as validated.
-    """
+    """An unmapped topic must fail loudly, not report success by doing nothing."""
     with pytest.raises(UnknownTopicError):
         validate_schema("some.unknown.topic", {"anything": "goes"})
 
 
 def test_unknown_topic_error_is_catchable_as_a_schema_failure() -> None:
-    """Producer and consumer both catch SchemaValidationError already.
-
-    An unmapped topic has to travel that same path — publish is skipped, a
-    consumed message is committed past — or adding a topic without a schema
-    would crash the worker loop instead of degrading it.
-    """
+    """Producer and consumer both catch SchemaValidationError already."""
     assert issubclass(UnknownTopicError, SchemaValidationError)
 
 
 def test_every_configured_topic_has_a_schema() -> None:
-    """The CLAUDE.md rule, as a test: every `Settings.kafka_topic_*` is covered.
-
-    Asserting on the derived mapping rather than a second hand-written list —
-    a list here could drift from the one in the registry exactly as the
-    registry's drifted from Settings.
-    """
+    """The CLAUDE.md rule, as a test: every `Settings.kafka_topic_*` is covered."""
     settings = get_settings()
     topics = {
         str(getattr(settings, field))
@@ -254,12 +227,7 @@ def test_every_configured_topic_has_a_schema() -> None:
 def test_a_new_topic_without_a_schema_fails_the_registry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The gate itself, exercised: add a topic, get a boot failure.
-
-    Adding a real field to Settings would leak into every other test in the
-    session, so the field is added to a throwaway subclass and `get_settings`
-    is pointed at it for the duration.
-    """
+    """The gate itself, exercised: add a topic, get a boot failure."""
     settings = get_settings()
 
     class SettingsWithNewTopic(type(settings)):  # type: ignore[misc,valid-type]

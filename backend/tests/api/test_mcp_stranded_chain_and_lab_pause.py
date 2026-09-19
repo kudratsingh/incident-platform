@@ -1,26 +1,4 @@
-"""The three worlds Family C could not reach, read back through the agent's own tools.
-
-WO-R3-274 + WO-R3-275, end to end over the MCP wire. The unit twin
-(`tests/unit/test_stranded_chain_and_lab_pause.py`) pins the schemas, the
-descriptions and the two documentation promises; this file proves that what the
-hooks write is what the read tools return, because that is the acceptance
-criterion for every one of these worlds — a fault nobody can observe through
-`get_dag_state` / `search_traces` / `list_dlq_messages` is not a world.
-
-  * `resolver_stall` — `create_stuck_dag(root_status="completed")`: root
-    `completed`, descendants `waiting`, and the DLQ untouched. The
-    discriminator is an *absence*, so the absence is asserted on the tool that
-    would show it.
-  * `downstream_child_failed` — the same plus `failed_step`: exactly one DLQ
-    row, under a root that succeeded.
-  * `paused_dag` — `pause_dag_chaos`: a pause that reads identically to one
-    `pause_dag` set. Asserted by taking BOTH pauses on two identical chains in
-    one test and comparing the tool output field by field, which is the only
-    form of that claim that cannot rot as `get_dag_state` grows fields.
-
-Harness is `test_mcp_chaos_stuck_dag.py`'s: a fresh MCP app under
-`CHAOS_ENABLED=true` with only the modules these tests invoke reloaded.
-"""
+"""The three worlds Family C could not reach, read back through the agent's own tools."""
 
 from __future__ import annotations
 
@@ -179,21 +157,12 @@ async def _job(db_session: AsyncSession, job_id: str) -> Job:
 
 
 # ---------------------------------------------------------------------------
-# resolver_stall — a chain with no dead-letter row in it
-# ---------------------------------------------------------------------------
 
 
 async def test_the_stranded_chain_reads_exactly_as_the_plan_describes(
     db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
 ) -> None:
-    """Every fact plan 01 §7.2 lists for `resolver_stall`, from the read tools.
-
-    Root `completed`, descendants `waiting`, `paused` false with `paused_by`
-    null, the descendants visible to `search_traces(status="waiting")` with a
-    long-past `created_at`, and the DLQ showing nothing of the chain. The last
-    one is the discriminator: there is nothing to replay, which is what makes
-    escalating the correct answer rather than a guess.
-    """
+    """Every fact plan 01 §7.2 lists for `resolver_stall`, from the read tools."""
     redis_stub = _RedisStub()
     app, teardown = _mcp_app_with_chaos_enabled(db_session, redis_stub)
     try:
@@ -272,13 +241,7 @@ async def test_the_stranded_chain_reads_exactly_as_the_plan_describes(
 async def test_the_default_chain_is_unchanged_by_the_new_inputs(
     db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
 ) -> None:
-    """The compatibility claim, asserted rather than asserted-about.
-
-    Four scenarios and the commander's canned fixtures are graded against the
-    dead-lettered chain, so a call that passes none of the new arguments has to
-    produce exactly what it always produced — including the two new output
-    fields agreeing with the old ones.
-    """
+    """The compatibility claim, asserted rather than asserted-about."""
     redis_stub = _RedisStub()
     app, teardown = _mcp_app_with_chaos_enabled(db_session, redis_stub)
     try:
@@ -317,21 +280,12 @@ async def test_the_default_chain_is_unchanged_by_the_new_inputs(
 
 
 # ---------------------------------------------------------------------------
-# downstream_child_failed — exactly one dead-letter row, below a good root
-# ---------------------------------------------------------------------------
 
 
 async def test_failed_step_dead_letters_one_descendant_and_only_one(
     db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
 ) -> None:
-    """The `downstream_child_failed` world, and its coherence.
-
-    `failed_step=2` on a three-step chain: step-1 `completed` (it had to run for
-    step-2 to have been dispatched at all), step-2 `dead_letter`, step-3
-    `waiting` behind it. The DLQ shows step-2 and nothing else, and the root —
-    the job an alert would name — is `completed`, which is what makes the world
-    different from every chain this hook could build before.
-    """
+    """The `downstream_child_failed` world, and its coherence."""
     redis_stub = _RedisStub()
     app, teardown = _mcp_app_with_chaos_enabled(db_session, redis_stub)
     try:
@@ -397,12 +351,8 @@ async def test_failed_step_dead_letters_one_descendant_and_only_one(
 async def test_the_same_chain_name_in_a_different_shape_is_refused(
     db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
 ) -> None:
-    """Ids do not depend on the shape, so asking for a different one under a
-    name that already exists is drift, not a repeat.
-
-    Refusing is the right answer: rewriting a chain's shape under its own name
-    would silently change a world a scenario has already pinned by id.
-    """
+    """Ids do not depend on the shape, so asking for a different one under a name that
+    already exists is drift, not a repeat."""
     redis_stub = _RedisStub()
     app, teardown = _mcp_app_with_chaos_enabled(db_session, redis_stub)
     try:
@@ -464,8 +414,8 @@ async def test_incoherent_arguments_are_refused_over_the_wire(
     test_user,  # type: ignore[no-untyped-def]
     arguments: dict[str, Any],
 ) -> None:
-    """All four refusals are argument errors, not `stuck_chain_name_in_use`:
-    nothing about the environment is wrong, and no row is written."""
+    """All four refusals are argument errors, not `stuck_chain_name_in_use`: nothing about
+    the environment is wrong, and no row is written."""
     redis_stub = _RedisStub()
     app, teardown = _mcp_app_with_chaos_enabled(db_session, redis_stub)
     try:
@@ -498,21 +448,12 @@ async def test_incoherent_arguments_are_refused_over_the_wire(
 
 
 # ---------------------------------------------------------------------------
-# paused_dag — the lab pause and the operator pause, side by side
-# ---------------------------------------------------------------------------
 
 
 async def test_the_lab_pause_reads_identically_to_an_operator_pause(
     db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
 ) -> None:
-    """The claim the whole hook exists for, asserted as an equality.
-
-    Two identical chains; one paused by `pause_dag` with `actions:execute`, the
-    other by `pause_dag_chaos` with `chaos:invoke`. Every field `get_dag_state`
-    returns is compared with the ids normalised away — so a field added to that
-    output later is covered by this test the day it ships, which a hand-listed
-    set of assertions would not be.
-    """
+    """The claim the whole hook exists for, asserted as an equality."""
     redis_stub = _RedisStub()
     app, teardown = _mcp_app_with_chaos_enabled(db_session, redis_stub)
     try:
@@ -590,12 +531,7 @@ async def test_the_lab_pause_reads_identically_to_an_operator_pause(
         assert lab_pause["pause_key"] == pause_key_for(by_lab["root_job_id"])
 
         def _normalise(read: dict[str, Any], made: dict[str, Any]) -> Any:
-            """Everything but the ids, which are the one thing that must differ.
-
-            Serialise, swap each chain id for its role, parse back. Comparing
-            the whole structure is what makes this survive `get_dag_state`
-            growing a field — a hand-listed set of assertions would not.
-            """
+            """Everything but the ids, which are the one thing that must differ."""
             names = {
                 made["completed_parent_id"]: "upstream",
                 made["root_job_id"]: "root",
@@ -627,15 +563,7 @@ async def test_the_lab_pause_reads_identically_to_an_operator_pause(
 async def test_the_lab_pause_lapses_and_the_reset_sweep_reaches_its_key(
     db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
 ) -> None:
-    """Two teardowns, both asserted, because the hook has no undo call.
-
-    The TTL: `get_dag_state` reports `paused` off the key's presence, so
-    dropping the key is what expiry does on Redis's own clock, and the chain
-    reads unpaused again with nothing called. The reset: the key is
-    `dag:paused:<root>` — deliberately NOT under `chaos:*`, because it has to be
-    the key the platform reads — so the sweep that reaches it is
-    `_clear_dag_pauses`, matched here against the pattern that sweep uses.
-    """
+    """Two teardowns, both asserted, because the hook has no undo call."""
     import fnmatch
 
     redis_stub = _RedisStub()
@@ -697,8 +625,8 @@ async def test_the_lab_pause_lapses_and_the_reset_sweep_reaches_its_key(
 async def test_the_lab_pause_refuses_a_root_it_cannot_see(
     db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
 ) -> None:
-    """A scenario that mistypes a job id must be told, not quietly succeed
-    against a key nothing reads. Same refusal `pause_dag` gives."""
+    """A scenario that mistypes a job id must be told, not quietly succeed against a key
+    nothing reads."""
     redis_stub = _RedisStub()
     app, teardown = _mcp_app_with_chaos_enabled(db_session, redis_stub)
     try:
@@ -724,9 +652,7 @@ async def test_the_lab_pause_refuses_a_root_it_cannot_see(
 async def test_the_lab_pause_needs_chaos_scope_and_is_gated_off_by_default(
     db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
 ) -> None:
-    """ADR 0008's first two gates, on the new hook. The third principal that
-    must not reach it is the one holding `actions:execute`: that is the operator
-    path, and it already has `pause_dag`."""
+    """ADR 0008's first two gates, on the new hook."""
     from app.mcp.standalone import create_mcp_app
 
     redis_stub = _RedisStub()

@@ -104,8 +104,8 @@ async def test_admin_create_tenant_writes_audit_row(
     admin_headers: dict[str, str],
     db_session,  # type: ignore[no-untyped-def]
 ) -> None:
-    """Creating a tenant is the most privileged operator action there is —
-    it must leave an audit row like every other admin mutation (F1-08)."""
+    """Creating a tenant is the most privileged operator action there is — it must leave an
+    audit row like every other admin mutation (F1-08)."""
     resp = await client.post(
         "/api/v1/admin/tenants",
         json={"slug": "audited", "name": "Audited Co."},
@@ -132,8 +132,8 @@ async def test_admin_update_tenant_limits_writes_audit_row(
     admin_headers: dict[str, str],
     db_session,  # type: ignore[no-untyped-def]
 ) -> None:
-    """Rate-limit / quota changes are audited with their before + after
-    values, so an operator can reconstruct who loosened what (F1-08)."""
+    """Rate-limit / quota changes are audited with their before + after values, so an
+    operator can reconstruct who loosened what (F1-08)."""
     tenant_id = str(admin_user.tenant_id)
     before_resp = await client.get(
         f"/api/v1/admin/tenants/{tenant_id}", headers=admin_headers
@@ -230,8 +230,8 @@ async def test_tenant_admin_without_platform_flag_cannot_list_tenants(
     db_session,  # type: ignore[no-untyped-def]
     default_tenant,  # type: ignore[no-untyped-def]
 ) -> None:
-    """A tenant admin (role=admin, is_platform_admin=False) must not be able
-    to list sibling tenants. Only platform admins cross tenant boundaries."""
+    """A tenant admin (role=admin, is_platform_admin=False) must not be able to list
+    sibling tenants."""
     from app.core.security import create_access_token, hash_password
     from app.models.enums import UserRole
     from app.models.user import User
@@ -264,9 +264,8 @@ async def test_tenant_admin_without_platform_flag_cannot_list_tenants(
 async def test_register_creates_new_tenant_on_demand(
     client: AsyncClient,
 ) -> None:
-    """Self-service tenant creation: the registering user becomes the admin
-    of a brand-new tenant when both new_tenant_name and a free slug are
-    provided."""
+    """Self-service tenant creation: the registering user becomes the admin of a brand-new
+    tenant when both new_tenant_name and a free slug are provided."""
     resp = await client.post(
         "/api/v1/auth/register",
         json={
@@ -290,11 +289,7 @@ async def test_platform_admin_cross_tenant_scope(
     client: AsyncClient,
     admin_headers: dict[str, str],
 ) -> None:
-    """A platform admin can pass ?tenant_id= and the endpoint scopes to it.
-
-    We can't fully verify RLS in SQLite, but we can verify the parameter is
-    plumbed through to the read-model lookup.
-    """
+    """A platform admin can pass ?tenant_id= and the endpoint scopes to it."""
     # First, create a second tenant via the platform admin.
     create_resp = await client.post(
         "/api/v1/admin/tenants",
@@ -317,9 +312,9 @@ async def test_token_with_mismatched_tenant_id_is_rejected(
     client: AsyncClient,
     test_user,  # type: ignore[no-untyped-def]
 ) -> None:
-    """A token whose tenant_id claim disagrees with the user's actual tenant
-    must not authenticate — defends against forged/stale tokens after a user
-    is moved to a different tenant."""
+    """A token whose tenant_id claim disagrees with the user's actual tenant must not
+    authenticate — defends against forged/stale tokens after a user is moved to a
+    different tenant."""
     from app.core.security import create_access_token
 
     bogus = create_access_token(

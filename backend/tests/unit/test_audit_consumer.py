@@ -180,10 +180,9 @@ async def test_redelivery_integrity_error_is_swallowed() -> None:
 
 
 async def test_audit_consumer_records_cancellation() -> None:
-    """WO-R2-113. Without a mapping entry the consumer logs "no audit mapping
-    for event" once per message and drops it — so subscribing to the topic
-    without teaching the map trades silence for log spam, not for an audit
-    trail."""
+    """WO-R2-113. Without a mapping entry the consumer logs "no audit mapping for event"
+    once per message and drops it — so subscribing to the topic without teaching the map
+    trades silence for log spam, not for an audit trail."""
     factory, audit_repo = _factory_with_audit()
     consumer = AuditConsumer(factory)
     tenant_id, job_id, user_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()

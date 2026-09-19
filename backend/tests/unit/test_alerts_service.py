@@ -64,15 +64,8 @@ async def test_create_rejects_unknown_severity() -> None:
 
 
 def test_the_accepted_severities_are_exactly_these_four() -> None:
-    """The vocabulary is a contract with the commander, so it is asserted
-    as a set rather than sampled (WO-R2-124).
-
-    `low` was added by user decision; `medium`, `high` and `unknown` were
-    declined in the same decision — the first two because they duplicate
-    `warning`/`critical`, and `unknown` because it is a receiver's default
-    for a malformed payload rather than something a producer may assert.
-    See ADR 0025.
-    """
+    """The vocabulary is a contract with the commander, so it is asserted as a set rather
+    than sampled (WO-R2-124)."""
     assert ALLOWED_SEVERITIES == {"low", "info", "warning", "critical"}
 
 
@@ -93,15 +86,7 @@ async def test_the_declined_values_are_still_refused(severity: str) -> None:
 async def test_a_low_alert_is_accepted_and_reaches_the_webhook_signed(
     alert_session: AsyncSession,
 ) -> None:
-    """The half a severity constant alone does not prove.
-
-    A value the service accepts but the emitter drops or mangles is not a
-    supported severity — the commander classifies on what arrives in the
-    body. This asserts the whole path: accepted, persisted, delivered after
-    the commit, and covered by the signature scheme as it stands today
-    (`{timestamp}.{nonce}.{body}`, WO-R2-70) rather than the body-only
-    scheme it replaced.
-    """
+    """The half a severity constant alone does not prove."""
     recorder = _Recorder()
     svc = AlertService(AlertRepository(alert_session))
 
@@ -158,17 +143,7 @@ async def test_create_rejects_empty_title() -> None:
 async def test_create_persists_row_and_skips_webhook_when_unset(
     url: str | None, secret: str | None
 ) -> None:
-    """The row is persisted and *no delivery is attempted*.
-
-    The skip has to be asserted, not assumed: `deliver_webhook` swallows
-    every exception it can reach, so an attempted-and-failed delivery is
-    indistinguishable from a skipped one at the return value. Patching
-    the client constructor and asserting it was never entered is the
-    only observable difference between the two.
-
-    Half-configured is covered as well as unconfigured — a URL with no
-    signing secret must not ship unsigned alerts to it.
-    """
+    """The row is persisted and *no delivery is attempted*."""
     svc, repo = _make_repo()
     repo.create.return_value = _fake_alert()
     client_ctor = MagicMock()
@@ -274,19 +249,8 @@ async def test_webhook_signs_and_posts_body() -> None:
     )
 
 
-# ---------------------------------------------------------------------------
 # Commit before delivery (WO-R2-70)
-#
 # The POST used to be awaited from inside the caller's still-open
-# transaction, so the commander was told an alert existed while the row was
-# invisible to every other connection — and any rollback afterwards erased
-# it, leaving the agent acting on an alert_id that would never resolve.
-# Delivery is now queued on the session's post-commit hook and runs only once
-# the transaction is durable.
-#
-# These use a real AsyncSession because the mechanism under test *is* the
-# session: `session.info` is where the queue lives, and a mock has no queue.
-# ---------------------------------------------------------------------------
 
 
 @pytest_asyncio.fixture
@@ -407,12 +371,7 @@ async def test_rolled_back_alert_is_never_delivered(
 async def test_replaying_a_delivery_with_a_new_timestamp_fails_verification(
     alert_session: AsyncSession,
 ) -> None:
-    """The replay defence the module docstring promises, actually bound.
-
-    At HEAD only the body was signed, so an attacker restamped
-    `X-Alert-Timestamp` to now and the signature still verified — the skew
-    check the receiver performs was checking an unauthenticated header.
-    """
+    """The replay defence the module docstring promises, actually bound."""
     recorder = _Recorder()
     svc = AlertService(AlertRepository(alert_session))
 

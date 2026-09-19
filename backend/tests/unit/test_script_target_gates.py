@@ -75,9 +75,7 @@ def _no_engine(*_a, **_k):  # type: ignore[no-untyped-def]
     )
 
 
-# ---------------------------------------------------------------------------
 # eval_safety._identity — what counts as "the same target"
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -168,20 +166,13 @@ def test_describe_target_names_both_backends() -> None:
     assert "localhost:6379/0" in described
 
 
-# ---------------------------------------------------------------------------
 # WO-R2-18 — reset() is gated on the database it is about to destroy
-# ---------------------------------------------------------------------------
 
 
 async def test_reset_refuses_a_database_url_that_is_not_the_configured_one(
     monkeypatch: pytest.MonkeyPatch, clean_settings
 ) -> None:
-    """The headline of WO-R2-18.
-
-    `ENVIRONMENT=development` here — the gate that existed before this
-    change passes cleanly, and every destructive statement then runs
-    against `prod-db.internal`. Nothing about the old check could tell
-    the difference, because it never looked at the argument."""
+    """The headline of WO-R2-18."""
     reset = _reset_module()
     monkeypatch.setattr(reset, "create_async_engine", _no_engine)
 
@@ -292,9 +283,7 @@ def test_reset_cli_exits_1_on_a_target_mismatch(
     assert "prod-db.internal" in err
 
 
-# ---------------------------------------------------------------------------
 # WO-R2-19 — the seeder family gets the same gate
-# ---------------------------------------------------------------------------
 
 
 async def test_seed_eval_fixtures_refuses_an_unconfigured_target(
@@ -388,9 +377,7 @@ async def test_seed_incident_commander_refuses_an_unconfigured_target(
     assert "refuses to run against a database_url" in capsys.readouterr().err
 
 
-# ---------------------------------------------------------------------------
 # WO-R2-19 — SA_TTL_DAYS credential-lifetime floor
-# ---------------------------------------------------------------------------
 
 
 def test_ttl_days_unset_means_platform_default() -> None:
@@ -461,14 +448,7 @@ async def test_ttl_days_zero_exits_non_zero_without_minting(
 
 
 def test_owner_and_app_role_dsns_are_the_same_target() -> None:
-    """The two-URL scheme (WO-P2-03 / ADR 0015) in one assertion.
-
-    The runtime `DATABASE_URL` is the non-owner `incident_app` role; the
-    owner URL is `postgres:postgres`. They differ only in credentials and
-    name the same database, and ad-hoc ops work runs through the owner
-    URL. A gate that compared usernames would refuse that every time,
-    and the fix for *that* would be an `--i-know-what-im-doing` baked
-    into the Makefile — at which point there is no gate left."""
+    """The two-URL scheme (WO-P2-03 / ADR 0015) in one assertion."""
     safety = _safety()
     assert safety._identity(
         "postgresql+asyncpg://incident_app:localdev@localhost:5432/incident_platform"

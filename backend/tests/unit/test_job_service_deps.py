@@ -25,7 +25,6 @@ def _make_service() -> tuple[JobService, AsyncMock, AsyncMock, AsyncMock, AsyncM
     job_repo = AsyncMock()
     # JobService.create_job wraps the DB insert in `session.begin_nested()`
     # to recover from the idempotency-key race. Stub the savepoint here so
-    # every test in this module gets a working async context manager.
     savepoint_ctx = MagicMock()
     savepoint_ctx.__aenter__ = AsyncMock(return_value=None)
     savepoint_ctx.__aexit__ = AsyncMock(return_value=False)

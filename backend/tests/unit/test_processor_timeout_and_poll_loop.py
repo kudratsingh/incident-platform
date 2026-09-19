@@ -1,21 +1,4 @@
-"""Bounded processor execution and a poll loop the semaphore cannot stall
-(WO-R2-07).
-
-Two defects, one blast radius. `await processor(payload, _publish)` had no
-deadline, and `handle_message` acquired the concurrency semaphore *inline in
-the consumer's poll loop* — so MAX_CONCURRENT_JOBS long-running jobs stopped
-the dispatcher group entirely, and the stale-RUNNING sweep deliberately
-skipped exactly those ids (ADR 0019 §3). Nothing in the tree could recover it.
-
-Real rows on a real (SQLite in-memory) engine for the terminal-state
-assertions, mirroring `test_stale_running_sweep.py`: the claim under test is
-that a timed-out job dead-letters *through* `JobRepository.update_status`, so
-the row and its `job.dlq` outbox event land in one transaction (ADR 0001
-addendum / the terminal single-writer). A mocked session proves neither.
-
-The engine is module-local so committed rows never leak into the shared
-session-scoped `sqlite_engine` other suites roll back against.
-"""
+"""Bounded processor execution and a poll loop the semaphore cannot stall (WO-R2-07)."""
 
 import asyncio
 import uuid
@@ -44,7 +27,6 @@ from sqlalchemy.pool import StaticPool
 
 # Mixed hex on purpose, same reason `DEFAULT_TENANT_ID` is: an all-digit UUID
 # hex round-trips through SQLite's NUMERIC affinity as a float and blows up
-# the UUID result processor.
 _USER_ID = uuid.UUID("c4b5a697-8d9e-4a0b-9c1d-2e3f4a5b6c7d")
 
 # Short enough to keep the suite fast, long enough that a healthy processor
@@ -155,7 +137,6 @@ def _hanging_processor(entered: asyncio.Event) -> Any:
 
 # --------------------------------------------------------------------------- #
 # 1. The processor deadline                                                     #
-# --------------------------------------------------------------------------- #
 
 
 async def test_hung_processor_dead_letters_with_a_distinct_timeout_reason(
@@ -163,12 +144,7 @@ async def test_hung_processor_dead_letters_with_a_distinct_timeout_reason(
     monkeypatch: pytest.MonkeyPatch,
     bounded_execution: None,
 ) -> None:
-    """THE assertion for the unbounded-execution half of the finding.
-
-    Before the fix `_run_job` awaited the processor forever, so this call
-    never returned and the outer `wait_for` was the only thing that ended
-    the test.
-    """
+    """THE assertion for the unbounded-execution half of the finding."""
     job_id = await _seed_pending_job(session_factory)
     entered = asyncio.Event()
     monkeypatch.setitem(
@@ -295,24 +271,12 @@ async def test_a_processor_inside_the_deadline_still_completes(
 
 # --------------------------------------------------------------------------- #
 # 2. The poll loop                                                              #
-# --------------------------------------------------------------------------- #
 
 
 async def test_saturated_dispatcher_does_not_block_the_poll_loop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """THE load-bearing assertion.
-
-    With every slot held, `handle_message` must still return promptly. It
-    used to `await self.semaphore.acquire()` inline, and `handle_message`
-    runs on the consumer's poll loop — so a saturated worker stopped calling
-    `getmany()`, and once `fetcher_idle_time` passed `max_poll_interval_ms`
-    the broker evicted the consumer from the group with nothing to restart
-    it.
-
-    Before the fix the second `handle_message` never returned and this raised
-    `TimeoutError`.
-    """
+    """THE load-bearing assertion."""
     consumer = dispatcher_mod.JobDispatcherConsumer(
         MagicMock(), MagicMock(), max_concurrent=1
     )
@@ -380,14 +344,7 @@ async def test_queued_job_runs_once_the_hung_one_hits_its_deadline(
 
 
 async def test_dispatch_backlog_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Not blocking the poll loop must not mean spawning tasks without limit.
-
-    Past the backlog cap `handle_message` raises, which is the base
-    consumer's existing backpressure primitive: the offset is not committed
-    and the partition seeks back for redelivery. The poll loop keeps polling
-    and heartbeating throughout — that is the whole difference from the old
-    inline `acquire()`.
-    """
+    """Not blocking the poll loop must not mean spawning tasks without limit."""
     consumer = dispatcher_mod.JobDispatcherConsumer(
         MagicMock(), MagicMock(), max_concurrent=1
     )
@@ -417,7 +374,6 @@ async def test_dispatch_backlog_is_bounded(monkeypatch: pytest.MonkeyPatch) -> N
 
 # --------------------------------------------------------------------------- #
 # 3. The sweep's in-flight exclusion is no longer permanent                     #
-# --------------------------------------------------------------------------- #
 
 
 async def _seed_running_job(

@@ -1,14 +1,4 @@
-"""Unit tests for the Kafka producer module.
-
-The real AIOKafkaProducer is replaced with an AsyncMock so we can assert the
-payload shape `publish_job_progress` and `publish_raw` send to the broker.
-
-Historical note: this module also used to expose `publish_job_submitted`,
-`publish_job_completed`, and `publish_job_failed` helpers. Those were
-superseded by the transactional outbox + `publish_raw` and are now gone —
-the only direct publish path left is `publish_job_progress` (high-frequency
-progress events that don't need outbox durability).
-"""
+"""Unit tests for the Kafka producer module."""
 
 import uuid
 from typing import Any
@@ -93,9 +83,7 @@ async def test_publish_raw_propagates_errors(_mock_producer: AsyncMock) -> None:
         )
 
 
-# --------------------------------------------------------------------------
 # Producer lifecycle / self-heal after a boot-time start failure
-# --------------------------------------------------------------------------
 
 
 class _DownProducer:

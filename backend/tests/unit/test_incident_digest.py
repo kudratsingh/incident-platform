@@ -137,9 +137,7 @@ async def test_run_digest_for_tenant_skips_empty_window(
     called.assert_not_called()
 
 
-# ---------------------------------------------------------------------------
 # The window query's error samples (WO-R2-63)
-# ---------------------------------------------------------------------------
 
 
 async def _job(  # type: ignore[no-untyped-def]
@@ -167,14 +165,7 @@ async def _job(  # type: ignore[no-untyped-def]
 async def test_error_samples_exclude_a_job_that_failed_then_succeeded(
     db_session, default_tenant  # type: ignore[no-untyped-def]
 ) -> None:
-    """The retry that worked is not an incident.
-
-    `error_message` is not cleared when a retry succeeds, so a completed job
-    still carries the text of the attempt that failed. Selecting on
-    `error_message IS NOT NULL` alone fed those to the digest as though they
-    were outcomes — the narrative then described failures the counts beside
-    it (always status-filtered) did not report.
-    """
+    """The retry that worked is not an incident."""
     from app.repositories.digest import DigestRepository
 
     await _job(
@@ -237,17 +228,8 @@ async def test_error_samples_and_failed_counts_describe_the_same_jobs(
     assert sum(failed_by_type.values()) == len(errors) == 1
 
 
-# ---------------------------------------------------------------------------
 # No DB transaction is held across the LLM call (WO-R2-63 / WO-R2-08)
-#
 # The transaction half of R2-63 was fixed by #161, which split the worker's
-# digest into read / call / write phases. This is the assertion that fix
-# never had: it is green at master by design, and it is here so that
-# re-composing the three phases into one `session.begin()` — the shape the
-# code had for its whole life before #161 — turns red instead of quietly
-# parking a pooled connection in `idle in transaction` for the length of an
-# Anthropic round-trip, once per tenant, serially.
-# ---------------------------------------------------------------------------
 
 
 class _TrackingFactory:

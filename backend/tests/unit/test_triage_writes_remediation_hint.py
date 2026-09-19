@@ -1,18 +1,4 @@
-"""LLM triage has to actually set `jobs.remediation_hint` (R2-24).
-
-Three places name triage as the setter of that column — the
-`RemediationHint` enum docstring, the model's column comment, and the DLQ
-tool descriptions the agent reads — and none of them was true. The
-consumer wrote a `job_triages` row and stopped, so no organically
-dead-lettered job ever carried a remediation category. Every hint in the
-system came from the eval seed script, the chaos hooks, or an agent's
-`mark_dlq_permanent`, which means the agent's categorised-replay path was
-only ever exercised against fixtures.
-
-Real rows on a real (SQLite in-memory) engine: the claim is what lands in
-the `jobs` row next to the `job_triages` row, in one transaction, and a
-mocked session proves neither.
-"""
+"""LLM triage has to actually set `jobs.remediation_hint` (R2-24)."""
 
 import uuid
 from collections.abc import AsyncGenerator
@@ -55,7 +41,6 @@ def _analysis(**overrides: Any) -> TriageAnalysis:
 
 # --------------------------------------------------------------------------- #
 # The mapping                                                                  #
-# --------------------------------------------------------------------------- #
 
 
 @pytest.mark.parametrize(
@@ -63,8 +48,6 @@ def _analysis(**overrides: Any) -> TriageAnalysis:
     [
         # Not replayable as-is → the category that stops automation from
         # trying. This is the same judgement `is_retryable` already encodes,
-        # so it is read first and the root cause only refines the retryable
-        # half.
         ("validation_error", False, RemediationHint.HUMAN_REQUIRED.value),
         ("configuration", False, RemediationHint.HUMAN_REQUIRED.value),
         ("data_corruption", False, RemediationHint.HUMAN_REQUIRED.value),
@@ -129,7 +112,6 @@ def test_every_mapped_value_is_a_real_enum_member() -> None:
 
 # --------------------------------------------------------------------------- #
 # The write                                                                    #
-# --------------------------------------------------------------------------- #
 
 
 @pytest_asyncio.fixture
@@ -380,7 +362,6 @@ async def test_triage_writes_nothing_when_the_job_belongs_to_another_tenant(
 
 # --------------------------------------------------------------------------- #
 # The advertised contract                                                      #
-# --------------------------------------------------------------------------- #
 
 
 def test_the_dlq_tool_description_admits_triage_is_off_by_default() -> None:
@@ -394,8 +375,6 @@ def test_the_dlq_tool_description_admits_triage_is_off_by_default() -> None:
     """
     # Importing the package is what fires the `@tool` decorators — the
     # registry is populated by import side-effect, so asking it anything
-    # without this passes only when some earlier test happened to import
-    # the MCP server first.
     import app.mcp.tools  # noqa: F401
     from app.config import get_settings
     from app.mcp import registry
@@ -415,7 +394,6 @@ def test_the_dlq_tool_description_admits_triage_is_off_by_default() -> None:
 
 # --------------------------------------------------------------------------- #
 # What it unlocks downstream                                                   #
-# --------------------------------------------------------------------------- #
 
 
 @pytest.mark.asyncio

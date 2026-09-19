@@ -1,17 +1,4 @@
-"""Tripwire against the compose comment mis-describing the chaos surface.
-
-`docker-compose.yml` explains to a reader of the `mcp` service what
-`CHAOS_ENABLED=true` actually turns on. It enumerated five chaos tools
-and called that the whole set. Nine are registered. An operator reading
-the comment to decide whether flipping the flag was safe was reading a
-blast radius roughly half the real one.
-
-The registered set is derived here from the `@chaos_tool` decorators in
-`app/mcp/tools/chaos/` rather than from the live registry, because the
-registry is populated at import time under `CHAOS_ENABLED=true` and the
-unit tier runs with the gate closed. The decorator call *is* the
-registration, so the source is the honest authority either way.
-"""
+"""Tripwire against the compose comment mis-describing the chaos surface."""
 
 from __future__ import annotations
 

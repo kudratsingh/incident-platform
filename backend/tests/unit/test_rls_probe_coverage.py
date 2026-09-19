@@ -1,20 +1,4 @@
-"""The boot RLS probe must cover every tenant-scoped table (R2-26).
-
-Sibling to `test_rls_coverage.py`, which checks that every tenant table
-is named by an RLS *migration*. This one checks the runtime half: that
-the boot-time posture probe actually looks at all of them.
-
-It used to look at exactly one, `jobs`, chosen as "the representative"
-on the reasoning that every tenant table got FORCE in the same
-migration. That holds for the migration chain and says nothing about the
-live database, which is the only thing a runtime probe is for: `ALTER
-TABLE ... DISABLE ROW LEVEL SECURITY` on any other table was invisible
-to it.
-
-Both the probe and the two RLS test tiers now derive their table list
-from one function, so a new tenant-scoped table is probed the moment its
-model exists — no list to remember to extend.
-"""
+"""The boot RLS probe must cover every tenant-scoped table (R2-26)."""
 
 import app.models  # noqa: F401  # importing registers every model on Base.metadata
 from app.core.rls_check import RLS_EXEMPT_TABLES, tenant_scoped_tables

@@ -1,20 +1,4 @@
-"""The SEED_EVAL_FIXTURES boot path and the pin manifest's location.
-
-Live finding (demo stack, 2026-08-16): with SEED_EVAL_FIXTURES=true the
-api logged `"eval fixture seed failed", error_type: PermissionError,
-[Errno 13] Permission denied: '/app/eval-fixtures-pins.json'` — while
-seeding had SUCCEEDED (5 alerts, 9 jobs, 4 dead-lettered, 6 deploy
-markers all committed). Two defects hid under that one line:
-
-  * the pins manifest defaulted to `/app/...`, which the shipped image's
-    non-root `appuser` cannot write (the Dockerfile COPYs /app as root);
-  * the lifespan wrapped `seed()` and `write_pins_json()` in one
-    try/except, so a pins-write failure was reported as a seed failure.
-
-These tests pin the fix for both: the default location is runtime-
-writable and `EVAL_PINS_PATH`-configurable, and the two failure domains
-are unconflatable in the boot log.
-"""
+"""The SEED_EVAL_FIXTURES boot path and the pin manifest's location."""
 
 from __future__ import annotations
 
@@ -38,9 +22,7 @@ def _seed_module():  # type: ignore[no-untyped-def]
     return importlib.import_module("seed_eval_fixtures")
 
 
-# ---------------------------------------------------------------------------
 # Pin manifest location — writable, configurable
-# ---------------------------------------------------------------------------
 
 
 def test_default_pins_path_is_runtime_writable(
@@ -92,9 +74,7 @@ def test_write_pins_json_raises_oserror_when_unwritable(
         blocked.chmod(0o700)
 
 
-# ---------------------------------------------------------------------------
 # Boot logging — the two failure domains stay apart
-# ---------------------------------------------------------------------------
 
 
 class _RecordingLogger:
@@ -201,20 +181,11 @@ async def test_boot_success_logs_seed_and_pins_separately(
     assert any("pins" in m for m in infos)
 
 
-# ---------------------------------------------------------------------------
 # A missing tenant slug degrades; it does not kill the process (WO-R2-69)
-# ---------------------------------------------------------------------------
 
 
 def test_missing_tenant_raises_a_catchable_exception() -> None:
-    """`_ensure_tenant` must not raise `SystemExit`.
-
-    `SystemExit` derives from `BaseException`, so the boot guard's
-    `except Exception` — whose whole job is to log and let the app start —
-    could not catch it. A `SEED_TENANT_SLUG` typo therefore unwound through
-    the lifespan and crash-looped the API, for a fixture set the platform is
-    designed to run without.
-    """
+    """`_ensure_tenant` must not raise `SystemExit`."""
     seed = _seed_module()
 
     assert issubclass(seed.SeedError, Exception)
@@ -227,14 +198,7 @@ async def test_boot_survives_a_missing_tenant_slug(
     monkeypatch: pytest.MonkeyPatch,
     db_session,  # type: ignore[no-untyped-def]
 ) -> None:
-    """End to end through the real guard, raising from the real function.
-
-    Deliberately calls `_ensure_tenant` rather than raising a stand-in: what
-    made this a crash-loop was the exception *class* that one function chose,
-    so a test that raises its own exception proves nothing. At HEAD this
-    unwinds `SystemExit` straight through `_boot_seed_eval_fixtures` and out
-    of the test.
-    """
+    """End to end through the real guard, raising from the real function."""
     from app import main as app_main
 
     seed = _seed_module()

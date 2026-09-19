@@ -1,16 +1,4 @@
-"""WO-R2-54 — the cache tools are scoped to the caller's tenant.
-
-`invalidate_cache_key` deleted, and `get_cache_key_info` inspected, any
-key under the prefix allowlist. `cache:job:{tenant_id}:{job_id}` is under
-that allowlist on purpose — force-refreshing a stale job read is the
-remediation the pair exists for — so a service account in tenant A could
-evict tenant B's cached job (a cross-tenant write) and confirm its
-existence, TTL and size (a cross-tenant existence oracle, which withholding
-the payload does not close).
-
-Driven through the real JSON-RPC surface, because the tenant now comes
-from the authenticated principal and that only exists on a real request.
-"""
+"""WO-R2-54 — the cache tools are scoped to the caller's tenant."""
 
 from __future__ import annotations
 
@@ -37,8 +25,8 @@ _FORBIDDEN = "cache_key_forbidden"
 
 
 class _RedisStub:
-    """Records what it was asked for, so a refusal that still touched
-    Redis is a visible failure rather than a silent one."""
+    """Records what it was asked for, so a refusal that still touched Redis is a visible
+    failure rather than a silent one."""
 
     def __init__(self) -> None:
         self.store: dict[str, str] = {}
@@ -99,8 +87,8 @@ async def _mint_token(
 
 @pytest_asyncio.fixture
 async def cache_client(db_session: AsyncSession, default_tenant):  # type: ignore[no-untyped-def]
-    """Yields (client, redis, token) for a principal in the default tenant
-    holding both cache scopes."""
+    """Yields (client, redis, token) for a principal in the default tenant holding both
+    cache scopes."""
     app = create_mcp_app()
     redis = _RedisStub()
 
@@ -143,8 +131,6 @@ async def _call(
 
 
 # ---------------------------------------------------------------------------
-# Cross-tenant keys are refused
-# ---------------------------------------------------------------------------
 
 
 async def test_invalidate_refuses_another_tenants_job_cache(
@@ -170,8 +156,8 @@ async def test_invalidate_refuses_another_tenants_job_cache(
 async def test_cache_key_info_refuses_another_tenants_job_cache(
     cache_client, other_tenant: Tenant  # type: ignore[no-untyped-def]
 ) -> None:
-    """The existence oracle: shape-only is not a defence when existence is
-    the thing being asked about."""
+    """The existence oracle: shape-only is not a defence when existence is the thing being
+    asked about."""
     ac, redis, token = cache_client
     victim = JobCache._key(uuid.uuid4(), other_tenant.id)
     redis.store[victim] = '{"id": "..."}'
@@ -186,8 +172,7 @@ async def test_cache_key_info_refuses_another_tenants_job_cache(
 async def test_the_refusal_does_not_reveal_whether_the_key_exists(
     cache_client, other_tenant: Tenant  # type: ignore[no-untyped-def]
 ) -> None:
-    """A refusal that varied with what is in Redis would rebuild the
-    oracle it closes."""
+    """A refusal that varied with what is in Redis would rebuild the oracle it closes."""
     ac, redis, token = cache_client
     present = JobCache._key(uuid.uuid4(), other_tenant.id)
     absent = JobCache._key(uuid.uuid4(), other_tenant.id)
@@ -207,8 +192,8 @@ async def test_the_refusal_does_not_reveal_whether_the_key_exists(
 async def test_a_malformed_tenant_segment_is_refused(
     cache_client,  # type: ignore[no-untyped-def]
 ) -> None:
-    """`cache:job:` with a non-UUID segment cannot be this principal's
-    tenant, so it is refused rather than compared as a string."""
+    """`cache:job:` with a non-UUID segment cannot be this principal's tenant, so it is
+    refused rather than compared as a string."""
     ac, redis, token = cache_client
     body = await _call(
         ac, token, "get_cache_key_info", {"key": "cache:job:not-a-uuid:xyz"}
@@ -218,15 +203,12 @@ async def test_a_malformed_tenant_segment_is_refused(
 
 
 # ---------------------------------------------------------------------------
-# The remediation loop still works inside your own tenant
-# ---------------------------------------------------------------------------
 
 
 async def test_own_tenant_job_cache_stays_inspectable_and_deletable(
     cache_client, default_tenant  # type: ignore[no-untyped-def]
 ) -> None:
-    """The regression guard. `cache:job:` is allowlisted precisely so an
-    agent can force-refresh a stale job read — scoping must not cost that."""
+    """The regression guard."""
     ac, redis, token = cache_client
     mine = JobCache._key(uuid.uuid4(), default_tenant.id)
     redis.store[mine] = '{"id": "..."}'
@@ -249,9 +231,9 @@ async def test_own_tenant_job_cache_stays_inspectable_and_deletable(
 async def test_platform_global_keys_are_unaffected(
     cache_client,  # type: ignore[no-untyped-def]
 ) -> None:
-    """Key families with no tenant segment have no tenant to compare and
-    expose nothing of one tenant's — they stay reachable on the allowlist
-    alone, or the metrics-cache and hot_set remediations break."""
+    """Key families with no tenant segment have no tenant to compare and expose nothing of
+    one tenant's — they stay reachable on the allowlist alone, or the metrics-cache and
+    hot_set remediations break."""
     ac, redis, token = cache_client
     for key in (
         "cache:jobs:worker-dispatcher:hot_set",
@@ -266,8 +248,8 @@ async def test_platform_global_keys_are_unaffected(
 async def test_keys_outside_the_allowlist_are_still_refused_first(
     cache_client,  # type: ignore[no-untyped-def]
 ) -> None:
-    """The prefix gate keeps its own message — tenant scoping is the
-    second gate, not a replacement."""
+    """The prefix gate keeps its own message — tenant scoping is the second gate, not a
+    replacement."""
     ac, _redis, token = cache_client
     body = await _call(ac, token, "get_cache_key_info", {"key": "jobs:tenant:x"})
     assert body["error"]["data"]["error_code"] == _FORBIDDEN
