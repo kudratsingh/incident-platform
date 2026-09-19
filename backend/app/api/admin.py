@@ -4,8 +4,16 @@ roles are a dependency and the work belongs to the services.
 """
 
 import uuid
+from datetime import UTC, datetime
 from typing import Any
 
+from app.core.breaker_state import read_breaker_states
+from app.core.consumer_lag import (
+    LIVE_REFRESHED_GROUP,
+    SEEDED_CONSUMER_GROUPS,
+    LagReading,
+    read_lag,
+)
 from app.core.logging import request_id_var
 from app.dependencies import (
     get_db,
@@ -16,8 +24,10 @@ from app.dependencies import (
     require_role,
     resolve_admin_tenant,
 )
-from app.models.enums import UserRole
+from app.models.enums import JobStatus, UserRole
 from app.models.user import User
+from app.repositories.agent_run import AgentRunRepository
+from app.repositories.alert import AlertRepository
 from app.repositories.audit import AuditRepository
 from app.repositories.digest import DigestRepository
 from app.repositories.event_log import EventLogRepository
@@ -27,8 +37,19 @@ from app.repositories.outbox import OutboxRepository
 from app.repositories.tenant import TenantRepository
 from app.repositories.triage import TriageRepository
 from app.repositories.user import UserRepository
+from app.schemas.agent_run import (
+    AgentRunListParams,
+    AgentRunResponse,
+    AlertListParams,
+    AlertResponse,
+    CircuitBreakerResponse,
+    CircuitBreakersResponse,
+    ConsumerLagGroupResponse,
+    ConsumerLagResponse,
+    ConsumerLagSampleResponse,
+)
 from app.schemas.common import MAX_PAGE_SIZE, PaginatedResponse
-from app.schemas.job import AdminJobListParams, JobResponse
+from app.schemas.job import AdminJobListParams, JobResponse, JobTriageSummary
 from app.schemas.tenant import TenantLimitsUpdate
 from app.schemas.user import UserResponse
 from app.services import incident_digest, nl_query
@@ -78,6 +99,25 @@ def _job_service(db: AsyncSession, redis: Redis) -> JobService:
     )
 
 
+async def _with_triage(db: AsyncSession, jobs: list[Any]) -> list[JobResponse]:
+    """Serialize a page of jobs, attaching the triage summary to dead-lettered rows.
+
+    One statement for the page, not one per row (WO-R3-312): the DLQ tab and the demo
+    console both poll this list. A job with no triage row keeps `triage: null`, which
+    is the normal case — the LLM triage consumer is off by default.
+    """
+    dlq_ids = [j.id for j in jobs if j.status == JobStatus.DEAD_LETTER.value]
+    triages = await TriageRepository(db).map_by_job_ids(dlq_ids)
+    items: list[JobResponse] = []
+    for job in jobs:
+        response = JobResponse.model_validate(job)
+        row = triages.get(job.id)
+        if row is not None:
+            response.triage = JobTriageSummary.model_validate(row)
+        items.append(response)
+    return items
+
+
 @router.get("/jobs", response_model=PaginatedResponse[JobResponse])
 async def admin_list_jobs(
     params: AdminJobListParams = Depends(),
@@ -100,7 +140,7 @@ async def admin_list_jobs(
         filter_user_id=params.user_id,
     )
     return PaginatedResponse.build(
-        items=[JobResponse.model_validate(j) for j in jobs],
+        items=await _with_triage(db, list(jobs)),
         total=total,
         page=params.page,
         page_size=params.page_size,
@@ -198,7 +238,7 @@ async def admin_get_job(
         user_role=current_user.role,
         tenant_id=current_user.tenant_id,
     )
-    return JobResponse.model_validate(job)
+    return (await _with_triage(db, [job]))[0]
 
 
 @router.post("/jobs/{job_id}/replay", response_model=JobResponse)
@@ -706,6 +746,203 @@ async def resolve_incident(
         tenant_id=current_user.tenant_id,
     )
     return JobResponse.model_validate(job)
+
+
+# ---------------------------------------------------------------------------
+# The demo console's reads (WO-R3-312, ADR 0035)
+#
+# Four readings a human operator could not get over REST before: what the responder
+# says it is doing, and the three platform numbers that were MCP-only. Every one is
+# `support|admin` and tenant-scoped exactly as the rest of this router is — the point
+# of ADR 0035 is that this half of the pair is operator-only, so none of it is
+# reachable by a machine principal's token.
+# ---------------------------------------------------------------------------
+
+
+@router.get("/agent-runs", response_model=PaginatedResponse[AgentRunResponse])
+async def admin_list_agent_runs(
+    params: AgentRunListParams = Depends(),
+    tenant_id: uuid.UUID | None = None,
+    current_user: User = Depends(_require_support_or_admin),
+    db: AsyncSession = Depends(get_db),
+) -> PaginatedResponse[AgentRunResponse]:
+    """Runs reported by an autonomous responder, newest first.
+
+    `?active=true` narrows to runs nobody has closed — the console's own query while a
+    demo is running. `?alert_id=` narrows to one alert's runs.
+    """
+    effective_tenant = await resolve_admin_tenant(current_user, db, tenant_id)
+    runs, total = await AgentRunRepository(db).list_for_tenant(
+        effective_tenant,
+        alert_id=params.alert_id,
+        active=params.active,
+        offset=params.offset,
+        limit=params.page_size,
+    )
+    return PaginatedResponse.build(
+        items=[AgentRunResponse.model_validate(r) for r in runs],
+        total=total,
+        page=params.page,
+        page_size=params.page_size,
+    )
+
+
+@router.get("/agent-runs/{run_id}", response_model=AgentRunResponse)
+async def admin_get_agent_run(
+    run_id: uuid.UUID,
+    tenant_id: uuid.UUID | None = None,
+    current_user: User = Depends(_require_support_or_admin),
+    db: AsyncSession = Depends(get_db),
+) -> AgentRunResponse:
+    """One run with its whole phase history and its briefing, if it has one."""
+    from app.core.exceptions import NotFoundError
+
+    effective_tenant = await resolve_admin_tenant(current_user, db, tenant_id)
+    run = await AgentRunRepository(db).get_for_tenant(run_id, effective_tenant)
+    if run is None:
+        # 404 for another tenant's run as well as a missing one: the id space stays
+        # opaque, exactly as `JobRepository.get_for_tenant` keeps it.
+        raise NotFoundError(f"Agent run {run_id} not found")
+    return AgentRunResponse.model_validate(run)
+
+
+@router.get("/consumer-lag", response_model=ConsumerLagResponse)
+async def admin_consumer_lag(
+    current_user: User = Depends(_require_support_or_admin),
+    redis: Redis = Depends(get_redis),
+) -> ConsumerLagResponse:
+    """Every consumer group the platform tracks, in one reading.
+
+    The same arithmetic the agent's `get_consumer_lag` uses (`app/core/consumer_lag.py`),
+    so the console and the agent cannot disagree about whether a lag is known. Unlike
+    that tool this takes no group argument: an operator watching a queue drain wants
+    every group at once. Not tenant-scoped, and it says so — consumer groups are
+    platform-wide.
+    """
+    groups: list[ConsumerLagGroupResponse] = []
+    for name in SEEDED_CONSUMER_GROUPS:
+        reading = await read_lag(redis, name)
+        groups.append(
+            ConsumerLagGroupResponse(
+                consumer_group=reading.consumer_group,
+                lag=reading.lag,
+                lag_known=reading.lag_known,
+                source=reading.source,
+                lag_unknown_reason=_lag_unknown_reason(reading),
+                measured_at=reading.measured_at,
+                age_seconds=reading.age_seconds,
+                recent_samples=[
+                    ConsumerLagSampleResponse(lag=s.lag, measured_at=s.measured_at)
+                    for s in reading.recent_samples
+                ],
+            )
+        )
+    return ConsumerLagResponse(
+        measured_at=datetime.now(UTC),
+        groups=groups,
+        total=len(groups),
+        live_group=LIVE_REFRESHED_GROUP,
+    )
+
+
+def _lag_unknown_reason(reading: LagReading) -> str | None:
+    """Why this group has no number, in words an operator can act on.
+
+    Never a zero and never a blank: a missing lag on a group that should carry a
+    recorded constant is an environment problem, and a missing one on the live group
+    means the metrics loop has not reported inside the cache's TTL. Those are different
+    jobs for the person reading the screen.
+    """
+    if reading.lag_known:
+        return None
+    if reading.source == "live":
+        return (
+            "no lag has been recorded for this group inside the cache window — the "
+            "metrics loop has not reported recently, or the worker is not running"
+        )
+    if reading.source == "static":
+        return (
+            "this group's value is a recorded constant and the record is absent — an "
+            "environment problem to fix, not a queue to investigate"
+        )
+    return "this platform does not track a consumer group by that name"
+
+
+@router.get("/circuit-breakers", response_model=CircuitBreakersResponse)
+async def admin_circuit_breakers(
+    current_user: User = Depends(_require_support_or_admin),
+    redis: Redis = Depends(get_redis),
+) -> CircuitBreakersResponse:
+    """Every breaker with a published state record (ADR 0030).
+
+    A breaker with no record is absent from the list, never reported closed, and an
+    empty list with `unknown_reason` set means the platform could say nothing. Breakers
+    are platform-wide, so this reading is not tenant-scoped.
+    """
+    records, unknown_reason = await read_breaker_states(redis)
+    measured_at = datetime.now(UTC)
+    breakers = [
+        CircuitBreakerResponse(
+            name=r.name,
+            state=r.state,
+            failure_count=r.failure_count,
+            failure_threshold=r.failure_threshold,
+            recovery_timeout_s=r.recovery_timeout_s,
+            last_state_change_at=r.last_state_change_at,
+            seconds_since_state_change=_age_s(measured_at, r.last_state_change_at),
+            last_failure_at=r.last_failure_at,
+            last_failure_reason_class=r.last_failure_reason_class,
+            recorded_at=r.recorded_at,
+            reported_age_s=_age_s(measured_at, r.recorded_at) or 0.0,
+        )
+        for r in records
+    ]
+    return CircuitBreakersResponse(
+        measured_at=measured_at,
+        breakers=breakers,
+        total=len(breakers),
+        unknown_reason=unknown_reason,
+    )
+
+
+def _age_s(measured_at: datetime, at: datetime | None) -> float | None:
+    """Seconds between a timestamp and the reading, clamped at 0 for clock skew.
+
+    Same arithmetic as `get_circuit_breakers`: the timestamps come from the process
+    that owns the breaker and the reading from this one, so an age compares two clocks.
+    """
+    if at is None:
+        return None
+    return round(max(0.0, (measured_at - at).total_seconds()), 3)
+
+
+@router.get("/alerts", response_model=PaginatedResponse[AlertResponse])
+async def admin_list_alerts(
+    params: AlertListParams = Depends(),
+    tenant_id: uuid.UUID | None = None,
+    current_user: User = Depends(_require_support_or_admin),
+    db: AsyncSession = Depends(get_db),
+) -> PaginatedResponse[AlertResponse]:
+    """Alerts for the caller's tenant, newest first.
+
+    `?active=true` is the agent's `list_active_alerts` view; omitting it shows resolved
+    alerts too, which is the one thing that tool never returns and the thing a human
+    reading a timeline after the fact needs.
+    """
+    effective_tenant = await resolve_admin_tenant(current_user, db, tenant_id)
+    alerts, total = await AlertRepository(db).list_for_tenant(
+        effective_tenant,
+        active=params.active,
+        severity=params.severity,
+        offset=params.offset,
+        limit=params.page_size,
+    )
+    return PaginatedResponse.build(
+        items=[AlertResponse.model_validate(a) for a in alerts],
+        total=total,
+        page=params.page,
+        page_size=params.page_size,
+    )
 
 
 @router.get("/users", response_model=PaginatedResponse[UserResponse])

@@ -30,6 +30,12 @@ CHAOS_TOOL_DENIED_ACTION = "chaos.tool_denied"
 # `tests/unit/test_operator_audit.py::test_chaos_actions_share_the_chaos_prefix`.
 CHAOS_ACTION_PREFIX = "chaos."
 
+# A third stream: the responder telling the platform what it is doing (ADR 0035). It
+# sits under `agent.` because a service account really did make the call, but it is
+# NOT `agent.tool_invoked` — that stream is what the agent did *to the platform*, and
+# an operator timeline that mixed the two would colour a status report as an action.
+AGENT_RUN_REPORTED_ACTION = "agent.run_reported"
+
 # Outcome values recorded on tool invocation rows. Kept as a fixed set so
 # admin filters and dashboards can rely on it.
 OUTCOME_SUCCESS = "success"
@@ -40,13 +46,25 @@ OUTCOME_UNAUTHORIZED = "unauthorized"
 def hidden_audit_action_prefixes(principal: Principal) -> tuple[str, ...]:
     """Audit-action prefixes `principal` must not be shown, ever.
 
-    One entry: the `chaos.` stream, visible only to a principal holding `chaos:invoke`
-    (ADR 0012). Callers pass it to `list_logs`'s `exclude_action_prefixes`, so it lands in
-    SQL and `total` counts only what the caller may see — a count is a fact about the rows.
+    Two rules, and they point opposite ways on purpose. Callers pass the result to
+    `list_logs`'s `exclude_action_prefixes`, so it lands in SQL and `total` counts only
+    what the caller may see — a count is a fact about the rows.
+
+    - The `chaos.` stream is shown **only** to a principal holding `chaos:invoke`: the
+      lab is invisible to the agent under test (ADR 0012).
+    - The `agent.run_reported` stream is hidden **from** a principal holding
+      `agent_runs:write`: the writer of that stream is not its reader. The platform
+      stores what a responder reports about itself and shows it to operators, never
+      back to the responder (ADR 0035) — and without this the run reports would have
+      come back through the audit tool, which is a read surface for `agent_runs` by
+      another name.
     """
-    if Scope.CHAOS_INVOKE.value in principal.scopes:
-        return ()
-    return (CHAOS_ACTION_PREFIX,)
+    hidden: list[str] = []
+    if Scope.CHAOS_INVOKE.value not in principal.scopes:
+        hidden.append(CHAOS_ACTION_PREFIX)
+    if Scope.AGENT_RUNS_WRITE.value in principal.scopes:
+        hidden.append(AGENT_RUN_REPORTED_ACTION)
+    return tuple(hidden)
 
 
 def _principal_kwargs(principal: Principal) -> dict[str, Any]:
@@ -76,13 +94,18 @@ async def record_tool_invocation(
     error_message: str | None = None,
     request_id: str | None = None,
     is_chaos: bool = False,
+    is_commander: bool = False,
     denied_by: str | None = None,
 ) -> bool:
     """Write an `agent.tool_invoked` row for one MCP tool call; returns whether it staged.
 
     `is_chaos=True` uses `chaos.tool_invoked` (or `chaos.tool_denied` with `denied_by`) so
-    chaos filters as its own stream (ADR 0008). Never raises — the savepoint costs only the
-    audit row, and the caller decides: `app.mcp.handlers` treats `False` as fatal (R2-51).
+    chaos filters as its own stream (ADR 0008); `is_commander=True` uses
+    `agent.run_reported` for the same reason (ADR 0035). The row shape is identical in all
+    three cases, which is what lets the phase strip be rebuilt from the audit log alone:
+    `extra_data.arguments` carries the run id and the state that was reported. Never
+    raises — the savepoint costs only the audit row, and the caller decides:
+    `app.mcp.handlers` treats `False` as fatal (R2-51).
     """
     extra: dict[str, Any] = {
         "tool_name": tool_name,
@@ -100,6 +123,8 @@ async def record_tool_invocation(
         action = (
             CHAOS_TOOL_DENIED_ACTION if denied_by is not None else CHAOS_TOOL_INVOKED_ACTION
         )
+    elif is_commander:
+        action = AGENT_RUN_REPORTED_ACTION
     else:
         action = TOOL_INVOKED_ACTION
 
@@ -126,6 +151,7 @@ async def record_tool_invocation(
 
 
 __all__ = [
+    "AGENT_RUN_REPORTED_ACTION",
     "CHAOS_ACTION_PREFIX",
     "CHAOS_TOOL_DENIED_ACTION",
     "CHAOS_TOOL_INVOKED_ACTION",

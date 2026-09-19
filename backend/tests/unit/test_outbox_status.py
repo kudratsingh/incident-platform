@@ -488,14 +488,24 @@ def test_the_read_tier_gained_exactly_this_tool() -> None:
     """A tool-surface delta is a contract delta: 20 non-chaos tools before this order, 21 after, and
     with `CHAOS_ENABLED=true` the number the commander pins moves 31 → 32. The two counts below
     moved again with WO-R3-217's `get_circuit_breakers` / `get_slo_status` (21 → 23, 33 → 35), which
-    is what this list is for: an addition edits it deliberately rather than sliding a number."""
+    is what this list is for: an addition edits it deliberately rather than sliding a number.
+
+    WO-R3-312 moves the second count and NOT the first: `report_agent_run` and
+    `report_agent_briefing` carry `agent_runs:write`, so the read tier is untouched at 16
+    while the non-chaos registry goes 23 → 25 (and the pinned surface 38 → 40)."""
     read = sorted(
         t.name
         for t in list_tools()
         if t.required_scope in {Scope.TELEMETRY_READ, Scope.INCIDENTS_READ}
     )
     assert read == READ_TIER_AFTER
-    assert len(list_tools()) == 23
+    assert len(list_tools()) == 25
+    # Which two the growth is, spelled out: a third tool riding in on this count is
+    # what the assertion above exists to stop.
+    assert sorted(t.name for t in list_tools() if t.is_commander) == [
+        "report_agent_briefing",
+        "report_agent_run",
+    ]
 
 
 def test_the_tool_declares_the_telemetry_read_scope() -> None:

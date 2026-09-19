@@ -13,7 +13,7 @@ For the Kafka side (event log, lifecycle topics), see [`docs/KAFKA.md`](KAFKA.md
                                   tenants
                  ┌──────────────┬─────┴──────┬──────────────┐
                  │              │            │              │
-               users          jobs ─── job_dependencies   alerts
+               users          jobs ─── job_dependencies   alerts ─── agent_runs
                  │              │         (self-join)     deploy_markers (tenant_id nullable)
                  │              ├── audit_logs            incident_summaries
                  │              ├── outbox_events         idempotency_records
@@ -21,16 +21,16 @@ For the Kafka side (event log, lifecycle topics), see [`docs/KAFKA.md`](KAFKA.md
                  │              ├── job_triages
                  │              └── (saga_id → sagas)
                  │
-          service_accounts
+          service_accounts ─── agent_runs (service_account_id)
                  │
           service_account_tokens
 ```
 
-Fifteen tables. `users` and `service_accounts` are the two principal tables — one human, one machine — and `service_account_tokens` hangs off the latter. `jobs` is the domain centre; `alerts`, `deploy_markers` and `idempotency_records` sit beside it rather than under it, because they are written by the operator path rather than by a job's lifecycle.
+Sixteen tables. `users` and `service_accounts` are the two principal tables — one human, one machine — and `service_account_tokens` hangs off the latter. `jobs` is the domain centre; `alerts`, `deploy_markers` and `idempotency_records` sit beside it rather than under it, because they are written by the operator path rather than by a job's lifecycle. `agent_runs` hangs off both `alerts` (the signal it answers, nullable) and `service_accounts` (the principal that reported it), and off `jobs` not at all — a run is about an incident, not about one job.
 
 Every domain table carries `tenant_id` as a FK to `tenants` so tenancy is enforced at the constraint layer (combined with RLS — see [ADR 0003](ADR/0003-rls-as-defense-in-depth.md)).
 
-**RLS coverage** (migrations `c4f8e9a52340` + `a7e3d9c41f28`): all 11 tenant-scoped tables — `jobs`, `audit_logs`, `outbox_events`, `job_events`, `sagas`, `job_triages`, `incident_summaries`, `service_accounts`, `alerts`, `idempotency_records`, `deploy_markers` — carry the `tenant_isolation` policy **and `FORCE ROW LEVEL SECURITY`**, so the policies bind the table owner too (the RDS master — the migration role; since WO-P2-03 the runtime itself connects as the non-owner `incident_app` role, which additionally holds no UPDATE/DELETE grant on `audit_logs`). The `deploy_markers` policy additionally admits `tenant_id IS NULL` rows (platform-wide deploys stay visible under tenant-scoped sessions) — and every writer honours that: `scripts/seed_eval_fixtures.py` used to stamp its six seeded markers with a concrete tenant, which put the eval fixtures on the wrong side of the policy's platform-wide branch, so `get_deploy_history` behaved differently on a seeded stack than on an empty one (WO-R2-69). The seeder now writes NULL and repairs any tenant-stamped row it finds from an older seed. `users` is the single deliberate exclusion — auth reads it before `app.tenant_id` is set (ADR 0003 bootstrap). `audit_logs` also carries RESTRICTIVE deny policies for UPDATE/DELETE, making it immutable at the DB layer while the `ON DELETE SET NULL` FKs keep working (referential-integrity actions bypass RLS). See [ADR 0015](ADR/0015-force-rls-and-nonowner-app-role.md). The unit gate `backend/tests/unit/test_rls_coverage.py` fails CI if a future `tenant_id` table ships without a policy, and the `integration` CI job proves the enforcement itself on a live server: `backend/tests/integration/test_rls_enforcement.py` asserts ENABLE+FORCE on all 11 tables, cross-tenant invisibility, and that `audit_logs` UPDATE/DELETE raise `insufficient_privilege` while the FK `SET NULL` still fires.
+**RLS coverage** (migrations `c4f8e9a52340` + `a7e3d9c41f28`, extended by `a2f7c05b8e13` for `agent_runs`): all 12 tenant-scoped tables — `jobs`, `audit_logs`, `outbox_events`, `job_events`, `sagas`, `job_triages`, `incident_summaries`, `service_accounts`, `alerts`, `idempotency_records`, `deploy_markers`, `agent_runs` — carry the `tenant_isolation` policy **and `FORCE ROW LEVEL SECURITY`**, so the policies bind the table owner too (the RDS master — the migration role; since WO-P2-03 the runtime itself connects as the non-owner `incident_app` role, which additionally holds no UPDATE/DELETE grant on `audit_logs`). The `deploy_markers` policy additionally admits `tenant_id IS NULL` rows (platform-wide deploys stay visible under tenant-scoped sessions) — and every writer honours that: `scripts/seed_eval_fixtures.py` used to stamp its six seeded markers with a concrete tenant, which put the eval fixtures on the wrong side of the policy's platform-wide branch, so `get_deploy_history` behaved differently on a seeded stack than on an empty one (WO-R2-69). The seeder now writes NULL and repairs any tenant-stamped row it finds from an older seed. `users` is the single deliberate exclusion — auth reads it before `app.tenant_id` is set (ADR 0003 bootstrap). `audit_logs` also carries RESTRICTIVE deny policies for UPDATE/DELETE, making it immutable at the DB layer while the `ON DELETE SET NULL` FKs keep working (referential-integrity actions bypass RLS). See [ADR 0015](ADR/0015-force-rls-and-nonowner-app-role.md). The unit gate `backend/tests/unit/test_rls_coverage.py` fails CI if a future `tenant_id` table ships without a policy, and the `integration` CI job proves the enforcement itself on a live server: `backend/tests/integration/test_rls_enforcement.py` asserts ENABLE+FORCE on all 12 tables (the list is derived from the ORM, so a new table joins it with no edit), cross-tenant invisibility, and that `audit_logs` UPDATE/DELETE raise `insufficient_privilege` while the FK `SET NULL` still fires.
 
 ---
 
@@ -223,7 +223,7 @@ Append-only log of every meaningful action (job creation, replay, incident resol
 | `tenant_id` | UUID NOT NULL FK → tenants.id | Indexed. |
 | `user_id` | UUID NULLABLE FK → users.id ON DELETE SET NULL | Nullable because some events have no user (e.g. system-emitted events). |
 | `job_id` | UUID NULLABLE FK → jobs.id ON DELETE SET NULL | Nullable because not every audit event is job-related. |
-| `action` | String(100) NOT NULL | Indexed. Snake_case verb, e.g. `job.created`, `job.replayed`, `saga.completed`, `tenant.created`, `tenant.limits_updated`. |
+| `action` | String(100) NOT NULL | Indexed. Snake_case verb, e.g. `job.created`, `job.replayed`, `saga.completed`, `tenant.created`, `tenant.limits_updated`. Machine-principal calls land in one of three streams, which is what makes them filterable apart: `agent.tool_invoked` (what the responder did to the platform), `chaos.tool_invoked` / `chaos.tool_denied` (the lab, withheld from a principal without `chaos:invoke`), and `agent.run_reported` (the responder's status reports — withheld from the principal that *writes* them, [ADR 0035](ADR/0035-the-agent-reports-its-run-and-cannot-read-it-back.md)). |
 | `resource_type`, `resource_id` | String(100), String(255) | Free-form. The convention is `resource_type=job, resource_id=<uuid>` etc. |
 | `request_id` | String(255) | The HTTP request that triggered the action. Used to correlate audit events across services. Caller-supplied via `X-Request-ID`, so the width is a correctness bound, not a formatting one — a value the column cannot hold makes the row fail to insert, and the MCP audit writer is savepoint-wrapped and silent. `app.core.middleware` validates the header down to 128 chars of a bounded charset before it ever reaches here, and `AuditRepository.log` truncates to `REQUEST_ID_MAX_LENGTH` as a last resort (WO-R2-51). |
 | `ip_address` | String(50) | |
@@ -379,6 +379,40 @@ LLM calls are expensive and slow. Every admin opening the Digests tab would re-b
 - `uq_alerts_tenant_dedup_key` — UNIQUE `(tenant_id, dedup_key)`. This is what stops a sustained SLO burn paging once per evaluation tick: the loop buckets its key by hour, so a second insert in the same window loses the race and is swallowed. It also stops two worker replicas evaluating the same window from both alerting. A NULL `dedup_key` is exempt, which is how one-off alerts stay possible.
 
 Every alert is also the trigger for a signed webhook, so this table is the entry point to the whole incident path the agent is evaluated against.
+
+---
+
+## `agent_runs` — what an autonomous responder said it was doing
+
+Written over MCP by the responder's own principal, read back only by a human operator
+([ADR 0035](ADR/0035-the-agent-reports-its-run-and-cannot-read-it-back.md)). The platform
+stores the report and interprets none of it: `state`, `current_hypothesis`, `last_step`
+and `briefing` are the caller's words.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | UUID PK | **Supplied by the caller**, not defaulted. `report_agent_run` is an upsert by run id, so the caller's own id has to be the key or a repeat report would need a content search to find its own row. |
+| `tenant_id` | UUID NOT NULL FK → tenants.id | Indexed, under the strict `tenant_isolation` policy plus FORCE RLS. |
+| `alert_id` | UUID NULLABLE FK → alerts.id ON DELETE SET NULL | Indexed. The alert this run answers, when the caller named one. SET NULL rather than CASCADE: the record of a run outlives the alert that started it, and losing the link beats losing the run or pinning the alert. |
+| `service_account_id` | UUID NOT NULL FK → service_accounts.id ON DELETE RESTRICT | Indexed. A real FK, unlike `audit_logs.principal_id` — that column has none because it may name either `users.id` or `service_accounts.id` ([ADR 0007](ADR/0007-machine-principal-scope-model.md)), and this one can only ever name a service account. RESTRICT: deleting a principal must not delete the history of what it did. |
+| `scenario` | String(128) NULLABLE | The caller's short name for the run, for an operator reading the record afterwards. Free text — the platform has no list of valid names. **On the wire this field is `run_label`**: ADR 0012's screen bans the lab's own vocabulary from a non-chaos tool's `tools/list` surface, so the column keeps the operator's word and the tool does not. |
+| `state` | String(32) NOT NULL | Indexed. An `AgentRunState` value: `triage` / `investigating` / `planning` / `awaiting_approval` / `remediating` / `verifying` / `resolved` / `escalated` / `failed`. **These nine strings are the responder's own state names, character for character**, so its reporter maps nothing and a state cannot be lost in translation. Plain string, as `jobs.status` is, so a new member needs no DDL — but adding one on either side without the other is the drift to watch for. |
+| `phase_history` | JSONB NOT NULL, default `[]` | Append-only list of `{"state": …, "at": …}`, oldest first, **one entry per state change**. A revisited state appends again (a responder going back to investigating is a real transition); a repeat of the current state adds nothing, or a caller reporting every loop iteration would turn a timeline into a call log. NOT NULL with a default so every row has a list to append to and no reader has to treat NULL as empty. |
+| `current_hypothesis` | JSONB NULLABLE | `{"name": …, "category": …, "confidence": …}`, or NULL while the caller has no leading explanation. The current reading, so it is **replaced** on every report — omitting it clears it. |
+| `last_step` | JSONB NULLABLE | `{"kind": "read"\|"action", "tool": …, "at": …}`, or NULL before the first step. Replaced on every report, like the hypothesis. |
+| `briefing` | JSONB NULLABLE | The caller's end-of-run write-up with its `prose` inside it, stored verbatim and validated nowhere — pinning its shape would couple two repositories' release cycles to buy nothing. Written **once**: a second write is refused 409, because an operator may already have read it. |
+| `started_at` | DateTime NOT NULL | When the first report landed, on the platform's clock. |
+| `updated_at` | DateTime NOT NULL | When the most recent report landed. |
+| `finished_at` | DateTime NULLABLE | Stamped the first time `state` reaches `resolved` / `escalated` / `failed`, and never cleared. NULL is what `?active=true` means on the console's read. A report on a run that already has one is refused 409 rather than allowed to rewind a strip an operator has read to its ending. |
+
+### Indexes and constraints
+
+- `ix_agent_runs_active` — partial index on `(tenant_id, started_at DESC)` `WHERE finished_at IS NULL`. The console's own query, twice a second while a demo runs; partial, like `ix_alerts_active`, so it stays small as finished runs accumulate.
+- No uniqueness beyond the primary key: one row per run id is the whole rule, and the caller owns the id space.
+- **Not immutable.** Unlike `audit_logs` this table is updated on every report, so it takes no REVOKE and no RESTRICTIVE deny policy — `incident_app` holds full DML on it through b8e4a1c92f35's default privileges.
+- **Not swept by the eval reset** (recorded, not solved): rows accumulate across runs, and a run the reset ends stays open unless the responder reported a terminal state. The console's newest-first `finished_at IS NULL` query is what keeps a stale finished run from being read as the current one.
+
+The phase strip is also rebuildable from `audit_logs` alone if this table is ever lost: every report writes one `agent.run_reported` row whose `extra_data.arguments` carries the run id, the state and the caller's time.
 
 ---
 

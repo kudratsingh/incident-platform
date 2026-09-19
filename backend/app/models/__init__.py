@@ -1,3 +1,4 @@
+from app.models.agent_run import AgentRun
 from app.models.alert import Alert
 from app.models.audit import AuditLog
 from app.models.deploy_marker import DeployMarker
@@ -14,6 +15,7 @@ from app.models.triage import JobTriage
 from app.models.user import User
 
 __all__ = [
+    "AgentRun",
     "Alert",
     "AuditLog",
     "DeployMarker",

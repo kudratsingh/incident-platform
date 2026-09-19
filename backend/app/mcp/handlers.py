@@ -202,8 +202,10 @@ async def _run_tool_call(
         )
 
     # Chaos tools route to the `chaos.tool_invoked` / `chaos.tool_denied`
-    # audit stream (see ADR 0008). Compute once so every branch gets it.
+    # audit stream (see ADR 0008), commander telemetry to `agent.run_reported`
+    # (ADR 0035). Computed once so every branch below gets both.
     is_chaos = tool_def.is_chaos
+    is_commander = tool_def.is_commander
 
     # Scope check — humans are rejected upstream by the auth dependency.
     if tool_def.required_scope is not None:
@@ -219,6 +221,7 @@ async def _run_tool_call(
                 error_message="missing required scope",
                 request_id=request_id_var.get("") or None,
                 is_chaos=is_chaos,
+                is_commander=is_commander,
                 denied_by="scope_check" if is_chaos else None,
             )
             return _error(
@@ -242,6 +245,7 @@ async def _run_tool_call(
             error_message="invalid arguments",
             request_id=request_id_var.get("") or None,
             is_chaos=is_chaos,
+            is_commander=is_commander,
         )
         return _error(
             request_id,
@@ -275,6 +279,7 @@ async def _run_tool_call(
                 error_message="idempotency_key required",
                 request_id=request_id_var.get("") or None,
                 is_chaos=is_chaos,
+                is_commander=is_commander,
             )
             return _error(
                 request_id,
@@ -304,6 +309,7 @@ async def _run_tool_call(
                 error_message=exc.message,
                 request_id=request_id_var.get("") or None,
                 is_chaos=is_chaos,
+                is_commander=is_commander,
             )
             return _error(
                 request_id,
@@ -323,6 +329,7 @@ async def _run_tool_call(
                 outcome=OUTCOME_SUCCESS,
                 request_id=request_id_var.get("") or None,
                 is_chaos=is_chaos,
+                is_commander=is_commander,
             )
             result = p.ToolCallResult(
                 content=[
@@ -356,6 +363,7 @@ async def _run_tool_call(
             error_message=exc.message,
             request_id=request_id_var.get("") or None,
             is_chaos=is_chaos,
+            is_commander=is_commander,
         )
         return _error(request_id, p.MCP_UNAUTHORIZED, exc.message)
     except AuthorizationError as exc:
@@ -371,6 +379,7 @@ async def _run_tool_call(
             error_message=exc.message,
             request_id=request_id_var.get("") or None,
             is_chaos=is_chaos,
+            is_commander=is_commander,
         )
         return _error(request_id, p.MCP_FORBIDDEN, exc.message)
     except AppError as exc:
@@ -386,6 +395,7 @@ async def _run_tool_call(
             error_message=exc.message,
             request_id=request_id_var.get("") or None,
             is_chaos=is_chaos,
+            is_commander=is_commander,
         )
         return _error(
             request_id,
@@ -410,6 +420,7 @@ async def _run_tool_call(
             error_message=str(exc),
             request_id=request_id_var.get("") or None,
             is_chaos=is_chaos,
+            is_commander=is_commander,
         )
         return _error(
             request_id, p.JSONRPC_INTERNAL_ERROR, "internal tool error"
@@ -437,6 +448,7 @@ async def _run_tool_call(
         outcome=OUTCOME_SUCCESS,
         request_id=request_id_var.get("") or None,
         is_chaos=is_chaos,
+        is_commander=is_commander,
     )
 
     # Attach the response to the claim we hold so a repeat call replays it:

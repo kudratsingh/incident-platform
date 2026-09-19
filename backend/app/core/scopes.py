@@ -15,6 +15,9 @@ class Scope(StrEnum):
     ACTIONS_PROPOSE = "actions:propose"
     ACTIONS_EXECUTE = "actions:execute"
     CHAOS_INVOKE = "chaos:invoke"
+    # Write-only, and the only scope whose holder is *denied* a read: the caller
+    # reports what it is doing to the platform and cannot read it back (ADR 0035).
+    AGENT_RUNS_WRITE = "agent_runs:write"
 
 
 ALL_SCOPES: frozenset[str] = frozenset(s.value for s in Scope)

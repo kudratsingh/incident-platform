@@ -696,7 +696,9 @@ def test_the_chaos_surface_grows_by_exactly_one_tool(
     }
     assert "slow_db_queries" in chaos_names
     assert len(chaos_names) == 15, sorted(chaos_names)
-    assert len(names) == 38, sorted(names)
+    # 38 → 40 with WO-R3-312's two `[commander: telemetry]` tools, which are
+    # neither chaos nor reads: the chaos count above and the read tier both stay put.
+    assert len(names) == 40, sorted(names)
 
 
 def test_no_new_refusal_code_reaches_the_commanders_chaos_client() -> None:

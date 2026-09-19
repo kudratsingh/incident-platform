@@ -1,6 +1,7 @@
 """Repository for the LLM triage analyses."""
 
 import uuid
+from collections.abc import Sequence
 from typing import Any
 
 from app.models.triage import JobTriage
@@ -15,6 +16,22 @@ class TriageRepository(BaseRepository[JobTriage]):
         stmt = select(JobTriage).where(JobTriage.job_id == job_id)
         result = await self.session.execute(stmt)
         return result.scalar_one_or_none()
+
+    async def map_by_job_ids(
+        self, job_ids: Sequence[uuid.UUID]
+    ) -> dict[uuid.UUID, JobTriage]:
+        """Triage rows for a page of jobs, keyed by job id.
+
+        One statement for the page rather than one per row: the admin job list widened
+        to carry triage (WO-R3-312), and a per-row `get_by_job_id` would be a query per
+        DLQ entry on a list the console polls. Missing ids are simply absent.
+        """
+        if not job_ids:
+            return {}
+        result = await self.session.execute(
+            select(JobTriage).where(JobTriage.job_id.in_(list(job_ids)))
+        )
+        return {row.job_id: row for row in result.scalars().all()}
 
     async def upsert(
         self,

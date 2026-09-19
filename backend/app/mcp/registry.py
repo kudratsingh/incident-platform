@@ -41,6 +41,10 @@ class ToolDefinition:
     # Audit row goes to `chaos.tool_invoked`, not `agent.tool_invoked`.
     # Set only when `settings.chaos_enabled=True`.
     is_chaos: bool = False
+    # Commander telemetry (ADR 0035): the responder's loop reports its own run
+    # here, no model chooses the call, and the audit row goes to
+    # `agent.run_reported` so the action stream stays what the agent *did*.
+    is_commander: bool = False
     # Tier 1 actions take an `idempotency_key`; a repeat on the same
     # (tenant, principal, key) returns the cached response.
     is_idempotent: bool = False
@@ -66,6 +70,7 @@ def tool[InputT: BaseModel, OutputT: BaseModel](
     output_model: type[OutputT],
     required_scope: Scope | None = None,
     is_chaos: bool = False,
+    is_commander: bool = False,
     is_idempotent: bool = False,
 ) -> Callable[[ToolHandler], ToolHandler]:
     """Register `func` as a tool. Duplicate names raise at import time, so a
@@ -82,6 +87,7 @@ def tool[InputT: BaseModel, OutputT: BaseModel](
             output_model=output_model,
             handler=func,
             is_chaos=is_chaos,
+            is_commander=is_commander,
             is_idempotent=is_idempotent,
         )
         return func

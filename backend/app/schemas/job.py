@@ -130,6 +130,20 @@ class JobCreate(BaseModel):
         return self
 
 
+# The triage row for a dead-lettered job, reduced to what an operator reads: the same
+# five fields the agent's `list_dlq_messages` returns, so the console and the agent look
+# at one analysis rather than two summaries of it. A comment, not a docstring — Pydantic
+# copies a class docstring into the JSON Schema, and this model reaches OpenAPI.
+class JobTriageSummary(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    root_cause_category: str | None = None
+    summary: str
+    suggested_fix: str | None = None
+    is_retryable: bool | None = None
+    confidence: float | None = None
+
+
 class JobResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -147,12 +161,46 @@ class JobResponse(BaseModel):
     max_attempts: int
     # DLQ attribution (F2-16). REST-only — the MCP output models are frozen.
     dead_lettered_by: str | None = None
+    # The five fields below are the WO-R3-312 widening: everything the agent's
+    # `list_dlq_messages` shows about a dead-lettered row, so an operator console does
+    # not have to read the agent's surface to see what the agent saw. Additive and
+    # nullable, and all five are null for a job that is not dead-lettered — `status`
+    # is the reason, so none of them carries a reason string of its own.
+    #
+    # Coarse category to route on: `replay_safe` / `wait_and_replay` /
+    # `human_required`. Null means nothing has categorised this row — NOT that it is
+    # safe to replay.
+    remediation_hint: str | None = None
+    # `mark_dlq_permanent`'s fence, and who raised it as `{principal_type}:{id}`.
+    # Re-stamped on every mark. Null `fenced_at` with a `human_required` hint means
+    # triage wrote the hint, not an operator.
+    fenced_at: datetime | None = None
+    fenced_by: str | None = None
+    # Attached by the admin endpoints for dead-lettered rows when a triage row exists;
+    # null everywhere else, including on surfaces that do not look it up.
+    triage: JobTriageSummary | None = None
     priority: int
     trace_id: str | None
     saga_id: uuid.UUID | None = None
     created_at: datetime
     started_at: datetime | None
     completed_at: datetime | None
+
+    @computed_field(  # type: ignore[prop-decorator]
+        description=(
+            "When the job reached the dead-letter queue, which is the clock the "
+            "DLQ is ordered by — not when it was submitted (`created_at`), and a "
+            "different clock again from `fenced_at`. Null for any job that is not "
+            "dead-lettered; there is no separate reason field because `status` is "
+            "the reason. Derived from `completed_at`, which is the terminal-state "
+            "stamp, so it is one fact rather than two that can disagree."
+        )
+    )
+    @property
+    def dead_lettered_at(self) -> datetime | None:
+        if self.status != JobStatus.DEAD_LETTER.value:
+            return None
+        return self.completed_at
 
     @computed_field(  # type: ignore[prop-decorator]
         description=(

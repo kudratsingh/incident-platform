@@ -122,7 +122,9 @@ def test_the_read_tier_grows_by_exactly_two() -> None:
     )
 
     assert read == READ_TIER_AFTER
-    assert len(list_tools()) == 23, sorted(t.name for t in list_tools())
+    # 23 → 25 with WO-R3-312's two `agent_runs:write` tools, which are not reads and so
+    # leave the list above alone (ADR 0035).
+    assert len(list_tools()) == 25, sorted(t.name for t in list_tools())
 
 
 def test_neither_new_tool_takes_an_argument() -> None:

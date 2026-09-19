@@ -8,6 +8,7 @@ from app.mcp.tools import (  # noqa: F401
     cache_key_info,
     chaos,
     circuit_breakers,
+    commander_runs,
     consumer_lag,
     dag_state,
     deploy_history,

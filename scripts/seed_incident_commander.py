@@ -4,7 +4,8 @@ Seed the eval's two service accounts and mint one scoped token for each.
 **Two principals, not one** (O-4, 2026-09-15). The platform withholds the `chaos.` audit stream
 from any principal without `chaos:invoke`, and that filter is inert if one token carries both:
 
-  - `incident-commander` — the agent under test: reads plus Tier-1 actions, **never**
+  - `incident-commander` — the agent under test: reads, Tier-1 actions and
+    `agent_runs:write` (WO-R3-312 — reporting its own run, write-only), **never**
     `chaos:invoke` (this script removes the grant if it finds it, on stderr). Printed as
     `PLATFORM_TOKEN`, the name the commander's `Settings.platform_token` reads.
   - `incident-commander-chaos` — the evaluator: `chaos:invoke` plus the two read scopes, so it
@@ -15,7 +16,8 @@ Neither plaintext is printed again. Paste both into the commander's `.env`; neve
 Usage (with the stack running): `python scripts/seed_incident_commander.py`. Optional env vars:
 `DATABASE_URL` (compose value), `SA_NAME` (incident-commander), `SA_CHAOS_NAME`
 (incident-commander-chaos), `SA_TENANT_SLUG` (default), `SA_SCOPES`
-(telemetry:read,incidents:read — `chaos:invoke` here is refused, it belongs to the chaos account),
+(telemetry:read,incidents:read,agent_runs:write — `chaos:invoke` here is refused, it belongs to
+the chaos account),
 `SA_CHAOS_SCOPES` (those two plus chaos:invoke; no `actions:execute`, remediation is the agent's
 job), `SA_TTL_DAYS` (1-365, the API's own bound; unset for the platform default of 90 — 0,
 negative or non-numeric exits without minting), `SA_REPLACE_SCOPES` (1 to REPLACE an account's
@@ -63,7 +65,18 @@ _CHAOS_SA_NAME = os.getenv("SA_CHAOS_NAME", "incident-commander-chaos")
 _TENANT_SLUG = os.getenv("SA_TENANT_SLUG", "default")
 _SCOPES_ENV = os.getenv(
     "SA_SCOPES",
-    f"{Scope.TELEMETRY_READ.value},{Scope.INCIDENTS_READ.value}",
+    # `agent_runs:write` joins the default set with WO-R3-312: it is how the agent
+    # reports its own run so a human can watch one (ADR 0035), and it is safe to grant
+    # by default because it buys the holder nothing to read — there is no read tool for
+    # `agent_runs`, and the audit stream those calls write is withheld from the very
+    # principal that writes it (`hidden_audit_action_prefixes`).
+    ",".join(
+        (
+            Scope.TELEMETRY_READ.value,
+            Scope.INCIDENTS_READ.value,
+            Scope.AGENT_RUNS_WRITE.value,
+        )
+    ),
 )
 _CHAOS_SCOPES_ENV = os.getenv(
     "SA_CHAOS_SCOPES",
