@@ -181,6 +181,8 @@ jobs:
               "test_outbox_stall",
               "test_resolver_stall",
               "test_stranded_chain",
+              "test_db_pool_saturation",
+              "test_downstream_latency",
           }
 
           try:

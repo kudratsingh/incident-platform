@@ -35,6 +35,7 @@ from app.utils.post_commit import run_post_commit
 from app.workers import (
     async_tasks,
     cpu_processors,
+    db_pool_hold,
     dlq_replay_scheduler,
     kafka_producer,
     queue,
@@ -1920,8 +1921,9 @@ async def worker_loop(
     0009 amendment) — so a transient boot error is retried with capped backoff instead
     of dropping that group for the process's life. Each loop reads `chaos:pause:<loop>`
     once per iteration and skips its work while set (`control_loop_pause.py`, ADR
-    0027); the consumer groups are NOT in that enum, `kill_consumer` stops those.
-    Cancel signal: cancel all, wait for in-flight jobs, stop all consumers.
+    0027); the consumer groups are NOT in that enum, `kill_consumer` stops those. Under
+    `CHAOS_ENABLED` one more task rides along — the pool holder, which is a lab task and not a
+    twelfth loop (ADR 0031). Cancel signal: cancel all, wait for in-flight jobs, stop all.
     """
     dispatcher = JobDispatcherConsumer(session_factory, redis)
     audit = AuditConsumer(session_factory)
@@ -1969,6 +1971,13 @@ async def worker_loop(
             asyncio.create_task(_slo_evaluation_loop(session_factory)),
         ]
     )
+
+    if get_settings().chaos_enabled:
+        # Not a twelfth background loop and deliberately not in `ControlLoopName`: it exists
+        # only under the chaos gate, and its off switch is its own key (ADR 0031).
+        tasks.append(
+            asyncio.create_task(db_pool_hold.hold_db_pool(session_factory, redis))
+        )
 
     try:
         await asyncio.gather(*tasks)

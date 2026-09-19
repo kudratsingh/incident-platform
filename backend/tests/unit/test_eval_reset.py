@@ -370,8 +370,18 @@ async def test_rebaseline_is_noop_when_already_fresh(
 def test_every_chaos_key_helper_lives_under_the_chaos_namespace() -> None:
     """`_CHAOS_KEY_PATTERNS` is complete only while every chaos key stays under `chaos:*`, so assert
     that statically rather than trusting the pattern list."""
+    from app.workers.async_tasks import downstream_flag_key
     from app.workers.control_loop_pause import pause_key_for
+    from app.workers.db_pool_hold import hold_key
     from app.workers.kafka_consumer import kill_key_for, latency_key_for
+
+    # The last two take no argument — one key each, which is what makes a repeat call replace the
+    # state rather than stack a second one (ADR 0031).
+    for nullary in (hold_key, downstream_flag_key):
+        assert fnmatch.fnmatch(nullary(), "chaos:*"), (
+            f"{nullary.__name__} produces a key outside chaos:* — either move "
+            "it back under that namespace or add a pattern for it"
+        )
 
     for helper in (kill_key_for, latency_key_for, pause_key_for):
         assert fnmatch.fnmatch(helper("any-group"), "chaos:*"), (
