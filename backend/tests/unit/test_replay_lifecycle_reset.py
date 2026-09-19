@@ -57,16 +57,10 @@ _USER_ID = uuid.UUID("b1c2d3e4-f5a6-4b7c-8d9e-0f1a2b3c4d5e")
 
 # --------------------------------------------------------------------------- #
 # Redis stand-ins                                                              #
-# --------------------------------------------------------------------------- #
 
 
 class _InMemoryRedis:
-    """Enough real Redis semantics to make the cache race observable.
-
-    `set(..., nx=True)` genuinely refuses to overwrite — that refusal is
-    the mechanism under test, so a stub that ignored `nx` would let the
-    race pass.
-    """
+    """Enough real Redis semantics to make the cache race observable."""
 
     def __init__(self) -> None:
         self.store: dict[str, str] = {}
@@ -107,7 +101,6 @@ class _InMemoryRedis:
 
 # --------------------------------------------------------------------------- #
 # Fixtures                                                                     #
-# --------------------------------------------------------------------------- #
 
 
 @pytest_asyncio.fixture
@@ -220,7 +213,6 @@ async def _reload(
 
 # --------------------------------------------------------------------------- #
 # Finding 1 — the remediation hint outlived its episode                        #
-# --------------------------------------------------------------------------- #
 
 
 @pytest.mark.asyncio
@@ -292,14 +284,7 @@ async def test_replay_clears_the_fence_stamps(
 async def test_a_replayed_job_is_visible_to_the_blind_bulk_replay_again(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """The fence must be per-episode in both directions (R2-22 + R2-23).
-
-    `replay_dlq_messages` now excludes `human_required` at the query
-    level. If the hint were sticky, one `mark_dlq_permanent` would
-    permanently remove a job from every future bulk remediation — a
-    fence that can be raised and never lowered. Asserted through the
-    exclusion the tool actually issues.
-    """
+    """The fence must be per-episode in both directions (R2-22 + R2-23)."""
     job_id = await _insert_dead_letter(
         session_factory, remediation_hint=RemediationHint.HUMAN_REQUIRED.value
     )
@@ -327,7 +312,6 @@ async def test_a_replayed_job_is_visible_to_the_blind_bulk_replay_again(
 
 # --------------------------------------------------------------------------- #
 # Finding 2 — previous_status was read after the flip                          #
-# --------------------------------------------------------------------------- #
 
 
 @pytest.mark.asyncio
@@ -390,7 +374,6 @@ async def test_replay_of_a_failed_job_records_failed_not_pending(
 
 # --------------------------------------------------------------------------- #
 # Finding 3 — the cache was invalidated inside the transaction                 #
-# --------------------------------------------------------------------------- #
 
 
 @pytest.mark.asyncio
@@ -434,17 +417,7 @@ async def test_cache_invalidation_happens_after_the_commit(
 async def test_a_racing_reader_cannot_repopulate_the_pre_replay_row(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """The race moving the delete alone does not close.
-
-    A reader that loaded the job from Postgres *before* the replay
-    committed still holds the pre-replay row. Whenever its `JobCache.set`
-    lands — including after the invalidation — it must not be able to
-    put that row back. The invalidation therefore leaves a short
-    no-cache tombstone in the slot rather than an empty hole.
-
-    RED before: `JobCache.set` overwrites unconditionally, so the stale
-    `dead_letter` row is served for a full TTL after the replay.
-    """
+    """The race moving the delete alone does not close."""
     job_id = await _insert_dead_letter(session_factory)
     redis = _InMemoryRedis()
 
@@ -471,12 +444,7 @@ async def test_a_racing_reader_cannot_repopulate_the_pre_replay_row(
 async def test_a_rolled_back_replay_never_touches_the_cache(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """The mirror of the ordering guarantee: no commit, no invalidation.
-
-    The pre-fix code deleted the key from inside the transaction, so a
-    replay that rolled back still evicted a perfectly valid entry —
-    cheap, but it is the same confusion about when a write is real.
-    """
+    """The mirror of the ordering guarantee: no commit, no invalidation."""
     job_id = await _insert_dead_letter(session_factory)
     redis = _InMemoryRedis()
 

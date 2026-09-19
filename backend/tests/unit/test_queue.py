@@ -1,8 +1,4 @@
-"""Unit tests for the Redis delayed-retry sorted set — Redis is fully mocked.
-
-Only the delayed set is in scope. The primary `jobs:queue` sorted set was
-removed in the queue-leak fix — Kafka took over primary dispatch in Phase 7.
-"""
+"""Unit tests for the Redis delayed-retry sorted set — Redis is fully mocked."""
 
 import time
 from unittest.mock import AsyncMock

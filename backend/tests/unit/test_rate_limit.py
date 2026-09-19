@@ -6,9 +6,7 @@ import pytest
 from app.core.exceptions import RateLimitError
 from app.utils.rate_limit import _check, _client_key
 
-# ---------------------------------------------------------------------------
 # _client_key
-# ---------------------------------------------------------------------------
 
 
 def _make_request(ip: str = "1.2.3.4", forwarded: str | None = None) -> MagicMock:
@@ -58,9 +56,7 @@ def test_client_key_falls_back_to_direct_ip_on_degenerate_header() -> None:
     assert _client_key(req) == "10.0.0.1"
 
 
-# ---------------------------------------------------------------------------
 # _check
-# ---------------------------------------------------------------------------
 
 
 async def test_check_allows_under_limit() -> None:

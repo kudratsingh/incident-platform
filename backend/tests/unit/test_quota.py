@@ -1,9 +1,4 @@
-"""Per-tenant rate-limit + monthly quota enforcement.
-
-These exercise the helper directly against the in-memory SQLite session +
-a mock Redis. The integration-level "POST /jobs returns 429" path is
-covered by the API layer.
-"""
+"""Per-tenant rate-limit + monthly quota enforcement."""
 
 import uuid
 from unittest.mock import AsyncMock
@@ -93,15 +88,8 @@ async def test_unknown_tenant_rejected(db_session: AsyncSession) -> None:
         await check_tenant_limits(db_session, _redis(), uuid.uuid4())
 
 
-# ---------------------------------------------------------------------------
 # job_count — a request that creates N jobs is checked as N (WO-R2-12)
-#
 # `POST /sagas` creates one job row per step. Checking it as a single job let
-# a saga cross the cap by N-1 rows; checking it as N refuses it before the
-# first INSERT, so a saga never commits half a chain and then meets the cap.
-# The default of 1 keeps `POST /jobs` byte-identical: `used + 1 > cap` is the
-# same predicate as the `used >= cap` it replaced.
-# ---------------------------------------------------------------------------
 
 
 async def _seed_jobs(  # type: ignore[no-untyped-def]
@@ -153,11 +141,7 @@ async def test_job_count_allows_a_batch_that_exactly_fits(
 async def test_single_job_semantics_are_unchanged(
     db_session: AsyncSession, default_tenant, test_user
 ) -> None:
-    """The default job_count=1 must be exactly the old `used >= cap` rule.
-
-    At the cap it refuses; one under it accepts. `POST /jobs` behaviour does
-    not move because the batch parameter exists.
-    """
+    """The default job_count=1 must be exactly the old `used >= cap` rule."""
     default_tenant.rate_limit_per_minute = 0
     default_tenant.quota_jobs_per_month = 3
     await db_session.flush()
@@ -187,12 +171,7 @@ async def test_job_count_is_ignored_when_the_quota_is_disabled(
 async def test_a_batch_counts_as_one_request_against_the_tenant_rate_limit(
     db_session: AsyncSession, default_tenant
 ) -> None:
-    """job_count bounds the monthly JOB quota, not the per-minute REQUEST rate.
-
-    `tenants.rate_limit_per_minute` counts requests, and one saga is one
-    request; multiplying it there would silently redefine a configured
-    column. Volume is the quota's job to bound, and it does.
-    """
+    """job_count bounds the monthly JOB quota, not the per-minute REQUEST rate."""
     default_tenant.rate_limit_per_minute = 10
     default_tenant.quota_jobs_per_month = 0
     await db_session.flush()

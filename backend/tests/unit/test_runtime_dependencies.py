@@ -1,17 +1,4 @@
-"""Every third-party module the app imports must be a *runtime* dependency.
-
-`httpx` was imported at module scope by `app/services/alerts.py` — the alert
-webhook, the incident commander's production trigger — while being declared
-only in the `[dev]` extra. The production image installs `.` without extras,
-so it got httpx purely as a transitive dependency of `anthropic`: an import
-the application never asked for, held up by a package that has no obligation
-to keep providing it (WO-R2-66).
-
-A hand-written "httpx is declared" assertion would pin that one line and
-nothing else, so this walks the application's own imports instead. It is the
-same tripwire shape as `test_docs_redis_key_drift.py`: assert the property,
-not the instance.
-"""
+"""Every third-party module the app imports must be a *runtime* dependency."""
 
 from __future__ import annotations
 
@@ -39,13 +26,7 @@ def _declared_runtime_distributions() -> set[str]:
 
 
 def _module_scope_imports() -> dict[str, set[pathlib.Path]]:
-    """Top-level import names used at module scope, mapped to their files.
-
-    Module scope only: an import inside a function is paid when that function
-    runs, which is a different (and often deliberate) decision — several
-    modules here defer heavy imports on purpose. An import at module scope is
-    paid at process start, so it must be installed for the process to boot.
-    """
+    """Top-level import names used at module scope, mapped to their files."""
     found: dict[str, set[pathlib.Path]] = {}
     for path in _APP.rglob("*.py"):
         tree = ast.parse(path.read_text("utf-8"), filename=str(path))
