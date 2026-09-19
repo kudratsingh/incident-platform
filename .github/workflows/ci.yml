@@ -187,6 +187,7 @@ jobs:
               "test_breaker_visibility",
               "test_postgres_health_pg",
               "test_sticky_kill_survives_restart",
+              "test_agent_runs_postgres",
           }
 
           try:

@@ -464,6 +464,10 @@ Three role tiers, with `is_platform_admin` as an additive cross-tenant flag:
 | Run NL admin query | — | ✓ | ✓ | ✓ |
 | Get triage analysis for a job | — | ✓ | ✓ | ✓ |
 | Get cross-tenant digest by ID | — | — | — (403) | ✓ |
+| Read agent runs (`/admin/agent-runs`) | — | ✓ | ✓ | ✓ (via `?tenant_id=`) |
+| Read consumer lag / breakers (`/admin/consumer-lag`, `/admin/circuit-breakers`) | — | ✓ | ✓ | ✓ |
+| Read alerts, resolved ones included (`/admin/alerts`) | — | ✓ | ✓ | ✓ (via `?tenant_id=`) |
+| **Report** an agent run (`report_agent_run`, MCP) | — | — | — | — (machine principal only) |
 
 ### Who may join a tenant (ADR 0024)
 
@@ -491,6 +495,53 @@ The last two rows of the matrix — create tenant, patch tenant limits — each 
 **Database roles:** the API, the worker loops, and the MCP process all share one engine (`backend/app/dependencies.py`) and connect as the non-owner **`incident_app`** role — DML only, no DDL, and no UPDATE/DELETE on `audit_logs` (tampering raises `insufficient_privilege`). Migrations run as the owner (the RDS master) on the separate `ALEMBIC_DATABASE_URL`; a boot-time probe (`app/core/rls_check.assert_rls_posture`) hard-fails a production process whose connection would silently bypass RLS. It checks all three ways that happens — superuser, RLS switched off (`relrowsecurity`), owner without FORCE — plus the presence of each `tenant_isolation` policy, across every tenant-scoped table the ORM declares rather than one representative (WO-R2-26).
 
 See [ADR 0003](ADR/0003-rls-as-defense-in-depth.md) for the RLS design and [ADR 0015](ADR/0015-force-rls-and-nonowner-app-role.md) for FORCE RLS and the role split.
+
+---
+
+## Operator REST surface for the demo console (WO-R3-312, ADR 0035)
+
+Five additions to the HTTP contract, all `support|admin`, all additive. The rule they
+share: **a reading that is unknown says why, in its own field, rather than defaulting to a
+zero an operator would read as healthy.** The full reasoning is
+[ADR 0035](ADR/0035-the-agent-reports-its-run-and-cannot-read-it-back.md); this is the
+shape.
+
+| Route | Answers | Notes |
+|---|---|---|
+| `GET /api/v1/admin/agent-runs?alert_id=&active=&page=&page_size=` | `PaginatedResponse[AgentRunResponse]` | Newest first. `active=true` is `finished_at IS NULL` — the console's own query while a run is live; `active=false` is its complement; omitted shows both. `?tenant_id=` is honoured for a platform admin only. |
+| `GET /api/v1/admin/agent-runs/{id}` | `AgentRunResponse` | 404 for a missing run **and** for another tenant's, so the id space stays opaque. |
+| `GET /api/v1/admin/consumer-lag` | `ConsumerLagResponse` | Every group in one reading, no arguments. Not tenant-scoped — consumer groups are platform-wide. |
+| `GET /api/v1/admin/circuit-breakers` | `CircuitBreakersResponse` | Every breaker with a published record ([ADR 0030](ADR/0030-breaker-state-is-published-and-a-reading-is-never-invented.md)); absent is unknown, never closed. Not tenant-scoped. |
+| `GET /api/v1/admin/alerts?active=&severity=&page=&page_size=` | `PaginatedResponse[AlertResponse]` | The one thing the agent's `list_active_alerts` never returns: alerts that have already been resolved, which is what a human reading a timeline afterwards needs. |
+
+`AgentRunResponse` carries `id`, `tenant_id`, `alert_id`, `service_account_id`,
+`scenario`, `state`, `phase_history`, `current_hypothesis`, `last_step`, `briefing`,
+`started_at`, `updated_at`, `finished_at`, plus a computed `active` (derived from
+`finished_at`, because there is one fact here and it is the timestamp).
+
+`ConsumerLagGroupResponse` carries the same numbers `get_consumer_lag` returns — from the
+same function, `app/core/consumer_lag.read_lag`, so the console and the agent cannot
+disagree about whether a lag is known — plus **`lag_unknown_reason`**, which is null
+exactly when `lag_known` is true. Its three values are three different jobs for the person
+reading the screen: nothing recorded inside the cache window on the live group (the
+metrics loop is not reporting), a missing recorded constant on one of the other seven (an
+environment problem, not a queue to investigate), or a group this platform does not track.
+
+### `JobResponse` gains five fields, all nullable, all additive
+
+`remediation_hint`, `fenced_at`, `fenced_by`, `triage` (the five-field summary of the
+`job_triages` row, attached by the admin endpoints for dead-lettered rows) and a computed
+**`dead_lettered_at`**. That last one is derived from `completed_at` when `status` is
+`dead_letter` and null otherwise, so it is one fact rather than two that can disagree —
+and it is the clock the DLQ is ordered by, which is neither `created_at` (submission) nor
+`fenced_at` (when an operator fenced the row). All five are null for a job that is not
+dead-lettered, and none carries a reason field of its own because `status` is the reason.
+`triage` stays null on surfaces that do not look it up; the admin list fetches the page's
+triage rows in one statement rather than one per row.
+
+Everything a human sees here, the responder's own principal cannot: there is no read tool
+for `agent_runs`, and the `agent.run_reported` audit stream those writes leave is withheld
+from any principal holding `agent_runs:write`.
 
 ---
 

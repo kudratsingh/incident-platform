@@ -43,6 +43,35 @@ class SagaStatus(StrEnum):
     COMPENSATED = "compensated"    # all compensation jobs settled
 
 
+class AgentRunState(StrEnum):
+    """Where an autonomous responder says it is in one incident (ADR 0035).
+
+    Reported by the responder, stored verbatim, never inferred by the platform. The
+    three terminal members stamp `agent_runs.finished_at`; the six before them do not.
+
+    **These nine strings are the commander's own `IncidentState` values, character for
+    character.** That is the point: the reporter maps nothing, so a state the responder
+    reaches cannot be lost in translation on its way to a console. Adding a member here
+    without adding it there (or the reverse) is the failure this note exists to prevent.
+    """
+
+    TRIAGE = "triage"
+    INVESTIGATING = "investigating"
+    PLANNING = "planning"
+    AWAITING_APPROVAL = "awaiting_approval"
+    REMEDIATING = "remediating"
+    VERIFYING = "verifying"
+    RESOLVED = "resolved"
+    ESCALATED = "escalated"
+    FAILED = "failed"
+
+
+#: The states a run never leaves: reaching one closes the run (`finished_at`).
+TERMINAL_AGENT_RUN_STATES: frozenset[str] = frozenset(
+    {AgentRunState.RESOLVED, AgentRunState.ESCALATED, AgentRunState.FAILED}
+)
+
+
 class RemediationHint(StrEnum):
     """Coarse DLQ category the agent routes on, persisted on `jobs.remediation_hint`."""
 

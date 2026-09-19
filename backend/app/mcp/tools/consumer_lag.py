@@ -4,12 +4,31 @@ Unknown groups return `lag: null`. Three things the description says out loud, s
 the agent cannot read this file: unknown is not zero (`lag_known`), only
 `worker-dispatcher`'s number moves (`source`), and one call carries the trend via
 `measured_at` + `recent_samples` (R2-17, WO-R3-254). Requires `telemetry:read`.
+
+The reading itself moved to `app/core/consumer_lag.py` (WO-R3-312) so the operator
+console reports the same number from the same arithmetic; this module is the agent's
+wording for it, and the wire shape is unchanged.
 """
 
-import json
-from datetime import UTC, datetime
-from typing import Any, Literal
+from datetime import datetime
 
+from app.core.consumer_lag import (
+    LAG_SAMPLES_KEEP as _LAG_SAMPLES_KEEP,
+)
+from app.core.consumer_lag import (
+    LIVE_REFRESHED_GROUP,
+    SEEDED_CONSUMER_GROUPS,
+    STATIC_LAG_GROUPS,
+    LagSource,
+    parse_lag,
+    read_lag,
+)
+from app.core.consumer_lag import (
+    lag_key as _redis_key,
+)
+from app.core.consumer_lag import (
+    samples_key as _samples_key,
+)
 from app.core.logging import get_logger
 from app.core.scopes import Scope
 from app.mcp.registry import ToolContext, tool
@@ -17,64 +36,9 @@ from pydantic import BaseModel, ConfigDict, Field
 
 logger = get_logger(__name__)
 
-# Must match `_metrics_loop` in `app/workers/dispatcher.py` and the seed script.
-_CONSUMER_LAG_KEY_PREFIX = "kafka:consumer_lag:"
-
-
-def _redis_key(group: str) -> str:
-    return f"{_CONSUMER_LAG_KEY_PREFIX}{group}"
-
-
-# The metrics loop's timestamped window, beside the value key because
-# `check_backpressure` fixes that shape. Mirrors `dispatcher.py:LAG_SAMPLES_KEY` /
-# `LAG_SAMPLES_KEEP` — no worker imports here.
-_LAG_SAMPLES_SUFFIX = ":samples"
-_LAG_SAMPLES_KEEP = 5
-
-
-def _samples_key(group: str) -> str:
-    return f"{_redis_key(group)}{_LAG_SAMPLES_SUFFIX}"
-
-
-def _parse_lag(raw: Any) -> int | None:
-    if raw is None:
-        return None
-    try:
-        return int(raw)
-    except (TypeError, ValueError):
-        return None
-
-
-# The one group genuinely refreshed: every ~60s, 90s TTL, so its number moves.
-LIVE_REFRESHED_GROUP = "worker-dispatcher"
-
-# Groups whose lag is a recorded constant, from
-# `seed_eval_fixtures._seed_consumer_lag`. Nothing refreshes them, so the value
-# does not move. Named "static" for what the WIRE calls them: ADR 0012 rule 1 bans
-# lab words here, and `test_no_lab_vocabulary_on_non_chaos_tool_surface` guards it.
-STATIC_LAG_GROUPS = (
-    "billing-consumer",
-    "orders-consumer",
-    "notifications-consumer",
-    "analytics-consumer",
-    "payments-consumer",
-    "shipping-consumer",
-    "healthy-consumer",
-)
-
-# Advertised in the input description so `tools/list` gives a menu.
-# A name outside it is allowed; it returns `lag: null`.
-SEEDED_CONSUMER_GROUPS = (LIVE_REFRESHED_GROUP,) + STATIC_LAG_GROUPS
-
-LagSource = Literal["live", "static", "unrecognized"]
-
-
-def _source_for(group: str) -> LagSource:
-    if group == LIVE_REFRESHED_GROUP:
-        return "live"
-    if group in STATIC_LAG_GROUPS:
-        return "static"
-    return "unrecognized"
+# Re-exported under their old private names so the existing tests keep importing them
+# from here; the definitions are in core.
+_parse_lag = parse_lag
 
 
 class GetConsumerLagInput(BaseModel):
@@ -161,50 +125,6 @@ class GetConsumerLagOutput(BaseModel):
     )
 
 
-def _parse_samples(raw: Any) -> list[LagSample]:
-    """Decode the recorded window, dropping anything unreadable.
-
-    Partial decoding beats none — one corrupt entry must not hide four good
-    measurements — and the result is re-sorted newest-first, as the description
-    promises.
-    """
-    if raw is None:
-        return []
-    if isinstance(raw, bytes | bytearray):
-        raw = raw.decode(errors="replace")
-    try:
-        loaded = json.loads(raw)
-    except (TypeError, ValueError):
-        logger.warning("consumer lag window unreadable", extra={"kind": "json"})
-        return []
-    if not isinstance(loaded, list):
-        return []
-
-    samples: list[LagSample] = []
-    for entry in loaded:
-        if not isinstance(entry, dict):
-            continue
-        lag = _parse_lag(entry.get("lag"))
-        measured_at = _parse_measured_at(entry.get("measured_at"))
-        if lag is None or measured_at is None:
-            continue
-        samples.append(LagSample(lag=lag, measured_at=measured_at))
-
-    samples.sort(key=lambda s: s.measured_at, reverse=True)
-    return samples[:_LAG_SAMPLES_KEEP]
-
-
-def _parse_measured_at(value: Any) -> datetime | None:
-    if not isinstance(value, str):
-        return None
-    try:
-        parsed = datetime.fromisoformat(value)
-    except ValueError:
-        return None
-    # A naive stamp means a writer dropped the offset; the clock is UTC everywhere.
-    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
-
-
 @tool(
     "get_consumer_lag",
     description=(
@@ -277,40 +197,19 @@ def _parse_measured_at(value: Any) -> datetime | None:
 async def get_consumer_lag(
     inp: GetConsumerLagInput, ctx: ToolContext
 ) -> GetConsumerLagOutput:
-    key = _redis_key(inp.consumer_group)
-    lag = _parse_lag(await ctx.redis.get(key))
-    source = _source_for(inp.consumer_group)
-
-    # Only the continuously-refreshed group has a recorded window;
-    # nothing writes one for a constant, so nothing reads one either.
-    samples: list[LagSample] = []
-    if source == "live":
-        samples = _parse_samples(await ctx.redis.get(_samples_key(inp.consumer_group)))
-
-    # The newest sample dates the current reading only if it IS that reading. The
-    # loop writes the value then the window, so a read between the two sees a
-    # number with no recorded time — reported unknown, never guessed.
-    measured_at = (
-        samples[0].measured_at
-        if samples and lag is not None and samples[0].lag == lag
-        else None
-    )
-    age_seconds = (
-        max(0, int((datetime.now(UTC) - measured_at).total_seconds()))
-        if measured_at is not None
-        else None
-    )
-
+    reading = await read_lag(ctx.redis, inp.consumer_group)
     return GetConsumerLagOutput(
-        consumer_group=inp.consumer_group,
-        lag=lag,
-        # From the read, not the group name; `source` tells those apart.
-        lag_known=lag is not None,
-        source=source,
-        cache_key=key,
-        measured_at=measured_at,
-        age_seconds=age_seconds,
-        recent_samples=samples,
+        consumer_group=reading.consumer_group,
+        lag=reading.lag,
+        lag_known=reading.lag_known,
+        source=reading.source,
+        cache_key=reading.cache_key,
+        measured_at=reading.measured_at,
+        age_seconds=reading.age_seconds,
+        recent_samples=[
+            LagSample(lag=s.lag, measured_at=s.measured_at)
+            for s in reading.recent_samples
+        ],
     )
 
 
@@ -321,5 +220,12 @@ __all__ = [
     "GetConsumerLagInput",
     "GetConsumerLagOutput",
     "LagSample",
+    # Re-exported under their pre-WO-R3-312 private names: several tests and
+    # `restart_consumer_group` import them from here, and moving the definitions to
+    # core is not a reason to move every import site.
+    "_LAG_SAMPLES_KEEP",
+    "_parse_lag",
+    "_redis_key",
+    "_samples_key",
     "get_consumer_lag",
 ]
