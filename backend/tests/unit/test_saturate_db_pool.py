@@ -537,15 +537,16 @@ def test_the_chaos_surface_grows_by_exactly_two_tools(
     whole_chaos_surface_registered: None,
 ) -> None:
     """33 → 35 with `CHAOS_ENABLED=true`, 14 of them chaos, counted off the registry — CLAUDE.md
-    says this figure has drifted before. The total moved to 37 with WO-R3-217's two read tools; the
-    chaos half, which is what this test is about, did not move."""
+    says this figure has drifted before. The total moved to 37 with WO-R3-217's two read tools,
+    which left the chaos half alone, and to 38 / 15 with WO-R3-218's `slow_db_queries`. What this
+    test keeps is that these two are among them."""
     names = {t.name for t in list_tools()}
     chaos_names = {
         t.name for t in list_tools() if t.required_scope == Scope.CHAOS_INVOKE
     }
     assert {"saturate_db_pool", "degrade_downstream"} <= chaos_names
-    assert len(chaos_names) == 14, sorted(chaos_names)
-    assert len(names) == 37, sorted(names)
+    assert len(chaos_names) == 15, sorted(chaos_names)
+    assert len(names) == 38, sorted(names)
 
 
 def test_neither_hook_adds_a_refusal_code_to_the_commanders_chaos_client() -> None:

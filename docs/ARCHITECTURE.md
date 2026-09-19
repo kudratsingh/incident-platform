@@ -552,6 +552,13 @@ Anything that swallows a DB error now goes through `app/core/db_degrade.degrade_
 **Recovery:** ECS restart. Other API replicas continue serving (we run ≥2 in prod).
 **Data loss:** in-flight HTTP requests are lost — clients retry.
 
+### Database queries running slowly
+
+**Symptom:** latency climbs on whatever reads the affected relation while the pool is nowhere near full, and a connection is acquired instantly. The distinguishing shape is the opposite of the section below: the queue is short and the work itself is slow.
+**Detection:** `pg_stat_activity` — how long the longest statement running right now has been running, and how many are past the 500 ms threshold. Both are read from the database server, so they are the same answer whichever process asks, which is what makes them the only query reading this platform can take across processes. There is no per-minute percentile: `pg_stat_statements` is not installed, and it could not answer one if it were ([ADR 0030](ADR/0030-breaker-state-is-published-and-a-reading-is-never-invented.md)).
+**Recovery:** whatever is running the long statements stops, is cancelled, or finishes. Nothing about the pool has to be reset, because nothing about the pool was wrong.
+**In the eval world:** `slow_db_queries` reproduces it on demand — one key, a chaos-only task in the worker process running real reads of one declared relation held open by a server-side sleep, two of them offset by half a chunk so the reading never dips back under the threshold between statements, and three teardowns (TTL, environment reset, restart) with at most one chunk of residue. It makes the *database* slow, not the platform: job durations, consumer lag and the SLO readings are untouched. See [ADR 0034](ADR/0034-a-slow-query-is-manufactured-where-the-server-can-see-it.md).
+
 ### Database connection pool exhausted
 
 **Symptom:** requests and background loops in one process wait to *acquire* a connection, then run at normal speed once they have one. Latency climbs across every endpoint at once while the database itself is idle; past the pool's `pool_timeout` (30s) acquisitions raise instead of waiting. The distinguishing shape is that per-query time is unchanged — this is queueing, not slowness.

@@ -102,10 +102,12 @@ _REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
 # One pattern, because every chaos key helper MUST live under `chaos:*` —
 # `chaos:kill:{group}`, `chaos:latency:{group}`, `chaos:pause:{loop}`, `chaos:db_pool:hold`,
-# `chaos:downstream:bulk_api_sync`. A new hook adds no pattern here, and
-# `test_every_chaos_key_helper_lives_under_the_chaos_namespace` fails if one escapes. Deleting the
-# first of those two is also what releases the held DB connections: the worker's holder gives them
-# back on its next pass when the key is gone, TTL or no TTL (ADR 0031).
+# `chaos:downstream:bulk_api_sync`, `chaos:db_query:slow`. A new hook adds no pattern here, and
+# `test_every_chaos_key_helper_lives_under_the_chaos_namespace` fails if one escapes. Deleting
+# `chaos:db_pool:hold` is also what releases the held DB connections: the worker's holder gives them
+# back on its next pass when the key is gone, TTL or no TTL (ADR 0031). `chaos:db_query:slow` is the
+# one key whose effect outlives the sweep at all, and only by the query already in flight — at most
+# `query_ms`, 10 s at its ceiling (ADR 0034).
 _CHAOS_KEY_PATTERNS = ("chaos:*",)
 
 # The one namespace chaos residue can reach WITHOUT a `chaos:` name (R2-20): `create_stale_cache`

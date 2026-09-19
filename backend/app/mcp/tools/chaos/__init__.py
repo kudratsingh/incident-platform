@@ -17,6 +17,7 @@ from app.mcp.tools.chaos import (  # noqa: F401
     saturate_db_pool,
     saturate_redis,
     seed_dlq_messages,
+    slow_query,
 )
 
 __all__: list[str] = []

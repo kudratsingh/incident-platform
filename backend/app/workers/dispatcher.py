@@ -37,6 +37,7 @@ from app.workers import (
     async_tasks,
     cpu_processors,
     db_pool_hold,
+    db_slow_query,
     dlq_replay_scheduler,
     kafka_producer,
     queue,
@@ -1974,10 +1975,13 @@ async def worker_loop(
     )
 
     if get_settings().chaos_enabled:
-        # Not a twelfth background loop and deliberately not in `ControlLoopName`: it exists
-        # only under the chaos gate, and its off switch is its own key (ADR 0031).
+        # Not background loops and deliberately not in `ControlLoopName`: they exist only under
+        # the chaos gate, and each one's off switch is its own key (ADR 0031, ADR 0034).
         tasks.append(
             asyncio.create_task(db_pool_hold.hold_db_pool(session_factory, redis))
+        )
+        tasks.append(
+            asyncio.create_task(db_slow_query.run_slow_queries(session_factory, redis))
         )
 
     # After the loops are running, never before them: a breaker that has never failed
