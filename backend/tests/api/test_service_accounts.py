@@ -1,13 +1,4 @@
-"""API contract tests for admin service-account CRUD + scope enforcement.
-
-Covers the PR-1 test bar from the agent-platform Wave 1 plan:
-  - wrong-scope 403
-  - revoked-token 401
-  - expired-token 401
-  - scope-subset validation refuses over-scoped mint
-Plus round-trip: create → mint → present the token → the scope-guarded
-dependency lets the request through.
-"""
+"""API contract tests for admin service-account CRUD + scope enforcement."""
 
 import uuid
 from collections.abc import Iterator
@@ -28,8 +19,6 @@ from app.repositories.service_account import ServiceAccountTokenRepository
 from fastapi import Depends, FastAPI
 from httpx import ASGITransport, AsyncClient
 
-# ---------------------------------------------------------------------------
-# admin CRUD
 # ---------------------------------------------------------------------------
 
 
@@ -69,9 +58,9 @@ async def test_tenant_admin_without_platform_flag_cannot_create_sa(
     db_session,  # type: ignore[no-untyped-def]
     default_tenant,  # type: ignore[no-untyped-def]
 ) -> None:
-    """Service-account management is a platform-operator workflow (X-01
-    hop 2): a tenant admin (role=admin, is_platform_admin=False) must get
-    403, exactly like the cross-tenant admin endpoints."""
+    """Service-account management is a platform-operator workflow (X-01 hop 2): a tenant
+    admin (role=admin, is_platform_admin=False) must get 403, exactly like the
+    cross-tenant admin endpoints."""
     from app.core.security import create_access_token, hash_password
     from app.models.enums import UserRole
     from app.models.user import User
@@ -127,8 +116,6 @@ async def test_create_rejects_unknown_scope(
     assert resp.status_code == 403
 
 
-# ---------------------------------------------------------------------------
-# mint tokens
 # ---------------------------------------------------------------------------
 
 
@@ -190,8 +177,6 @@ async def test_revoke_token_returns_204(
 
 
 # ---------------------------------------------------------------------------
-# PATCH /admin/service-accounts/{id} — scope updates
-# ---------------------------------------------------------------------------
 
 
 async def test_patch_widens_scopes(
@@ -221,8 +206,7 @@ async def test_patch_widens_scopes(
 async def test_patch_narrows_scopes(
     client: AsyncClient, admin_headers: dict[str, str]
 ) -> None:
-    """Dropping scopes is legitimate too — kill switch for a
-    compromised SA. Verify PATCH accepts a strictly smaller list."""
+    """Dropping scopes is legitimate too — kill switch for a compromised SA."""
     sa = await _create_sa(
         client,
         admin_headers,
@@ -277,9 +261,7 @@ async def test_patch_non_admin_forbidden(
 async def test_patch_idempotent_no_audit_row_when_unchanged(
     client: AsyncClient, admin_headers: dict[str, str], db_session,  # type: ignore[no-untyped-def]
 ) -> None:
-    """update_scopes short-circuits when the new list matches — no
-    audit row written. Confirms re-running seed scripts doesn't flood
-    the audit log."""
+    """update_scopes short-circuits when the new list matches — no audit row written."""
     from app.models.audit import AuditLog
     from sqlalchemy import select as _select
 
@@ -315,10 +297,7 @@ async def test_patch_idempotent_no_audit_row_when_unchanged(
 async def test_patch_then_mint_yields_wider_token(
     client: AsyncClient, admin_headers: dict[str, str]
 ) -> None:
-    """After PATCH widens the SA, a newly minted token can carry the
-    added scopes. Old tokens keep their original set — that's the
-    whole point of tokens-are-immutable — but the fresh mint picks up
-    the new capability."""
+    """After PATCH widens the SA, a newly minted token can carry the added scopes."""
     sa = await _create_sa(client, admin_headers, [Scope.TELEMETRY_READ.value])
     await client.patch(
         f"/api/v1/admin/service-accounts/{sa['id']}",
@@ -342,16 +321,6 @@ async def test_patch_then_mint_yields_wider_token(
 
 
 # ---------------------------------------------------------------------------
-# chaos:invoke at the API boundary (X-01 hop 3)
-#
-# With the chaos gate closed (CHAOS_ENABLED unset/false — the default, and
-# forced false in production) chaos:invoke is not grantable through the human
-# API on any of the three grant paths, even by a platform admin. On a
-# chaos-enabled stack (the platform's own docker-compose, which the
-# incident-commander bootstrap targets) a platform admin can still grant it.
-# The operator seed script provisions through the service layer and is
-# unaffected either way.
-# ---------------------------------------------------------------------------
 
 
 async def test_api_refuses_chaos_scope_grant(
@@ -360,8 +329,8 @@ async def test_api_refuses_chaos_scope_grant(
     db_session,  # type: ignore[no-untyped-def]
     default_tenant,  # type: ignore[no-untyped-def]
 ) -> None:
-    """Chaos gate closed: create, PATCH, and mint all refuse chaos:invoke
-    with 403; the service layer (seed-script path) still provisions it."""
+    """Chaos gate closed: create, PATCH, and mint all refuse chaos:invoke with 403; the
+    service layer (seed-script path) still provisions it."""
     # create
     resp = await client.post(
         "/api/v1/admin/service-accounts",
@@ -380,8 +349,6 @@ async def test_api_refuses_chaos_scope_grant(
     assert resp.status_code == 403
 
     # mint — needs an account that legitimately holds chaos:invoke, which
-    # only the operator path can produce: provision through the service
-    # layer exactly like scripts/seed_incident_commander.py does.
     from app.repositories.audit import AuditRepository
     from app.repositories.service_account import ServiceAccountRepository
     from app.services.service_account import ServiceAccountService
@@ -410,9 +377,8 @@ async def test_api_refuses_chaos_scope_grant(
 
 @pytest.fixture
 def chaos_enabled_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """Simulate a chaos-enabled stack (CHAOS_ENABLED=true), matching the
-    platform docker-compose environment the incident-commander bootstrap
-    script runs against."""
+    """Simulate a chaos-enabled stack (CHAOS_ENABLED=true), matching the platform
+    docker-compose environment the incident-commander bootstrap script runs against."""
     monkeypatch.setenv("CHAOS_ENABLED", "true")
     get_settings.cache_clear()
     yield
@@ -424,10 +390,8 @@ async def test_chaos_scope_grantable_by_platform_admin_when_chaos_enabled(
     admin_headers: dict[str, str],
     chaos_enabled_env: None,
 ) -> None:
-    """Chaos gate open: a platform admin can still provision a chaos:invoke
-    service account through the API. This is the incident-commander
-    `make bootstrap-token` flow (create a 4-scope SA, mint with an empty
-    body, PATCH-widen on re-run) and must keep working."""
+    """Chaos gate open: a platform admin can still provision a chaos:invoke service account
+    through the API."""
     bootstrap_scopes = [
         Scope.TELEMETRY_READ.value,
         Scope.INCIDENTS_READ.value,
@@ -472,17 +436,7 @@ async def test_chaos_scope_grantable_by_platform_admin_when_chaos_enabled(
 
 
 # ---------------------------------------------------------------------------
-# Scope-guarded endpoint round-trip
-#
-# We mount a throwaway probe endpoint that requires `telemetry:read` and
-# verify the auth path for both principal shapes:
 #   - human JWT → 403 (scopes are machine-only, see ADR 0007)
-#   - unknown/malformed sa token → 401
-#   - correct sa token → 200
-#   - sa token missing the required scope → 403
-#   - revoked sa token → 401
-#   - expired sa token → 401
-# ---------------------------------------------------------------------------
 
 
 def _build_probe_app(db_session) -> FastAPI:  # type: ignore[no-untyped-def]
