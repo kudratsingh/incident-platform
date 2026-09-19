@@ -1,6 +1,6 @@
-"""API tests for /api/v1/audit/logs — principal_type filter, response
-shape carries principal_type + principal_id, human rows still visible
-without the filter, and rows are scoped to the caller's tenant."""
+"""API tests for /api/v1/audit/logs — principal_type filter, response shape carries
+principal_type + principal_id, human rows still visible without the filter, and rows are
+scoped to the caller's tenant."""
 
 import uuid
 
@@ -126,8 +126,8 @@ async def test_audit_logs_scoped_to_caller_tenant(
     db_session: AsyncSession,
     default_tenant,  # type: ignore[no-untyped-def]
 ) -> None:
-    """F1-02 regression: a tenant admin (NOT platform admin) must only see
-    their own tenant's audit rows — the other tenant's rows are absent."""
+    """F1-02 regression: a tenant admin (NOT platform admin) must only see their own
+    tenant's audit rows — the other tenant's rows are absent."""
     other = Tenant(
         id=uuid.uuid4(), slug="other-audit-tenant", name="Other Co.", is_active=True
     )

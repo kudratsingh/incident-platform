@@ -1,10 +1,4 @@
-"""End-to-end tests for `list_audit_events`.
-
-The reviewer's PR-2 blocker: the agent needs read access to the audit
-log for crash reconciliation + as ground truth for its own safety
-graders. This tool is that surface, scoped to the caller's tenant,
-requiring `incidents:read`.
-"""
+"""End-to-end tests for `list_audit_events`."""
 
 from __future__ import annotations
 
@@ -103,8 +97,8 @@ def _content(body: dict[str, Any]) -> dict[str, Any]:
 
 
 async def _seed(db_session: AsyncSession, tenant_id: uuid.UUID) -> None:
-    """Seed a representative mix — one of each principal type + each
-    stream (agent, chaos, service_account, generic user)."""
+    """Seed a representative mix — one of each principal type + each stream (agent, chaos,
+    service_account, generic user)."""
     rows = [
         AuditLog(
             tenant_id=tenant_id,
@@ -143,8 +137,6 @@ async def _seed(db_session: AsyncSession, tenant_id: uuid.UUID) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Happy paths
-# ---------------------------------------------------------------------------
 
 
 async def test_returns_all_rows_for_tenant(
@@ -152,14 +144,7 @@ async def test_returns_all_rows_for_tenant(
     db_session: AsyncSession,
     default_tenant,  # type: ignore[no-untyped-def]
 ) -> None:
-    """Every stream, for the principal entitled to every stream.
-
-    `chaos:invoke` is in the token because the `chaos.` stream is
-    withheld from principals that cannot fire chaos (WO-R3-187) — the
-    evaluator holds it, the agent under test does not. The withholding
-    itself is tested in `test_mcp_chaos_audit_visibility.py`; this case
-    stays the unfiltered baseline it always was.
-    """
+    """Every stream, for the principal entitled to every stream."""
     await _seed(db_session, default_tenant.id)
     token = await _token(
         db_session,
@@ -197,13 +182,8 @@ async def test_action_exact_match_takes_precedence(
     db_session: AsyncSession,
     default_tenant,  # type: ignore[no-untyped-def]
 ) -> None:
-    """When both `action` and `action_prefix` are set, `action` wins —
-    the tool suppresses prefix rather than AND-ing them.
-
-    Under a `chaos:invoke` token so the exact action asked for is one
-    this principal may read; the point being tested is the precedence,
-    not the visibility rule.
-    """
+    """When both `action` and `action_prefix` are set, `action` wins — the tool suppresses
+    prefix rather than AND-ing them."""
     await _seed(db_session, default_tenant.id)
     token = await _token(
         db_session,
@@ -263,8 +243,6 @@ async def test_response_carries_extra_data(
 
 
 # ---------------------------------------------------------------------------
-# Auth boundaries
-# ---------------------------------------------------------------------------
 
 
 async def test_wrong_scope_forbidden(
@@ -284,8 +262,8 @@ async def test_unknown_field_is_rejected(
     db_session: AsyncSession,
     default_tenant,  # type: ignore[no-untyped-def]
 ) -> None:
-    """Extra=forbid on the input model so a nonsense filter fails
-    validation rather than silently returning everything."""
+    """Extra=forbid on the input model so a nonsense filter fails validation rather than
+    silently returning everything."""
     token = await _token(
         db_session, default_tenant.id, [Scope.INCIDENTS_READ.value]
     )
@@ -303,14 +281,7 @@ async def test_bad_principal_type_is_rejected(
     default_tenant,  # type: ignore[no-untyped-def]
     bad: str,
 ) -> None:
-    """The filter is closed over the two principal shapes that exist.
-
-    This test used to pass an *unknown field* and call that a bad
-    principal_type — so it proved `extra=forbid` (already covered above)
-    and nothing about `principal_type`, which was an unconstrained
-    `str | None`. An unrecognised value silently matched no rows, and an
-    empty result set reads to the agent as "nothing happened" rather than
-    "you asked the wrong question" (R2-61)."""
+    """The filter is closed over the two principal shapes that exist."""
     token = await _token(
         db_session, default_tenant.id, [Scope.INCIDENTS_READ.value]
     )
@@ -333,11 +304,9 @@ async def test_known_principal_types_are_accepted(
 
 
 def test_principal_type_literal_matches_the_model_constants() -> None:
-    """The `Literal` is spelled out because its members are baked into
-    the tool's inputSchema, which the agent reads and the contract
-    snapshot pins — so a change has to be visible in that file's diff.
-    This test is what keeps the spelled-out copy honest, the same
-    arrangement as `test_seed_dlq_hint_literal_matches_the_enum`."""
+    """The `Literal` is spelled out because its members are baked into the tool's
+    inputSchema, which the agent reads and the contract snapshot pins — so a change has
+    to be visible in that file's diff."""
     from typing import get_args
 
     from app.mcp.tools.list_audit_events import _PRINCIPAL_TYPES

@@ -1,25 +1,4 @@
-"""The agent's scope set is refused by every chaos hook, one by one.
-
-WO-R3-187 (owner decision O-4). The token split only means something if the
-agent's scopes cannot fire a single hook — and "cannot" has to be checked
-against the chaos registry rather than against a list someone maintains,
-because a hook added later would otherwise inherit whatever the last
-reviewer assumed.
-
-Chaos tools only register under `CHAOS_ENABLED=true`, so the module reloads
-every module in `app.mcp.tools.chaos` under patched settings — the trick
-`test_mcp_wave1_pr_b` established — and walks the package rather than
-naming its members, so a new hook is covered on the day it lands.
-
-No hook is ever *invoked* here. Each call is expected to stop at the scope
-check in `app.mcp.handlers._run_tool_call`, before argument parsing and
-before the handler, which is why `{}` is a safe argument for all of them:
-a refusal that depended on the arguments would not be a refusal. The
-positive half of the contract — that the evaluator's token does work — is
-asserted at the registry level (`required_scope` is `chaos:invoke` on every
-hook, and the chaos account holds it) rather than by firing a hook at a
-stubbed Redis and a Kafka producer that has no broker.
-"""
+"""The agent's scope set is refused by every chaos hook, one by one."""
 
 from __future__ import annotations
 
@@ -54,8 +33,6 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 # What `scripts/seed_incident_commander.py` mints for each principal. The
-# agent's set is the one under test; the evaluator's is here so the pair is
-# readable in one place.
 AGENT_SCOPES = [
     Scope.TELEMETRY_READ.value,
     Scope.INCIDENTS_READ.value,
@@ -68,9 +45,6 @@ EVALUATOR_SCOPES = [
 ]
 
 # The registered chaos surface at the time of writing: 10 hooks. Asserted as
-# a floor, not an equality — a new hook should not fail this file, it should
-# be swept by it — but a floor is what stops the parameterisation from
-# passing on an empty registry.
 _MIN_CHAOS_TOOLS = 10
 
 
@@ -80,15 +54,7 @@ class _RedisStub:
 
 
 def _reload_every_tool_module() -> None:
-    """Re-run every tool module's decorators against a cleared registry.
-
-    Walked rather than listed, for the reason this whole file is walked: a
-    hook or a tool added later has to be covered without anyone
-    remembering to add it here. Reloading a module is what re-fires its
-    `@tool` / `@chaos_tool` decorator — importing it again would not,
-    since it is already in `sys.modules` — and the non-chaos tools have to
-    come back too, because clearing the registry dropped them as well.
-    """
+    """Re-run every tool module's decorators against a cleared registry."""
     import app.mcp.tools as tools_pkg
 
     for info in pkgutil.walk_packages(
@@ -155,12 +121,7 @@ async def chaos_enabled_client(  # type: ignore[no-untyped-def]
 
 
 def _chaos_tool_names() -> list[str]:
-    """Chaos tools, as the running registry sees them.
-
-    Collected at call time inside a chaos-enabled fixture; at module import
-    the registry holds none, which is why the parameterisation below reads
-    the names from the fixture rather than from a decorator argument.
-    """
+    """Chaos tools, as the running registry sees them."""
     return sorted(
         t.name for t in list_tools() if t.required_scope == Scope.CHAOS_INVOKE
     )
@@ -189,12 +150,7 @@ async def _call(
 async def test_every_chaos_hook_refuses_the_agent_token(
     chaos_enabled_client: tuple[AsyncClient, dict[str, str]],
 ) -> None:
-    """THE assertion. Walk the chaos registry; every hook says no.
-
-    One test rather than a parameterised family because the registry is
-    only populated inside the fixture — the failure message names the
-    offending hooks, which is what a parameterised id would have given.
-    """
+    """THE assertion."""
     ac, tokens = chaos_enabled_client
     names = _chaos_tool_names()
     assert len(names) >= _MIN_CHAOS_TOOLS, (
@@ -221,13 +177,9 @@ async def test_every_chaos_hook_refuses_the_agent_token(
 async def test_every_chaos_hook_requires_the_chaos_scope(
     chaos_enabled_client: tuple[AsyncClient, dict[str, str]],
 ) -> None:
-    """The other half of "refused by every hook": the refusal above is the
-    scope check, so a hook that required something else — or nothing —
-    would be reachable by the agent whatever the token carries.
-
-    Read off the registry rather than by firing the hooks: invoking one
-    means a broker and a real Redis, and this file must never seed chaos.
-    """
+    """The other half of "refused by every hook": the refusal above is the scope check, so
+    a hook that required something else — or nothing — would be reachable by the agent
+    whatever the token carries."""
     ac, tokens = chaos_enabled_client
     del ac, tokens
     offenders = {
@@ -249,12 +201,7 @@ async def test_the_refusal_is_audited_as_a_chaos_denial(
     chaos_enabled_client: tuple[AsyncClient, dict[str, str]],
     db_session: AsyncSession,
 ) -> None:
-    """A refused attempt is a fact an operator should be able to read.
-
-    It routes to the `chaos.tool_denied` stream with `denied_by`, which is
-    also the row the agent itself can no longer see — the withholding and
-    the denial are the same decision seen from two sides.
-    """
+    """A refused attempt is a fact an operator should be able to read."""
     ac, tokens = chaos_enabled_client
     name = _chaos_tool_names()[0]
 
@@ -281,11 +228,7 @@ async def test_the_refusal_is_audited_as_a_chaos_denial(
 async def test_the_agent_token_still_works_on_the_read_surface(
     chaos_enabled_client: tuple[AsyncClient, dict[str, str]],
 ) -> None:
-    """The split must not have cost the agent anything it needs.
-
-    A token that had been narrowed too far would fail this, and the eval
-    would fail later in a way that looks like an agent defect.
-    """
+    """The split must not have cost the agent anything it needs."""
     ac, tokens = chaos_enabled_client
     body = await _call(ac, tokens["agent"], "list_audit_events", {})
     assert "error" not in body, body
@@ -295,8 +238,8 @@ async def test_the_agent_token_still_works_on_the_read_surface(
 
 @pytest.mark.parametrize("scope", sorted(AGENT_SCOPES))
 def test_the_agent_scope_set_is_the_seeded_one(scope: str) -> None:
-    """Pins the set this file is written about, so a change to the seeder's
-    defaults shows up here as well as in its own tests."""
+    """Pins the set this file is written about, so a change to the seeder's defaults shows
+    up here as well as in its own tests."""
     assert scope in {
         Scope.TELEMETRY_READ.value,
         Scope.INCIDENTS_READ.value,

@@ -52,15 +52,7 @@ async def test_create_job_idempotency(
 async def test_create_job_idempotency_race_returns_201_not_500(
     client: AsyncClient, auth_headers: dict[str, str]
 ) -> None:
-    """End-to-end guard on the check-then-insert race.
-
-    Simulates the race by patching JobRepository.get_by_idempotency_key
-    to return None on the first (pre-check) call — as if the second
-    concurrent request's read landed in the window before the first's
-    commit. The subsequent DB insert then hits the composite UNIQUE
-    constraint. Pre-fix, that returned 500. Post-fix, the service catches
-    the IntegrityError, re-fetches, and returns the winner with 201.
-    """
+    """End-to-end guard on the check-then-insert race."""
     from unittest.mock import patch
 
     from app.repositories.job import JobRepository
@@ -72,8 +64,6 @@ async def test_create_job_idempotency_race_returns_201_not_500(
     winner_id = resp1.json()["id"]
 
     # Second request: patch the pre-check to miss (simulating the race
-    # window). The DB constraint will then reject the insert, and the
-    # service's IntegrityError handler must recover.
     real_getter = JobRepository.get_by_idempotency_key
     call_count = {"n": 0}
 
@@ -253,12 +243,7 @@ async def test_admin_stats_reads_from_read_model(
     body = resp.json()
     assert "by_status" in body
     # Mocked Redis in tests returns 0 cardinality.
-    #
     # `cancelled` joined the set with WO-R2-113. It is an additive change to
-    # this response — a new key, no key removed or renamed — but it is a
-    # response-shape change all the same, and it is the point of the work
-    # order rather than a side effect: a cancelled job used to be counted
-    # under whatever status it held before it stopped.
     assert set(body["by_status"].keys()) == {
         "running",
         "completed",
@@ -366,9 +351,6 @@ async def test_admin_triage_returns_404_when_missing(
         error_message="boom",
     )
     # The same session the `client` fixture overrides get_db with, taken
-    # from the fixture rather than by re-driving the override generator
-    # through `client._transport.app` — that reached into httpx internals
-    # and left the async generator unclosed.
     db_session.add(job)
     await db_session.flush()
     await db_session.refresh(job)
@@ -484,8 +466,7 @@ async def test_admin_replay_resets_retry_count(
 async def test_get_job_exposes_dead_lettered_by(
     client: AsyncClient, auth_headers: dict[str, str]
 ) -> None:
-    """F2-16: the DLQ badge needs a per-row attribution signal on the REST
-    payload. A job that never dead-lettered carries it as null."""
+    """F2-16: the DLQ badge needs a per-row attribution signal on the REST payload."""
     create_resp = await client.post(
         "/api/v1/jobs", json={"type": "doc_analysis"}, headers=auth_headers
     )
@@ -501,13 +482,8 @@ async def test_get_job_exposes_dead_lettered_by(
 async def test_job_response_carries_both_attempt_field_names(
     client: AsyncClient, auth_headers: dict[str, str]
 ) -> None:
-    """WO-R2-172: the ceiling is `max_attempts` now, and `max_retries` rides
-    along for one release carrying the identical value.
-
-    Additive on purpose. The name was wrong — the field caps total runs, not
-    retries — but a client reading `max_retries` is not wrong to have read the
-    contract it was given, so it keeps working until the field is dropped.
-    """
+    """WO-R2-172: the ceiling is `max_attempts` now, and `max_retries` rides along for one
+    release carrying the identical value."""
     create_resp = await client.post(
         "/api/v1/jobs", json={"type": "doc_analysis"}, headers=auth_headers
     )
@@ -523,8 +499,7 @@ async def test_job_response_carries_both_attempt_field_names(
 async def test_openapi_marks_the_old_attempt_field_deprecated(
     client: AsyncClient,
 ) -> None:
-    """A client team reads the deprecation off the schema, not off a changelog
-    it never sees. `max_attempts` carries no such marker."""
+    """A client team reads the deprecation off the schema, not off a changelog it never sees."""
     spec = (await client.get("/api/v1/openapi.json")).json()
     props = spec["components"]["schemas"]["JobResponse"]["properties"]
     assert props["max_retries"]["deprecated"] is True
@@ -538,8 +513,8 @@ async def test_admin_replay_clears_dead_lettered_by(
     admin_user,  # type: ignore[no-untyped-def]
     admin_headers: dict[str, str],
 ) -> None:
-    """A replayed job starts a fresh lifecycle — it must not carry the
-    previous run's dead-letter attribution into it."""
+    """A replayed job starts a fresh lifecycle — it must not carry the previous run's
+    dead-letter attribution into it."""
     from app.models.enums import JobStatus, JobType
     from app.models.job import Job
 
@@ -567,11 +542,6 @@ async def test_admin_replay_clears_dead_lettered_by(
 
 # ---------------------------------------------------------------------------
 # Processor payload bounds (WO-P4-04 / E1-05)
-#
-# Unbounded payload knobs let a single POST /jobs schedule effectively
-# unbounded work in the worker process that also hosts the API. These assert
-# the per-type bound models reject the pathological values at the edge.
-# ---------------------------------------------------------------------------
 
 
 async def test_create_job_rejects_oversized_endpoint_count(
@@ -639,10 +609,7 @@ async def test_create_job_rejects_zero_chunk_size(
 async def test_create_job_rejects_a_cheap_payload_that_buys_hours_of_work(
     client: AsyncClient, auth_headers: dict[str, str]
 ) -> None:
-    """WO-R2-07. row_count and chunk_size were bounded separately and their
-    relationship was not — so this payload passed both field bounds and
-    bought a million 0.08s chunk reads, hours of execution from a request
-    that costs nothing to submit."""
+    """WO-R2-07."""
     resp = await client.post(
         "/api/v1/jobs",
         json={
@@ -658,8 +625,8 @@ async def test_create_job_rejects_a_cheap_payload_that_buys_hours_of_work(
 async def test_create_job_accepts_the_boundary_chunk_count(
     client: AsyncClient, auth_headers: dict[str, str]
 ) -> None:
-    """The cap is the documented maximum row_count at the default chunk_size,
-    so every shape that was reasonable before the bound still validates."""
+    """The cap is the documented maximum row_count at the default chunk_size, so every
+    shape that was reasonable before the bound still validates."""
     resp = await client.post(
         "/api/v1/jobs",
         json={
@@ -702,16 +669,7 @@ async def test_create_job_allows_unrelated_payload_keys(
 async def test_create_job_rejects_an_oversize_payload(
     client: AsyncClient, auth_headers: dict[str, str]
 ) -> None:
-    """A payload too big to publish must be refused at the door (WO-R2-05).
-
-    `extra="allow"` bounds the knobs the processors read and nothing else, so
-    one arbitrary key used to be enough to build a job whose `job.submitted`
-    event exceeds Kafka's 1 MiB limit. The broker refuses that record
-    identically on every retry — a poison outbox row, created by an ordinary
-    user through the ordinary API. The relay dead-letters such a row now, but
-    a 422 here is a far better answer than accepting the job and silently
-    never emitting any of its events.
-    """
+    """A payload too big to publish must be refused at the door (WO-R2-05)."""
     resp = await client.post(
         "/api/v1/jobs",
         json={
@@ -742,12 +700,7 @@ async def test_create_job_accepts_a_large_but_publishable_payload(
 async def test_oversize_payload_is_rejected_for_unbounded_job_types(
     client: AsyncClient, auth_headers: dict[str, str]
 ) -> None:
-    """Job types with no bound model are the bypass the size check must cover.
-
-    `validate_processor_payload` returns early for any type without a payload
-    model. If the size check sat after that lookup it would protect exactly
-    the four types that need it least.
-    """
+    """Job types with no bound model are the bypass the size check must cover."""
     from app.schemas.job import validate_processor_payload
 
     with pytest.raises(ValueError, match="exceeds"):
@@ -759,10 +712,9 @@ async def test_oversize_payload_is_rejected_for_unbounded_job_types(
 async def test_get_job_falls_through_to_postgres_when_the_cache_is_poisoned(
     client: AsyncClient, auth_headers: dict[str, str]
 ) -> None:
-    """R2-20: a `cache:job:` entry holding something that is not a job
-    dict (what `create_stale_cache` writes: a JSON array) used to reach
-    `JobResponse.model_validate` and 500 the endpoint for the whole TTL.
-    A corrupt entry must degrade to a slower read, not an outage."""
+    """R2-20: a `cache:job:` entry holding something that is not a job dict (what
+    `create_stale_cache` writes: a JSON array) used to reach
+    `JobResponse.model_validate` and 500 the endpoint for the whole TTL."""
     import json
     from unittest.mock import AsyncMock
 
