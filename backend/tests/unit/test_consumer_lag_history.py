@@ -1,26 +1,4 @@
-"""The consumer-lag reading carries time (WO-R3-254).
-
-`get_consumer_lag` used to return one bare number. The metrics loop
-overwrites that number about once a minute, so a caller that cannot
-sleep — the agent is exactly that caller — could not tell a lag that is
-climbing from one that is flat: three reads inside 25 seconds returned
-the same cached value, which reads as "not moving" and really means "not
-re-measured yet". A live run was lost to that reading on 2026-09-17.
-
-So the loop records WHEN it measured each value and keeps a short capped
-window of recent measurements, and the tool returns `measured_at`,
-`age_seconds` and `recent_samples` beside the number.
-
-Two properties these tests exist to hold:
-
-  * **The value key is untouched.** `kafka:consumer_lag:worker-dispatcher`
-    keeps its exact shape — an integer under a 90s TTL — because
-    `check_backpressure` and every other reader parse it. The window is a
-    second key.
-  * **Nothing is fabricated.** No recorded measurement, no `measured_at`
-    and no samples; the current `lag` is still returned. An empty window
-    is missing history, never evidence of a steady lag.
-"""
+"""The consumer-lag reading carries time (WO-R3-254)."""
 
 from __future__ import annotations
 
@@ -112,9 +90,7 @@ async def _one_loop_pass(redis: Any, lag: int | None) -> None:
         await _metrics_loop(redis, consumer)
 
 
-# ---------------------------------------------------------------------------
 # The writer: the metrics loop records when it measured
-# ---------------------------------------------------------------------------
 
 
 async def test_the_loop_records_the_value_and_the_time_it_measured_it() -> None:
@@ -138,10 +114,7 @@ async def test_the_loop_records_the_value_and_the_time_it_measured_it() -> None:
 
 
 async def test_the_window_is_capped_and_newest_first() -> None:
-    """Five is the whole window; the sixth pass drops the oldest.
-
-    Unbounded history would grow one entry a minute for as long as the
-    worker is up, in a value every reader deserializes whole."""
+    """Five is the whole window; the sixth pass drops the oldest."""
     redis = _RedisStub()
 
     for lag in range(LAG_SAMPLES_KEEP + 3):
@@ -203,9 +176,7 @@ async def test_record_lag_sample_accepts_a_bytes_window() -> None:
     assert [s["lag"] for s in _window(redis)] == [9, 4]
 
 
-# ---------------------------------------------------------------------------
 # The reader: one call shows the trend
-# ---------------------------------------------------------------------------
 
 
 async def test_the_live_group_carries_its_measurement_time_and_the_window() -> None:
@@ -412,9 +383,7 @@ async def test_age_seconds_is_never_negative() -> None:
     assert out.age_seconds == 0
 
 
-# ---------------------------------------------------------------------------
 # The three literals that must not drift
-# ---------------------------------------------------------------------------
 
 
 def test_the_reader_and_the_writer_name_the_same_window_key() -> None:

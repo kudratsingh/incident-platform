@@ -1,16 +1,4 @@
-"""R2-51 — the caller does not get to choose what lands in `audit_logs`.
-
-`X-Request-ID` is copied onto every audit row this request writes. The
-column is `String(255)`, and every audit writer on the MCP path is
-savepoint-wrapped and silent on failure, so a header the column cannot
-hold does not fail the request — it deletes the record of it. That makes
-the header an audit-suppression switch for anyone who can reach the load
-balancer.
-
-These tests pin the two halves of the fix: the middleware refuses to put
-an unusable id into circulation, and the bound it enforces is provably
-inside the column it has to fit.
-"""
+"""R2-51 — the caller does not get to choose what lands in `audit_logs`."""
 
 import re
 import uuid

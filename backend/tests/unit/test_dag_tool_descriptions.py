@@ -1,31 +1,4 @@
-"""The DAG tools describe the fix, not the pause (WO-R2-141).
-
-Tool descriptions are the whole interface — the agent cannot read the
-docstrings, the ADRs or this file, so a description that steers wrong is
-a functional defect (CLAUDE.md, "Tool descriptions — normative"). These
-four steered wrong together, and every layer agreed with them:
-
-  * `get_dag_state` called itself "the verification surface for
-    pause_dag", which is the reading a *working* pause produces on a
-    chain that is still stuck.
-  * `replay_dlq_by_ids` never mentioned DAG roots, though replaying the
-    dead-lettered root is the platform's only un-stick path.
-  * `pause_dag` described its own effect accurately and never said the
-    effect expires, or that it blocks the replay while it holds.
-  * `list_dlq_messages` never said it is the only read carrying a job's
-    `remediation_hint`, which is what an agent needs before deciding a
-    replay is safe.
-
-Commander PR #191 countered all four in its planner prompt, in prose, as
-a workaround — and wrote the durable deltas into its body for this repo
-to apply. These are those deltas, pinned as claims rather than as a
-whole-string snapshot: a snapshot of a 1500-character description
-fails on every wording change and tells the next reader nothing about
-which sentence mattered.
-
-Rebless note: these strings are pinned by the commander's contract
-snapshot, so they land at the next re-pin.
-"""
+"""The DAG tools describe the fix, not the pause (WO-R2-141)."""
 
 import app.mcp.tools  # noqa: F401  — import fires every @tool decorator
 import pytest
@@ -38,9 +11,7 @@ def _description(tool_name: str) -> str:
     return spec.description
 
 
-# --------------------------------------------------------------------------
 # get_dag_state — verifies the fix as well as the pause
-# --------------------------------------------------------------------------
 
 
 def test_get_dag_state_is_not_advertised_as_the_pause_surface_alone() -> None:
@@ -66,9 +37,7 @@ def test_get_dag_state_describes_what_a_successful_replay_reads_as() -> None:
     assert "descendants that were `waiting` promoted" in text
 
 
-# --------------------------------------------------------------------------
 # replay_dlq_by_ids — names the DAG-root case
-# --------------------------------------------------------------------------
 
 
 def test_replay_by_ids_names_the_dag_root_case() -> None:
@@ -92,9 +61,7 @@ def test_replay_by_ids_warns_that_a_pause_blocks_it() -> None:
     assert "do not pause a chain you intend to replay" in text
 
 
-# --------------------------------------------------------------------------
 # pause_dag — a stabilizer that says so
-# --------------------------------------------------------------------------
 
 
 def test_pause_dag_says_it_is_not_a_fix() -> None:
@@ -114,9 +81,7 @@ def test_pause_dag_says_it_blocks_the_remedy_while_it_holds() -> None:
     assert "never as a remediation" in text
 
 
-# --------------------------------------------------------------------------
 # list_dlq_messages — the only read carrying a hint
-# --------------------------------------------------------------------------
 
 
 def test_list_dlq_says_it_is_the_only_read_exposing_a_hint() -> None:
@@ -138,9 +103,7 @@ def test_list_dlq_states_the_cost_of_finding_one_row() -> None:
     assert "paging or filtering by category" in text
 
 
-# --------------------------------------------------------------------------
 # The pair reads consistently from both ends
-# --------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
