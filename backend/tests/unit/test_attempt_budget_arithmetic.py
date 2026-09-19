@@ -1,25 +1,4 @@
-"""The attempt budget, pinned in words (WO-R2-172).
-
-`jobs.max_attempts` caps how many times a job RUNS — the original run
-plus its retries. The dispatcher retries while
-`retry_count < max_attempts`, so the default 3 buys three runs and two
-retries, and the job dead-letters when the third run fails.
-
-That sentence was true before this work order and is true after it. What
-changed is the name: the column was `max_retries`, which told a reader
-the ceiling was a retry count, and a reader who believed it budgeted one
-run more than the platform has ever given. WO-R2-158's fence columns and
-F2-16's badge both had to work around the off-by-one; the retry log line
-on the dispatcher's own failure path already printed
-`attempt {n}/{max}`, reading the value as attempts.
-
-The other tests in this tree assert the ceiling from one side or the
-other — one failure retries, a job at `retry_count = max - 1` dead-letters.
-Neither of them counts the runs. This one drives a whole job to its death
-and counts, because the count *is* the claim the name now makes, and a
-future change to the comparison must fail here loudly rather than quietly
-re-baselining an assertion about a single transition.
-"""
+"""The attempt budget, pinned in words (WO-R2-172)."""
 
 from __future__ import annotations
 
@@ -33,14 +12,7 @@ from .test_dispatcher import _make_job, _make_session_factory
 
 
 async def _run_to_death(max_attempts: int) -> tuple[AsyncMock, AsyncMock, AsyncMock]:
-    """Drive one always-failing job until it dead-letters.
-
-    Returns (processor, push_delayed mock, job_repo). The job mock carries
-    its own `retry_count` forward between runs the way the row does: each
-    `update_status` writes the count the dispatcher decided on, and the
-    next dispatch reads it back. Without that the loop would re-run run 1
-    forever and the count would prove nothing.
-    """
+    """Drive one always-failing job until it dead-letters."""
     job = _make_job(
         type=JobType.BULK_API_SYNC, retry_count=0, max_attempts=max_attempts
     )
@@ -118,11 +90,10 @@ async def test_runs_always_equal_the_ceiling_and_retries_are_one_fewer(
 
 
 async def test_the_retry_message_counts_runs_in_words() -> None:
-    """`attempt {n} of {max}` — one word, matching the dead-letter line's
-    "exhausted after N attempts" and the lab's seeded `attempt 3/3` texts.
-    The slash form was the shape a reader most often mistook for a retry
-    count, so the wording spells the relationship out.
-    """
+    """`attempt {n} of {max}` — one word, matching the dead-letter line's "exhausted after
+    N attempts" and the lab's seeded `attempt 3/3` texts. The slash form was the shape a
+    reader most often mistook for a retry count, so the wording spells the relationship
+    out."""
     job = _make_job(type=JobType.BULK_API_SYNC, retry_count=0, max_attempts=3)
     factory, job_repo, audit_repo = _make_session_factory(job)
     outbox = AsyncMock()
