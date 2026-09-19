@@ -537,6 +537,22 @@ Anything that swallows a DB error now goes through `app/core/db_degrade.degrade_
 **Recovery:** ECS restart. Other API replicas continue serving (we run ≥2 in prod).
 **Data loss:** in-flight HTTP requests are lost — clients retry.
 
+### Database connection pool exhausted
+
+**Symptom:** requests and background loops in one process wait to *acquire* a connection, then run at normal speed once they have one. Latency climbs across every endpoint at once while the database itself is idle; past the pool's `pool_timeout` (30s) acquisitions raise instead of waiting. The distinguishing shape is that per-query time is unchanged — this is queueing, not slowness.
+**Detection:** the pool's own counters (checked-out connections at the pool size, overflow in use, acquisition waits). `pg_stat_activity` shows the held connections as `idle in transaction`, not `active`, so an activity count alone misses them.
+**Recovery:** whatever holds the connections gives them back, or the process restarts — a pool is per-process state, so a restart always clears it.
+**Which pool:** there are two, and they are not interchangeable. The API and the worker share one process and therefore one pool, along with all eight consumer groups and all eleven background loops; the MCP server is a separate process with its own ([ADR 0006](ADR/0006-mcp-server-standalone-process.md)). A reading taken in one says nothing about the other, so a pool metric has to name the process it came from.
+**In the eval world:** `saturate_db_pool` reproduces it on demand — one key, a chaos-only task in the worker process, a clamp that always leaves four connections acquirable so the loops slow down rather than stop, and three teardowns (TTL, environment reset, restart). See [ADR 0031](ADR/0031-a-held-pool-and-a-degraded-dependency-are-flagged-not-broken.md).
+
+### Downstream dependency (`bulk-api-sync`) failing or slow
+
+**Symptom:** `bulk_api_sync` jobs fail while every other job type is fine and the database and cache are healthy. After three consecutive endpoint failures the `bulk-api-sync` circuit breaker opens and the endpoints stop being called at all; 30s later it admits exactly one probe, and a still-broken dependency re-opens it. A reader that samples the breaker once can therefore legally see `open` or `half_open` — the state cycles for as long as the dependency is down.
+**Detection:** the breaker's state and failure count; `bulk_api_sync` jobs failing and then dead-lettering, with other types unaffected.
+**Recovery:** the dependency answers again, one probe succeeds, and the breaker closes itself. Nothing has to be called.
+**Where the state lives:** the breaker registry is a module-level dict in the process that created it — the worker's. Nothing in the MCP process can read it without that state being published somewhere shared.
+**In the eval world:** `degrade_downstream` sets one key that makes the simulated endpoint calls fail (`mode=fail`, which the breaker counts) or answer late but succeed (`mode=slow`, which it does not). While that flag is set, a job whose every endpoint call failed fails the job, so the failure reaches the job surface — retries, then the DLQ — instead of completing with an error count in a result payload no operational tool reads. See [ADR 0031](ADR/0031-a-held-pool-and-a-degraded-dependency-are-flagged-not-broken.md).
+
 ---
 
 ## SLOs and error budgets

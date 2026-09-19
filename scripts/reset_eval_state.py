@@ -101,8 +101,11 @@ _DB_URL = os.getenv(
 _REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
 # One pattern, because every chaos key helper MUST live under `chaos:*` —
-# `chaos:kill:{group}`, `chaos:latency:{group}`, `chaos:pause:{loop}`. A new hook adds no pattern
-# here, and `test_every_chaos_key_helper_lives_under_the_chaos_namespace` fails if one escapes.
+# `chaos:kill:{group}`, `chaos:latency:{group}`, `chaos:pause:{loop}`, `chaos:db_pool:hold`,
+# `chaos:downstream:bulk_api_sync`. A new hook adds no pattern here, and
+# `test_every_chaos_key_helper_lives_under_the_chaos_namespace` fails if one escapes. Deleting the
+# first of those two is also what releases the held DB connections: the worker's holder gives them
+# back on its next pass when the key is gone, TTL or no TTL (ADR 0031).
 _CHAOS_KEY_PATTERNS = ("chaos:*",)
 
 # The one namespace chaos residue can reach WITHOUT a `chaos:` name (R2-20): `create_stale_cache`

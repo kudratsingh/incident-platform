@@ -561,15 +561,17 @@ def test_the_shape_deltas_are_exactly_these(chaos_registered: None) -> None:
 def test_the_chaos_surface_grows_by_exactly_one_tool(
     whole_chaos_surface_registered: None,
 ) -> None:
-    """32 → 33 with `CHAOS_ENABLED=true`, 12 of them chaos, counted off the registry — CLAUDE.md
-    says this figure has drifted before."""
+    """This packet's own delta was 32 → 33, 12 of them chaos. The totals moved again with
+    WO-R3-219/220 (`saturate_db_pool`, `degrade_downstream` — 35 / 14); the claim kept here is
+    that `pause_dag_chaos` is one of them, counted off the registry, because CLAUDE.md says this
+    figure has drifted before."""
     names = {t.name for t in list_tools()}
     chaos_names = {
         t.name for t in list_tools() if t.required_scope == Scope.CHAOS_INVOKE
     }
     assert "pause_dag_chaos" in chaos_names
-    assert len(chaos_names) == 12, sorted(chaos_names)
-    assert len(names) == 33, sorted(names)
+    assert len(chaos_names) == 14, sorted(chaos_names)
+    assert len(names) == 35, sorted(names)
 
 
 def test_no_new_refusal_code_reaches_the_commanders_chaos_client() -> None:

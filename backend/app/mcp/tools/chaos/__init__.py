@@ -8,11 +8,13 @@ from app.mcp.tools.chaos import (  # noqa: F401
     create_mislabeled_dlq_job,
     create_stale_cache,
     create_stuck_dag,
+    degrade_downstream,
     inject_latency,
     kill_consumer,
     pause_control_loop,
     pause_dag_chaos,
     poison_message,
+    saturate_db_pool,
     saturate_redis,
     seed_dlq_messages,
 )

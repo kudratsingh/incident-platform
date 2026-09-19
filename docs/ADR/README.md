@@ -36,6 +36,8 @@ Status is stated in each file's own header; the table below mirrors it. All 26 a
 | [0028](0028-outbox-relay-heartbeat-and-delivery-reading.md) | The outbox relay records each pass, and one reading reports delivery | Accepted | Adds `outbox:relay:last_tick` and the `get_outbox_status` tool; builds on 0020 and 0027 |
 | [0029](0029-stranded-chain-and-lab-pause-are-manufactured.md) | A stranded chain and a lab pause are manufactured, not found | Accepted | Adds `pause_dag_chaos` and three `create_stuck_dag` inputs; the boot-seeded DAG is drained, not a fixture; the lab pause writes the operator's own `dag:paused:*` flag and so sits outside `chaos:*` deliberately; builds on 0011, 0012, 0022 and 0027 |
 
+| [0031](0031-a-held-pool-and-a-degraded-dependency-are-flagged-not-broken.md) | A held pool and a degraded dependency are flagged, not broken | Accepted | Adds `saturate_db_pool` and `degrade_downstream`; the pool that starves is the API/worker process's, not the MCP process's own, so a pool reading has to say which one it read; the holder is a lab task and not a twelfth member of 0027's enum; under the downstream flag a sync that synced nothing fails the job, because otherwise nothing the agent reads moves; builds on 0006, 0008, 0012, 0026 and 0027 |
+
 ## Writing one
 
 Number it next in sequence, state the status in the header, and say what was decided, what was rejected and what it costs. Once merged, the file is not rewritten — amend it from a new ADR and link both ways.

@@ -5,10 +5,13 @@ standing in for network latency.
 
 import asyncio
 import random
+from dataclasses import dataclass
 from typing import Any
 
-from app.core.circuit_breaker import CircuitOpenError, get_circuit_breaker
+from app.config import get_settings
+from app.core.circuit_breaker import CircuitBreaker, CircuitOpenError, get_circuit_breaker
 from app.core.logging import get_logger
+from app.core.redis import get_redis_client
 from app.core.tracing import get_tracer
 from app.workers.progress import ProgressPublisher
 from opentelemetry.trace import SpanKind
@@ -27,6 +30,78 @@ _bulk_api_breaker = get_circuit_breaker(
     recovery_timeout=30.0,
 )
 
+# `degrade_downstream` writes this key; this module reads it once per job (WO-R3-220). Under
+# `chaos:*`, so the environment reset sweeps it with every other flag.
+DOWNSTREAM_FLAG_KEY = "chaos:downstream:bulk_api_sync"
+
+#: Endpoint calls raise, so the breaker counts them and opens at its threshold.
+DEGRADE_FAIL = "fail"
+#: Endpoint calls answer late but succeed, so the breaker stays closed.
+DEGRADE_SLOW = "slow"
+
+
+def bulk_api_breaker() -> CircuitBreaker:
+    """The one registered breaker, so callers read its threshold rather than restating it."""
+    return _bulk_api_breaker
+
+
+def downstream_flag_key() -> str:
+    """The key that degrades this processor's simulated endpoints."""
+    return DOWNSTREAM_FLAG_KEY
+
+
+@dataclass(frozen=True)
+class Degradation:
+    mode: str
+    delay_ms: int
+
+
+def parse_degradation(raw: Any) -> Degradation | None:
+    """`"<mode>:<delay_ms>"` → a `Degradation`, or `None` when it is not one."""
+    if raw is None:
+        return None
+    text = raw.decode() if isinstance(raw, bytes) else str(raw)
+    mode, _, delay = text.partition(":")
+    if mode not in (DEGRADE_FAIL, DEGRADE_SLOW):
+        logger.warning("downstream flag names no known mode", extra={"value": text})
+        return None
+    try:
+        delay_ms = int(delay)
+    except ValueError:
+        delay_ms = 0
+    return Degradation(mode=mode, delay_ms=max(0, delay_ms))
+
+
+async def read_degradation(redis: Any | None = None) -> Degradation | None:
+    """What the flag asks for now: `None` when chaos is off, the key is absent, or Redis is down."""
+    if not get_settings().chaos_enabled:
+        return None
+    client = redis if redis is not None else get_redis_client()
+    try:
+        raw = await client.get(DOWNSTREAM_FLAG_KEY)
+    except Exception:
+        # Fail open, like every other flag read: a Redis blip is not a fault to inject.
+        logger.warning("downstream flag unreadable", exc_info=True)
+        return None
+    return parse_degradation(raw)
+
+
+def _synced(index: int) -> dict[str, Any]:
+    """One endpoint's successful answer."""
+    return {
+        "endpoint": index,
+        "status": "ok",
+        "records_synced": random.randint(10, 500),
+    }
+
+
+async def _degraded_call(degraded: Degradation, index: int) -> dict[str, Any]:
+    """One endpoint call while the dependency is degraded: late, or a 503 the breaker counts."""
+    if degraded.mode == DEGRADE_SLOW:
+        await asyncio.sleep(degraded.delay_ms / 1000)
+        return _synced(index)
+    raise RuntimeError(f"endpoint {index} returned 503")
+
 
 async def process_bulk_api_sync(
     payload: dict[str, Any],
@@ -34,6 +109,8 @@ async def process_bulk_api_sync(
 ) -> dict[str, Any]:
     """Call the payload's endpoints concurrently behind a circuit breaker,
     reporting progress as each one lands, and return per-endpoint results."""
+    # One read per job, not per endpoint: the whole fan-out sees one dependency state.
+    degraded = await read_degradation()
     requested_count: int = int(payload.get("endpoint_count", 5))
     endpoint_count: int = max(0, min(requested_count, MAX_ENDPOINT_COUNT))
     if endpoint_count != requested_count:
@@ -65,14 +142,12 @@ async def process_bulk_api_sync(
 
             try:
                 async def _do_call() -> dict[str, Any]:
+                    if degraded is not None:
+                        return await _degraded_call(degraded, index)
                     await asyncio.sleep(random.uniform(0.05, 0.3))
                     if random.random() < 0.10:
                         raise RuntimeError(f"endpoint {index} returned 503")
-                    return {
-                        "endpoint": index,
-                        "status": "ok",
-                        "records_synced": random.randint(10, 500),
-                    }
+                    return _synced(index)
 
                 result = await _bulk_api_breaker.call(_do_call)
                 span.set_attribute("endpoint.status", "ok")
@@ -96,6 +171,14 @@ async def process_bulk_api_sync(
 
     ok = sum(1 for r in results if r["status"] == "ok")
     errors = len(results) - ok
+    if degraded is not None and ok == 0:
+        # A sync that synced nothing is a failed job, so the failure reaches the job surface —
+        # retries, then the dead-letter queue — rather than completing with an error count no
+        # operational tool reads. Only while the flag is set: the organic path has always
+        # reported per-endpoint errors in its result and left the job completed.
+        raise RuntimeError(
+            f"bulk api sync failed: 0 of {endpoint_count} endpoints returned a result"
+        )
     return {
         "endpoints_synced": ok,
         "errors": errors,
