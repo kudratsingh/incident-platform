@@ -27,9 +27,7 @@ import pytest
 from app.main import create_app, lifespan
 from httpx import ASGITransport, AsyncClient
 
-# ---------------------------------------------------------------------------
 # Boot harness
-# ---------------------------------------------------------------------------
 
 
 class _FakeConn:
@@ -88,12 +86,7 @@ def _patch_boot(monkeypatch: pytest.MonkeyPatch, worker: Callable[..., Any]) -> 
 async def _booted(
     monkeypatch: pytest.MonkeyPatch, worker: Callable[..., Any]
 ) -> AsyncGenerator[tuple[AsyncClient, _Boot], None]:
-    """Run the real lifespan around a client bound to the same app.
-
-    A failing *shutdown* is recorded on `boot.shutdown_error` rather than
-    raised, so each test fails on its own claim instead of on the unrelated
-    (and separately tested) re-raise at `await worker_task`.
-    """
+    """Run the real lifespan around a client bound to the same app."""
     boot = _patch_boot(monkeypatch, worker)
     app = create_app()
     started = lifespan(app)
@@ -121,9 +114,7 @@ async def _wait_for(predicate: Callable[[], bool], timeout: float = 2.0) -> bool
     return predicate()
 
 
-# ---------------------------------------------------------------------------
 # Worker doubles
-# ---------------------------------------------------------------------------
 
 
 class _CrashingWorker:
@@ -171,9 +162,7 @@ class _HealthyWorker:
             raise
 
 
-# ---------------------------------------------------------------------------
 # (a) the death is observed and logged
-# ---------------------------------------------------------------------------
 
 
 async def test_a_dead_worker_task_is_logged(
@@ -197,9 +186,7 @@ async def test_a_dead_worker_task_is_logged(
     ), "the log line does not carry the exception that killed the worker"
 
 
-# ---------------------------------------------------------------------------
 # (c) the worker is restarted
-# ---------------------------------------------------------------------------
 
 
 async def test_c_a_crashed_worker_is_restarted(
@@ -239,9 +226,7 @@ async def test_an_orderly_shutdown_does_not_restart_the_worker(
     assert worker.cancelled == 1, "shutdown must still cancel the worker task"
 
 
-# ---------------------------------------------------------------------------
 # (b) the deep health check sees it
-# ---------------------------------------------------------------------------
 
 
 async def test_b_deep_health_check_reports_a_dead_worker(
@@ -361,9 +346,7 @@ async def test_the_promote_loop_reports_a_worker_tick() -> None:
     )
 
 
-# ---------------------------------------------------------------------------
 # Shutdown must not be aborted by the worker's stored exception
-# ---------------------------------------------------------------------------
 
 
 async def test_shutdown_closes_producer_and_pools_when_the_worker_died(
@@ -384,21 +367,8 @@ async def test_shutdown_closes_producer_and_pools_when_the_worker_died(
     boot.close_sse_redis_pool.assert_awaited_once()
 
 
-# ---------------------------------------------------------------------------
 # Which probe is allowed to notice what (WO-R2-65)
-#
 # ADR 0009 put worker liveness on the deep check because the probe that
-# governs restarts had to be able to see a dead worker. That was right, and
-# the endpoint it landed on was also the ALB target-group check and the ECS
-# container check — so it governed *traffic* too, and it also reported
-# Postgres and Redis. A Redis outage therefore deregistered every backend
-# target at once and recycled every task mid-job, over a dependency that
-# every request path already fails open on.
-#
-# The split: /healthz answers "can this task serve HTTP" (ALB),
-# /healthz/worker answers "is this task worth keeping" (ECS, restart
-# authority), /api/v1/health keeps the whole truth for operators.
-# ---------------------------------------------------------------------------
 
 
 async def test_worker_probe_reports_a_dead_worker(
@@ -441,12 +411,7 @@ async def test_worker_probe_is_green_with_a_live_worker(
 async def test_the_alb_probe_ignores_a_dead_worker(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A dead worker is not a reason to stop routing HTTP to this task.
-
-    The API half still serves every request it could serve a moment ago;
-    the remedy is a task recycle, which the ECS probe above orders. Failing
-    the target group as well would take the API down for a worker fault.
-    """
+    """A dead worker is not a reason to stop routing HTTP to this task."""
     worker = _CrashingWorker()
     async with _booted(monkeypatch, worker) as (client, _boot):
         # Wait until the worker is genuinely being reported dead...
@@ -465,14 +430,7 @@ async def test_the_alb_probe_ignores_a_dead_worker(
 async def test_a_redis_outage_fails_only_the_deep_check(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """THE assertion for WO-R2-65.
-
-    With Redis unreachable, neither the probe that routes traffic nor the
-    probe that recycles tasks may fail — a replacement task comes back to
-    the same Redis, and every target sharing the outage means there is
-    nothing to route around. The deep check still tells the truth, because
-    nothing acts on it automatically.
-    """
+    """THE assertion for WO-R2-65."""
     worker = _HealthyWorker()
     async with _booted(monkeypatch, worker) as (client, boot):
         await asyncio.sleep(0.05)

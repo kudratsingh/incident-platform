@@ -1,21 +1,4 @@
-"""Tests for `scripts/seed_incident_commander.py` (D-01, D-11).
-
-D-01: the seeder called `ServiceAccountService.update_scopes`, which
-REPLACES the scope set. A default re-run (`make seed-incident-commander`
-with no SA_SCOPES) therefore silently down-scoped the live 4-scope
-`incident-commander` account to the two default read scopes, and the
-token minted in the same transaction inherited the narrowed set. These
-tests pin the union semantics plus the deliberate-narrowing escape
-hatch.
-
-D-11: the banner printed `PLATFORM_MCP_TOKEN=`, but the commander reads
-`PLATFORM_TOKEN` (incident-commander `src/incident_commander/config.py`
-declares `platform_token: SecretStr` with no env prefix;
-`.env.example` ships `PLATFORM_TOKEN=`).
-
-Import-guarded via the sys.path pattern in `test_eval_reset.py` — the
-scripts/ dir isn't a package on disk.
-"""
+"""Tests for `scripts/seed_incident_commander.py` (D-01, D-11)."""
 
 from __future__ import annotations
 
@@ -64,24 +47,13 @@ async def _existing_sa(
     )
 
 
-# ---------------------------------------------------------------------------
 # D-01 — scope merge
-# ---------------------------------------------------------------------------
 
 
 async def test_default_rerun_never_removes_write_or_chaos_scopes(
     db_session: AsyncSession, default_tenant
 ) -> None:
-    """THE assertion that would have caught D-01.
-
-    A live 4-scope account re-seeded with the SA_SCOPES default keeps
-    its write/chaos grants.
-
-    This is the helper's own union semantics, with no `forbidden_scopes`
-    passed — still the behaviour every caller but one relies on. The agent
-    path (WO-R3-187) passes `{chaos:invoke}` and does narrow, which is
-    tested separately below; D-01's rule is that a grant is never dropped
-    *silently*, not that one can never be dropped."""
+    """THE assertion that would have caught D-01."""
     seed = _seed_module()
     sa = await _existing_sa(db_session, default_tenant.id, _FULL_SCOPES)
 
@@ -146,9 +118,7 @@ async def test_creates_account_with_requested_scopes_when_absent(
     assert sorted(sa.scopes) == sorted(_DEFAULT_SCOPES)  # type: ignore[attr-defined]
 
 
-# ---------------------------------------------------------------------------
 # O-4 / WO-R3-187 — two accounts, and the agent never holds chaos:invoke
-# ---------------------------------------------------------------------------
 
 
 async def test_agent_rerun_removes_chaos_invoke(
@@ -156,14 +126,7 @@ async def test_agent_rerun_removes_chaos_invoke(
     default_tenant,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """THE assertion for the split.
-
-    The live agent account holds `chaos:invoke` today (divergence report
-    G3), and the audit filter this work order lands keys on that scope —
-    so a union-only seeder could never reach the state owner decision O-4
-    asks for. Re-seeding the agent account drops the grant, keeps every
-    other one, and says so on stderr.
-    """
+    """THE assertion for the split."""
     seed = _seed_module()
     sa = await _existing_sa(db_session, default_tenant.id, _FULL_SCOPES)
 
@@ -240,9 +203,7 @@ def test_the_two_accounts_are_different_principals() -> None:
     assert Scope.ACTIONS_EXECUTE.value not in chaos
 
 
-# ---------------------------------------------------------------------------
 # D-11 — the banner names the env vars the commander actually reads
-# ---------------------------------------------------------------------------
 
 
 def test_banner_prints_both_labelled_tokens(

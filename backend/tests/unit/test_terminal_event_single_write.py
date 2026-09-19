@@ -1,22 +1,4 @@
-"""The invariant: a terminal job status and its lifecycle event are one write.
-
-Real rows on a real (SQLite in-memory) engine rather than the mock-heavy
-`test_dispatcher.py` style, for the same reason `test_stale_running_sweep.py`
-is: the thing under test is what actually lands in two tables inside one
-transaction, and a mocked session proves nothing about either.
-
-Three writers used to break the invariant, all in the same way — they wrote a
-terminal status and no event, so the job died (or completed) in Postgres while
-every consumer downstream went on believing the old state:
-
-  1. `JobDispatcherConsumer._force_dead_letter` — DEAD_LETTER, no `job.dlq`.
-  2. `JobService.resolve_incident` — COMPLETED, no `job.completed`.
-  3. the retry branch's unguarded `queue.push_delayed`, which is how jobs with
-     retries left got fed to (1) in the first place.
-
-The engine is module-local so committed rows never leak into the shared
-session-scoped `sqlite_engine` other suites roll back against.
-"""
+"""The invariant: a terminal job status and its lifecycle event are one write."""
 
 import uuid
 from collections.abc import AsyncGenerator
@@ -50,7 +32,6 @@ from sqlalchemy.pool import StaticPool
 
 # Mixed hex on purpose, same reason `DEFAULT_TENANT_ID` is: an all-digit UUID
 # hex round-trips through SQLite's NUMERIC affinity as a float and blows up
-# the UUID result processor.
 _USER_ID = uuid.UUID("c4b3a291-8d7e-4f60-9a1b-2c3d4e5f6a7b")
 
 _TRACEPARENT = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
@@ -154,7 +135,6 @@ async def _job_status(
 
 # --------------------------------------------------------------------------- #
 # Finding 1 — _force_dead_letter wrote DEAD_LETTER and announced nothing        #
-# --------------------------------------------------------------------------- #
 
 
 @pytest.mark.asyncio
@@ -195,7 +175,6 @@ async def test_force_dead_letter_writes_status_and_dlq_event_together(
     assert payload["max_attempts"] == 3
     # The deprecated alias rides along for one release, carrying the
     # identical value — a consumer on either name gets the same ceiling
-    # (WO-R2-172).
     assert payload["max_retries"] == payload["max_attempts"]
     assert payload["trace_id"] == "trace-terminal"
     # The OTel carrier is tracing plumbing and must not ride along onto
@@ -205,7 +184,6 @@ async def test_force_dead_letter_writes_status_and_dlq_event_together(
 
     # And the relay will accept it: a derived payload that fails schema
     # validation would be marked permanently failed, losing the event in a
-    # new way rather than the old one.
     schema_registry.validate(settings.kafka_topic_job_dlq, payload)
 
 
@@ -233,7 +211,6 @@ async def test_force_dead_letter_leaves_an_already_settled_job_alone(
 
 # --------------------------------------------------------------------------- #
 # Finding 3 — resolve_incident wrote COMPLETED and announced nothing            #
-# --------------------------------------------------------------------------- #
 
 
 @pytest.mark.asyncio
@@ -281,7 +258,6 @@ async def test_resolve_incident_emits_job_completed_and_settles_the_saga(
 
     # The consumer half: this is the event the outbox relay publishes, and it
     # is what unsticks the saga. Repository access is mocked here — the point
-    # is that the coordinator now receives an event at all.
     saga = MagicMock()
     saga.id = saga_id
     saga.status = SagaStatus.RUNNING
@@ -332,7 +308,6 @@ async def test_resolve_incident_emits_job_completed_and_settles_the_saga(
 
 # --------------------------------------------------------------------------- #
 # The producer contract, asserted where the single producer now lives          #
-# --------------------------------------------------------------------------- #
 
 
 @pytest.mark.asyncio

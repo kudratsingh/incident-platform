@@ -65,9 +65,7 @@ def _make_service() -> tuple[ServiceAccountService, AsyncMock, AsyncMock, AsyncM
     return svc, sa_repo, token_repo, audit_repo
 
 
-# ---------------------------------------------------------------------------
 # create_service_account
-# ---------------------------------------------------------------------------
 
 
 async def test_create_rejects_unknown_scope() -> None:
@@ -109,9 +107,7 @@ async def test_create_writes_audit_row() -> None:
     assert args[0] == "service_account.created"
 
 
-# ---------------------------------------------------------------------------
 # mint_token
-# ---------------------------------------------------------------------------
 
 
 async def test_mint_returns_plaintext_with_expected_prefix() -> None:
@@ -184,9 +180,7 @@ async def test_mint_respects_custom_ttl() -> None:
     assert timedelta(days=6, hours=23) < delta <= timedelta(days=7, minutes=1)
 
 
-# ---------------------------------------------------------------------------
 # verify_token
-# ---------------------------------------------------------------------------
 
 
 async def test_verify_rejects_non_sa_prefix() -> None:
@@ -243,9 +237,7 @@ async def test_verify_success_updates_last_used_at() -> None:
     assert token.last_used_at is not None
 
 
-# ---------------------------------------------------------------------------
 # revoke_token
-# ---------------------------------------------------------------------------
 
 
 async def test_revoke_is_idempotent() -> None:
