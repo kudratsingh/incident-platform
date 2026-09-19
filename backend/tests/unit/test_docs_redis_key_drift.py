@@ -1,13 +1,4 @@
-"""Tripwire against docs drifting from the real consumer-lag key (D-16).
-
-docs/REDIS.md and docs/KAFKA.md once documented
-`kafka:consumer_lag:dispatcher` while the code writes
-`kafka:consumer_lag:worker-dispatcher` — so the docs' copy-pasteable
-inspect command read a key that never exists and pointed on-call at a
-"dead" metrics loop. This exact drift already happened once; asserting
-against the constant the code actually uses makes a rename fail here
-instead of silently stranding the docs again.
-"""
+"""Tripwire against docs drifting from the real consumer-lag key (D-16)."""
 
 from __future__ import annotations
 
@@ -21,7 +12,6 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 
 # The stale spelling as a *full* key: not followed by a word character
 # or hyphen, so the real `kafka:consumer_lag:worker-dispatcher` (which
-# differs in the segment prefix) and any longer group name never trip it.
 _STALE_KEY = re.compile(r"kafka:consumer_lag:dispatcher(?![\w-])")
 
 

@@ -1,18 +1,4 @@
-"""Unit tests for the boot-time incident_app password sync (WO-P2-03, F1-01).
-
-Two load-bearing properties, provable without Postgres:
-
-1. No-op discipline: phase-1 boots (INCIDENT_APP_DB_PASSWORD does not
-   exist yet) and non-Postgres stacks (SQLite tests, missing URL) must
-   not even attempt a connection — the sync runs in scripts/entrypoint.sh
-   under `set -e`, so an eager connect would brick every boot that
-   predates the Terraform secret.
-2. Injection safety: the password travels to the server only as a bound
-   parameter into set_config(); the ALTER ROLE DDL (which cannot take
-   bind parameters) reads it back server-side with
-   format('%L', current_setting(...)). The password must never be
-   interpolated into a statement string.
-"""
+"""Unit tests for the boot-time incident_app password sync (WO-P2-03, F1-01)."""
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -67,13 +53,7 @@ async def test_noop_when_no_url_configured() -> None:
 
 
 async def test_sync_binds_password_and_never_interpolates_it() -> None:
-    """The injection-safety contract of the two-step pattern.
-
-    Statement 1 carries the password strictly as a bound parameter into
-    set_config(); statement 2 is a DO block that quote-literals it
-    server-side via format('%L', current_setting(...)). A hostile
-    password must appear in neither statement string.
-    """
+    """The injection-safety contract of the two-step pattern."""
     engine, conn = _fake_engine()
     hostile = "p'; DROP ROLE postgres; --"
     with patch.object(db_bootstrap, "create_async_engine", return_value=engine) as factory:

@@ -1,20 +1,4 @@
-"""Tripwire: the docs must describe the attempt budget the code implements.
-
-Three doc lines were wrong at once when WO-R2-172 was filed, and all three
-were wrong in the same way — they described a retry budget for a field that
-caps runs:
-
-  * `docs/KAFKA.md` called the `job.dlq` field "the job's retry budget".
-  * `docs/DATA_MODEL.md` called the column a "per-job cap", which is true of
-    either reading and therefore settles nothing.
-  * `docs/REDIS.md` said a job waiting on a retry sits in `failed` status —
-    stale on a second count, because the retry path writes `pending`.
-
-A rename fixes the code and leaves prose free to drift back, so the rules are
-bound to the code here rather than to review: the column name comes from the
-model, and the old name is allowed in the docs only on a line that says it is
-the old name.
-"""
+"""Tripwire: the docs must describe the attempt budget the code implements."""
 
 from __future__ import annotations
 
