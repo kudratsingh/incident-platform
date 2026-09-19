@@ -19,6 +19,7 @@ import { adminApi } from '../api/admin'
 import { AppError } from '../api/client'
 import { useAuth } from '../hooks/useAuth'
 import { useAsyncData } from '../hooks/useAsyncData'
+import { usePolling } from '../hooks/usePolling'
 import { formatDate, JOB_TYPE_LABELS } from '../utils/format'
 
 type Tab =
@@ -45,6 +46,38 @@ const JOBS_PAGE_SIZE = 20
 const USERS_PAGE_SIZE = 50 // mirrors adminApi.listUsers
 const TENANTS_PAGE_SIZE = 50 // mirrors adminApi.listTenants
 const AUDIT_PAGE_SIZE = 20 // the API's PaginationParams default
+
+/**
+ * The audit log refreshes itself while an operator is watching it.
+ *
+ * Five seconds, the same cadence the Overview tab has used since Phase 7. The
+ * tab used to refetch only on a tab switch, which made an incident unfolding in
+ * front of the operator look frozen — and the audit log is the one tab they keep
+ * open during an incident.
+ */
+const AUDIT_REFRESH_MS = 5000
+
+/**
+ * Whole audit streams, as a prefix.
+ *
+ * `action=` is an exact match, so isolating everything the agent did, or
+ * everything the lab did, meant reading pages by eye. The empty value is "all
+ * actions" and must send no parameter at all rather than an empty one.
+ *
+ * `chaos.` is here because a human operator reading the REST audit API sees the
+ * lab's rows — it is the AGENT's own MCP reads that withhold them (ADR 0012).
+ */
+const ACTION_PREFIXES: ReadonlyArray<{ value: string; label: string }> = [
+  { value: '', label: 'All actions' },
+  { value: 'agent.', label: 'agent. — the agent’s MCP calls and run reports' },
+  { value: 'chaos.', label: 'chaos. — the lab’s fault injection' },
+  { value: 'job.', label: 'job. — job lifecycle' },
+  { value: 'event.', label: 'event. — the event-sourced mirror' },
+  { value: 'saga.', label: 'saga. — saga lifecycle' },
+  { value: 'tenant.', label: 'tenant. — tenant administration' },
+  { value: 'user.', label: 'user. — registration and sign-in' },
+  { value: 'service_account.', label: 'service_account. — machine principals' },
+]
 
 const PAGE_SIZE: Record<Tab, number | null> = {
   overview: null,
@@ -406,6 +439,7 @@ export default function AdminPage() {
   const [principalFilter, setPrincipalFilter] = useState<
     'all' | 'user' | 'service_account'
   >('all')
+  const [actionPrefix, setActionPrefix] = useState('')
   const [selectedUser, setSelectedUser] = useState<User | null>(null)
   const [dlqStats, setDlqStats] = useState<{ total: number; by_type: Record<string, number> } | null>(null)
   const [nlQuestion, setNlQuestion] = useState('')
@@ -486,10 +520,14 @@ export default function AdminPage() {
       adminApi.listAuditLogs({
         page: auditPage,
         principal_type: principalFilter === 'all' ? undefined : principalFilter,
+        // Empty means "all actions" and must not reach the query string: an
+        // `action_prefix=` would match every row by accident rather than by
+        // intent, which is a different thing to mean.
+        action_prefix: actionPrefix || undefined,
       }),
-    [auditPage, principalFilter],
+    [auditPage, principalFilter, actionPrefix],
   )
-  const logsList = useAsyncData(loadLogs, {
+  const logsList = usePolling(loadLogs, AUDIT_REFRESH_MS, {
     enabled: tab === 'audit',
     errorMessage: 'Could not load the audit log.',
   })
@@ -1302,7 +1340,7 @@ export default function AdminPage() {
 
       {tab === 'audit' && (
         <>
-        <div className="flex items-center gap-2 mb-3">
+        <div className="flex flex-wrap items-center gap-2 mb-3">
           <span className="text-xs text-gray-500 uppercase tracking-wide">Actor</span>
           {(['all', 'user', 'service_account'] as const).map((v) => (
             <button
@@ -1320,15 +1358,64 @@ export default function AdminPage() {
               {v === 'all' ? 'All' : v === 'user' ? 'Human' : 'Agent'}
             </button>
           ))}
+
+          <label
+            htmlFor="audit-action-prefix"
+            className="text-xs text-gray-500 uppercase tracking-wide ml-2"
+          >
+            Action prefix
+          </label>
+          <select
+            id="audit-action-prefix"
+            value={actionPrefix}
+            onChange={(e) => {
+              setActionPrefix(e.target.value)
+              // A narrower filter has fewer pages, so page 4 of the old query
+              // is usually past the end of the new one.
+              resetPage('audit')
+            }}
+            className="bg-gray-800/60 border border-gray-700/50 rounded px-2 py-1 text-xs text-gray-200 focus:outline-none focus:border-blue-500/50"
+          >
+            {ACTION_PREFIXES.map((p) => (
+              <option key={p.value} value={p.value}>
+                {p.label}
+              </option>
+            ))}
+          </select>
+
+          <span className="ml-auto text-xs text-gray-600 flex items-center gap-1.5">
+            <span className="w-1.5 h-1.5 rounded-full bg-blue-400 animate-pulse" />
+            live · refreshed every {AUDIT_REFRESH_MS / 1000}s
+          </span>
         </div>
+        {/* One failed poll must not take the table away: the rows on screen are
+            still the last true answer, so the failure is a banner beside them
+            and only a first load with nothing to show becomes an ErrorState. */}
+        {logsList.error && logsList.data !== null && (
+          <div className="mb-3 flex items-center gap-3 text-xs text-amber-300 bg-amber-900/15 border border-amber-800/40 rounded px-3 py-2">
+            <span>
+              The last refresh failed ({logsList.error}). These rows are the last
+              successful read.
+            </span>
+            <button
+              onClick={logsList.reload}
+              className="ml-auto text-xs px-2 py-0.5 rounded border border-gray-700 text-gray-300 hover:text-white"
+            >
+              Retry
+            </button>
+          </div>
+        )}
         <div className="bg-gray-900 border border-gray-800 rounded-lg overflow-hidden">
-          {logsList.loading ? (
+          {/* `loading` goes true on every 5s poll now, so the skeleton is keyed
+              on "loading AND nothing loaded yet". Keying it on `loading` alone
+              made the table flash a skeleton twelve times a minute. */}
+          {logsList.loading && logsList.data === null ? (
             <table className="w-full text-sm">
               <tbody className="divide-y divide-gray-800/60">
                 {Array.from({ length: 8 }).map((_, i) => <TableRowSkeleton key={i} />)}
               </tbody>
             </table>
-          ) : logsList.error ? (
+          ) : logsList.error && logsList.data === null ? (
             <ErrorState message={logsList.error} onRetry={logsList.reload} />
           ) : logRows.length === 0 ? (
             <div className="px-6 py-12 text-center text-sm text-gray-500">

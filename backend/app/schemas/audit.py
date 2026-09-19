@@ -3,7 +3,7 @@ from datetime import datetime
 from typing import Any, Literal
 
 from app.schemas.common import PaginationParams
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class AuditLogResponse(BaseModel):
@@ -29,6 +29,10 @@ class AuditListParams(PaginationParams):
     user_id: uuid.UUID | None = None
     job_id: uuid.UUID | None = None
     action: str | None = None
+    # `action` is an exact match, which cannot isolate a stream: `agent.`,
+    # `chaos.` and `job.` are prefixes, and the console's audit views filter on
+    # whole streams. Bounded because it reaches a LIKE pattern.
+    action_prefix: str | None = Field(default=None, max_length=100)
     # Isolate operator activity (`user`) from agent activity
     # (`service_account`). Omit to see both.
     principal_type: Literal["user", "service_account"] | None = None

@@ -1,11 +1,15 @@
-import { api } from './client'
+import { api, AppError } from './client'
 import type {
+  AgentRun,
   AuditLog,
+  CircuitBreakerReading,
+  ConsumerLagReading,
   IncidentDigest,
   Job,
   JobTimeline,
   JobTriage,
   PaginatedResponse,
+  PlatformAlert,
   Runbook,
   SLOState,
   SystemStats,
@@ -18,6 +22,35 @@ import type { JobListParams } from './jobs'
 export interface AdminJobListParams extends JobListParams {
   user_id?: string
   tenant_id?: string
+}
+
+/**
+ * Pull a list out of whichever envelope an endpoint uses.
+ *
+ * The admin surface is not consistent about this and never has been: `/admin/
+ * runbooks` answers `{items, count}`, `/admin/slos` answers `{slos}`, `/admin/
+ * jobs` answers a full `PaginatedResponse`. Rather than guess once per endpoint
+ * and be wrong, each caller below names the keys it will accept.
+ *
+ * It **throws** on a shape it does not recognise instead of returning `[]`. An
+ * unrecognised envelope is a contract mismatch between this console and the
+ * backend it is talking to, and the one thing it must not do is render as "no
+ * rows" — that is the failure mode `useAsyncData` exists to prevent, arriving
+ * one layer lower down.
+ */
+function listFrom<T>(body: unknown, keys: readonly string[], what: string): T[] {
+  if (Array.isArray(body)) return body as T[]
+  if (body !== null && typeof body === 'object') {
+    for (const key of keys) {
+      const value = (body as Record<string, unknown>)[key]
+      if (Array.isArray(value)) return value as T[]
+    }
+  }
+  throw new AppError(
+    `The ${what} endpoint answered a shape this console does not recognise ` +
+      `(expected a bare array or one of: ${keys.join(', ')}).`,
+    'unexpected_response_shape',
+  )
 }
 
 export const adminApi = {
@@ -110,22 +143,64 @@ export const adminApi = {
     body: { rate_limit_per_minute?: number; quota_jobs_per_month?: number },
   ) => api.patch<Tenant>(`/admin/tenants/${id}`, body),
 
-  listAuditLogs: (
-    params: {
-      page?: number
-      job_id?: string
-      user_id?: string
-      action?: string
-      principal_type?: 'user' | 'service_account'
-    } = {},
-  ) => {
+  listAuditLogs: (params: AuditListParams = {}) => {
     const qs = new URLSearchParams()
     if (params.page) qs.set('page', String(params.page))
+    if (params.page_size) qs.set('page_size', String(params.page_size))
     if (params.job_id) qs.set('job_id', params.job_id)
     if (params.user_id) qs.set('user_id', params.user_id)
     if (params.action) qs.set('action', params.action)
+    // A whole stream (`agent.`, `chaos.`, `job.`), where `action` is one row's
+    // exact name. Added to the endpoint by WO-R3-313.
+    if (params.action_prefix) qs.set('action_prefix', params.action_prefix)
     if (params.principal_type) qs.set('principal_type', params.principal_type)
     const q = qs.toString()
     return api.get<PaginatedResponse<AuditLog>>(`/audit/logs${q ? `?${q}` : ''}`)
   },
+
+  // ── operator-only readings behind the /demo page (WO-R3-312) ──────────────
+
+  /**
+   * The agent runs the commander has reported (ADR 0035).
+   *
+   * `active` asks for runs that have not finished. The agent's own principal
+   * cannot read this at all — there is no MCP tool for it, deliberately.
+   */
+  listAgentRuns: async (params: { alert_id?: string; active?: boolean } = {}) => {
+    const qs = new URLSearchParams()
+    if (params.alert_id) qs.set('alert_id', params.alert_id)
+    if (params.active !== undefined) qs.set('active', String(params.active))
+    const q = qs.toString()
+    const body = await api.get<unknown>(`/admin/agent-runs${q ? `?${q}` : ''}`)
+    return listFrom<AgentRun>(body, ['items', 'runs'], 'agent-runs')
+  },
+
+  getAgentRun: (id: string) => api.get<AgentRun>(`/admin/agent-runs/${id}`),
+
+  /** Every consumer group's lag, with `lag_known` so an absent reading stays absent. */
+  consumerLag: async () => {
+    const body = await api.get<unknown>('/admin/consumer-lag')
+    return listFrom<ConsumerLagReading>(body, ['groups', 'items'], 'consumer-lag')
+  },
+
+  /** Breaker state as published in Redis (ADR 0030). A breaker with no record is ABSENT from this list, never reported closed. */
+  circuitBreakers: async () => {
+    const body = await api.get<unknown>('/admin/circuit-breakers')
+    return listFrom<CircuitBreakerReading>(body, ['breakers', 'items'], 'circuit-breakers')
+  },
+
+  listAlerts: async (active = true) => {
+    const body = await api.get<unknown>(`/admin/alerts?active=${String(active)}`)
+    return listFrom<PlatformAlert>(body, ['alerts', 'items'], 'alerts')
+  },
+}
+
+export interface AuditListParams {
+  page?: number
+  page_size?: number
+  job_id?: string
+  user_id?: string
+  action?: string
+  action_prefix?: string
+  principal_type?: 'user' | 'service_account'
 }

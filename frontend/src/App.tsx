@@ -7,6 +7,7 @@ import DashboardPage from './pages/DashboardPage'
 import JobDetailPage from './pages/JobDetailPage'
 import AdminPage from './pages/AdminPage'
 import AdminTenantDetailPage from './pages/AdminTenantDetailPage'
+import DemoPage from './pages/DemoPage'
 import SagasPage from './pages/SagasPage'
 import SagaNewPage from './pages/SagaNewPage'
 import SagaDetailPage from './pages/SagaDetailPage'
@@ -64,6 +65,17 @@ export default function App() {
             element={
               <ProtectedRoute requiredRole="support">
                 <AdminPage />
+              </ProtectedRoute>
+            }
+          />
+          {/* The live-demo screen. Support and above, same bar as /admin: it
+              reads operator-only surfaces (agent runs, the lab's audit rows)
+              that no `user` may see. */}
+          <Route
+            path="/demo"
+            element={
+              <ProtectedRoute requiredRole="support">
+                <DemoPage />
               </ProtectedRoute>
             }
           />

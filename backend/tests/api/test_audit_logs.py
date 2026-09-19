@@ -98,6 +98,98 @@ async def test_principal_type_service_account_filter_hides_human_rows(
     assert all(row["user_id"] is None for row in items)
 
 
+async def test_action_prefix_isolates_one_stream(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    default_tenant,  # type: ignore[no-untyped-def]
+    admin_headers: dict[str, str],
+) -> None:
+    """WO-R3-313: `action=` is an exact match, so isolating `agent.*` or `chaos.*` —
+    whole streams the console filters on — needed a prefix filter of its own."""
+    await _seed_rows(db_session, default_tenant.id)
+    resp = await client.get(
+        "/api/v1/audit/logs?action_prefix=agent.", headers=admin_headers
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["items"], "expected the agent row"
+    assert all(row["action"].startswith("agent.") for row in body["items"])
+    # `total` uses the same WHERE, so the pager cannot offer pages of rows the
+    # filter excludes.
+    assert body["total"] == len(body["items"])
+
+
+async def test_action_prefix_matching_nothing_returns_an_empty_page(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    default_tenant,  # type: ignore[no-untyped-def]
+    admin_headers: dict[str, str],
+) -> None:
+    await _seed_rows(db_session, default_tenant.id)
+    resp = await client.get(
+        "/api/v1/audit/logs?action_prefix=nothing.", headers=admin_headers
+    )
+    assert resp.status_code == 200
+    assert resp.json()["items"] == []
+    assert resp.json()["total"] == 0
+
+
+async def test_action_prefix_composes_with_principal_type(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    default_tenant,  # type: ignore[no-untyped-def]
+    admin_headers: dict[str, str],
+) -> None:
+    await _seed_rows(db_session, default_tenant.id)
+    resp = await client.get(
+        "/api/v1/audit/logs?action_prefix=agent.&principal_type=user",
+        headers=admin_headers,
+    )
+    assert resp.status_code == 200
+    # The agent row is the only `agent.*` row and it is a service account, so
+    # the two filters AND to nothing rather than one winning.
+    assert resp.json()["items"] == []
+
+
+async def test_chaos_rows_are_visible_to_a_human_operator_by_prefix(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    default_tenant,  # type: ignore[no-untyped-def]
+    admin_headers: dict[str, str],
+) -> None:
+    """ADR 0012 withholds `chaos.*` from the AGENT's MCP reads, never from the REST
+    audit API a human operator reads. The /demo page's phase strip depends on it."""
+    # Seed the agent + human rows too, so an ignored filter fails this test
+    # rather than passing on a single-row table.
+    await _seed_rows(db_session, default_tenant.id)
+    db_session.add(
+        AuditLog(
+            tenant_id=default_tenant.id,
+            action="chaos.tool_invoked",
+            principal_type=PRINCIPAL_TYPE_SERVICE_ACCOUNT,
+            principal_id=uuid.uuid4(),
+            user_id=None,
+        )
+    )
+    await db_session.flush()
+
+    resp = await client.get(
+        "/api/v1/audit/logs?action_prefix=chaos.", headers=admin_headers
+    )
+    assert resp.status_code == 200
+    assert [row["action"] for row in resp.json()["items"]] == ["chaos.tool_invoked"]
+
+
+async def test_over_long_action_prefix_returns_422(
+    client: AsyncClient,
+    admin_headers: dict[str, str],
+) -> None:
+    resp = await client.get(
+        f"/api/v1/audit/logs?action_prefix={'x' * 200}", headers=admin_headers
+    )
+    assert resp.status_code == 422
+
+
 async def test_bad_principal_type_returns_422(
     client: AsyncClient,
     admin_headers: dict[str, str],
