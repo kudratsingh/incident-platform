@@ -1,15 +1,4 @@
-"""A small, shared HCL scanner for the Terraform tripwire tests.
-
-Not a Terraform parser: it reads enough of `infra/*.tf` to answer "does this
-block exist and what is this scalar set to", which is all the guards in
-`test_alarm_metrics_match_emitters.py` and `test_runbook_lint.py` need. Both
-files grew the same brace-matcher independently, which is how the two of them
-could have disagreed about what the stack contains; there is one copy now.
-
-Deliberately not `python-hcl2`: this runs in the unit tier, which has no
-Terraform toolchain and no network, and the guards need to survive a syntax
-error in a .tf file by failing loudly rather than by not running at all.
-"""
+"""A small, shared HCL scanner for the Terraform tripwire tests."""
 
 from __future__ import annotations
 
@@ -26,12 +15,7 @@ def repo_root() -> Path:
 
 
 def match_brace(text: str, open_index: int) -> int:
-    """Index just past the `}` closing the `{` at `open_index`.
-
-    String-aware and comment-aware: SEARCH expressions embed literal braces
-    (`'{IncidentPlatform,JobType} MetricName=...'`) and a naive depth counter
-    walks straight off the end of the file on them.
-    """
+    """Index just past the `}` closing the `{` at `open_index`."""
     depth = 0
     i = open_index
     n = len(text)
@@ -66,12 +50,7 @@ def blocks(text: str, pattern: str) -> list[tuple[re.Match[str], str, int, int]]
 
 
 def scalar(body: str, key: str) -> str | None:
-    """Value of a top-level `key = "value"` assignment, still backslash-escaped.
-
-    The string body must tolerate `\\"` — the SEARCH expressions embed quoted
-    metric names — so a plain `[^"]*` would truncate at the first inner quote
-    and silently yield no match at all.
-    """
+    """Value of a top-level `key = "value"` assignment, still backslash-escaped."""
     match = re.search(
         rf'^\s*{key}\s*=\s*"((?:[^"\\]|\\.)*)"\s*$', body, flags=re.MULTILINE
     )
@@ -93,13 +72,7 @@ def excise(body: str, spans: list[tuple[int, int]]) -> str:
 
 
 def strip_nested(body: str) -> str:
-    """Body with every nested `{...}` block blanked out, offsets preserved.
-
-    Without this, a line-anchored search for `name` inside
-    `resource "aws_ecs_cluster"` finds the `name = "containerInsights"` of the
-    nested `setting` block instead of the cluster's own — a wrong answer that
-    still looks like a resource name, which is the worst kind.
-    """
+    """Body with every nested `{...}` block blanked out, offsets preserved."""
     spans = []
     i = 0
     n = len(body)
@@ -129,13 +102,7 @@ _ASSIGNMENT = r'^\s*{key}\s*=\s*([^\s#][^\n#]*?)\s*$'
 
 
 def top_attribute(body: str, key: str) -> str | None:
-    """Value of `key = ...` at the top level of `body`, quotes stripped.
-
-    Unlike `scalar`, this accepts unquoted values — Terraform writes
-    `name = var.app_name` as often as it writes a string literal, and a
-    scanner that silently skips the unquoted half reports a resource as
-    nameless rather than as named-by-a-variable.
-    """
+    """Value of `key = ...` at the top level of `body`, quotes stripped."""
     match = re.search(
         _ASSIGNMENT.format(key=key), strip_nested(body), flags=re.MULTILINE
     )
@@ -156,12 +123,7 @@ _BARE_VAR = re.compile(r"^var\.(\w+)$")
 
 
 def variable_defaults() -> dict[str, str]:
-    """`variable "x" { default = "y" }` from infra/variables.tf, as x -> y.
-
-    Only string defaults: every name this scanner resolves is a string, and a
-    number or list default would be a signal that the caller is reading
-    something it should not be.
-    """
+    """`variable "x" { default = "y" }` from infra/variables.tf, as x -> y."""
     text = (repo_root() / "infra" / "variables.tf").read_text()
     out: dict[str, str] = {}
     for header, body, _, _ in blocks(text, r'variable\s+"(\w+)"\s*(?=\{)'):
@@ -172,14 +134,7 @@ def variable_defaults() -> dict[str, str]:
 
 
 def resolve(value: str, variables: dict[str, str]) -> str | None:
-    """Substitute `${var.x}` / `var.x` in a Terraform scalar.
-
-    Returns None when the value still depends on something this scanner cannot
-    resolve — a variable with no default, or a reference to another resource's
-    attribute. Callers must treat None as "unknown", never as a name: silently
-    resolving to a literal `"${var.app_name}"` would let a guard compare a
-    runbook against a string no AWS account ever sees.
-    """
+    """Substitute `${var.x}` / `var.x` in a Terraform scalar."""
     bare = _BARE_VAR.match(value.strip())
     if bare:
         return variables.get(bare.group(1))
