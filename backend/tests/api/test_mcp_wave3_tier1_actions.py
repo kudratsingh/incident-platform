@@ -1,12 +1,5 @@
-"""End-to-end tests for Wave 3 PR E — 4 Tier 1 idempotent actions +
-idempotency dispatch integration.
-
-Covers the memory-called-out PR-E test bar:
-  * Double-fire same idempotency key executes once
-  * Same key + different args → 409-shaped MCP_TOOL_ERROR
-  * Missing idempotency_key → INVALID_PARAMS
-Per-tool happy path is one call per file so the section stays legible.
-"""
+"""End-to-end tests for Wave 3 PR E — 4 Tier 1 idempotent actions + idempotency dispatch
+integration."""
 
 from __future__ import annotations
 
@@ -41,8 +34,6 @@ class _RedisStub:
     def __init__(self) -> None:
         self._store: dict[str, bytes | str] = {}
         # R2-27: a cached replay and a genuine re-execution produce the
-        # same payload, so the payload alone cannot tell them apart. The
-        # side effect can — count the calls that actually reached Redis.
         self.delete_calls: list[tuple[str, ...]] = []
 
     async def get(self, key: str) -> bytes | str | None:
@@ -133,9 +124,7 @@ def _content(body: dict[str, Any]) -> dict[str, Any]:
 
 
 async def _principal_id(db_session: AsyncSession, token: str) -> uuid.UUID:
-    """The service-account id `_token` just minted for. Idempotency
-    records are scoped by (tenant, principal, key), so a test that seeds
-    one by hand has to seed it under the caller's own principal."""
+    """The service-account id `_token` just minted for."""
     prefix = token.split(".", 1)[0]
     sa = (
         await db_session.execute(
@@ -147,22 +136,18 @@ async def _principal_id(db_session: AsyncSession, token: str) -> uuid.UUID:
 
 
 # ---------------------------------------------------------------------------
-# Idempotency semantics — the load-bearing tests
-# ---------------------------------------------------------------------------
 
 
 async def test_idempotency_double_fire_executes_once(
     mcp_client, db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
 ) -> None:
-    """First call executes the tool; second call with the same key +
-    same args returns the cached response without re-running."""
+    """First call executes the tool; second call with the same key + same args returns the
+    cached response without re-running."""
     ac, redis_stub = mcp_client
     token = await _token(
         db_session, default_tenant.id, [Scope.ACTIONS_EXECUTE.value]
     )
     # Pre-set the kill key so the first restart_consumer_group actually
-    # clears it. The second call should NOT re-execute (i.e. it doesn't
-    # need the key to exist any more; the cached response takes over).
     redis_stub._store[kill_key_for("worker-dispatcher")] = "killed"
 
     args = {
@@ -173,10 +158,6 @@ async def test_idempotency_double_fire_executes_once(
     assert first["kill_key_cleared"] is True
 
     # Re-set the kill key. If the second call were to actually execute,
-    # it would clear it again and report `kill_key_cleared=True`. If
-    # the dispatch layer returns the cached response instead, we get
-    # back exactly the first call's payload — and the kill key stays
-    # in Redis.
     redis_stub._store[kill_key_for("worker-dispatcher")] = "killed"
     second = _content(await _call(ac, token, "restart_consumer_group", args))
     assert second == first
@@ -240,8 +221,6 @@ async def test_wrong_scope_forbidden(
 
 
 # ---------------------------------------------------------------------------
-# Per-tool happy paths
-# ---------------------------------------------------------------------------
 
 
 async def test_restart_consumer_group_clears_kill_key(
@@ -270,9 +249,6 @@ async def test_restart_consumer_group_clears_kill_key(
     assert latency_key_for("worker-dispatcher") not in redis_stub._store
 
     # v0.4.9 leak guard: this tool only requires `actions:execute`, so
-    # its response must not name the chaos rig. Spelling out
-    # `chaos:kill:*` / `chaos:latency:*` here once sent an agent
-    # investigating the harness instead of the fault.
     assert "kill_key" not in payload
     assert "latency_key" not in payload
     assert "chaos" not in json.dumps(payload)
@@ -281,9 +257,9 @@ async def test_restart_consumer_group_clears_kill_key(
 async def test_restart_consumer_group_clears_injected_latency_without_kill(
     mcp_client, db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
 ) -> None:
-    """inject_latency (no kill) must be remediable by restart alone —
-    the doc-code contract the chaos help text promises (`restart clears
-    the latency by dropping the consumer's Redis state`)."""
+    """inject_latency (no kill) must be remediable by restart alone — the doc-code contract
+    the chaos help text promises (`restart clears the latency by dropping the consumer's
+    Redis state`)."""
     ac, redis_stub = mcp_client
     redis_stub._store[latency_key_for("worker-dispatcher")] = "2000"
     token = await _token(
@@ -432,15 +408,8 @@ async def test_invalidate_cache_key_refuses_disallowed_prefix(
 async def test_invalidate_cache_key_idempotent_on_missing_key(
     mcp_client, db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
 ) -> None:
-    """First call finds no key -> deleted=False; second call is served
-    from the idempotency cache.
-
-    The payload assertion alone could not prove that. A cached replay and
-    a genuine re-execution both produce `deleted=False` on a missing key,
-    so `second == first` held either way and the test would have passed
-    against a completely broken cache. Counting the invocations that
-    reached Redis is what distinguishes them: exactly one, from the call
-    that actually executed."""
+    """First call finds no key -> deleted=False; second call is served from the idempotency
+    cache."""
     ac, redis_stub = mcp_client
     token = await _token(
         db_session, default_tenant.id, [Scope.ACTIONS_EXECUTE.value]
@@ -458,9 +427,8 @@ async def test_invalidate_cache_key_idempotent_on_missing_key(
 async def test_same_key_different_args_refuses_without_re_executing(
     mcp_client, db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
 ) -> None:
-    """The other half of the same distinction: reusing a key with
-    different arguments must refuse (409-shaped) and must not reach the
-    side effect a second time."""
+    """The other half of the same distinction: reusing a key with different arguments must
+    refuse (409-shaped) and must not reach the side effect a second time."""
     ac, redis_stub = mcp_client
     token = await _token(
         db_session, default_tenant.id, [Scope.ACTIONS_EXECUTE.value]
@@ -483,16 +451,7 @@ async def test_same_key_different_args_refuses_without_re_executing(
 async def test_expired_but_unreaped_record_is_replaced_not_collided_with(
     mcp_client, db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
 ) -> None:
-    """R2-27. `lookup` treated an expired record as absent while the
-    UNIQUE (tenant, principal, key) index went on holding it, so the
-    re-execution's insert collided *after* the action had taken effect.
-    #154 stopped that from being a 500; the action still ran uncached,
-    which meant the next retry re-ran the side effect too.
-
-    The claim takes the expired record over: the call succeeds, the side
-    effect happens exactly once, and the record now holds the fresh
-    response rather than the stale one — so a retry replays instead of
-    re-executing."""
+    """R2-27."""
     ac, redis_stub = mcp_client
     token = await _token(
         db_session, default_tenant.id, [Scope.ACTIONS_EXECUTE.value]
@@ -539,18 +498,15 @@ async def test_expired_but_unreaped_record_is_replaced_not_collided_with(
 
 
 # ---------------------------------------------------------------------------
-# Commit-before-response — SAVEPOINT-per-item contract (#5)
-# ---------------------------------------------------------------------------
 
 
 async def test_replay_dlq_messages_mid_loop_crash_isolates_via_savepoint(
     mcp_client, db_session: AsyncSession, default_tenant, test_user, monkeypatch  # type: ignore[no-untyped-def]
 ) -> None:
-    """Contract lock for #5: a non-AppError raised on job N of a batch
-    must roll back only that item's writes (savepoint), keep the batch
-    going, and return a success shape with `failed=N` — not surface as
-    the tool's `except Exception` handler committing a partial replay
-    behind an 'internal tool error' response."""
+    """Contract lock for #5: a non-AppError raised on job N of a batch must roll back only
+    that item's writes (savepoint), keep the batch going, and return a success shape
+    with `failed=N` — not surface as the tool's `except Exception` handler committing a
+    partial replay behind an 'internal tool error' response."""
     # Three DLQ jobs. Middle one will trigger the injected crash; the
     # other two should complete via savepoint-committed replays.
     jobs = []
@@ -619,13 +575,8 @@ async def test_replay_dlq_messages_mid_loop_crash_isolates_via_savepoint(
 async def test_replay_dlq_by_ids_refuses_a_job_in_a_paused_dag(
     mcp_client, db_session: AsyncSession, default_tenant, test_user  # type: ignore[no-untyped-def]
 ) -> None:
-    """E1-08 through the agent's own surface: `pause_dag` held promotion
-    but every replay tool fired straight into the paused DAG.
-
-    The refusal rides the existing per-item savepoint (a JobError is an
-    AppError, so it is counted as a failed item) — the batch response
-    shape is unchanged, which is what keeps the tool contract frozen.
-    """
+    """E1-08 through the agent's own surface: `pause_dag` held promotion but every replay
+    tool fired straight into the paused DAG."""
     ac, redis_stub = mcp_client
     jobs = []
     for i in range(2):
@@ -675,13 +626,9 @@ async def test_replay_dlq_by_ids_refuses_a_job_in_a_paused_dag(
 async def test_restart_consumer_group_reports_whether_it_knows_the_group(
     mcp_client, db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
 ) -> None:
-    """R2-17: the tool never checked `consumer_group` against anything,
-    so a typo'd name cleared no flags and still answered
-    `accepted: true` — the stalled consumer stayed dead while the agent
-    read success. No hard whitelist (that would refuse a legitimate
-    future group); instead the response says whether the platform
-    recognises the name, so a caller can tell a no-op apart from a
-    restart."""
+    """R2-17: the tool never checked `consumer_group` against anything, so a typo'd name
+    cleared no flags and still answered `accepted: true` — the stalled consumer stayed
+    dead while the agent read success."""
     ac, redis_stub = mcp_client
     token = await _token(
         db_session, default_tenant.id, [Scope.ACTIONS_EXECUTE.value]
@@ -742,10 +689,7 @@ async def test_restart_consumer_group_reports_whether_it_knows_the_group(
 async def test_restart_consumer_group_description_does_not_promise_a_restart(
     mcp_client, db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
 ) -> None:
-    """Contract test: `accepted` means the flags were cleared, not that
-    a consumer came back. The description must say what the platform
-    actually checks, since `group_recognized: false` is the only signal
-    distinguishing a typo from a genuine no-op restart."""
+    """Contract test: `accepted` means the flags were cleared, not that a consumer came back."""
     ac, _ = mcp_client
     token = await _token(
         db_session, default_tenant.id, [Scope.ACTIONS_EXECUTE.value]

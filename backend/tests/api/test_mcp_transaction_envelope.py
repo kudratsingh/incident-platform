@@ -1,30 +1,4 @@
-"""Transaction-envelope contract for `tools/call` (WO-R2-06).
-
-Every one of these tests drives the MCP app through a `get_db`-shaped
-session override — a *fresh* session per request wrapped in
-`async with session.begin()`, exactly like `app.dependencies.get_db` —
-rather than the shared, never-committing `db_session` fixture the rest
-of the MCP suite uses. That difference is the whole point: the defects
-this file pins are about what the request transaction does at teardown
-(commit vs. rollback) and about statements issued after the transaction
-has been closed, neither of which a session that never commits can
-express.
-
-Four contracts:
-
-  1. A tool handler that raises returns a JSON-RPC error envelope *and*
-     leaves a persisted `agent.tool_invoked` row with `outcome=error`.
-     The audit trail is what `evals/guards.py` grades on, so a crashed
-     Tier-1 call that leaves no row reads as "never happened".
-  2. The crashed tool's own writes roll back (savepoint) while that
-     audit row survives — the two must not share a fate.
-  3. An idempotency `store()` collision against the real unique
-     constraint comes back as a JSON-RPC envelope, not a bare HTTP 500,
-     and the success audit row for the action that *did* execute is
-     still committed.
-  4. Anything that escapes dispatch entirely still reaches the client as
-     a JSON-RPC envelope (catch-all handler on the MCP app).
-"""
+"""Transaction-envelope contract for `tools/call` (WO-R2-06)."""
 
 from __future__ import annotations
 
@@ -75,9 +49,6 @@ class _RedisStub:
 
 
 # ---------------------------------------------------------------------------
-# Probe tools — registered per test so the contract doesn't ride on the
-# internals of whichever real tool happens to be convenient today.
-# ---------------------------------------------------------------------------
 
 
 class _CrashIn(BaseModel):
@@ -127,8 +98,6 @@ def _register_probe_tools() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Environment: real per-request transactions over a committing engine.
-# ---------------------------------------------------------------------------
 
 
 class _Env:
@@ -160,8 +129,8 @@ class _Env:
         )
 
     async def audit_rows(self, action: str) -> list[AuditLog]:
-        """Read committed rows through a brand-new session, so nothing
-        the request left pending in its own session can fake a pass."""
+        """Read committed rows through a brand-new session, so nothing the request left
+        pending in its own session can fake a pass."""
         async with self.factory() as session:
             result = await session.execute(
                 select(AuditLog).where(AuditLog.action == action)
@@ -240,10 +209,7 @@ async def env():  # type: ignore[no-untyped-def]
 
 
 def _envelope(resp: Any) -> dict[str, Any]:
-    """Assert the response is a JSON-RPC envelope and return it.
-
-    A bare HTTP 500 fails here with the plain-text body in the message,
-    which is exactly the pre-fix failure we want legible."""
+    """Assert the response is a JSON-RPC envelope and return it."""
     body = resp.text
     try:
         parsed = json.loads(body)
@@ -258,8 +224,6 @@ def _envelope(resp: Any) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# 1 + 2: crash path — envelope out, audit row in, tool's writes gone
-# ---------------------------------------------------------------------------
 
 
 async def test_crashing_tool_returns_envelope_and_persists_error_audit(
@@ -272,7 +236,6 @@ async def test_crashing_tool_returns_envelope_and_persists_error_audit(
     assert body["id"] == "1"
 
     # The row `evals/guards.py` grades on. Before the fix the rollback at
-    # the top of the crash path closed the request transaction, so this
     # write could never be issued and the crashed call read as clean.
     rows = await env.audit_rows("agent.tool_invoked")
     assert len(rows) == 1, "crashed tool left no audit row"
@@ -284,8 +247,8 @@ async def test_crashing_tool_returns_envelope_and_persists_error_audit(
 async def test_crashed_tool_writes_roll_back_but_audit_row_survives(
     env: _Env,
 ) -> None:
-    """The savepoint boundary: the tool's own staged write dies with it,
-    the audit row for the attempt does not."""
+    """The savepoint boundary: the tool's own staged write dies with it, the audit row for
+    the attempt does not."""
     await env.call("envelope_probe_crash", {})
 
     assert await env.audit_rows(PROBE_SIDE_EFFECT_ACTION) == [], (
@@ -294,8 +257,6 @@ async def test_crashed_tool_writes_roll_back_but_audit_row_survives(
     assert len(await env.audit_rows("agent.tool_invoked")) == 1
 
 
-# ---------------------------------------------------------------------------
-# 3: idempotency store() collision against the real unique constraint
 # ---------------------------------------------------------------------------
 
 
@@ -328,19 +289,8 @@ async def _insert_record(
 async def test_expired_key_re_executes_and_returns_an_envelope(
     env: _Env,
 ) -> None:
-    """An expired record must not stop the tool from running, and must
-    not blow up the call either.
-
-    This used to be the collision case: `lookup` read past the expired
-    row while `uq_idempotency_scope` went on holding it, so the
-    re-execution's `store()` raised `IntegrityError` from the real
-    database, and #154's savepoint was what kept the response an
-    envelope. Since R2-27 the claim evicts the expired holder up front,
-    so there is no collision left to survive — but the caller-visible
-    contract is unchanged and still worth pinning: the action executes,
-    the answer is a JSON-RPC envelope, and the success audit row is
-    committed.
-    """
+    """An expired record must not stop the tool from running, and must not blow up the call
+    either."""
     args = {"idempotency_key": "expired-k-1"}
     await _insert_record(
         env,
@@ -366,17 +316,8 @@ async def test_expired_key_re_executes_and_returns_an_envelope(
 async def test_duplicate_call_returns_the_recorded_outcome(
     env: _Env,
 ) -> None:
-    """One answer per key: a duplicate call returns the recorded response
-    rather than its own freshly computed one.
-
-    The intent is #154's; the mechanism moved. That test had to
-    monkeypatch `lookup` into missing once, because the loser was only
-    stopped at `store()` — after it had already run the action. R2-27
-    stops it at the claim instead, so the race no longer needs
-    simulating: a live record simply means the key is taken, and the
-    caller never reaches the handler. That the assertion now holds
-    without the mock is the fix.
-    """
+    """One answer per key: a duplicate call returns the recorded response rather than its
+    own freshly computed one."""
     args = {"idempotency_key": "inflight-k-1"}
     await _insert_record(
         env,
@@ -401,8 +342,6 @@ async def test_duplicate_call_returns_the_recorded_outcome(
     assert rows[0].extra_data["outcome"] == "success"
 
 
-# ---------------------------------------------------------------------------
-# 4: nothing escapes as a non-JSON-RPC 500
 # ---------------------------------------------------------------------------
 
 
