@@ -92,7 +92,11 @@ def read_pool_stats(pool: Any) -> tuple[PoolStats | None, str | None]:
         stats = PoolStats(
             size=int(size()),
             checked_out=int(checked_out()),
-            overflow=int(overflow()),
+            # `QueuePool.overflow()` starts at `-pool_size` and counts connections *ever
+            # created* minus that size, so it is negative until the pool has filled once:
+            # a fresh pool answers -5, which under the name "overflow" reads as a number
+            # five below zero rather than as "none". Clamped, and the field says so.
+            overflow=max(0, int(overflow())),
             max_overflow=_max_overflow(pool),
             wait_timeouts_1m=pool_wait_timeouts_in_window(),
         )

@@ -103,7 +103,9 @@ async def _read(engine: AsyncEngine) -> PostgresHealthOutput:
 
 async def test_the_pool_numbers_are_real_on_a_queue_pool(engine: AsyncEngine) -> None:
     """Non-null, and interpretable: a checked-out count with no ceiling beside it cannot
-    be read."""
+    be read. The 1 is this call's own connection — a session checks one out lazily, on its
+    first statement, so a reading taken before the ping counts the pool as empty (CI found
+    exactly that: `pool_checked_out: 0` against a live Postgres)."""
     out = await _read(engine)
 
     assert out.ok is True
@@ -111,10 +113,27 @@ async def test_the_pool_numbers_are_real_on_a_queue_pool(engine: AsyncEngine) ->
     assert out.pool_stats_unknown_reason is None
     assert out.pool_size == 5
     assert out.pool_max_overflow == 3
-    assert out.pool_checked_out is not None and out.pool_checked_out >= 1
-    assert out.pool_overflow is not None
+    assert out.pool_checked_out is not None and out.pool_checked_out >= 1, (
+        "the reading missed the connection the call itself was holding"
+    )
+    assert out.pool_overflow == 0, "an unfilled pool has no overflow, and 0 says so"
     assert out.pool_wait_timeouts_1m == 0, "nothing waited, which is a measurement"
     assert out.active_connections is not None and out.active_connections >= 1
+
+
+async def test_held_connections_raise_the_checked_out_count(engine: AsyncEngine) -> None:
+    """The number has to move, or it is furniture: two connections held on the same pool
+    read back above the baseline that the call's own connection sets."""
+    baseline = await _read(engine)
+    assert baseline.pool_checked_out is not None
+
+    async with engine.connect(), engine.connect():
+        held = await _read(engine)
+
+    assert held.pool_checked_out is not None
+    assert held.pool_checked_out >= baseline.pool_checked_out + 2, (
+        "connections held elsewhere in this process did not show up in the reading"
+    )
 
 
 async def test_a_quiet_database_reports_no_slow_queries(engine: AsyncEngine) -> None:

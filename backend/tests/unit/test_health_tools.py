@@ -37,7 +37,11 @@ from app.mcp.tools.health import (
     get_postgres_health,
 )
 from sqlalchemy.exc import TimeoutError as SATimeoutError
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.ext.asyncio import (
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 from sqlalchemy.pool import StaticPool
 
 
@@ -168,6 +172,54 @@ def test_read_pool_stats_reports_a_queue_pool_and_no_reason() -> None:
         2,
         10,
     )
+
+
+def test_a_pool_that_has_never_filled_reports_no_overflow_rather_than_a_negative() -> None:
+    """`QueuePool.overflow()` starts at `-pool_size` and counts connections ever created
+    minus that size, so a fresh pool answers -5. Under the name "overflow" that reads as
+    five below zero instead of "none" — CI caught it on a live Postgres."""
+
+    class _FreshPool:
+        _max_overflow = 3
+
+        def size(self) -> int:
+            return 5
+
+        def checkedout(self) -> int:
+            return 0
+
+        def overflow(self) -> int:
+            return -5
+
+    stats, reason = read_pool_stats(_FreshPool())
+
+    assert reason is None
+    assert stats is not None
+    assert stats.overflow == 0
+
+
+async def test_the_reading_counts_the_connection_the_call_itself_holds() -> None:
+    """A session checks a connection out lazily, on its first statement, so a reading
+    taken before the ping counts the pool as empty. That shipped once and CI found it:
+    `pool_checked_out: 0` against a live Postgres while the call held a connection."""
+    engine = create_async_engine(
+        "sqlite+aiosqlite://", poolclass=CountingQueuePool, pool_size=5, max_overflow=2
+    )
+    try:
+        factory = async_sessionmaker(engine, expire_on_commit=False)
+        async with factory() as session:
+            async with session.begin():
+                definition = get_tool("get_postgres_health")
+                assert definition is not None
+                out = await get_postgres_health(definition.input_model(), _ctx(session))
+    finally:
+        await engine.dispose()
+
+    assert out.pool_stats_unknown_reason is None
+    assert out.pool_checked_out == 1, "the reading missed its own connection"
+    assert out.pool_overflow == 0
+    assert out.pool_size == 5
+    assert out.pool_max_overflow == 2
 
 
 def test_read_pool_stats_refuses_a_pool_that_reports_nothing() -> None:

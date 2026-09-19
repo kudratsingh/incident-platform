@@ -142,14 +142,17 @@ class PostgresHealthOutput(BaseModel):
     pool_checked_out: int | None = Field(
         default=None,
         description="Connections in use right now, in the pool of the process that "
-        "answered this call. Read it against `pool_size` and `pool_max_overflow`: on "
-        "its own a number here says nothing. `null` means unknown, never idle.",
+        "answered this call — **including the one this call is holding**, so on an "
+        "otherwise idle process it reads 1 rather than 0. Read it against `pool_size` "
+        "and `pool_max_overflow`: on its own a number here says nothing. `null` means "
+        "unknown, never idle.",
     )
     pool_overflow: int | None = Field(
         default=None,
         description="Connections currently open beyond `pool_size`, in the pool of the "
-        "process that answered this call. At `pool_max_overflow` the pool is full and "
-        "the next caller waits. `null` means unknown.",
+        "process that answered this call. 0 until the pool is full, then climbing to "
+        "`pool_max_overflow`, at which point the next caller waits. `null` means "
+        "unknown.",
     )
     pool_max_overflow: int | None = Field(
         default=None,
@@ -260,12 +263,6 @@ async def get_postgres_health(
     dialect = "unknown"
     healthy: PostgresHealthOutput | None = None
 
-    # The pool is read outside the savepoint: it is in-process state, so a database that
-    # is refusing statements does not make it unknown.
-    pool_stats, pool_unknown = read_pool_stats(
-        getattr(ctx.db.bind, "pool", None) if ctx.db.bind is not None else None
-    )
-
     # SAVEPOINT around the probe: `ok=false` is a report, not a licence to leave the
     # session wrecked. Before R2-59 an unhealthy probe aborted the Postgres
     # transaction, taking this call's own audit row with it.
@@ -324,8 +321,18 @@ async def get_postgres_health(
             active_queries_over_slow_threshold=over_threshold,
             slow_query_threshold_ms=SLOW_QUERY_THRESHOLD_MS,
             query_stats_unknown_reason=query_unknown,
-            **_pool_fields(pool_stats, pool_unknown),
         )
+
+    # Read the pool AFTER the probe, never before it: a session checks a connection out
+    # lazily, on its first statement, so a reading taken at the top of this handler counts
+    # the pool as empty and misses this call's own connection (CI caught exactly that —
+    # `pool_checked_out: 0` on a live Postgres). It stays outside the SAVEPOINT because it
+    # is in-process state: a database refusing statements must not make pool use unknown.
+    pool_stats, pool_unknown = read_pool_stats(
+        getattr(ctx.db.bind, "pool", None) if ctx.db.bind is not None else None
+    )
+    if healthy is not None and not probe.failed:
+        healthy = healthy.model_copy(update=_pool_fields(pool_stats, pool_unknown))
 
     if probe.failed or healthy is None:
         return PostgresHealthOutput(
