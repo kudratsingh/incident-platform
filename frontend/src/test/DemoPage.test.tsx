@@ -633,7 +633,7 @@ describe('DemoPage — the agent panel is the middle of the page', () => {
     renderDemo()
     const meter = await screen.findByTestId('budget-meter')
     expect(meter.textContent).toContain('7')
-    expect(meter.textContent).toContain('/ 13')
+    expect(meter.textContent).toContain('/13')
     expect(meter.textContent).toContain('4210 tokens')
     expect(meter.textContent).toContain('$0.4200')
   })
@@ -696,7 +696,9 @@ describe('DemoPage — the action ledger', () => {
     step(3, 'report', 'report_agent_run', '2026-09-19T10:02:01Z'),
   ]
 
-  it('is one row per step, newest first, with a kind badge each', async () => {
+  it('is one row per step, oldest first with the newest at the bottom', async () => {
+    // WO-R3-334 turned the ledger round: a live run's newest call is where the eye
+    // already is, so the panel reads like a transcript and follows the bottom.
     stub({ runs: [agentRun()], steps, audit: [RESET_ROW, FAULT_ROW] })
     renderDemo()
     await screen.findByTestId('action-ledger')
@@ -704,7 +706,21 @@ describe('DemoPage — the action ledger', () => {
       expect(screen.getAllByTestId('ledger-entry').length).toBeGreaterThanOrEqual(4)
     })
     const kinds = screen.getAllByTestId('ledger-entry').map((e) => e.dataset.kind)
-    expect(kinds.slice(0, 4)).toEqual(['report', 'action', 'read', 'lab'])
+    expect(kinds.slice(-4)).toEqual(['lab', 'read', 'action', 'report'])
+  })
+
+  it('summarises what a read answered on its one line', async () => {
+    stub({ runs: [agentRun()], steps, audit: [FAULT_ROW] })
+    renderDemo()
+    await screen.findByTestId('action-ledger')
+    await waitFor(() => {
+      expect(screen.getAllByTestId('ledger-entry').length).toBeGreaterThan(0)
+    })
+    const read = screen
+      .getAllByTestId('ledger-entry')
+      .find((e) => e.dataset.kind === 'read')
+    expect(read?.textContent).toMatch(/get_consumer_lag/)
+    expect(read?.textContent).toMatch(/→ lag 42, known/)
   })
 
   it('carries the result the audit log does not have, behind one click', async () => {
@@ -716,8 +732,28 @@ describe('DemoPage — the action ledger', () => {
       expect(screen.getAllByTestId('ledger-entry').length).toBeGreaterThan(0)
     })
     expect(screen.queryByTestId('ledger-result')).toBeNull()
-    await user.click(screen.getByRole('button', { name: 'result' }))
+    const read = screen
+      .getAllByTestId('ledger-entry')
+      .find((e) => e.dataset.kind === 'read')
+    await user.click(within(read as HTMLElement).getByRole('button'))
     expect(screen.getByTestId('ledger-result').textContent).toMatch(/lag 42 on worker/)
+  })
+
+  it('never collapses an ACTION row — the action is the point', async () => {
+    stub({ runs: [agentRun()], steps, audit: [FAULT_ROW] })
+    renderDemo()
+    await screen.findByTestId('action-ledger')
+    await waitFor(() => {
+      expect(
+        screen.getAllByTestId('ledger-entry').some((e) => e.dataset.kind === 'action'),
+      ).toBe(true)
+    })
+    const action = screen
+      .getAllByTestId('ledger-entry')
+      .find((e) => e.dataset.kind === 'action')
+    // Its arguments and its latency are on screen with nothing clicked.
+    expect(action?.textContent).toMatch(/worker-dispatcher/)
+    expect(action?.textContent).toMatch(/18 ms/)
   })
 
   it('draws the reset as a divider rather than as an event', async () => {
@@ -1035,6 +1071,24 @@ describe('DemoPage — the briefing', () => {
     )
   })
 
+  it('says why a run that never acted has no attribution', async () => {
+    // The third take's `plan`, `verification` and `attribution` were all null and
+    // all three were correct: the agent handed off without acting. "None recorded"
+    // reads as a gap in the record; this reads as the consequence it is.
+    const neverActed = agentRun({
+      state: 'escalated',
+      briefing: { ...briefing, final_state: 'escalated', attempted_action: null, attribution: null },
+      finished_at: '2026-09-19T10:05:00Z',
+      active: false,
+    })
+    stub({ runs: [neverActed], detail: neverActed })
+    renderDemo()
+    await screen.findByTestId('briefing-card')
+    expect(screen.getByTestId('briefing-attribution').textContent).toMatch(
+      /no attribution because no action/i,
+    )
+  })
+
   it('copies itself as Markdown, attribution and verdict included', async () => {
     const user = userEvent.setup()
     const writeText = vi.fn<(text: string) => Promise<void>>().mockResolvedValue(undefined)
@@ -1098,5 +1152,409 @@ describe('DemoPage — the DLQ table', () => {
     await waitFor(() => {
       expect(screen.getByText(/No dead-letter rows right now/i)).toBeTruthy()
     })
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WO-R3-334 — the page reads ONE take.
+//
+// The owner recorded the third take, the runner wound the world down, and the page
+// was reloaded two minutes later. The screenshot showed a header saying "no run in
+// this take yet", a PLATFORM row saying `healthy · since the reset`, an AGENT row
+// saying `escalated`, three blue action markers for calls the evaluator's guard
+// probes had made, and a ledger claiming 89 calls against 0 steps. Every number was
+// true of some moment; none of them were true of the same one.
+//
+// The rows below are that screenshot's shape:
+//
+//   09:59  boundary          ← the take opens
+//   10:00  kill_consumer     ← the lab's fault
+//   10:01  the run starts … escalates at 10:03
+//   10:04  boundary          ← the wind-down closes the take
+//   10:05  lab.probe + a call by the runner's principal
+// ─────────────────────────────────────────────────────────────────────────────
+
+const OPEN_BOUNDARY = auditRow({
+  action: 'lab.world_reset',
+  created_at: '2026-09-19T09:59:00Z',
+  extra_data: { chaos_keys_cleared: 4 },
+})
+const CLOSE_BOUNDARY = auditRow({
+  action: 'lab.world_reset',
+  created_at: '2026-09-19T10:04:00Z',
+  extra_data: { chaos_keys_cleared: 6 },
+})
+/** The evaluator's own read, labelled by the lab because it wears the agent's token. */
+const LAB_PROBE_ROW = auditRow({
+  action: 'lab.probe',
+  created_at: '2026-09-19T10:05:00Z',
+  extra_data: { tool_name: 'mark_dlq_permanent', arguments: {}, outcome: 'error' },
+})
+/** A call by the demo runner's own principal, after the boundary. */
+const RUNNER_ROW = auditRow({
+  action: 'agent.tool_invoked',
+  principal_id: 'sa-runner',
+  created_at: '2026-09-19T10:05:10Z',
+  extra_data: { tool_name: 'mark_dlq_permanent', arguments: {}, outcome: 'success' },
+})
+
+const WIND_DOWN_ROWS = [
+  OPEN_BOUNDARY,
+  FAULT_ROW,
+  toolRow('agent.tool_invoked', 'get_consumer_lag', '2026-09-19T10:01:30Z'),
+  CLOSE_BOUNDARY,
+  LAB_PROBE_ROW,
+  RUNNER_ROW,
+]
+
+const CLOSED_RUN = agentRun({
+  id: 'run-take-3',
+  state: 'escalated',
+  phase_history: [
+    { state: 'triage', at: '2026-09-19T10:01:00Z' },
+    { state: 'investigating', at: '2026-09-19T10:01:00Z' },
+    { state: 'escalated', at: '2026-09-19T10:01:00Z' },
+  ],
+  started_at: '2026-09-19T10:01:00Z',
+  finished_at: '2026-09-19T10:03:00Z',
+  active: false,
+})
+
+describe('DemoPage — one take, chosen by the run', () => {
+  it('shows the run’s own take after the wind-down, and says the take ended', async () => {
+    stub({ runs: [CLOSED_RUN], detail: CLOSED_RUN, audit: WIND_DOWN_ROWS })
+    renderDemo()
+    await screen.findByTestId('phase-row-platform')
+    await waitFor(() => {
+      expect(screen.getByTestId('take-label').textContent).toMatch(/take ended at/)
+    })
+    // The reading the screenshot could not give: the platform saw the fault of the
+    // take the agent's `escalated` belongs to.
+    expect(stationState('fault_injected')).not.toBe('pending')
+    expect(screen.getByTestId('fault-clock').textContent).toMatch(/T\+/)
+    expect(screen.getByTestId('fault-clock').textContent).toMatch(/stopped at the take/)
+    expect((screen.getByTestId('run-selector') as HTMLSelectElement).value).toBe('run-take-3')
+  })
+
+  it('leaves the next take’s rows out of this take’s ledger', async () => {
+    // The seven bogus "agent" rows of finding F4: the evaluator's probes and the
+    // world audit, written AFTER the boundary, which the page read as a new run.
+    stub({ runs: [CLOSED_RUN], detail: CLOSED_RUN, audit: WIND_DOWN_ROWS })
+    renderDemo()
+    await screen.findByTestId('action-ledger')
+    await waitFor(() => {
+      expect(screen.getAllByTestId('ledger-entry').length).toBeGreaterThan(0)
+    })
+    expect(screen.getByTestId('action-ledger').textContent).not.toMatch(/mark_dlq_permanent/)
+    // Both edges of the take are drawn, so it is clear where it begins and ends.
+    expect(screen.getAllByTestId('ledger-reset-divider')).toHaveLength(2)
+  })
+
+  it('marks no agent action for a take where the agent never acted', async () => {
+    stub({ runs: [CLOSED_RUN], detail: CLOSED_RUN, audit: WIND_DOWN_ROWS })
+    renderDemo()
+    await screen.findByTestId('metric-chart-lag')
+    await waitFor(() => {
+      expect(screen.getAllByTestId('chart-marker-fault').length).toBe(1)
+    })
+    expect(screen.queryAllByTestId('chart-marker-action')).toHaveLength(0)
+    expect(screen.getAllByTestId('chart-marker-reset')).toHaveLength(2)
+  })
+
+  it('honours ?run= and reads that run’s take', async () => {
+    const liveRun = agentRun({ id: 'run-live', started_at: '2026-09-19T10:06:00Z' })
+    stub({ runs: [CLOSED_RUN, liveRun], detail: liveRun, audit: WIND_DOWN_ROWS })
+    renderDemo('?run=run-live')
+    await screen.findByTestId('run-selector')
+    await waitFor(() => {
+      expect(screen.getByTestId('take-label').textContent).toMatch(/live/)
+    })
+    expect(getAgentRun).toHaveBeenCalledWith('run-live')
+  })
+})
+
+describe('DemoPage — a late report reads as late', () => {
+  const runId = 'run-late'
+  function reportRow(state: string, at: string): AuditLog {
+    return auditRow({
+      action: 'agent.run_reported',
+      created_at: at,
+      extra_data: { tool_name: 'report_agent_run', arguments: { run_id: runId, state } },
+    })
+  }
+  const late = agentRun({
+    id: runId,
+    state: 'investigating',
+    phase_history: [
+      { state: 'triage', at: '2026-09-19T10:01:00Z' },
+      { state: 'investigating', at: '2026-09-19T10:01:00Z' },
+    ],
+  })
+
+  it('shows when the report arrived, beside when the event happened', async () => {
+    // F2: `phase_history` was three entries stamped 08:17:59 with 76 ms / 9 ms / 0 ms
+    // of duration, and the whole burst reached the platform 41 seconds later.
+    stub({
+      runs: [late],
+      detail: late,
+      audit: [
+        RESET_ROW,
+        FAULT_ROW,
+        reportRow('triage', '2026-09-19T10:01:41Z'),
+        reportRow('investigating', '2026-09-19T10:01:41Z'),
+      ],
+    })
+    renderDemo()
+    await screen.findByTestId('phase-row-agent')
+    await waitFor(() => {
+      expect(screen.getByTestId('station-triage-reported')).toBeTruthy()
+    })
+    expect(screen.getByTestId('station-triage-reported').textContent).toMatch(/reported /)
+  })
+
+  it('says nothing about a report that arrived when it happened', async () => {
+    stub({
+      runs: [late],
+      detail: late,
+      audit: [RESET_ROW, FAULT_ROW, reportRow('triage', '2026-09-19T10:01:01Z')],
+    })
+    renderDemo()
+    await screen.findByTestId('phase-row-agent')
+    await waitFor(() => {
+      expect(stationState('triage')).not.toBe('pending')
+    })
+    expect(screen.queryByTestId('station-triage-reported')).toBeNull()
+  })
+
+  it('advances one station at a time when a burst of reports lands at once', async () => {
+    vi.useFakeTimers()
+    const first = agentRun({
+      state: 'triage',
+      phase_history: [{ state: 'triage', at: '2026-09-19T10:01:00Z' }],
+    })
+    const burst = agentRun({
+      state: 'escalated',
+      phase_history: [
+        { state: 'triage', at: '2026-09-19T10:01:00Z' },
+        { state: 'investigating', at: '2026-09-19T10:01:01Z' },
+        { state: 'planning', at: '2026-09-19T10:01:02Z' },
+        { state: 'escalated', at: '2026-09-19T10:01:03Z' },
+      ],
+      finished_at: '2026-09-19T10:01:03Z',
+      active: false,
+    })
+    stub({ runs: [first], detail: first, audit: [RESET_ROW, FAULT_ROW] })
+    listAgentRuns.mockResolvedValueOnce(page([first])).mockResolvedValue(page([burst]))
+    getAgentRun.mockResolvedValueOnce(first).mockResolvedValue(burst)
+
+    renderDemo()
+    await vi.waitFor(() => {
+      expect(stationState('triage')).toBe('current')
+    })
+    // The burst arrives on the next poll: three more stations in one answer.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2100)
+    })
+    expect(stationState('investigating')).toBe('pending')
+
+    // One station per tick, in order, rather than four in one frame. Each advance is
+    // one reveal step: the next station's timer is set by the render the previous one
+    // caused, so a single long advance would only prove that they all arrive.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(350)
+    })
+    expect(stationState('investigating')).toBe('current')
+    expect(stationState('planning')).toBe('pending')
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(300)
+    })
+    expect(stationState('planning')).toBe('current')
+    expect(stationState('terminal')).toBe('pending')
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(300)
+    })
+    expect(stationState('planning')).toBe('passed')
+    expect(stationState('terminal')).toBe('current')
+  })
+})
+
+describe('DemoPage — the ledger hides what is not this run’s', () => {
+  const rows = [
+    RESET_ROW,
+    FAULT_ROW,
+    toolRow('agent.tool_invoked', 'get_consumer_lag', '2026-09-19T10:01:00Z'),
+    auditRow({
+      action: 'agent.tool_invoked',
+      principal_id: 'sa-runner',
+      created_at: '2026-09-19T10:01:03Z',
+      extra_data: { tool_name: 'get_consumer_lag', arguments: {}, outcome: 'success' },
+    }),
+    auditRow({
+      action: 'lab.probe',
+      created_at: '2026-09-19T10:01:06Z',
+      extra_data: { tool_name: 'list_dlq_messages', arguments: {}, outcome: 'success' },
+    }),
+  ]
+
+  it('counts the hidden reads and leaves them out of the comparison', async () => {
+    stub({ runs: [agentRun()], steps: [], audit: rows })
+    renderDemo()
+    await screen.findByTestId('action-ledger')
+    await waitFor(() => {
+      expect(screen.getByTestId('ledger-hidden-reads')).toBeTruthy()
+    })
+    expect(screen.getByTestId('ledger-hidden-reads').textContent).toMatch(
+      /2 evaluator\/traffic reads hidden/,
+    )
+    // One call by this run's own principal, not three.
+    expect(screen.getByTestId('ledger-counts').textContent).toMatch(
+      /1 calls the platform recorded/,
+    )
+  })
+
+  it('shows them, each labelled for whose they are, on the toggle', async () => {
+    const user = userEvent.setup()
+    stub({ runs: [agentRun()], steps: [], audit: rows })
+    renderDemo()
+    await screen.findByTestId('action-ledger')
+    await waitFor(() => {
+      expect(screen.getAllByTestId('ledger-entry').length).toBeGreaterThan(0)
+    })
+    expect(
+      screen.getAllByTestId('ledger-entry').some((e) => e.dataset.kind === 'lab_probe'),
+    ).toBe(false)
+
+    await user.click(screen.getByTestId('hidden-reads-toggle'))
+    await waitFor(() => {
+      expect(
+        screen.getAllByTestId('ledger-entry').some((e) => e.dataset.kind === 'lab_probe'),
+      ).toBe(true)
+    })
+    const kinds = screen.getAllByTestId('ledger-entry').map((e) => e.dataset.kind)
+    expect(kinds).toContain('other_principal')
+    expect(screen.getByTestId('action-ledger').textContent).toMatch(/NOT THIS RUN/)
+  })
+})
+
+describe('DemoPage — the chart reads the take', () => {
+  it('zooms to the take and back out to the platform’s whole window', async () => {
+    const user = userEvent.setup()
+    stub({
+      runs: [agentRun()],
+      audit: [
+        RESET_ROW,
+        auditRow({
+          action: 'chaos.tool_invoked',
+          created_at: ago(4),
+          extra_data: { tool_name: 'kill_consumer', arguments: {} },
+        }),
+      ],
+      samples: [
+        { lag: 30, measured_at: ago(0.5) },
+        { lag: 10, measured_at: ago(2) },
+      ],
+      lag: 30,
+    })
+    renderDemo()
+    const chart = await screen.findByTestId('metric-chart-lag')
+    // Fault − 2 min → now: six minutes, not fifteen.
+    await waitFor(() => {
+      expect(chart.textContent).toMatch(/−6 min/)
+    })
+    await user.click(screen.getByTestId('metric-chart-lag-zoom'))
+    await waitFor(() => {
+      expect(chart.textContent).toMatch(/−15 min/)
+    })
+  })
+
+  it('draws a cursor on the right edge with the newest reading on it', async () => {
+    stub({ lag: 30, samples: [{ lag: 30, measured_at: ago(0.5) }] })
+    renderDemo()
+    await screen.findByTestId('metric-chart-lag')
+    await waitFor(() => {
+      expect(screen.getByTestId('metric-chart-lag-cursor').textContent).toBe('30')
+    })
+  })
+})
+
+describe('DemoPage — the agent panel after the third take', () => {
+  const longReasoning =
+    'lag climbed from 0 to 30 on worker-dispatcher and no member is assigned to the group, ' +
+    'which is what a killed consumer looks like from the outside; the DLQ is empty and every ' +
+    'breaker is closed, so nothing downstream explains it.'
+
+  it('shows the top hypothesis whole and truncates the rest', async () => {
+    const run = agentRun({
+      hypotheses: [
+        {
+          name: 'dispatcher consumer is down',
+          category: 'consumer_failure',
+          confidence: 0.82,
+          reasoning_excerpt: longReasoning,
+        },
+        {
+          name: 'slow downstream',
+          category: 'dependency',
+          confidence: 0.2,
+          reasoning_excerpt: longReasoning,
+        },
+      ],
+    })
+    stub({ runs: [run], detail: run })
+    renderDemo()
+    await screen.findByTestId('agent-panel')
+    await waitFor(() => {
+      expect(screen.getAllByTestId('hypothesis-row')).toHaveLength(2)
+    })
+    const [top, second] = screen.getAllByTestId('hypothesis-row')
+    // The screenshot truncated the top one with "more…", which hid the only
+    // explanation of why the agent believed what it believed.
+    expect(top.textContent).toContain('nothing downstream explains it.')
+    expect(within(top).queryByRole('button', { name: /more/i })).toBeNull()
+    expect(second.textContent).not.toContain('nothing downstream explains it.')
+    expect(within(second).getByRole('button', { name: /more/i })).toBeTruthy()
+  })
+
+  it('draws the remediate threshold on the confidence bar', async () => {
+    const run = agentRun({
+      hypotheses: [{ name: 'consumer down', category: 'consumer_failure', confidence: 0.82 }],
+    })
+    stub({ runs: [run], detail: run })
+    renderDemo()
+    await screen.findByTestId('agent-panel')
+    await waitFor(() => {
+      expect(screen.getAllByTestId('confidence-threshold-tick').length).toBe(1)
+    })
+  })
+
+  it('says plainly why a terminal run has no plan and no verification', async () => {
+    const escalated = agentRun({
+      state: 'escalated',
+      finished_at: '2026-09-19T10:03:00Z',
+      active: false,
+    })
+    stub({ runs: [escalated], detail: escalated })
+    renderDemo()
+    await screen.findByTestId('agent-panel')
+    await waitFor(() => {
+      expect(screen.getByTestId('plan-empty').textContent).toMatch(
+        /handed off without acting/,
+      )
+    })
+    expect(screen.getByTestId('verifications-empty').textContent).toMatch(
+      /no verification because no action/i,
+    )
+  })
+
+  it('still says "not yet" while the run is live', async () => {
+    stub({ runs: [agentRun()] })
+    renderDemo()
+    await screen.findByTestId('agent-panel')
+    await waitFor(() => {
+      expect(screen.getByTestId('plan-empty').textContent).toMatch(/No action planned yet/)
+    })
+    expect(screen.getByTestId('verifications-empty').textContent).toMatch(/Nothing verified yet/)
   })
 })

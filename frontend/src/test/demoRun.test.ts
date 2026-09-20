@@ -28,9 +28,12 @@ import {
   dlqDecisionFromSteps,
   hypothesesSource,
   ledgerCounts,
+  ledgerExclusions,
   mergeSteps,
   rankedHypotheses,
   runVerifications,
+  summariseResult,
+  summariseStep,
 } from '../utils/demoRun'
 import { WORLD_RESET_ACTION } from '../utils/demoPhase'
 import type {
@@ -334,6 +337,7 @@ describe('buildLedger — the run’s own actions, with the lab interleaved', ()
       calls: 2,
       auditCalls: 2,
       labRows: 1,
+      hiddenReads: 0,
       agreed: true,
     })
     // One witness ahead of the other is the interesting case: the platform saw
@@ -398,5 +402,192 @@ describe('dlqDecisionFromSteps — the badge, from the steps rather than the aud
       }),
     ]
     expect(dlqDecisionFromSteps(job(), steps)).toBe('leave')
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WO-R3-334 — whose call was it, and what did it answer?
+//
+// The third take's ledger said "0 steps reported · 89 calls the platform recorded —
+// the two do not agree" over a run that made four calls. The 89 were real calls the
+// platform really served, and almost none of them were the agent's: the demo runner
+// built two of its clients with the AGENT's token and read lag every three seconds
+// (F3), and the evaluator's principal-guard probes fired seven more after the reset
+// boundary (F4). Both are now excluded, counted and shown behind a toggle.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const RUN_SA = 'sa-1'
+const RUNNER_SA = 'sa-runner'
+
+/** A read the demo runner took under the agent's token (F3). */
+function runnerRead(at: string): AuditLog {
+  return auditRow({
+    action: 'agent.tool_invoked',
+    principal_id: RUNNER_SA,
+    created_at: at,
+    extra_data: { tool_name: 'get_consumer_lag', arguments: {}, outcome: 'success' },
+  })
+}
+
+/** A read the evaluator took under the agent's token and labelled itself (WO-R3-333). */
+function labProbe(at: string): AuditLog {
+  return auditRow({
+    action: 'lab.probe',
+    principal_id: RUN_SA,
+    created_at: at,
+    extra_data: { tool_name: 'mark_dlq_permanent', arguments: {}, outcome: 'error' },
+  })
+}
+
+describe('the ledger hides what is not this run’s, and says how much', () => {
+  const mine = toolRow('agent.tool_invoked', 'get_consumer_lag', '2026-09-19T10:01:00Z')
+
+  it('counts the lab’s probes and the other principals’ reads', () => {
+    const audit = [mine, runnerRead('2026-09-19T10:01:03Z'), labProbe('2026-09-19T10:01:06Z')]
+    expect(ledgerExclusions({ audit, runPrincipalId: RUN_SA })).toEqual({
+      labProbe: 1,
+      otherPrincipal: 1,
+      total: 2,
+    })
+  })
+
+  it('counts a lab probe even with no run to compare principals against', () => {
+    // The lab labels its own reads, so that one needs no principal to be sure of.
+    const audit = [runnerRead('2026-09-19T10:01:03Z'), labProbe('2026-09-19T10:01:06Z')]
+    expect(ledgerExclusions({ audit })).toEqual({
+      labProbe: 1,
+      otherPrincipal: 0,
+      total: 1,
+    })
+  })
+
+  it('leaves both out of the rows by default', () => {
+    const ledger = buildLedger({
+      steps: [],
+      audit: [mine, runnerRead('2026-09-19T10:01:03Z'), labProbe('2026-09-19T10:01:06Z')],
+      runPrincipalId: RUN_SA,
+    })
+    expect(ledger.map((e) => e.kind)).toEqual(['agent_audit'])
+  })
+
+  it('shows them, each named for what it is, on the toggle', () => {
+    const ledger = buildLedger({
+      steps: [],
+      audit: [mine, runnerRead('2026-09-19T10:01:03Z'), labProbe('2026-09-19T10:01:06Z')],
+      runPrincipalId: RUN_SA,
+      showHiddenReads: true,
+    })
+    expect(ledger.map((e) => e.kind)).toEqual(['lab_probe', 'other_principal', 'agent_audit'])
+  })
+
+  it('counts only this run’s own calls as what the platform recorded', () => {
+    const counts = ledgerCounts({
+      steps: [step(1, 'read', 'get_consumer_lag', '2026-09-19T10:01:00Z')],
+      audit: [
+        mine,
+        runnerRead('2026-09-19T10:01:03Z'),
+        runnerRead('2026-09-19T10:01:06Z'),
+        labProbe('2026-09-19T10:01:09Z'),
+      ],
+      runPrincipalId: RUN_SA,
+    })
+    // One step, one call by this run: the two witnesses agree, which they could not
+    // be said to do while the runner's reads were in the comparison.
+    expect(counts.auditCalls).toBe(1)
+    expect(counts.agreed).toBe(true)
+    expect(counts.hiddenReads).toBe(3)
+  })
+
+  it('never draws the same call twice when the steps carry it', () => {
+    const steps = [step(1, 'read', 'get_consumer_lag', '2026-09-19T10:01:00Z')]
+    const ledger = buildLedger({ steps, audit: [mine], runPrincipalId: RUN_SA })
+    expect(ledger.map((e) => e.kind)).toEqual(['step'])
+  })
+})
+
+describe('buildLedger — newest at the bottom when the page asks for it', () => {
+  const steps = [
+    step(1, 'read', 'get_consumer_lag', '2026-09-19T10:01:00Z'),
+    step(2, 'action', 'restart_consumer_group', '2026-09-19T10:02:00Z'),
+  ]
+
+  it('reverses into a transcript without changing what is in it', () => {
+    const newestFirst = buildLedger({ steps, audit: [] })
+    const oldestFirst = buildLedger({ steps, audit: [], oldestFirst: true })
+    expect(newestFirst.map((e) => e.step?.seq)).toEqual([2, 1])
+    expect(oldestFirst.map((e) => e.step?.seq)).toEqual([1, 2])
+  })
+})
+
+describe('summariseResult — one line that says what came back', () => {
+  it('reads a lag from prose or from JSON, and says when it is unknown', () => {
+    expect(summariseResult('get_consumer_lag', '{"lag": 30, "lag_known": true}')).toBe(
+      'lag 30, known',
+    )
+    expect(
+      summariseResult('get_consumer_lag', 'lag 42 on worker-dispatcher, known, measured 3s ago'),
+    ).toBe('lag 42, known')
+    expect(
+      summariseResult('get_consumer_lag', '{"lag": null, "lag_known": false}'),
+    ).toBe('lag unknown')
+  })
+
+  it('reads the dead-letter total', () => {
+    expect(summariseResult('list_dlq_messages', '{"total": 5, "items": []}')).toBe('DLQ total 5')
+  })
+
+  it('names an open breaker, and says none where none is open', () => {
+    expect(
+      summariseResult(
+        'get_circuit_breakers',
+        '{"breakers": [{"name": "bulk-api-sync", "state": "open"}]}',
+      ),
+    ).toBe('bulk-api-sync open')
+    expect(
+      summariseResult(
+        'get_circuit_breakers',
+        '{"breakers": [{"name": "bulk-api-sync", "state": "closed"}]}',
+      ),
+    ).toBe('1 breaker, none open')
+  })
+
+  it('says whether a cache entry exists, and how big it is', () => {
+    expect(summariseResult('get_cache_key_info', '{"exists": true, "size_bytes": 512}')).toBe(
+      'exists, 512 bytes',
+    )
+    expect(summariseResult('get_cache_key_info', '{"exists": false}')).toBe('absent')
+  })
+
+  it('reports what an action did', () => {
+    expect(
+      summariseResult('restart_consumer_group', '{"accepted": true, "kill_key_cleared": true}'),
+    ).toBe('accepted, kill key cleared')
+    expect(summariseResult('replay_dlq_by_ids', '{"replayed": 1, "scheduled": 0}')).toBe(
+      'replayed 1, scheduled 0',
+    )
+  })
+
+  it('falls back to the excerpt itself rather than inventing a reading', () => {
+    // A tool nobody has written a summariser for is still better read than hidden,
+    // and the whole excerpt is one click away.
+    const long = `${'x'.repeat(200)}`
+    const summary = summariseResult('get_outbox_status', long)
+    expect(summary?.endsWith('…')).toBe(true)
+    expect((summary ?? '').length).toBeLessThan(70)
+    expect(summariseResult('some_new_tool', '  unpublished 3   waiting  ')).toBe(
+      'unpublished 3 waiting',
+    )
+  })
+
+  it('has nothing to say where the call reported no result', () => {
+    expect(summariseResult('get_consumer_lag', null)).toBeNull()
+    expect(summariseResult(null, '')).toBeNull()
+    expect(summariseStep(step(1, 'read', 'get_consumer_lag', '2026-09-19T10:01:00Z'))).toBeNull()
+  })
+
+  it('survives a truncated excerpt, which is what a 400-char cap produces', () => {
+    expect(summariseResult('get_consumer_lag', '{"lag": 30, "lag_known": tr')).toBe(
+      'lag 30, known',
+    )
   })
 })

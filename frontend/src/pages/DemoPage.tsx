@@ -40,6 +40,36 @@
  * this page reads REST as a human operator, so it sees the `chaos.*` rows the
  * agent's MCP withholds (ADR 0012), the `lab.world_reset` boundary beside them, and
  * the `agent_runs` the agent cannot read at all (ADR 0035).
+ *
+ * ── WO-R3-334: the page reads ONE take ──────────────────────────────────────────
+ *
+ * The third live take was recorded, wound down, and the page reloaded two minutes
+ * later. Everything on screen was true of a different moment, and the six fixes here
+ * all come from that:
+ *
+ *  1. **A take is the span between two boundaries.** "Since the newest boundary" put
+ *     the boundary AFTER the run, so the PLATFORM row read `healthy · no fault yet`
+ *     beside an AGENT row that read `escalated`. The page now picks the newest run
+ *     with a fault in its OWN take and reads that take end to end — the platform
+ *     row, the clock, the chart, the ledger and the badges.
+ *  2. **A late report reads as late.** Three stations stamped 08:17:59 with 76 / 9 /
+ *     0 ms rendered a 41-second run as an 85-millisecond one, because the reporter
+ *     queued its reports and flushed them in one burst with their original times.
+ *     Each station now also says when its report ARRIVED, when that was later, and
+ *     stations reveal one at a time instead of all lighting in one frame.
+ *  3. **Somebody else's reads are not the agent's.** The runner read lag every three
+ *     seconds under the agent's token, and the evaluator's guard probes fired seven
+ *     more calls after the boundary, so the ledger said "89 calls" for a four-call
+ *     run. Rows are matched against the run's own `service_account_id`, `lab.probe`
+ *     rows (WO-R3-333) are the lab's, and the excluded count is on screen with a
+ *     toggle rather than silently dropped.
+ *  4. **The ledger is a transcript.** One line per call with what it answered
+ *     (`get_consumer_lag → lag 30, known`), the rest behind a click, actions never
+ *     collapsed, newest at the bottom.
+ *  5. **The chart is the take.** A fifteen-minute axis drew the incident in its last
+ *     eighth; the span is now two minutes before the fault to now, the markers are
+ *     only the four moments that matter, and there is a cursor on the right.
+ *  6. **An absence a terminal run will never fill is a sentence, not a blank.**
  */
 
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
@@ -56,13 +86,18 @@ import {
   agentRow,
   agentStateLabel,
   chartMarkers,
+  chartWindow,
+  faultInTake,
   isDemoMode,
   metricRecovery,
-  newestFaultAt,
-  newestResetAt,
   platformRow,
-  runsSinceReset,
-  selectRun,
+  reportArrivals,
+  rowsInTake,
+  rowsInTakeWithEdges,
+  selectTake,
+  takeKey,
+  takeOfRun,
+  yAxisTicks,
 } from '../utils/demoPhase'
 import type {
   AgentStation,
@@ -71,6 +106,7 @@ import type {
   MetricSample,
   PlatformStation,
   Station,
+  Take,
 } from '../utils/demoPhase'
 import {
   budgetMeter,
@@ -82,6 +118,7 @@ import {
   mergeSteps,
   rankedHypotheses,
   runVerifications,
+  summariseStep,
 } from '../utils/demoRun'
 import type { LedgerEntry, LedgerKind } from '../utils/demoRun'
 import type {
@@ -109,6 +146,10 @@ const DISPATCHER_GROUP = 'worker-dispatcher'
 const WINDOW_MS = 15 * 60 * 1000
 /** The platform's cap on `verifications` — past it the oldest are dropped. */
 const VERIFICATIONS_CAP = 50
+/** One station at a time, so a burst of reports reads as a sequence (WO-R3-334). */
+const STATION_REVEAL_MS = 300
+/** The bar a hypothesis has to clear before the loop may act on it (ADR 0009). */
+const REMEDIATE_THRESHOLD = 0.7
 /** Enough rows for a whole take once the job events are out of the way. */
 const AUDIT_ROWS = 100
 /**
@@ -134,6 +175,49 @@ function useNow(intervalMs: number): number {
     return () => clearInterval(t)
   }, [intervalMs])
   return now
+}
+
+/**
+ * A count that walks up to its target one step at a time.
+ *
+ * The reporter can queue four step reports and a terminal state and flush them in one
+ * burst — on the third take all four arrived at 15:18:40 — and four stations lighting
+ * in a single frame does not read as a run advancing, it reads as a page catching up.
+ * So the row advances one station per tick.
+ *
+ * The first target for a key is taken WHOLE, with no animation: a run the page is
+ * opening on has already happened, and replaying its stations one by one on every
+ * reload would be theatre rather than information.
+ */
+function useStaggeredReveal(
+  key: string | null,
+  target: number,
+  stepMs: number = STATION_REVEAL_MS,
+): number {
+  const [state, setState] = useState<{ key: string | null; shown: number }>({
+    key,
+    shown: target,
+  })
+
+  useEffect(() => {
+    setState((prev) => {
+      if (prev.key !== key) return { key, shown: target }
+      // A run that lost stations (a switch, a re-read) snaps rather than counting down.
+      return target < prev.shown ? { key, shown: target } : prev
+    })
+  }, [key, target])
+
+  useEffect(() => {
+    if (state.key !== key || state.shown >= target) return
+    const timer = setTimeout(() => {
+      setState((prev) =>
+        prev.key === key && prev.shown < target ? { key, shown: prev.shown + 1 } : prev,
+      )
+    }, stepMs)
+    return () => clearTimeout(timer)
+  }, [key, target, state, stepMs])
+
+  return state.key === key ? state.shown : target
 }
 
 function formatMs(ms: number): string {
@@ -163,19 +247,28 @@ function shortId(id: string): string {
 
 // ─────────────────────────────────────────────────────── header: run + mode
 
+/**
+ * Every run the page can see, each labelled with the take it belongs to.
+ *
+ * Across takes, not within one: the run the page is showing may be in a take that
+ * has ended, which is exactly the case the third take needed, so a selector offering
+ * only "this take's runs" would have offered nothing at all.
+ */
 function RunSelector({
   runs,
   selected,
+  takeStartOf,
   onSelect,
 }: {
   runs: AgentRun[]
   selected: AgentRun | null
+  takeStartOf: (run: AgentRun) => string | null
   onSelect: (id: string) => void
 }) {
   if (runs.length === 0) {
     return (
       <span data-testid="run-selector-empty" className="text-sm text-gray-500">
-        no run in this take yet
+        no run reported yet
       </span>
     )
   }
@@ -189,18 +282,61 @@ function RunSelector({
         onChange={(e) => onSelect(e.target.value)}
         className="bg-gray-800 border border-gray-700 rounded px-2 py-1.5 text-sm text-gray-100 font-mono"
       >
-        {runs.map((r, i) => (
-          <option key={r.id} value={r.id}>
-            {shortId(r.id)} · {r.scenario ?? 'no label'} · {r.state}
-            {i === 0 ? ' · newest' : ''}
-          </option>
-        ))}
+        {runs.map((r, i) => {
+          const takeStart = takeStartOf(r)
+          return (
+            <option key={r.id} value={r.id}>
+              {shortId(r.id)} · {r.scenario ?? 'no label'} · {r.state}
+              {takeStart === null ? '' : ` · take ${clockTime(takeStart)}`}
+              {i === 0 ? ' · newest' : ''}
+            </option>
+          )
+        })}
       </select>
     </label>
   )
 }
 
-function FaultClock({ faultAt, now }: { faultAt: string | null; now: number }) {
+/**
+ * Which take is on screen, and whether it is still running.
+ *
+ * "take ended at 08:20" is the one sentence the third take's screen needed: it is
+ * what turns a page full of past readings from wrong into history.
+ */
+function TakeLabel({
+  take,
+  newerTakeRunning,
+}: {
+  take: Take
+  newerTakeRunning: boolean
+}) {
+  return (
+    <span data-testid="take-label" className="text-xs font-mono text-gray-500">
+      {take.startAt === null ? 'take start not in view' : `take from ${clockTime(take.startAt)}`}
+      {take.endAt === null ? ' · live' : ` · take ended at ${clockTime(take.endAt)}`}
+      {newerTakeRunning && (
+        <span className="text-amber-300/80"> · a newer take is running with no run yet</span>
+      )}
+    </span>
+  )
+}
+
+/**
+ * Time since this take's fault — and no further than the take.
+ *
+ * A clock that keeps counting on a take that ended at 08:20 is the same class of
+ * error as the one WO-R3-327 fixed: a true number about a world that is gone. It
+ * stops at the boundary and says so.
+ */
+function FaultClock({
+  faultAt,
+  now,
+  takeEndAt,
+}: {
+  faultAt: string | null
+  now: number
+  takeEndAt: string | null
+}) {
   if (faultAt === null) {
     return (
       <div data-testid="fault-clock" className="text-right">
@@ -209,14 +345,22 @@ function FaultClock({ faultAt, now }: { faultAt: string | null; now: number }) {
       </div>
     )
   }
-  const elapsed = Math.max(0, now - new Date(faultAt).getTime())
+  const stoppedAt = takeEndAt === null ? now : new Date(takeEndAt).getTime()
+  const elapsed = Math.max(0, stoppedAt - new Date(faultAt).getTime())
   return (
     <div data-testid="fault-clock" className="text-right">
       <p className="text-xs uppercase tracking-wider text-gray-500">since the fault</p>
-      <p className="text-3xl font-mono text-amber-300 leading-tight">
+      <p
+        className={`text-3xl font-mono leading-tight ${
+          takeEndAt === null ? 'text-amber-300' : 'text-amber-300/60'
+        }`}
+      >
         T+ {formatMs(elapsed)}
       </p>
-      <p className="text-xs font-mono text-gray-500">injected {clockTime(faultAt)}</p>
+      <p className="text-xs font-mono text-gray-500">
+        injected {clockTime(faultAt)}
+        {takeEndAt !== null && ' · stopped at the take’s end'}
+      </p>
     </div>
   )
 }
@@ -268,6 +412,16 @@ function StationCell<K extends string>({
         {station.durationMs !== null && ` · ${formatMs(station.durationMs)}`}
         {elapsed !== null && station.durationMs === null && ` · ${formatMs(elapsed)}`}
       </span>
+      {/* The event's time is above; this is when the page could have known it. A
+          station with both is a station whose report arrived late (WO-R3-334, F2). */}
+      {station.reportedAt !== null && (
+        <span
+          data-testid={`station-${station.key}-reported`}
+          className="block text-[11px] mt-0.5 font-mono text-amber-300/90 leading-tight whitespace-nowrap"
+        >
+          reported {clockTime(station.reportedAt)}
+        </span>
+      )}
       {station.note !== null && (
         <span className="block text-[11px] mt-0.5 opacity-70 leading-tight">
           {station.note}
@@ -303,9 +457,9 @@ function PhaseRow<K extends string>({
   return (
     <div
       data-testid={testId}
-      className="bg-gray-900 border border-gray-800 rounded-lg px-4 py-3"
+      className="bg-gray-900 border border-gray-800 rounded-lg px-4 py-2"
     >
-      <div className="flex items-baseline gap-3 mb-2">
+      <div className="flex items-baseline gap-3 mb-1.5">
         <h2
           className={`text-sm font-semibold tracking-wider uppercase ${
             tone === 'platform' ? 'text-blue-300' : 'text-purple-300'
@@ -336,23 +490,6 @@ const MARKER_STYLE: Record<
   recovery: { stroke: '#34d399', fill: '#34d399', glyph: 'R', label: 'recovered' },
 }
 
-/**
- * A clean upper bound just above the data.
- *
- * The ladder is finer than 1/2/5 on purpose: a peak of 53 on a 1/2/5 ladder
- * becomes an axis to 100, which pushes the whole incident into the bottom half
- * of the plot and makes a lag of 42 look like nothing.
- */
-function niceMax(value: number): number {
-  if (value <= 1) return 1
-  const exp = Math.floor(Math.log10(value))
-  const base = Math.pow(10, exp)
-  for (const step of [1, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10]) {
-    if (value <= step * base) return step * base
-  }
-  return 10 * base
-}
-
 interface ChartHover {
   sample: MetricSample
   x: number
@@ -360,15 +497,25 @@ interface ChartHover {
 }
 
 /**
- * The metric over the window, with the moments that changed it marked on it.
+ * The metric over the take, with the moments that changed it marked on it.
  *
  * One series, one axis. The DLQ depth in `dlq_backlog` mode is a second CHART
  * rather than a second line: lag runs to tens and the dead-letter depth to five,
  * so one plot with two scales would invent a relationship between them.
  *
- * Reads are deliberately not marked — fifteen ticks on a fifteen-minute chart is a
- * comb, and the ledger is where every call belongs. What the chart marks is the
- * three or four moments that moved the line.
+ * Four rules, all from the third take's screenshot (WO-R3-334):
+ *
+ *  - **the x-axis is the take**, two minutes before the fault to now, because a
+ *    fixed fifteen minutes drew a two-minute climb in the last eighth of the plot.
+ *    The `full window` button zooms back out to everything the platform still holds;
+ *  - **the marker set is closed** — the boundaries, the lab's fault, the run's own
+ *    Tier-1 actions, the recovery. Reads are not marked (fifteen ticks is a comb),
+ *    and neither are the runner's or the evaluator's calls, which is what put three
+ *    blue `A` markers on a take where the agent never acted;
+ *  - **a cursor on the right edge** with the latest reading beside it, so the end of
+ *    the line has a number on it without hovering;
+ *  - **the plot is the panel minus two lines of caption.** Everything else about the
+ *    chart — the samples, the marker times — is in those two lines or behind them.
  */
 function MetricChart({
   testId,
@@ -385,6 +532,9 @@ function MetricChart({
   markers,
   windowStart,
   windowEnd,
+  zoomed,
+  onToggleZoom,
+  liveEdge,
   error,
   onRetry,
 }: {
@@ -402,6 +552,11 @@ function MetricChart({
   markers: ChartMarker[]
   windowStart: number
   windowEnd: number
+  /** True while the axis is the take's span rather than the platform's whole window. */
+  zoomed: boolean
+  onToggleZoom: () => void
+  /** False on a take that has ended: the right edge is the boundary, not "now". */
+  liveEdge: boolean
   error: string | null
   onRetry: () => void
 }) {
@@ -411,14 +566,15 @@ function MetricChart({
   // The viewBox's aspect is the plot's aspect: the SVG scales to its column's
   // width, so a wide viewBox in a narrow column letterboxes and the line ends up
   // occupying half the height the panel gave it.
-  const W = 480
-  const H = 260
-  const PAD = { l: 46, r: 14, t: 16, b: 32 }
+  const W = 560
+  const H = 220
+  const PAD = { l: 50, r: 18, t: 16, b: 30 }
   const plotW = W - PAD.l - PAD.r
   const plotH = H - PAD.t - PAD.b
 
   const peak = samples.reduce((m, s) => Math.max(m, s.v), 0)
-  const yMax = niceMax(Math.max(threshold * 1.4, peak * 1.15, 1))
+  const ticks = yAxisTicks(Math.max(threshold * 1.4, peak * 1.15, 1))
+  const yMax = ticks[ticks.length - 1]
   const span = Math.max(1, windowEnd - windowStart)
   const x = (t: number) => PAD.l + ((t - windowStart) / span) * plotW
   const y = (v: number) => PAD.t + plotH - (Math.min(v, yMax) / yMax) * plotH
@@ -427,6 +583,7 @@ function MetricChart({
   const points = inWindow.map((s) => `${String(x(s.t))},${y(s.v).toFixed(1)}`).join(' ')
   const last = inWindow[inWindow.length - 1] ?? null
   const breaching = known && value !== null && value > threshold
+  const spanMinutes = Math.max(1, Math.round(span / 60_000))
 
   function onMove(event: React.PointerEvent<SVGSVGElement>) {
     const svg = svgRef.current
@@ -445,7 +602,7 @@ function MetricChart({
   return (
     <section
       data-testid={testId}
-      className="bg-gray-900 border border-gray-800 rounded-lg px-4 py-3"
+      className="bg-gray-900 border border-gray-800 rounded-lg px-4 py-3 flex flex-col shrink-0"
     >
       <div className="flex items-start justify-between gap-3">
         <div>
@@ -488,11 +645,12 @@ function MetricChart({
           viewBox={`0 0 ${String(W)} ${String(H)}`}
           className="w-full h-auto"
           role="img"
-          aria-label={`${title} over the last 15 minutes, threshold ${String(threshold)}`}
+          aria-label={`${title} over ${String(spanMinutes)} minutes, threshold ${String(threshold)}`}
           onPointerMove={onMove}
           onPointerLeave={() => setHover(null)}
         >
-          {/* The band above the threshold: where the reading is a breach. */}
+          {/* The band above the threshold: where the reading is a breach. Labelled
+              on the LEFT, where the eye starts and where no marker can cover it. */}
           <rect
             x={PAD.l}
             y={PAD.t}
@@ -507,36 +665,29 @@ function MetricChart({
             y2={y(threshold)}
             className="stroke-red-400/70"
             strokeWidth={1}
+            strokeDasharray="4 3"
           />
           <text
-            x={PAD.l + plotW - 4}
+            x={PAD.l + 5}
             y={y(threshold) - 5}
-            textAnchor="end"
-            className="fill-red-300/80"
+            textAnchor="start"
+            className="fill-red-300/90"
             style={{ fontSize: '11px' }}
           >
             threshold {threshold}
           </text>
 
-          {/* Axes: hairline, solid, recessive. */}
-          <line
-            x1={PAD.l}
-            x2={PAD.l + plotW}
-            y1={PAD.t + plotH}
-            y2={PAD.t + plotH}
-            className="stroke-gray-700"
-            strokeWidth={1}
-          />
-          <line
-            x1={PAD.l}
-            x2={PAD.l}
-            y1={PAD.t}
-            y2={PAD.t + plotH}
-            className="stroke-gray-700"
-            strokeWidth={1}
-          />
-          {[0, yMax / 2, yMax].map((tick) => (
+          {/* Axes and gridlines: hairline, recessive, and zero always drawn. */}
+          {ticks.map((tick) => (
             <Fragment key={tick}>
+              <line
+                x1={PAD.l}
+                x2={PAD.l + plotW}
+                y1={y(tick)}
+                y2={y(tick)}
+                className={tick === 0 ? 'stroke-gray-600' : 'stroke-gray-800'}
+                strokeWidth={1}
+              />
               <text
                 x={PAD.l - 8}
                 y={y(tick) + 4}
@@ -548,14 +699,21 @@ function MetricChart({
               </text>
             </Fragment>
           ))}
+          <line
+            x1={PAD.l}
+            x2={PAD.l}
+            y1={PAD.t}
+            y2={PAD.t + plotH}
+            className="stroke-gray-700"
+            strokeWidth={1}
+          />
           <text
             x={PAD.l}
             y={H - 8}
             className="fill-gray-500"
             style={{ fontSize: '11px' }}
           >
-            {clockTime(new Date(windowStart).toISOString())} (−
-            {Math.round((windowEnd - windowStart) / 60_000)} min)
+            {clockTime(new Date(windowStart).toISOString())} (−{spanMinutes} min)
           </text>
           <text
             x={PAD.l + plotW}
@@ -564,7 +722,7 @@ function MetricChart({
             className="fill-gray-500"
             style={{ fontSize: '11px' }}
           >
-            now
+            {liveEdge ? 'now' : 'take ended'}
           </text>
 
           {/* Markers, under the line so the data stays on top. */}
@@ -633,6 +791,31 @@ function MetricChart({
             </>
           )}
 
+          {/* The cursor on the right edge, with the newest reading on it: the end of
+              the line is where a viewer looks, and it had no number of its own. */}
+          <g data-testid={`${testId}-cursor`}>
+            <line
+              x1={PAD.l + plotW}
+              x2={PAD.l + plotW}
+              y1={PAD.t}
+              y2={PAD.t + plotH}
+              className={liveEdge ? 'stroke-blue-300/70' : 'stroke-gray-500/70'}
+              strokeWidth={1}
+              strokeDasharray="3 3"
+            />
+            {last !== null && (
+              <text
+                x={PAD.l + plotW - 6}
+                y={Math.min(Math.max(y(last.v) - 10, PAD.t + 26), PAD.t + plotH - 6)}
+                textAnchor="end"
+                className={liveEdge ? 'fill-blue-200' : 'fill-gray-400'}
+                style={{ fontSize: '22px', fontVariantNumeric: 'tabular-nums' }}
+              >
+                {last.v}
+              </text>
+            )}
+          </g>
+
           {hover !== null && (
             <>
               <line
@@ -666,54 +849,58 @@ function MetricChart({
         )}
       </div>
 
-      {/* Identity is never colour alone: every marker on the plot is listed, in
-          time order, with its own glyph and time. This is also the chart's table
-          view for the markers. */}
-      {markers.length > 0 && (
-        <ul className="flex flex-wrap gap-x-4 gap-y-1 mt-1">
-          {markers.map((m) => (
-            <li key={`legend-${m.kind}-${m.at}`} className="flex items-center gap-1.5 text-xs">
-              <span
-                aria-hidden
-                className="inline-block w-3.5 h-3.5 rounded-sm text-center leading-[0.875rem] text-gray-950 font-semibold"
-                style={{ background: MARKER_STYLE[m.kind].fill, fontSize: '9px' }}
-              >
-                {MARKER_STYLE[m.kind].glyph}
-              </span>
-              <span className="text-gray-300">{m.label}</span>
-              <span className="font-mono text-gray-500">{clockTime(m.at)}</span>
-            </li>
-          ))}
-        </ul>
-      )}
-
-      <p className="text-xs text-gray-500 mt-1">
+      {/* Two lines of caption, and the plot gets the rest of the panel. Line one is
+          the threshold and the window; line two is every marker, named, plus the
+          samples themselves — identity is never colour alone and no value on this
+          chart is reachable only by hovering. */}
+      <p className="text-xs text-gray-500 mt-1 truncate">
         threshold {threshold} — {thresholdWhy}
+        {' · '}
+        <button
+          data-testid={`${testId}-zoom`}
+          onClick={onToggleZoom}
+          className="text-blue-300 hover:text-blue-200"
+        >
+          {zoomed ? 'full window' : 'zoom to the take'}
+        </button>
       </p>
-      <p className="text-xs text-gray-600">{caption}</p>
-
-      {/* Every value the hover shows, reachable without hovering. */}
-      <details className="mt-1">
-        <summary className="text-xs text-gray-500 cursor-pointer">
-          samples ({inWindow.length})
-        </summary>
-        <table className="mt-1 text-xs w-full">
-          <thead>
-            <tr className="text-left text-gray-500">
-              <th className="font-medium">measured at</th>
-              <th className="font-medium">{unit}</th>
-            </tr>
-          </thead>
-          <tbody className="font-mono text-gray-400">
-            {inWindow.map((s) => (
-              <tr key={s.at}>
-                <td>{clockTime(s.at)}</td>
-                <td>{s.v}</td>
+      <div className="flex items-center gap-x-3 gap-y-1 flex-wrap text-xs text-gray-600">
+        {markers.map((m) => (
+          <span key={`legend-${m.kind}-${m.at}`} className="flex items-center gap-1.5">
+            <span
+              aria-hidden
+              className="inline-block w-3.5 h-3.5 rounded-sm text-center leading-[0.875rem] text-gray-950 font-semibold"
+              style={{ background: MARKER_STYLE[m.kind].fill, fontSize: '9px' }}
+            >
+              {MARKER_STYLE[m.kind].glyph}
+            </span>
+            <span className="text-gray-300">{m.label}</span>
+            <span className="font-mono text-gray-500">{clockTime(m.at)}</span>
+          </span>
+        ))}
+        <details className="ml-auto">
+          <summary className="cursor-pointer whitespace-nowrap">
+            samples ({inWindow.length})
+          </summary>
+          <p className="text-gray-600">{caption}</p>
+          <table className="mt-1 text-xs w-full">
+            <thead>
+              <tr className="text-left text-gray-500">
+                <th className="font-medium">measured at</th>
+                <th className="font-medium">{unit}</th>
               </tr>
-            ))}
-          </tbody>
-        </table>
-      </details>
+            </thead>
+            <tbody className="font-mono text-gray-400">
+              {inWindow.map((s) => (
+                <tr key={s.at}>
+                  <td>{clockTime(s.at)}</td>
+                  <td>{s.v}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </details>
+      </div>
     </section>
   )
 }
@@ -731,12 +918,31 @@ function verdictStyle(verdict: string): string {
   return VERDICT_STYLE[verdict] ?? 'bg-gray-700/40 text-gray-300 border-gray-600'
 }
 
+/**
+ * Confidence, with the bar the loop actually gates on drawn on it.
+ *
+ * A number on its own does not say whether the agent was allowed to act. The tick at
+ * 0.7 is the remediate threshold, so a viewer can see at a glance that the third
+ * take's 0.82 was over the bar for the whole run and the agent still did not act —
+ * which is the finding the demo exists to show (INC-004).
+ */
 function ConfidenceBar({ confidence }: { confidence: number }) {
   const pct = Math.max(0, Math.min(100, confidence * 100))
+  const over = confidence >= REMEDIATE_THRESHOLD
   return (
     <div className="flex items-center gap-2">
-      <div className="flex-1 h-2.5 bg-gray-800 rounded overflow-hidden">
-        <div className="h-full bg-purple-400" style={{ width: `${String(pct)}%` }} />
+      <div className="relative flex-1 h-2.5 bg-gray-800 rounded overflow-hidden">
+        <div
+          className={`h-full ${over ? 'bg-purple-300' : 'bg-purple-400/60'}`}
+          style={{ width: `${String(pct)}%` }}
+        />
+        <span
+          data-testid="confidence-threshold-tick"
+          aria-hidden
+          title={`the ${String(REMEDIATE_THRESHOLD)} remediate threshold`}
+          className="absolute top-0 bottom-0 w-0.5 bg-gray-300/80"
+          style={{ left: `${String(REMEDIATE_THRESHOLD * 100)}%` }}
+        />
       </div>
       <span className="text-sm font-mono text-gray-300 w-12 text-right">
         {Math.round(pct)}%
@@ -745,9 +951,25 @@ function ConfidenceBar({ confidence }: { confidence: number }) {
   )
 }
 
-function Excerpt({ text, testId }: { text: string; testId?: string }) {
+/**
+ * A reasoning excerpt, truncated unless it is the one that matters.
+ *
+ * The top hypothesis is shown whole: the third take's screenshot truncated it with
+ * "more…" — so the one sentence explaining why the agent believed what it believed
+ * was the one sentence not on screen. Every other excerpt still truncates, because
+ * five of them at full length is the panel.
+ */
+function Excerpt({
+  text,
+  testId,
+  full = false,
+}: {
+  text: string
+  testId?: string
+  full?: boolean
+}) {
   const [open, setOpen] = useState(false)
-  const long = text.length > 140
+  const long = !full && text.length > 140
   return (
     <p data-testid={testId} className="text-sm text-gray-400 leading-snug">
       {open || !long ? text : `${text.slice(0, 140)}…`}
@@ -761,6 +983,20 @@ function Excerpt({ text, testId }: { text: string; testId?: string }) {
       )}
     </p>
   )
+}
+
+/**
+ * The three terminal states, which is when an absence stops being "not yet".
+ *
+ * `plan`, `verification` and `attribution` were all null in the third take and all
+ * three were correct — the agent never acted, so there was nothing to plan, verify or
+ * attribute. "No action planned yet" on a run that has escalated is the page implying
+ * a wait that will never end, so a terminal run gets the sentence instead.
+ */
+const TERMINAL_RUN_STATES = ['resolved', 'escalated', 'failed']
+
+function isTerminalRun(run: AgentRun | null): boolean {
+  return run !== null && (run.finished_at !== null || TERMINAL_RUN_STATES.includes(run.state))
 }
 
 function AgentPanel({
@@ -782,6 +1018,8 @@ function AgentPanel({
   const plan = run?.plan ?? null
   const meter = budgetMeter(run?.budget)
   const lastStep = steps[steps.length - 1] ?? null
+  const terminal = isTerminalRun(run)
+  const acted = plan !== null || steps.some((s) => s.kind === 'action')
 
   if (error !== null) {
     return (
@@ -821,8 +1059,8 @@ function AgentPanel({
       aria-labelledby="demo-agent"
       className="bg-gray-900 border border-gray-800 rounded-lg px-4 py-3 space-y-4 overflow-y-auto"
     >
-      <div className="flex items-start justify-between gap-3">
-        <div>
+      <div className="space-y-1.5">
+        <div className="flex items-baseline gap-2 flex-wrap">
           <h2 id="demo-agent" className="sr-only">
             The agent
           </h2>
@@ -832,35 +1070,36 @@ function AgentPanel({
           >
             {agentStateLabel(run)}
           </span>
-          <p className="text-xs font-mono text-gray-500 mt-1">
+          <p className="text-xs font-mono text-gray-500">
             {run.scenario ?? 'no run label'} · {shortId(run.id)}
             {run.finished_at !== null && ` · finished ${clockTime(run.finished_at)}`}
           </p>
         </div>
-        <div data-testid="budget-meter" className="w-44">
-          <p className="text-xs uppercase tracking-wider text-gray-500">Budget</p>
+        <div data-testid="budget-meter">
           {meter.used === null ? (
-            <p className="text-sm text-gray-600">not reported</p>
+            <p className="text-sm text-gray-600">
+              <span className="text-xs uppercase tracking-wider text-gray-500">Budget</span> not
+              reported
+            </p>
           ) : (
             <>
-              <p className="text-lg font-mono text-gray-200">
-                {meter.used}
-                {meter.max !== null && <span className="text-gray-500"> / {meter.max}</span>}
-                <span className="text-xs text-gray-500"> tool calls</span>
+              <p className="text-sm font-mono text-gray-300">
+                <span className="text-xs uppercase tracking-wider text-gray-500">Budget </span>
+                <span className="text-lg text-gray-100">{meter.used}</span>
+                {meter.max !== null && <span className="text-gray-500">/{meter.max}</span>}
+                <span className="text-xs text-gray-500"> calls</span> ·{' '}
+                {meter.tokens === null ? 'tokens —' : `${meter.tokens} tokens`} ·{' '}
+                {meter.usd === null ? '$—' : `$${meter.usd.toFixed(4)}`}
+                {meter.wallSeconds !== null && ` · ${Math.round(meter.wallSeconds)}s`}
               </p>
               {meter.percent !== null && (
-                <div className="h-2.5 bg-gray-800 rounded overflow-hidden mt-1">
+                <div className="h-2 bg-gray-800 rounded overflow-hidden mt-1">
                   <div
                     className={`h-full ${meter.over ? 'bg-red-400' : 'bg-blue-400'}`}
                     style={{ width: `${String(meter.percent)}%` }}
                   />
                 </div>
               )}
-              <p className="text-xs font-mono text-gray-500 mt-0.5">
-                {meter.tokens === null ? 'tokens —' : `${meter.tokens} tokens`} ·{' '}
-                {meter.usd === null ? '$—' : `$${meter.usd.toFixed(4)}`}
-                {meter.wallSeconds !== null && ` · ${Math.round(meter.wallSeconds)}s`}
-              </p>
             </>
           )}
         </div>
@@ -892,7 +1131,8 @@ function AgentPanel({
                 </div>
                 {h.reasoning_excerpt ? (
                   <div className="mt-1">
-                    <Excerpt text={h.reasoning_excerpt} />
+                    {/* The top one whole; the rest truncated. */}
+                    <Excerpt text={h.reasoning_excerpt} full={i === 0} />
                   </div>
                 ) : (
                   <p className="text-xs text-gray-600 mt-1">no reasoning reported</p>
@@ -914,7 +1154,9 @@ function AgentPanel({
         <h3 className="text-sm uppercase tracking-wider text-gray-500 mb-1">The plan</h3>
         {plan === null ? (
           <p data-testid="plan-empty" className="text-sm text-gray-600">
-            No action planned yet.
+            {terminal
+              ? 'The agent handed off without acting — it never planned an action.'
+              : 'No action planned yet.'}
           </p>
         ) : (
           <div
@@ -947,7 +1189,11 @@ function AgentPanel({
         </h3>
         {verifications.length === 0 ? (
           <p data-testid="verifications-empty" className="text-sm text-gray-600">
-            Nothing verified yet.
+            {terminal
+              ? acted
+                ? 'No verification recorded, although the run acted — the reporter sent none.'
+                : 'No verification because no action: there was nothing to check.'
+              : 'Nothing verified yet.'}
           </p>
         ) : (
           <ul className="space-y-1.5">
@@ -996,6 +1242,20 @@ function AgentPanel({
 }
 
 // ─────────────────────────────────────────────────────── the ledger (right)
+//
+// WO-R3-334 rebuilt this panel around one question: what did the call answer?
+//
+// The third take's ledger was raw audit rows — tool, arguments, latency, no result —
+// and most of them were not even the agent's: the runner read lag every three seconds
+// under the agent's token (F3) and the evaluator's guard probes fired seven more calls
+// after the boundary (F4). So the panel now reads like a transcript of ONE run:
+//
+//   * one line per call, with the answer summarised on it;
+//   * the arguments, the whole excerpt and the latency behind a click — except on an
+//     ACTION row, which is never collapsed, because the action is the point;
+//   * newest at the BOTTOM, pinned there unless the operator scrolls up;
+//   * everything that is not this run's own call counted and hidden behind a toggle,
+//     never silently dropped.
 
 const KIND_BADGE: Record<string, { label: string; className: string }> = {
   read: { label: 'READ', className: 'bg-gray-700/50 text-gray-300 border-gray-600' },
@@ -1011,19 +1271,57 @@ const LEDGER_TONE: Record<LedgerKind, string> = {
   agent_audit: 'border-gray-800 bg-gray-950/50',
   agent_report: 'border-purple-900/60 bg-purple-950/20',
   lab: 'border-amber-700/60 bg-amber-950/25',
+  lab_probe: 'border-gray-800 bg-gray-950/40',
+  other_principal: 'border-gray-800 bg-gray-950/40',
   reset: 'border-gray-700 bg-gray-800/30',
   job_event: 'border-gray-800 bg-gray-900/40',
   human: 'border-green-800/50 bg-green-950/20',
 }
 
+/** The one line every row shares: when, what kind, which tool, what it answered. */
+function LedgerLine({
+  at,
+  badge,
+  badgeClassName,
+  subject,
+  summary,
+}: {
+  at: string | null
+  badge: string
+  badgeClassName: string
+  subject: string
+  summary: string | null
+}) {
+  return (
+    <span className="flex items-center gap-1.5 min-w-0">
+      <span className="text-[10px] font-mono text-gray-500 shrink-0">
+        {/* Every field but `seq` and `kind` can be null: this is the responder's own
+            account of its own call and the platform fills nothing in. */}
+        {at === null ? 'no time reported' : clockTime(at)}
+      </span>
+      <span
+        className={`px-1.5 py-0.5 rounded text-[10px] border font-mono shrink-0 ${badgeClassName}`}
+      >
+        {badge}
+      </span>
+      <span className="text-[13px] font-mono text-gray-100 truncate">{subject}</span>
+      {summary !== null && (
+        <span className="text-xs text-gray-400 truncate shrink-[2]">→ {summary}</span>
+      )}
+    </span>
+  )
+}
+
 function StepEntry({ step }: { step: AgentRunStepRecord }) {
-  const [open, setOpen] = useState(false)
   // `kind` is an open string on the wire; an unrecognised one is shown verbatim
   // rather than dressed up as a read.
   const badge = KIND_BADGE[step.kind] ?? {
     label: step.kind.toUpperCase(),
     className: 'bg-gray-700/50 text-gray-300 border-gray-600',
   }
+  const isAction = step.kind === 'action'
+  const [open, setOpen] = useState(false)
+  const expanded = open || isAction
   const args = compactJson(step.arguments)
   const excerpt = step.result_excerpt
   const failed = step.outcome != null && step.outcome !== 'success'
@@ -1032,116 +1330,142 @@ function StepEntry({ step }: { step: AgentRunStepRecord }) {
     <div
       data-testid="ledger-entry"
       data-kind={step.kind}
-      className={`rounded border px-2.5 py-2 ${LEDGER_TONE.step}`}
+      className={`rounded border px-2 py-1 ${
+        isAction
+          ? 'border-blue-500/60 bg-blue-950/30'
+          : failed
+            ? 'border-red-900/60 bg-red-950/20'
+            : LEDGER_TONE.step
+      }`}
     >
-      {/* Two lines rather than one: the tool name is the row's subject and a
-          narrow column truncates it to `restart…` when everything shares a line. */}
-      <div className="flex items-center gap-2">
-        <span className={`px-1.5 py-0.5 rounded text-[11px] border font-mono ${badge.className}`}>
-          {badge.label}
-        </span>
-        <span className="text-xs font-mono text-gray-600">#{step.seq}</span>
-        <span className="text-xs font-mono text-gray-500 ml-auto">
-          {/* Every field but `seq` and `kind` can be null: this is the
-              responder's account of its own call and the platform fills nothing in. */}
-          {step.at === null ? 'no time reported' : clockTime(step.at)}
-        </span>
-      </div>
-      <p className="text-sm font-mono text-gray-100 break-all leading-snug mt-0.5">
-        {step.tool ?? 'no tool reported'}
-      </p>
-      {args !== null && (
-        <pre className="text-xs font-mono text-gray-400 whitespace-pre-wrap break-all mt-1">
-          {args}
-        </pre>
+      {isAction ? (
+        <LedgerLine
+          at={step.at}
+          badge={badge.label}
+          badgeClassName={badge.className}
+          subject={step.tool ?? 'no tool reported'}
+          summary={summariseStep(step)}
+        />
+      ) : (
+        <button
+          onClick={() => setOpen((o) => !o)}
+          aria-expanded={open}
+          className="w-full text-left"
+        >
+          <LedgerLine
+            at={step.at}
+            badge={badge.label}
+            badgeClassName={badge.className}
+            subject={step.tool ?? 'no tool reported'}
+            summary={summariseStep(step)}
+          />
+        </button>
       )}
-      <div className="flex items-center gap-2 mt-1">
-        <span
-          className={`text-xs font-mono ${failed ? 'text-red-300' : 'text-gray-500'}`}
-        >
-          {step.outcome ?? 'outcome —'}
-        </span>
-        {step.latency_ms != null && (
-          <span className="text-xs font-mono text-gray-500">
-            {step.latency_ms.toFixed(0)} ms
-          </span>
-        )}
-        {excerpt != null && excerpt !== '' && (
-          <button
-            onClick={() => setOpen((o) => !o)}
-            className="text-xs text-blue-300 hover:text-blue-200 ml-auto"
-          >
-            {open ? 'hide result' : 'result'}
-          </button>
-        )}
-      </div>
-      {open && excerpt != null && (
-        <pre
-          data-testid="ledger-result"
-          className="text-xs font-mono text-gray-300 whitespace-pre-wrap break-all mt-1 bg-gray-950 border border-gray-800 rounded p-2"
-        >
-          {excerpt}
-        </pre>
+
+      {expanded && (
+        <div className="mt-1 space-y-1">
+          {args !== null && (
+            <pre className="text-[11px] font-mono text-gray-400 whitespace-pre-wrap break-all">
+              {args}
+            </pre>
+          )}
+          {excerpt != null && excerpt !== '' && (
+            <pre
+              data-testid="ledger-result"
+              className="text-[11px] font-mono text-gray-300 whitespace-pre-wrap break-all bg-gray-950 border border-gray-800 rounded p-1.5"
+            >
+              {excerpt}
+            </pre>
+          )}
+          <p className="text-[11px] font-mono text-gray-500">
+            step #{step.seq} ·{' '}
+            <span className={failed ? 'text-red-300' : undefined}>
+              {step.outcome ?? 'outcome —'}
+            </span>
+            {step.latency_ms != null && ` · ${step.latency_ms.toFixed(0)} ms`}
+          </p>
+        </div>
       )}
     </div>
   )
 }
 
+/** The badge an audit-derived row wears, which is the answer to "whose call was this?". */
+const ROW_BADGE: Record<string, { label: string; className: string }> = {
+  lab: { label: 'LAB', className: 'bg-amber-500/25 text-amber-200 border-amber-500/50' },
+  lab_probe: {
+    label: 'LAB PROBE',
+    className: 'bg-amber-500/10 text-amber-200/70 border-amber-700/40',
+  },
+  other_principal: {
+    label: 'NOT THIS RUN',
+    className: 'bg-gray-700/30 text-gray-400 border-gray-700',
+  },
+  human: { label: 'HUMAN', className: 'bg-green-500/20 text-green-200 border-green-600/50' },
+  job_event: { label: 'JOB', className: 'bg-gray-700/40 text-gray-400 border-gray-700' },
+  agent_report: {
+    label: 'REPORT',
+    className: 'bg-purple-500/25 text-purple-200 border-purple-500/50',
+  },
+  agent_audit: { label: 'AGENT', className: 'bg-gray-700/50 text-gray-300 border-gray-600' },
+}
+
 function RowEntry({ entry }: { entry: LedgerEntry }) {
   const row = entry.row
+  const [open, setOpen] = useState(false)
   if (!row) return null
   const extra = row.extra_data ?? {}
   const tool = typeof extra.tool_name === 'string' ? extra.tool_name : null
   const args = compactJson(extra.arguments)
   const latency = typeof extra.latency_ms === 'number' ? extra.latency_ms : null
+  const badge = ROW_BADGE[entry.kind] ?? {
+    label: 'ROW',
+    className: 'bg-gray-700/50 text-gray-300 border-gray-600',
+  }
+  const reason =
+    entry.kind === 'lab_probe'
+      ? 'the lab labelled this read as its own'
+      : entry.kind === 'other_principal'
+        ? 'another principal, not this run’s'
+        : null
 
   return (
     <div
       data-testid="ledger-entry"
       data-kind={entry.kind}
-      className={`rounded border px-2.5 py-2 ${LEDGER_TONE[entry.kind]}`}
+      className={`rounded border px-2 py-1 ${LEDGER_TONE[entry.kind]}`}
     >
-      <div className="flex items-center gap-2">
-        <span
-          className={`px-1.5 py-0.5 rounded text-[11px] border font-mono ${
-            entry.kind === 'lab'
-              ? 'bg-amber-500/25 text-amber-200 border-amber-500/50'
-              : entry.kind === 'human'
-                ? 'bg-green-500/20 text-green-200 border-green-600/50'
-                : 'bg-gray-700/50 text-gray-300 border-gray-600'
-          }`}
-        >
-          {entry.kind === 'lab'
-            ? 'LAB'
-            : entry.kind === 'human'
-              ? 'HUMAN'
-              : entry.kind === 'job_event'
-                ? 'JOB'
-                : entry.kind === 'agent_report'
-                  ? 'REPORT'
-                  : 'AGENT'}
-        </span>
-        <span className="text-xs font-mono text-gray-500 ml-auto">
-          {clockTime(row.created_at)}
-        </span>
-      </div>
-      <p className="text-sm font-mono text-gray-100 break-all leading-snug mt-0.5">
-        {tool ?? row.action}
-      </p>
-      {tool !== null && <p className="text-xs font-mono text-gray-600">{row.action}</p>}
-      {args !== null && (
-        <pre
-          className={`text-xs font-mono whitespace-pre-wrap break-all mt-1 ${
-            entry.kind === 'lab' ? 'text-amber-200/80' : 'text-gray-400'
-          }`}
-        >
-          {args}
-        </pre>
-      )}
-      {latency !== null && (
-        <p className="text-xs font-mono text-gray-500 mt-0.5">
-          {latency.toFixed(0)} ms — the audit log records no result (WO-R3-328)
-        </p>
+      <button
+        onClick={() => setOpen((o) => !o)}
+        aria-expanded={open}
+        className="w-full text-left"
+      >
+        <LedgerLine
+          at={row.created_at}
+          badge={badge.label}
+          badgeClassName={badge.className}
+          subject={tool ?? row.action}
+          summary={reason}
+        />
+      </button>
+      {open && (
+        <div className="mt-1 space-y-0.5">
+          <p className="text-[11px] font-mono text-gray-600">{row.action}</p>
+          {args !== null && (
+            <pre
+              className={`text-[11px] font-mono whitespace-pre-wrap break-all ${
+                entry.kind === 'lab' ? 'text-amber-200/80' : 'text-gray-400'
+              }`}
+            >
+              {args}
+            </pre>
+          )}
+          <p className="text-[11px] font-mono text-gray-500">
+            {latency === null
+              ? 'the audit log records no result (WO-R3-328)'
+              : `${latency.toFixed(0)} ms — the audit log records no result (WO-R3-328)`}
+          </p>
+        </div>
       )}
     </div>
   )
@@ -1150,9 +1474,9 @@ function RowEntry({ entry }: { entry: LedgerEntry }) {
 /**
  * The boundary, drawn as a line rather than an event.
  *
- * Grey and with no actor: nothing happened to the world here. Everything below it
- * is a take that is over — which is what the page needed to be able to say, because
- * `audit_logs` is append-only and those rows never leave.
+ * Grey and with no actor: nothing happened to the world here. It is the edge of a
+ * take — which is what the page needed to be able to say, because `audit_logs` is
+ * append-only and those rows never leave.
  */
 function ResetDivider({ at }: { at: string }) {
   return (
@@ -1178,40 +1502,89 @@ function ActionLedger({
   usingAudit,
   showJobEvents,
   onToggleJobEvents,
+  showHiddenReads,
+  onToggleHiddenReads,
   loading,
   error,
   onRetry,
 }: {
   entries: LedgerEntry[]
-  counts: { steps: number; calls: number; auditCalls: number; agreed: boolean }
+  counts: {
+    steps: number
+    calls: number
+    auditCalls: number
+    hiddenReads: number
+    agreed: boolean
+  }
   stepsDropped: number
   usingAudit: boolean
   showJobEvents: boolean
   onToggleJobEvents: (next: boolean) => void
+  showHiddenReads: boolean
+  onToggleHiddenReads: (next: boolean) => void
   loading: boolean
   error: string | null
   onRetry: () => void
 }) {
+  // Newest at the bottom means the newest row is the one that scrolls away, so the
+  // panel follows it — until the operator scrolls up, at which point following would
+  // be yanking the page out from under them.
+  const scroller = useRef<HTMLDivElement | null>(null)
+  const [pinned, setPinned] = useState(true)
+  const count = entries.length
+
+  useEffect(() => {
+    const box = scroller.current
+    if (box === null || !pinned) return
+    box.scrollTop = box.scrollHeight
+  }, [count, pinned])
+
+  function onScroll() {
+    const box = scroller.current
+    if (box === null) return
+    const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 24
+    setPinned(atBottom)
+  }
+
+  function toBottom() {
+    const box = scroller.current
+    if (box === null) return
+    box.scrollTop = box.scrollHeight
+    setPinned(true)
+  }
+
   return (
     <section
       data-testid="action-ledger"
       aria-labelledby="demo-ledger"
-      className="bg-gray-900 border border-gray-800 rounded-lg px-4 py-3 flex flex-col min-h-0"
+      className="bg-gray-900 border border-gray-800 rounded-lg px-3 py-3 flex flex-col min-h-0"
     >
       <div className="flex items-start justify-between gap-2">
         <h2 id="demo-ledger" className="text-base text-gray-200">
           Action ledger
         </h2>
-        <label className="flex items-center gap-1.5 text-xs text-gray-400">
-          <input
-            data-testid="job-events-toggle"
-            type="checkbox"
-            checked={showJobEvents}
-            onChange={(e) => onToggleJobEvents(e.target.checked)}
-            className="accent-blue-500"
-          />
-          job events
-        </label>
+        <div className="flex items-center gap-3">
+          <label className="flex items-center gap-1.5 text-xs text-gray-400">
+            <input
+              data-testid="hidden-reads-toggle"
+              type="checkbox"
+              checked={showHiddenReads}
+              onChange={(e) => onToggleHiddenReads(e.target.checked)}
+              className="accent-blue-500"
+            />
+            other reads
+          </label>
+          <label className="flex items-center gap-1.5 text-xs text-gray-400">
+            <input
+              data-testid="job-events-toggle"
+              type="checkbox"
+              checked={showJobEvents}
+              onChange={(e) => onToggleJobEvents(e.target.checked)}
+              className="accent-blue-500"
+            />
+            job events
+          </label>
+        </div>
       </div>
 
       <p data-testid="ledger-counts" className="text-xs text-gray-500 mt-0.5">
@@ -1223,6 +1596,12 @@ function ActionLedger({
           </span>
         )}
       </p>
+      {counts.hiddenReads > 0 && (
+        <p data-testid="ledger-hidden-reads" className="text-xs text-gray-500">
+          {counts.hiddenReads} evaluator/traffic reads hidden — the lab&rsquo;s probes and
+          other principals&rsquo; calls
+        </p>
+      )}
       {stepsDropped > 0 && (
         <p className="text-xs text-amber-300/90">
           {stepsDropped} earlier steps dropped by the platform&rsquo;s 200-step cap.
@@ -1244,7 +1623,12 @@ function ActionLedger({
           Nothing on the operator streams yet.
         </p>
       ) : (
-        <div className="space-y-1.5 mt-2 overflow-y-auto pr-1 flex-1 min-h-0">
+        <div
+          ref={scroller}
+          onScroll={onScroll}
+          data-testid="ledger-scroller"
+          className="space-y-1 mt-2 overflow-y-auto pr-1 flex-1 min-h-0"
+        >
           {entries.map((entry) =>
             entry.kind === 'reset' ? (
               <ResetDivider key={entry.id} at={entry.at} />
@@ -1257,9 +1641,20 @@ function ActionLedger({
         </div>
       )}
 
-      <p className="text-xs text-gray-600 font-mono mt-2">
-        …/steps + /audit/logs ({OPERATOR_STREAMS})
-      </p>
+      <div className="flex items-center justify-between gap-2 mt-2">
+        <p className="text-xs text-gray-600 font-mono truncate">
+          …/steps + /audit/logs — newest last
+        </p>
+        {!pinned && (
+          <button
+            data-testid="ledger-to-bottom"
+            onClick={toBottom}
+            className="text-xs text-blue-300 hover:text-blue-200 shrink-0"
+          >
+            newest ↓
+          </button>
+        )}
+      </div>
     </section>
   )
 }
@@ -1565,8 +1960,13 @@ function BriefingCard({
               Recovery attribution (ADR 0071)
             </p>
             {attribution === null ? (
+              // A terminal run that never acted will never have one, and saying
+              // "none recorded" about it reads as a gap in the record rather than as
+              // the consequence of the run's own decision (WO-R3-334).
               <p data-testid="briefing-attribution" className="text-sm text-gray-600">
-                None recorded — this run&rsquo;s trajectory carries no attribution read.
+                {briefing.attempted_action
+                  ? 'None recorded — this run’s trajectory carries no attribution read.'
+                  : 'No attribution because no action: there is nothing to credit a recovery to.'}
               </p>
             ) : (
               <div data-testid="briefing-attribution">
@@ -1724,14 +2124,30 @@ export default function DemoPage() {
     errorMessage: 'Could not read circuit breakers.',
   })
 
-  // ── the boundary, the run, the steps ────────────────────────────────────
-  const resetAt = useMemo(() => newestResetAt(auditRows), [auditRows])
-  const takeRuns = useMemo(
-    () => runsSinceReset(runs.data?.items ?? [], resetAt),
-    [runs.data, resetAt],
+  // ── the take, the run, the steps ─────────────────────────────────────────
+  //
+  // One take, chosen by the run rather than by the clock (WO-R3-334). The rule is
+  // "the newest run with a fault row in its own take", so the page shows a coherent
+  // incident even when it is reloaded after the wind-down — which is exactly what
+  // happened on the third take and why the platform row and the agent row were
+  // describing two different worlds.
+  const selection = useMemo(
+    () => selectTake({ runs: runs.data?.items ?? [], audit: auditRows, wanted: wantedRun }),
+    [runs.data, auditRows, wantedRun],
   )
-  const listedRun = useMemo(() => selectRun(takeRuns, wantedRun), [takeRuns, wantedRun])
+  const take = selection.take
+  const listedRun = selection.run
   const runId = listedRun?.id ?? null
+  /**
+   * True when the take on screen has been closed and the take after it has reported
+   * no run yet — the state the third take's reload was in, and the one sentence that
+   * makes "why am I looking at 08:17" answerable.
+   */
+  const newerTakeRunning = useMemo(() => {
+    const endAt = take.endAt
+    if (endAt === null) return false
+    return !(runs.data?.items ?? []).some((r) => r.started_at > endAt)
+  }, [take.endAt, runs.data])
 
   // The detail carries everything the list summary does not — the ledger above
   // all, which the LISTING omits rather than empties (WO-R3-328).
@@ -1811,10 +2227,14 @@ export default function DemoPage() {
   // ── the fault, latched for the take ─────────────────────────────────────
   // Mutating a ref during render is safe here: the update is idempotent, schedules
   // nothing, and the render that sets it already reads the new value.
-  const rowFaultAt = useMemo(() => newestFaultAt(auditRows), [auditRows])
+  //
+  // Keyed on the whole take rather than on its opening boundary since WO-R3-334:
+  // switching from a closed take to the live one shares no key, so a latch can
+  // neither outlive its take nor leak backwards into an earlier one.
+  const rowFaultAt = useMemo(() => faultInTake(auditRows, take), [auditRows, take])
   const latch = useRef<{ take: string; faultAt: string | null }>({ take: '', faultAt: null })
-  if (latch.current.take !== (resetAt ?? '')) {
-    latch.current = { take: resetAt ?? '', faultAt: null }
+  if (latch.current.take !== takeKey(take)) {
+    latch.current = { take: takeKey(take), faultAt: null }
   }
   if (
     rowFaultAt !== null &&
@@ -1884,57 +2304,120 @@ export default function DemoPage() {
   )
   const insideSustained = metricSamples.length > 0 ? recovery.sustained : metricInsideNow
 
+  /**
+   * The principal every row on this page is measured against.
+   *
+   * The run says who wrote it (`service_account_id`), so a call by anyone else — the
+   * demo runner reading lag under the agent's token, the evaluator's guard probes —
+   * is not this run's work (F3/F4). With no run selected there is nothing to compare
+   * against and every row counts, which the ledger's own line says.
+   */
+  const runPrincipalId = run?.service_account_id ?? null
+
   const platformStations: PlatformStation[] = useMemo(
     () =>
       platformRow({
         audit: auditRows,
+        take,
+        runPrincipalId,
         faultAt,
         recoveredAt: recovery.recoveredAt,
         metricKnown,
         metricInsideThreshold: insideSustained,
         metricBreachedSinceFault: recovery.breachedAt !== null,
       }),
-    [auditRows, faultAt, recovery, metricKnown, insideSustained],
+    [auditRows, take, runPrincipalId, faultAt, recovery, metricKnown, insideSustained],
   )
-  const agentStations: AgentStation[] = useMemo(() => agentRow(run), [run])
+
+  // When each reported state reached the platform, so a station whose report arrived
+  // in a late burst says so instead of reading as instantaneous (F2).
+  const arrivals = useMemo(() => reportArrivals(auditRows, runId), [auditRows, runId])
+  const reachedStations = useMemo(
+    () => agentRow(run, { arrivals }).filter((s) => s.state !== 'pending').length,
+    [run, arrivals],
+  )
+  const reveal = useStaggeredReveal(runId, reachedStations)
+  const agentStations: AgentStation[] = useMemo(
+    () => agentRow(run, { arrivals, reveal }),
+    [run, arrivals, reveal],
+  )
 
   const platformCurrent = platformStations.find((s) => s.state === 'current') ?? null
   const agentCurrent = agentStations.find((s) => s.state === 'current') ?? null
 
-  // ── the chart's markers and the ledger ──────────────────────────────────
-  // The window is the platform's, taken from the reply rather than assumed: the
-  // reading says how much history it can hold and how far apart the samples are
-  // (900 / 60 today), so the axis is labelled from the answer and a change of
-  // cadence on the platform does not silently mislabel this chart.
+  // ── the chart's window, its markers and the ledger ───────────────────────
+  // The platform's window is taken from the reply rather than assumed: the reading
+  // says how much history it can hold and how far apart the samples are (900 / 60
+  // today), so a change of cadence on the platform cannot silently mislabel this
+  // chart. What the axis SHOWS is the take, though — see `chartWindow`.
   const windowSeconds = lag.data?.sample_window_seconds ?? WINDOW_MS / 1000
   const sampleInterval = lag.data?.sample_interval_seconds ?? null
-  const windowEnd = now
-  const windowStart = windowEnd - windowSeconds * 1000
+  const [fullWindow, setFullWindow] = useState(false)
+  const chartSpan = chartWindow({
+    faultAt,
+    takeStartAt: take.startAt,
+    takeEndAt: take.endAt,
+    now,
+    windowSeconds,
+    full: fullWindow,
+  })
+  const windowStart = chartSpan.start
+  const windowEnd = chartSpan.end
   const markers = useMemo(
     () =>
       chartMarkers({
         faultAt,
         recoveredAt: recovery.recoveredAt,
-        resetAt,
+        resetAts: [take.startAt, take.endAt],
         steps,
         audit: auditRows,
+        runPrincipalId,
         windowStart,
         windowEnd,
       }),
-    [faultAt, recovery.recoveredAt, resetAt, steps, auditRows, windowStart, windowEnd],
+    [
+      faultAt,
+      recovery.recoveredAt,
+      take.startAt,
+      take.endAt,
+      steps,
+      auditRows,
+      runPrincipalId,
+      windowStart,
+      windowEnd,
+    ],
   )
 
+  // The ledger reads the take's rows, not the page's whole window: a row from the
+  // take after this one belongs to that take's ledger, and the third take's page put
+  // seven of them under a run that had already finished.
+  const takeRows = useMemo(() => rowsInTake(auditRows, take), [auditRows, take])
   const ledgerRows = useMemo(
-    () => [...auditRows, ...(showJobEvents ? (jobEvents.data?.items ?? []) : [])],
-    [auditRows, showJobEvents, jobEvents.data],
+    () => [
+      // With the edges: the boundary that opened the take is the divider the ledger
+      // starts from, and the one that closed it is the divider it ends on.
+      ...rowsInTakeWithEdges(auditRows, take),
+      ...(showJobEvents ? rowsInTake(jobEvents.data?.items ?? [], take) : []),
+    ],
+    [auditRows, showJobEvents, jobEvents.data, take],
   )
+  const [showHiddenReads, setShowHiddenReads] = useState(false)
   const ledger: LedgerEntry[] = useMemo(
-    () => buildLedger({ steps, audit: ledgerRows, showJobEvents }),
-    [steps, ledgerRows, showJobEvents],
+    () =>
+      buildLedger({
+        steps,
+        audit: ledgerRows,
+        showJobEvents,
+        runPrincipalId,
+        showHiddenReads,
+        // Newest at the bottom: a live run's newest call is where the eye already is.
+        oldestFirst: true,
+      }),
+    [steps, ledgerRows, showJobEvents, runPrincipalId, showHiddenReads],
   )
   const counts = useMemo(
-    () => ledgerCounts({ steps, audit: auditRows }),
-    [steps, auditRows],
+    () => ledgerCounts({ steps, audit: takeRows, runPrincipalId }),
+    [steps, takeRows, runPrincipalId],
   )
 
   const briefing = run?.briefing ?? null
@@ -1944,8 +2427,8 @@ export default function DemoPage() {
   const openBreakers = (breakers.data?.breakers ?? []).filter((b) => b.state !== 'closed')
   const breakersUnknownReason = breakers.data?.unknown_reason ?? null
   const labRow = useMemo(
-    () => auditRows.find((r) => r.action.startsWith('chaos.')) ?? null,
-    [auditRows],
+    () => takeRows.find((r) => r.action.startsWith('chaos.')) ?? null,
+    [takeRows],
   )
 
   const runsError = runs.error ?? runDetail.error
@@ -1953,17 +2436,23 @@ export default function DemoPage() {
   return (
     <Layout>
       {/* ── header ───────────────────────────────────────────────────────── */}
-      <div className="flex flex-wrap items-start justify-between gap-4 mb-3">
+      <div className="flex flex-wrap items-start justify-between gap-4 mb-2">
         <div>
-          <h1 className="text-2xl font-semibold text-white leading-tight">
+          <h1 className="text-xl font-semibold text-white leading-tight">
             Agent run — {mode === 'consumer_outage' ? 'consumer outage' : 'DLQ backlog'}
           </h1>
           <div className="flex items-center gap-4 mt-1.5">
             <RunSelector
-              runs={takeRuns}
+              runs={selection.runs}
               selected={listedRun}
+              takeStartOf={(r) => takeOfRun(auditRows, r).startAt}
               onSelect={(id) => setParam('run', id)}
             />
+          </div>
+          {/* Its own line: the take label is a sentence, and beside a run selector
+              full of ids it pushed the clock and the mode buttons onto a third row. */}
+          <div className="flex items-center gap-4 mt-1">
+            <TakeLabel take={take} newerTakeRunning={newerTakeRunning} />
             {labRow !== null && (
               <span className="text-xs font-mono text-amber-300/80">
                 lab: {labToolName(labRow)}
@@ -1972,7 +2461,7 @@ export default function DemoPage() {
           </div>
         </div>
         <div className="flex items-start gap-5">
-          <FaultClock faultAt={faultAt} now={now} />
+          <FaultClock faultAt={faultAt} now={now} takeEndAt={take.endAt} />
           <div className="flex gap-1 bg-gray-800/60 rounded-lg p-1">
             <button
               onClick={() => setParam('mode', 'consumer_outage')}
@@ -2048,10 +2537,12 @@ export default function DemoPage() {
       </div>
 
       {/* ── the three panels: world, agent, ledger ────────────────────────── */}
-      {/* 26rem, not more: the three panels plus the two rows and the header are
+      {/* 21rem, not more: the three panels plus the two rows and the header are
           the top half, and the top half has to be one screen at 1440×900 with no
-          scroll. Each panel scrolls inside itself instead. */}
-      <div className="grid grid-cols-1 xl:grid-cols-12 gap-3 mt-3 xl:h-[26rem]">
+          scroll — measured in a real browser, not guessed. A station carries a
+          "reported" line now (WO-R3-334), so the rows are taller and this is
+          shorter. Each panel scrolls inside itself instead. */}
+      <div className="grid grid-cols-1 xl:grid-cols-12 gap-3 mt-2 xl:h-[22rem]">
         <div className="xl:col-span-4 flex flex-col gap-3 min-h-0 overflow-y-auto">
           {mode === 'consumer_outage' ? (
             <MetricChart
@@ -2077,6 +2568,9 @@ export default function DemoPage() {
               markers={markers}
               windowStart={windowStart}
               windowEnd={windowEnd}
+              zoomed={chartSpan.zoomed}
+              onToggleZoom={() => setFullWindow((f) => !f)}
+              liveEdge={take.endAt === null}
               error={lag.error}
               onRetry={lag.reload}
             />
@@ -2096,12 +2590,15 @@ export default function DemoPage() {
               markers={markers}
               windowStart={windowStart}
               windowEnd={windowEnd}
+              zoomed={chartSpan.zoomed}
+              onToggleZoom={() => setFullWindow((f) => !f)}
+              liveEdge={take.endAt === null}
               error={dlq.error}
               onRetry={dlq.reload}
             />
           )}
 
-          <div className="bg-gray-900 border border-gray-800 rounded-lg px-4 py-3 text-sm space-y-1">
+          <div className="bg-gray-900 border border-gray-800 rounded-lg px-4 py-2 text-xs space-y-0.5 shrink-0">
             <p className="text-gray-300">Platform readings</p>
             {alerts.error !== null ? (
               <p className="text-amber-300/80">{alerts.error}</p>
@@ -2145,7 +2642,7 @@ export default function DemoPage() {
           </div>
         </div>
 
-        <div className="xl:col-span-5 min-h-0 flex flex-col">
+        <div className="xl:col-span-4 min-h-0 flex flex-col">
           <AgentPanel
             run={run}
             steps={steps}
@@ -2158,7 +2655,7 @@ export default function DemoPage() {
           />
         </div>
 
-        <div className="xl:col-span-3 min-h-0 flex flex-col">
+        <div className="xl:col-span-4 min-h-0 flex flex-col">
           <ActionLedger
             entries={ledger}
             counts={counts}
@@ -2168,6 +2665,8 @@ export default function DemoPage() {
             usingAudit={steps.length === 0 && run !== null}
             showJobEvents={showJobEvents}
             onToggleJobEvents={setShowJobEvents}
+            showHiddenReads={showHiddenReads}
+            onToggleHiddenReads={setShowHiddenReads}
             loading={audit.loading && audit.data === null}
             error={audit.error ?? stepPoll.error}
             onRetry={() => {

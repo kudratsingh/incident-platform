@@ -28,6 +28,13 @@
  *     ledger uses them only as a fallback — and `ledgerCounts` reports both
  *     witnesses' totals, because a reporter that stopped reporting mid-run is
  *     exactly what a demo must not hide.
+ *  3. **A call that is not this run's is not this run's** (WO-R3-334). The third
+ *     live take's ledger counted 89 calls against a four-call run: the demo runner
+ *     read lag every three seconds under the AGENT's token and the evaluator's
+ *     guard probes fired seven more. Rows are matched against the run's own
+ *     `service_account_id`, `lab.probe` rows are the lab's own (WO-R3-333), and
+ *     what is excluded is counted and shown behind a toggle rather than dropped.
+ *     The rows themselves are one line each, with the answer summarised on them.
  */
 
 import type {
@@ -44,6 +51,7 @@ import {
   AGENT_RUN_REPORT_ACTION,
   AGENT_TOOL_ACTION,
   LAB_ACTION_PREFIX,
+  isLabProbeRow,
   isResetRow,
   toolCall,
 } from './demoPhase'
@@ -170,9 +178,16 @@ export type LedgerKind =
   | 'agent_audit'
   | 'agent_report'
   | 'lab'
+  /** A read the lab took under the agent's token, labelled by the lab (WO-R3-333). */
+  | 'lab_probe'
+  /** An `agent.tool_invoked` row by a principal that is not this run's (F3). */
+  | 'other_principal'
   | 'reset'
   | 'job_event'
   | 'human'
+
+/** The two kinds the ledger hides behind the "reads hidden" toggle. */
+export const HIDDEN_LEDGER_KINDS: readonly LedgerKind[] = ['lab_probe', 'other_principal']
 
 export interface LedgerEntry {
   id: string
@@ -195,6 +210,60 @@ export interface LedgerInput {
    * and the four rows the demo is about were somewhere under them.
    */
   showJobEvents?: boolean
+  /**
+   * The run's own `service_account_id` (WO-R3-334).
+   *
+   * The third take's ledger was a wall of `get_consumer_lag` every three seconds
+   * under the AGENT principal, and none of it was the agent's: the demo runner built
+   * two clients with the agent's token (F3) and the evaluator's guard probes fired
+   * seven more calls after the reset boundary (F4). A row by another principal is
+   * somebody else's read, and the page now says so instead of showing it as the
+   * agent's.
+   */
+  runPrincipalId?: string | null
+  /** Show the excluded reads — the toggle behind the "reads hidden" count. */
+  showHiddenReads?: boolean
+  /**
+   * Oldest first, which is how the page draws it: newest at the BOTTOM, where the
+   * eye already is while a run is live, so the ledger reads like a transcript.
+   * Default stays newest-first.
+   */
+  oldestFirst?: boolean
+}
+
+export interface LedgerExclusions {
+  /** `lab.probe` rows — the evaluator's own reads, labelled at the source. */
+  labProbe: number
+  /** `agent.tool_invoked` rows by a principal that is not the run's. */
+  otherPrincipal: number
+  total: number
+}
+
+/**
+ * What the ledger is leaving out, counted so the page can say how much.
+ *
+ * "N evaluator/traffic reads hidden" with a toggle, rather than a silently shorter
+ * list: the reads are real calls the platform really served, and an operator who
+ * cannot see them cannot tell a quiet run from a filtered one.
+ */
+export function ledgerExclusions(input: {
+  audit: AuditLog[]
+  runPrincipalId?: string | null
+}): LedgerExclusions {
+  let labProbe = 0
+  let otherPrincipal = 0
+  for (const row of input.audit) {
+    if (isLabProbeRow(row)) labProbe += 1
+    else if (isForeignToolRow(row, input.runPrincipalId)) otherPrincipal += 1
+  }
+  return { labProbe, otherPrincipal, total: labProbe + otherPrincipal }
+}
+
+/** An `agent.tool_invoked` row that some other principal made. */
+function isForeignToolRow(row: AuditLog, runPrincipalId: string | null | undefined): boolean {
+  if (row.action !== AGENT_TOOL_ACTION) return false
+  if (runPrincipalId === null || runPrincipalId === undefined) return false
+  return row.principal_id !== runPrincipalId
 }
 
 /**
@@ -229,32 +298,53 @@ export function buildLedger(input: LedgerInput): LedgerEntry[] {
   }))
 
   for (const row of input.audit) {
-    const kind = auditLedgerKind(row, haveSteps, input.showJobEvents === true)
+    const kind = auditLedgerKind(row, {
+      haveSteps,
+      showJobEvents: input.showJobEvents === true,
+      showHiddenReads: input.showHiddenReads === true,
+      runPrincipalId: input.runPrincipalId,
+    })
     if (kind === null) continue
     entries.push({ id: `row-${row.id}`, at: row.created_at, kind, row })
   }
 
-  return entries.sort((a, b) => {
+  const newestFirst = entries.sort((a, b) => {
     if (a.at !== b.at) return a.at < b.at ? 1 : -1
     // Same instant: the step order is the run's own order, and a step is more
     // specific than the row that recorded it.
     return (b.step?.seq ?? 0) - (a.step?.seq ?? 0)
   })
+  return input.oldestFirst === true ? newestFirst.reverse() : newestFirst
 }
 
 function auditLedgerKind(
   row: AuditLog,
-  haveSteps: boolean,
-  showJobEvents: boolean,
+  options: {
+    haveSteps: boolean
+    showJobEvents: boolean
+    showHiddenReads: boolean
+    runPrincipalId?: string | null
+  },
 ): LedgerKind | null {
   if (isResetRow(row)) return 'reset'
   // Matched on the ACTION, not the principal: the evaluator is a service account
   // too, so a principal-only test files the lab's own rows under the agent and
   // makes the fault look like something the agent did.
   if (row.action.startsWith(LAB_ACTION_PREFIX)) return 'lab'
-  if (row.action.startsWith(JOB_EVENT_PREFIX)) return showJobEvents ? 'job_event' : null
-  if (row.action === AGENT_RUN_REPORT_ACTION) return haveSteps ? null : 'agent_report'
-  if (row.action === AGENT_TOOL_ACTION) return haveSteps ? null : 'agent_audit'
+  // A lab row that is not the boundary is a read the lab took under the agent's own
+  // token (WO-R3-333) — hidden with the other principals' reads, never drawn as the
+  // agent's own.
+  if (isLabProbeRow(row)) return options.showHiddenReads ? 'lab_probe' : null
+  if (row.action.startsWith(JOB_EVENT_PREFIX)) return options.showJobEvents ? 'job_event' : null
+  if (row.action === AGENT_RUN_REPORT_ACTION) return options.haveSteps ? null : 'agent_report'
+  if (row.action === AGENT_TOOL_ACTION) {
+    if (isForeignToolRow(row, options.runPrincipalId)) {
+      return options.showHiddenReads ? 'other_principal' : null
+    }
+    // With steps, the steps ARE the ledger: these are the same calls without their
+    // results, and drawing both would show every call twice.
+    return options.haveSteps ? null : 'agent_audit'
+  }
   if (row.principal_type === 'user') return 'human'
   return null
 }
@@ -264,9 +354,19 @@ export interface LedgerCounts {
   steps: number
   /** The steps that were MCP calls — a `read` or an `action`. */
   calls: number
-  /** The `agent.tool_invoked` rows the platform recorded. */
+  /**
+   * The `agent.tool_invoked` rows the platform recorded **for this run's own
+   * principal**.
+   *
+   * The third take's page said "0 steps reported · 89 calls the platform recorded —
+   * the two do not agree", and the 89 was mostly the runner reading lag every three
+   * seconds under the agent's token. A count that includes somebody else's calls
+   * cannot be compared with the run's own steps, so this one does not.
+   */
   auditCalls: number
   labRows: number
+  /** The rows the exclusions hid — the evaluator's and the runner's reads. */
+  hiddenReads: number
   /** False when the two witnesses do not agree on how many calls there were. */
   agreed: boolean
 }
@@ -283,8 +383,11 @@ export interface LedgerCounts {
 export function ledgerCounts(input: {
   steps: AgentRunStepRecord[]
   audit: AuditLog[]
+  runPrincipalId?: string | null
 }): LedgerCounts {
-  const auditCalls = input.audit.filter((r) => r.action === AGENT_TOOL_ACTION).length
+  const auditCalls = input.audit.filter(
+    (r) => r.action === AGENT_TOOL_ACTION && !isForeignToolRow(r, input.runPrincipalId),
+  ).length
   // Report steps have no `agent.tool_invoked` row — they audit as
   // `agent.run_reported` — so they are not part of the comparison.
   const calls = input.steps.filter((s) => s.kind !== 'report').length
@@ -293,8 +396,170 @@ export function ledgerCounts(input: {
     calls,
     auditCalls,
     labRows: input.audit.filter((r) => r.action.startsWith(LAB_ACTION_PREFIX)).length,
+    hiddenReads: ledgerExclusions(input).total,
     agreed: calls === auditCalls,
   }
+}
+
+// ── one row, one line ────────────────────────────────────────────────────────
+//
+// The third take's ledger showed raw audit rows — tool name, arguments, a latency —
+// and the one thing a viewer wants from a read is what it ANSWERED. A step carries a
+// 400-character excerpt of that answer (ADR 0037), which is too much for a row and
+// exactly right behind a click. So every row is one line by default:
+//
+//   08:19:44  READ  get_consumer_lag → lag 30, known
+//
+// and the summary on the right of the arrow comes from the table below: a named
+// reading per tool, because "lag 30, known" is a sentence and the first sixty
+// characters of a JSON blob is not.
+
+/** How much of an unrecognised excerpt fits on one line. */
+const GENERIC_SUMMARY_CHARS = 64
+
+function collapse(text: string): string {
+  return text.replace(/\s+/g, ' ').trim()
+}
+
+/** The excerpt as an object, when it is one — the reporter sends JSON where a tool returns it. */
+function excerptObject(excerpt: string): Record<string, unknown> | null {
+  const text = excerpt.trim()
+  if (!text.startsWith('{')) return null
+  try {
+    const parsed: unknown = JSON.parse(text)
+    return parsed !== null && typeof parsed === 'object'
+      ? (parsed as Record<string, unknown>)
+      : null
+  } catch {
+    // A 400-character excerpt of a longer body is usually truncated JSON, which is
+    // not parseable and not a defect: the regexes below read it as text.
+    return null
+  }
+}
+
+function numberField(o: Record<string, unknown> | null, key: string): number | null {
+  const value = o?.[key]
+  return typeof value === 'number' ? value : null
+}
+
+function boolField(o: Record<string, unknown> | null, key: string): boolean | null {
+  const value = o?.[key]
+  return typeof value === 'boolean' ? value : null
+}
+
+/** The first captured number of a pattern, from a prose or truncated-JSON excerpt. */
+function firstNumber(text: string, pattern: RegExp): number | null {
+  const found = pattern.exec(text)
+  if (found === null) return null
+  const value = Number(found[1])
+  return Number.isFinite(value) ? value : null
+}
+
+type Summariser = (json: Record<string, unknown> | null, text: string) => string | null
+
+/**
+ * One summary per tool the demo's two scenarios touch, plus the readings a run
+ * reaches for when it is guessing.
+ *
+ * Each one reads the parsed excerpt where it can and the text where it cannot, and
+ * returns null to fall through to the generic excerpt rather than inventing a
+ * reading — an excerpt that does not carry the field is not a field worth guessing.
+ */
+const SUMMARISERS: Record<string, Summariser> = {
+  get_consumer_lag: (json, text) => {
+    const known = boolField(json, 'lag_known')
+    const lag = numberField(json, 'lag') ?? firstNumber(text, /lag\D{0,12}(-?\d+)/i)
+    if (known === false || (lag === null && /unknown/i.test(text))) return 'lag unknown'
+    if (lag === null) return null
+    return `lag ${String(lag)}, known`
+  },
+  list_dlq_messages: (json, text) => {
+    const total = numberField(json, 'total') ?? firstNumber(text, /total\D{0,8}(\d+)/i)
+    return total === null ? null : `DLQ total ${String(total)}`
+  },
+  get_circuit_breakers: (json, text) => {
+    const breakers = json?.breakers
+    if (Array.isArray(breakers)) {
+      const open = breakers.filter(
+        (b): b is Record<string, unknown> =>
+          b !== null && typeof b === 'object' && (b as Record<string, unknown>).state !== 'closed',
+      )
+      if (open.length === 0) {
+        return `${String(breakers.length)} breaker${breakers.length === 1 ? '' : 's'}, none open`
+      }
+      return open
+        .map((b) => `${String(b.name ?? 'breaker')} ${String(b.state ?? 'open')}`)
+        .join(', ')
+    }
+    const open = /([\w-]+)\s*[:=]?\s*(half_open|open)\b/i.exec(text)
+    if (open !== null) return `${open[1]} ${open[2].toLowerCase()}`
+    return /none open|all closed/i.test(text) ? 'none open' : null
+  },
+  get_cache_key_info: (json, text) => {
+    const exists = boolField(json, 'exists') ?? (/"?exists"?\s*[:=]\s*true/i.test(text) ? true : null)
+    if (exists === false || /"?exists"?\s*[:=]\s*false/i.test(text)) return 'absent'
+    if (exists !== true) return null
+    const size = numberField(json, 'size_bytes') ?? firstNumber(text, /size_bytes\D{0,6}(\d+)/i)
+    return size === null ? 'exists' : `exists, ${String(size)} bytes`
+  },
+  restart_consumer_group: (json, text) => {
+    const accepted = boolField(json, 'accepted')
+    const cleared = boolField(json, 'kill_key_cleared')
+    if (accepted === null && !/accepted/i.test(text)) return null
+    const parts = [accepted === false ? 'not accepted' : 'accepted']
+    if (cleared !== null) parts.push(cleared ? 'kill key cleared' : 'kill key still set')
+    return parts.join(', ')
+  },
+  mark_dlq_permanent: (json, text) =>
+    json?.fenced_at !== undefined || /fenced/i.test(text) ? 'fenced' : null,
+  get_dag_state: (json, text) => {
+    const paused = boolField(json, 'paused')
+    if (paused !== null) return paused ? 'paused' : 'not paused'
+    return /"?paused"?\s*[:=]\s*true/i.test(text) ? 'paused' : null
+  },
+}
+
+const REPLAY_TOOLS = ['replay_dlq_by_ids', 'replay_dlq_messages', 'replay_dlq_by_category']
+
+function replaySummary(json: Record<string, unknown> | null, text: string): string | null {
+  const replayed = numberField(json, 'replayed') ?? firstNumber(text, /replayed\D{0,6}(\d+)/i)
+  if (replayed === null) return null
+  const scheduled = numberField(json, 'scheduled') ?? firstNumber(text, /scheduled\D{0,6}(\d+)/i)
+  return scheduled === null
+    ? `replayed ${String(replayed)}`
+    : `replayed ${String(replayed)}, scheduled ${String(scheduled)}`
+}
+
+/**
+ * The one-line summary of what a call answered, or null where there is nothing to
+ * summarise.
+ *
+ * The generic fallback is the excerpt itself, collapsed to one line and cut — a
+ * reading nobody has written a summariser for is still better read than hidden, and
+ * the full excerpt is one click away.
+ */
+export function summariseResult(
+  tool: string | null | undefined,
+  excerpt: string | null | undefined,
+): string | null {
+  if (excerpt === null || excerpt === undefined || excerpt.trim() === '') return null
+  const text = collapse(excerpt)
+  const json = excerptObject(excerpt)
+  const named =
+    tool === null || tool === undefined
+      ? null
+      : REPLAY_TOOLS.includes(tool)
+        ? replaySummary(json, text)
+        : (SUMMARISERS[tool]?.(json, text) ?? null)
+  if (named !== null) return named
+  return text.length > GENERIC_SUMMARY_CHARS
+    ? `${text.slice(0, GENERIC_SUMMARY_CHARS)}…`
+    : text
+}
+
+/** The same, for a step: the excerpt it carries, summarised by its own tool. */
+export function summariseStep(step: AgentRunStepRecord): string | null {
+  return summariseResult(step.tool, step.result_excerpt)
 }
 
 // ── what the run decided about one dead-letter row ───────────────────────────
