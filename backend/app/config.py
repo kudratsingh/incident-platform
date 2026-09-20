@@ -220,6 +220,14 @@ class Settings(BaseSettings):
     # same at boot.
     chaos_enabled: bool = False
 
+    # The read-only account whose credential may label a call `lab.probe` beside a
+    # principal holding `chaos:invoke` (WO-R3-333, ADR 0038). A NAME rather than a
+    # scope because this account's scopes are the agent's scopes exactly — read-only
+    # is the point of it — so nothing else tells the two apart; `app/mcp/lab_probe.py`
+    # re-checks that it holds no write scope before honouring the name. Inert while
+    # `chaos_enabled` is false, which is every production deployment.
+    lab_probe_smoke_account_name: str = "incident-commander-smoke"
+
     # Alert emission — signed webhook + poll fallback. With no
     # `alert_webhook_url` alerts are still persisted (readable via
     # `list_active_alerts`), just not pushed. HMAC-SHA256 over the body.

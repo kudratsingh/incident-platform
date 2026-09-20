@@ -116,9 +116,33 @@ class ToolsListResult(BaseModel):
     tools: list[ToolInfo]
 
 
+# The lab's own field on a `tools/call` request, and it is a SIBLING of `arguments`
+# rather than a member of it (WO-R3-333, ADR 0038). Inside `arguments` it would be
+# parsed by the tool's input model — refused by `extra="forbid"` on most of them, and
+# on the wire in `tools/list` for every one — so the agent's prompt could carry it and
+# the contract snapshot would move. Beside `arguments` it reaches the envelope only:
+# nothing in `tools/list` changes, and no tool handler can see it.
+LAB_PROBE_FIELD = "_lab_probe"
+
+
 class ToolCallParams(BaseModel):
+    """One `tools/call` request's params.
+
+    `_lab_probe` carries a short reason string when the caller is the lab probing the
+    platform *under the agent's own token* — which the principal guards and the world
+    audit do on purpose, because what that token can and cannot do is the thing they
+    prove. Honoured only against an `X-Lab-Principal` credential
+    (`app/mcp/lab_probe.py`); the audit row for the call is then `lab.probe` instead of
+    `agent.tool_invoked`, so the console can tell the evaluator's reads from the
+    agent's. The field is validated by its alias alone: `lab_probe` without the
+    underscore is not a second spelling, it is an unknown key that changes nothing.
+    """
+
     name: str
     arguments: dict[str, Any] = Field(default_factory=dict)
+    # The alias is the literal because mypy requires one here; the constant above is what
+    # every other reader imports, and `test_lab_probe.py` pins the two together.
+    lab_probe: str | None = Field(default=None, alias="_lab_probe")
 
 
 class ToolCallContent(BaseModel):
@@ -139,6 +163,7 @@ __all__ = [
     "JSONRPC_INVALID_REQUEST",
     "JSONRPC_METHOD_NOT_FOUND",
     "JSONRPC_PARSE_ERROR",
+    "LAB_PROBE_FIELD",
     "InitializeParams",
     "InitializeResult",
     "JsonRpcError",

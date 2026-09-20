@@ -28,6 +28,7 @@ from app.dependencies import (
 )
 from app.mcp import handlers, protocol
 from app.mcp import tools as _tools  # noqa: F401 — side-effect: register tools
+from app.mcp.lab_probe import LAB_PRINCIPAL_HEADER
 from app.utils.rate_limit import check_identity_rate_limit
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -174,6 +175,10 @@ def create_mcp_app() -> FastAPI:
             db=db,
             redis=redis,
             principal_or_error=principal_or_error,
+            # Read here and passed down: this is the only layer that holds a request.
+            # A second credential, never a second principal — the call stays the
+            # caller's, and all this one can do is label the audit row (ADR 0038).
+            lab_principal_header=request.headers.get(LAB_PRINCIPAL_HEADER),
         )
         return JSONResponse(
             status_code=200,

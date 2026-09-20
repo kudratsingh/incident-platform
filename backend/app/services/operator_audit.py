@@ -9,6 +9,10 @@ read side of the same stream — lives here so writer and reader share one file.
 One row here is not a tool call: `lab.world_reset`, written by `scripts/reset_eval_state.py`
 once per reset, carrying that reset's own counters. It lives in this file for the same reason
 the withholding does — the writer and the reader of a withheld stream belong together.
+
+One row here IS a tool call, and it is in the same withheld stream: `lab.probe`, the label a
+call carries when the lab made it under the agent's own token (WO-R3-333, ADR 0038). Same
+writer, same shape, two extra fields in `extra_data`.
 """
 
 import uuid
@@ -52,6 +56,17 @@ AGENT_RUN_REPORTED_ACTION = "agent.run_reported"
 LAB_ACTION_PREFIX = "lab."
 WORLD_RESET_ACTION = "lab.world_reset"
 
+# The second member of that stream (WO-R3-333, ADR 0038). One MCP call the lab made
+# *under the agent's token* — the principal guards and the world audit do that on
+# purpose, because what the agent's token can and cannot do is what they prove. The row
+# is the same shape as `agent.tool_invoked` and carries two extra fields: the caller's
+# own short reason and the lab credential that authorised the label. It joins `lab.`
+# rather than `chaos.` for the reason the boundary row did: to the `/demo` console the
+# newest `chaos.` row IS the fault, and a read is not a fault. It is withheld from the
+# agent by the same prefix rule, which is the whole point — a read the agent did not
+# make must not appear in the ledger the console builds from its stream.
+LAB_PROBE_ACTION = "lab.probe"
+
 # What the boundary row says it is about. There is no single resource, so
 # `resource_id` stays null — the row's identity is its `created_at`.
 WORLD_RESET_RESOURCE_TYPE = "world"
@@ -75,7 +90,10 @@ def hidden_audit_action_prefixes(principal: Principal) -> tuple[str, ...]:
       prefixes, one condition — whoever may fire the lab may read the lab. `chaos.`
       is the lab injecting a fault; `lab.` is the lab resetting the world it injected
       into, and its `lab.world_reset` payload names every mechanism the reset swept,
-      so it leaks more than a hook name would (2026-09-20 amendment).
+      so it leaks more than a hook name would (2026-09-20 amendment). The prefix now
+      carries `lab.probe` too (WO-R3-333) and needs no second rule for it: one
+      prefix, one condition, and a read the lab took under the agent's token is the
+      last thing the agent should be able to read back as its own.
     - The `agent.run_reported` stream is hidden **from** a principal holding
       `agent_runs:write`: the writer of that stream is not its reader. The platform
       stores what a responder reports about itself and shows it to operators, never
@@ -121,6 +139,8 @@ async def record_tool_invocation(
     is_chaos: bool = False,
     is_commander: bool = False,
     denied_by: str | None = None,
+    lab_probe_reason: str | None = None,
+    lab_probe_principal: str | None = None,
 ) -> bool:
     """Write an `agent.tool_invoked` row for one MCP tool call; returns whether it staged.
 
@@ -131,6 +151,14 @@ async def record_tool_invocation(
     `extra_data.arguments` carries the run id and the state that was reported. Never
     raises — the savepoint costs only the audit row, and the caller decides:
     `app.mcp.handlers` treats `False` as fatal (R2-51).
+
+    `lab_probe_reason` is a fourth case and the narrowest one (WO-R3-333): an honoured
+    `_lab_probe` makes the row `lab.probe` **instead of `agent.tool_invoked`**, and
+    instead of nothing else. A chaos call and a run report already say the lab or the
+    reporter made them, and the `chaos.` stream in particular is what the console reads
+    as the fault — relabelling either would move a fact rather than add one. So on those
+    two the action does not move and the reason rides along in `extra_data`, which is
+    where an operator looks for it anyway.
     """
     extra: dict[str, Any] = {
         "tool_name": tool_name,
@@ -143,6 +171,11 @@ async def record_tool_invocation(
         extra["error_message"] = error_message
     if denied_by is not None:
         extra["denied_by"] = denied_by
+    # Recorded whatever the action turns out to be: the claim is a fact about the call.
+    if lab_probe_reason is not None:
+        extra["lab_probe_reason"] = lab_probe_reason
+    if lab_probe_principal is not None:
+        extra["lab_probe_principal"] = lab_probe_principal
 
     if is_chaos:
         action = (
@@ -150,6 +183,8 @@ async def record_tool_invocation(
         )
     elif is_commander:
         action = AGENT_RUN_REPORTED_ACTION
+    elif lab_probe_reason is not None:
+        action = LAB_PROBE_ACTION
     else:
         action = TOOL_INVOKED_ACTION
 
@@ -219,6 +254,7 @@ __all__ = [
     "CHAOS_TOOL_DENIED_ACTION",
     "CHAOS_TOOL_INVOKED_ACTION",
     "LAB_ACTION_PREFIX",
+    "LAB_PROBE_ACTION",
     "OUTCOME_ERROR",
     "OUTCOME_SUCCESS",
     "OUTCOME_UNAUTHORIZED",
