@@ -3,7 +3,8 @@
 What it shows, where every number on it comes from, and what the two principals
 can and cannot see. Built by WO-R3-313 for the live demo: an operator opens one
 screen, records it, and narrates an incident from injection to resolution
-without switching tabs.
+without switching tabs. WO-R3-327 added the reset boundary, so a second take on
+the same stack opens clean instead of opening on the first take's incident.
 
 The other half of the demo — the step machine that fires the fault, runs the
 agent and resets the world — lives in the commander repo
@@ -46,6 +47,66 @@ going on camera.
    gives you — degrades that panel and leaves the world and the audit log up. A
    single failed poll shows the error *beside* the last good reading rather than
    blanking the panel.
+4. **A reset is a boundary, and nothing older than the newest one is read.**
+   See below — it is the reason a second take opens clean instead of opening on
+   the first take's incident.
+
+---
+
+## A reset ends a take, and the page knows where
+
+`audit_logs` is append-only by design, so a take's rows are still there after the
+world it describes is gone. That made the page confidently wrong in exactly the
+moment it exists for: after `make eval-reset`, the newest `chaos.*` row was still
+the *previous* take's kill, so a freshly wiped world opened at **agent
+remediating**, with `T+ 4m 12s since the fault` counting from an incident that no
+longer existed. Every derived reading was affected — the strip, the clock, the
+agent card, the metric latch, and the DLQ "agent decided" badges (the seeded
+dead-letter rows come back under *stable* ids, so last take's replay named this
+take's row).
+
+The page cannot infer the boundary. It is not in the audit log, the Redis keys are
+gone, and `agent_runs` says only that a run ended. So the reset **states** it: one
+`lab.world_reset` audit row per reset, appended last, carrying that reset's own
+counters as its payload (platform WO-R3-327).
+
+| | |
+|---|---|
+| **Action** | `lab.world_reset` |
+| **Written by** | `scripts/reset_eval_state.py`, once per reset, after every restoring step |
+| **Payload** | that reset's summary of counters — `chaos_keys_cleared`, `dlq_reset`, `hot_set_reseeded`, … |
+| **Principal** | the evaluator's service account (`incident-commander-chaos`), or a null machine principal on a stack where that account has not been seeded |
+| **Visible to** | human operators, over REST. **Withheld from the agent** beside `chaos.`, under the same `chaos:invoke` condition ([ADR 0012](ADR/0012-the-lab-is-invisible-to-the-agent.md), 2026-09-20 amendment) — its payload names every mechanism the reset swept, which leaks more than a hook name would |
+
+**Its own prefix, not `chaos.`** — because to this page the newest `chaos.*` row
+*is* the fault. A boundary filed under that prefix would be read as the very thing
+it exists to say did not happen.
+
+What reads the boundary, all in `frontend/src/utils/demoPhase.ts`:
+
+- the phase strip's platform reading and the fault clock — rows strictly newer than
+  it, so a previous take's fault **and** its remediation are discarded together
+  (crediting one take's `restart_consumer_group` to the next take's fault is the
+  same lie in a different station);
+- the agent card — the newest run the boundary has not closed out. `make eval-reset`
+  closes open runs as `failed` with a `closed_by: reset` marker (WO-R3-315), so those
+  are dropped. A run still **open** and older than the boundary is deliberately kept:
+  that is either a race with the reset's own sweep or a responder it could not reach,
+  and on camera the disagreement is worth seeing;
+- the metric latch — keyed on the boundary as well as the fault, so a reset with no
+  new fault yet cannot carry the previous take's observed breach;
+- the DLQ badges — a decision older than the boundary is not this take's.
+
+Two details worth knowing. A row sharing the boundary's exact timestamp belongs to
+the take being **closed** — the reset writes its row last, so anything simultaneous
+with it is the world it just wound up. And on a stack older than WO-R3-327 there is
+no boundary row, so the page behaves exactly as it did before and reads the whole
+history: an inferred boundary would be a guess about which rows to throw away.
+
+In the timeline the boundary is drawn as a **grey divider** (`world reset · HH:MM:SS`)
+rather than as a row, under every filter chip — rows below the line are a previous
+take. It is the only thing on the page with no actor colour, because nothing happened
+to the world there.
 
 ---
 
@@ -115,12 +176,14 @@ the lab's word for it from a non-chaos tool's `tools/list` surface. It lands in
 
 ### The platform's reading
 
-Sources: `GET /api/v1/audit/logs` (unfiltered) plus the mode's own metric. The
-rule, in order:
+Sources: `GET /api/v1/audit/logs` (unfiltered) plus the mode's own metric. Every
+step below reads only rows **newer than the newest `lab.world_reset`** — see "A
+reset ends a take" above. The rule, in order:
 
-1. **No `chaos.*` row anywhere → `healthy`.** Nothing was injected, whatever
+1. **No `chaos.*` row in this take → `healthy`.** Nothing was injected, whatever
    else is happening. A healthy world with an agent poking at it is still a
-   healthy world.
+   healthy world, and a world that was just reset is a healthy world however
+   complete the take before it was.
 2. **The metric has been breached and is now back inside its threshold →
    `recovered`.** All three conditions are required: a reading exists, a breach
    really happened, and the reading is back inside the bar.
@@ -146,8 +209,9 @@ exactly this reason.
 ### The clock
 
 `T+ <elapsed> since the fault`, counted from the newest `chaos.*` audit row's
-`created_at` — the platform's own clock, not the browser's idea of when the
-operator pressed a key. Before any lab row it reads *no fault injected yet*.
+`created_at` **in the current take** — the platform's own clock, not the browser's
+idea of when the operator pressed a key. Before any lab row, and after a reset with
+no new fault yet, it reads *no fault injected yet*.
 
 ---
 
@@ -221,9 +285,12 @@ first, so a run that changed its mind shows the last thing it decided:
 | `fence` | `mark_dlq_permanent` whose `job_id` is this row |
 | `leave` | nothing above |
 
-Only `agent.tool_invoked` rows count. `chaos.tool_invoked` rows are excluded on
-purpose: the evaluator seeds this world, and attributing its seeding to the agent
-would badge every planted row as something the agent decided.
+Only `agent.tool_invoked` rows count, and only those newer than the newest
+`lab.world_reset`. `chaos.tool_invoked` rows are excluded on purpose: the evaluator
+seeds this world, and attributing its seeding to the agent would badge every planted
+row as something the agent decided. Rows from a previous take are excluded for a
+sharper version of the same reason — the seeded dead-letter rows come back under
+*stable* ids, so last take's `replay_dlq_by_ids` names this take's row exactly.
 
 `leave` is a **result, not a blank**. For `dlq_backlog` the correct answer is to
 replay one row and leave four alone, so four `leave` badges is the agent passing,
@@ -262,10 +329,12 @@ Before the agent reports anything: *Waiting for the agent to report a run.*
 
 ## Right column — the audit timeline
 
-Newest first, from `GET /api/v1/audit/logs`. Five lanes, colour-coded:
+Newest first, from `GET /api/v1/audit/logs`. Five lanes plus the boundary,
+colour-coded:
 
 | Lane | Colour | Rows | Rendering |
 |---|---|---|---|
+| world reset | grey | `lab.world_reset` | a **divider** across the timeline, not a row — `world reset · HH:MM:SS` |
 | lab | amber | `chaos.*` | tool name and arguments — what exactly was fired |
 | agent action | blue | `agent.tool_invoked` whose tool is a Tier-1 action | expanded: tool, arguments, platform outcome, latency |
 | agent read | grey | `agent.tool_invoked`, anything else | consecutive reads collapse into one "N reads" group you can expand |
@@ -282,6 +351,14 @@ filter the render, so the two can never show different rows. The unfiltered
 stream is always fetched as well, because the phase strip and the DLQ badges
 derive from it: a chip the operator clicked must not be able to change what the
 strip says.
+
+The divider comes from that unfiltered stream too, which is why it survives every
+chip: `lab.` and `chaos.` are different prefixes and one server-side filter cannot
+carry both, so the `lab` chip fetches the faults and the line is drawn from what the
+page already has. The rows are split at the boundary *before* they are grouped, so a
+run of collapsible reads can never straddle the line and hide it inside a "N reads"
+group. Where a reset has happened and nothing has followed it, the panel is the
+divider alone — which is the truthful first frame of a recording.
 
 ---
 
@@ -320,6 +397,7 @@ This difference *is* the demo's point, and the page is on the human side of it.
 | | The agent (`incident-commander`, MCP) | A human operator (this page, REST) |
 |---|---|---|
 | `chaos.*` audit rows | **withheld** — `list_audit_events` and `get_trace` exclude the prefix in SQL and out of `total` for any principal without `chaos:invoke` ([ADR 0012](ADR/0012-the-lab-is-invisible-to-the-agent.md), 2026-09-15 amendment) | visible |
+| `lab.world_reset` — the boundary | **withheld**, same mechanism and same condition (2026-09-20 amendment). Asking for it by prefix or by exact action is an empty page with `total: 0`, never a refusal | visible, payload included — this page reads the boundary from it |
 | `agent_runs` — its own reported run | **not readable at all**. There is no read tool, by design (platform ADR 0035, written by WO-R3-312); the two write tools are called by the loop's checkpoint hook, not chosen by the model, and are excluded from the planner surface | visible |
 | Consumer lag | `get_consumer_lag` (one group per call) | `GET /admin/consumer-lag` (every group) |
 | DLQ rows | `list_dlq_messages` | `GET /admin/jobs?status=dead_letter`, with `remediation_hint` / `dead_lettered_at` / `fenced_at` / `fenced_by` / `triage` |

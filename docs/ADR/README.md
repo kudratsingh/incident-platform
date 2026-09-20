@@ -17,7 +17,7 @@ Status is stated in each file's own header; the table below mirrors it. All 26 a
 | [0009](0009-consumer-lifecycle-and-supervision.md) | Consumer lifecycle and supervision | Accepted | Self-amended 2026-08-30 — worker liveness moved off the deep health check |
 | [0010](0010-idempotency-record-lifecycle.md) | Idempotency record lifecycle | Accepted | 2026-08-30 addendum: the key is claimed before the action runs |
 | [0011](0011-dag-pause-enforcement.md) | DAG pause is enforced by the resolver, not just recorded | Accepted | Amended by 0022 |
-| [0012](0012-the-lab-is-invisible-to-the-agent.md) | The lab is invisible to the agent | Rule 1 accepted and shipped; rule 2 accepted-deferred | 2026-09-15 amendment extends rule 1 to response bodies |
+| [0012](0012-the-lab-is-invisible-to-the-agent.md) | The lab is invisible to the agent | Rule 1 accepted and shipped; rule 2 accepted-deferred | 2026-09-15 amendment extends rule 1 to response bodies; **2026-09-20 amendment** adds `lab.` beside `chaos.` to the withheld audit prefixes — the environment reset's `lab.world_reset` boundary row, whose payload is the mechanism list, kept out of `chaos.` because to the `/demo` console the newest `chaos.*` row *is* the fault |
 | [0013](0013-release-before-rerun.md) | Release before rerun: ship the release, re-pin, then evaluate | Accepted | — |
 | [0014](0014-sse-stream-token-transport.md) | SSE stream auth is a short-lived, job-bound stream token | Accepted | The v2 signature scheme it defines is superseded by agent-repo ADR 0023 |
 | [0015](0015-force-rls-and-nonowner-app-role.md) | FORCE RLS, the non-owner `incident_app` runtime role, DB-level `audit_logs` immutability | Accepted | Superseded in part by 0026 |
