@@ -1,5 +1,5 @@
 # ADR 0031 — A held pool and a degraded dependency are flagged, not broken
-*Status: Accepted · 2026-09-18 · WO-R3-219 + WO-R3-220 (plan v2.1 WP-8.3 + WP-8.4, Family A platform half)*
+*Status: Accepted · 2026-09-18 · WO-R3-219 + WO-R3-220 (plan v2.1 WP-8.3 + WP-8.4, Family A platform half) · amended 2026-09-19 by WO-R3-322 (owner decision O-31 D4): a job whose every endpoint call failed fails unconditionally, and the flag decides only the injection*
 
 ## Context
 
@@ -141,6 +141,54 @@ is filed as a follow-up instead.
   which is stated in the PR body rather than papered over.
 - `docker-compose.yml`'s chaos comment, the surface counts in `CLAUDE.md`, and
   the failure-mode catalog in `docs/ARCHITECTURE.md` move with this change.
+
+## Amendment — 2026-09-19: the failed job is unconditional (owner decision O-31 D4, WO-R3-322)
+
+Decision 5's follow-up was taken. The paragraph above stands as the record of what
+shipped on 2026-09-18 and is not rewritten; what changed on 2026-09-19 is the one
+clause that made the outcome depend on the flag.
+
+**`process_bulk_api_sync` now raises whenever a job's every endpoint call failed,
+flag or no flag.** The flag still decides the *injection* — `fail` makes each call
+return 503, `slow` makes each answer late and succeed — and it no longer decides
+the *semantics*: a sync that synced nothing is a failed job because that is what it
+is, not because a lab key is set. The error message names the count and stays
+operational: `bulk api sync failed: all N endpoint calls failed (0 of N endpoints
+returned a result)`. Nothing else about the processor moves. A partial failure is
+unchanged — still a completed job with `errors` counted in its result — and the
+breaker's threshold, states and probe rule are untouched.
+
+**The SLO consequence, stated rather than discovered.** The objective that moves is
+`job_completion_rate` (99% over a rolling 24h window, `app/services/slo.py`): its
+denominator is jobs that settled `completed` or `dead_letter`, so a job that used to
+land in the first half can now land in the second. Retries do not spend that budget —
+only the dead-letter outcome does. On a quiet window one dead-letter is enough for a
+14.4× fast burn, which raises a `critical` Alert and the signed webhook with it; that
+is the designed behaviour of the evaluation loop, not a new fault, and it is the same
+consequence the eval world already ledgers for the flagged path.
+
+`job_dispatch_latency` does **not** move, and the reason is worth writing down because
+it is nearly the opposite: `claim_for_running` stamps `started_at` on *every* claim, so
+a retried job's recorded dispatch latency is creation → its last attempt's start, not
+its first. With the default backoff (`job_retry_backoff_base = 2.0`, so 2s then 4s) the
+last attempt starts well inside the 30-second threshold, and `dead_letter` was already
+in `_DISPATCHED_STATUSES`. A deployment with a much larger backoff base would eventually
+see retried jobs cross that threshold — that is a property of the retry ladder, not of
+this change.
+
+**What the organic path costs, arithmetically.** Each simulated endpoint fails
+independently 10% of the time, so a run fails entirely with probability 0.1^N: the
+default 5-endpoint job once in 100,000 runs, a 1-endpoint job once in 10. Dead-lettering
+takes all three runs failing entirely — one job in a thousand for that 1-endpoint case.
+The rejection in Decision 5 called this "a platform decision with its own SLO
+consequences"; it is, and the owner took it (O-31, 2026-09-19).
+
+**No contract delta.** No tool name, description, schema, scope or `is_idempotent` flag
+changes — `degrade_downstream`'s description already said a job whose every endpoint call
+failed is itself failed under `fail`, which is still true, so `tools/list` is byte-identical
+and there is nothing to re-pin. The DLQ row's shape does not change either; the one moving
+value is the text inside `jobs.error_message`, which no tool contract, canned fixture or
+grader pins (it appears only inside an archived recorded world, which stays as recorded).
 
 ## Links
 

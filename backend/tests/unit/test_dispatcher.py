@@ -5,16 +5,32 @@ import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from app.config import Settings
+from app.core.circuit_breaker import CircuitState
 from app.models.enums import JobStatus, JobType
 from app.models.job import Job
 from app.schemas import job_events
 from app.utils.post_commit import register_post_commit
-from app.workers import dispatcher
+from app.workers import async_tasks, dispatcher
 from redis.exceptions import ConnectionError as RedisConnectionError
 
 # A well-formed W3C traceparent, so `extract_context` gets something real to
 # parse when a test exercises the carrier-popping path.
 _TRACEPARENT = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+
+
+class _AllEndpointsFail:
+    """`async_tasks.random`, fixed so every simulated endpoint call takes the processor's own
+    failure branch (`random() < 0.10`) with no waiting. No lab flag involved."""
+
+    def random(self) -> float:
+        return 0.0
+
+    def uniform(self, _low: float, _high: float) -> float:
+        return 0.0
+
+    def randint(self, low: int, _high: int) -> int:
+        return low
 
 
 def _make_job(**kwargs: object) -> MagicMock:
@@ -212,6 +228,62 @@ async def test_run_job_dead_letters_after_exhaustion() -> None:
     # And it does NOT hand-write an outbox row of its own — a second `job.dlq`
     # for one death would double-trigger triage and the saga coordinator.
     outbox_mock.add.assert_not_awaited()
+
+
+async def test_run_job_dead_letters_a_bulk_api_sync_whose_every_endpoint_failed() -> None:
+    """The real processor, no flag: a sync that synced nothing dead-letters (WO-R3-322, owner
+    decision O-31 D4).
+
+    `_PROCESSORS` is deliberately not patched — the point is the shipped route from
+    `bulk_api_sync` to `process_bulk_api_sync` — and chaos is off, so no `chaos:*` key is read
+    on the way. Before this change the processor returned a summary with three errors in it and
+    the job was marked COMPLETED, which is why nothing the agent reads moved. The failed count
+    reaches `jobs.error_message` and the `job.dlq` event message.
+    """
+    job = _make_job(
+        type=JobType.BULK_API_SYNC,
+        retry_count=2,
+        max_attempts=3,
+        payload={"endpoint_count": 3},
+    )
+    factory, job_repo, audit_repo = _make_session_factory(job)
+    redis = AsyncMock()
+
+    breaker = async_tasks.bulk_api_breaker()
+    try:
+        with patch("app.workers.dispatcher.JobRepository", return_value=job_repo), \
+             patch("app.workers.dispatcher.AuditRepository", return_value=audit_repo), \
+             patch(
+                 "app.workers.dispatcher.OutboxRepository",
+                 new=MagicMock(return_value=AsyncMock()),
+             ), \
+             patch.multiple(
+                 async_tasks,
+                 get_settings=lambda: Settings(
+                     chaos_enabled=False, environment="test"
+                 ),
+                 random=_AllEndpointsFail(),
+             ), \
+             patch("app.workers.dispatcher.queue.push_delayed", new=AsyncMock()) as delay:
+            await dispatcher._run_job(str(job.id), factory, redis)
+    finally:
+        # Module-level singleton: three failures opened it, and the next test in this process
+        # must not inherit that.
+        breaker._state = CircuitState.CLOSED
+        breaker._failure_count = 0
+        breaker._opened_at = None
+        breaker._probe_in_flight = False
+
+    delay.assert_not_awaited()
+    calls = [c.args[1] for c in job_repo.update_status.call_args_list]
+    assert JobStatus.DEAD_LETTER in calls
+
+    dead_letter_call = next(
+        c for c in job_repo.update_status.call_args_list
+        if c.args[1] == JobStatus.DEAD_LETTER
+    )
+    assert "all 3 endpoint calls failed" in dead_letter_call.kwargs["extra"]["error_message"]
+    assert "all 3 endpoint calls failed" in dead_letter_call.kwargs["event_message"]
 
 
 async def test_run_job_llm_policy_forces_dead_letter_before_exhaustion() -> None:

@@ -22,7 +22,11 @@ diagnosis_steps:
     description: "Look at the actual error messages on the most recent failures."
     command: "psql -c \"SELECT type, error_message, COUNT(*) FROM jobs WHERE status = 'dead_letter' AND created_at > now() - interval '1 hour' GROUP BY type, error_message ORDER BY 3 DESC LIMIT 20\""
   - id: external-deps
-    description: "If bulk_api_sync dominates, is the upstream API down?"
+    description: "If bulk_api_sync dominates, is the upstream API down? A dead-lettered
+      bulk_api_sync job means EVERY endpoint call in it failed on all three attempts —
+      its error_message says `all N endpoint calls failed`. A job where only some
+      endpoints failed completes, and those per-endpoint errors live in the job's result
+      payload rather than on the row, so the DLQ under-counts a partly-broken dependency."
   - id: check-circuit-breaker
     description: "Is the circuit breaker open? That should be shedding load cleanly."
 

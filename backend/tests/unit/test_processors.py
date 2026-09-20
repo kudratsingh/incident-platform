@@ -1,13 +1,15 @@
 """Unit tests for all three job processor families."""
 
 import asyncio
+from collections.abc import Iterator
 from concurrent.futures.process import BrokenProcessPool
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from app.config import Settings
 from app.core.circuit_breaker import CircuitState
-from app.workers import cpu_processors, thread_adapters
+from app.workers import async_tasks, cpu_processors, thread_adapters
 from app.workers.async_tasks import (
     MAX_ENDPOINT_COUNT,
     _bulk_api_breaker,
@@ -39,11 +41,65 @@ def _collect_publishes() -> tuple[list[tuple[int, str]], AsyncMock]:
 # async_tasks
 
 
+@pytest.fixture(autouse=True)
+def fresh_bulk_api_breaker() -> Iterator[None]:
+    """The `bulk-api-sync` breaker is a module-level singleton shared with every other test in
+    the process, and since WO-R3-322 a job that reaches it OPEN synces nothing and therefore
+    raises — so a leaked open breaker would fail a test about something else. Start clean."""
+
+    def _reset() -> None:
+        _bulk_api_breaker._state = CircuitState.CLOSED
+        _bulk_api_breaker._failure_count = 0
+        _bulk_api_breaker._opened_at = None
+        _bulk_api_breaker._probe_in_flight = False
+
+    _reset()
+    yield
+    _reset()
+
+
+class _FixedDice:
+    """`random` as the processor uses it: one roll per endpoint, no real waiting."""
+
+    def __init__(self, rolls: list[float]) -> None:
+        self._rolls = iter(rolls)
+
+    def random(self) -> float:
+        return next(self._rolls)
+
+    def uniform(self, _low: float, _high: float) -> float:
+        return 0.0
+
+    def randint(self, low: int, _high: int) -> int:
+        return low
+
+
+def _endpoint_outcomes(*rolls: float) -> Any:
+    """Run the processor's own (non-lab) endpoint path with its dice fixed.
+
+    `random.random() < 0.10` is the organic failure, so a roll of 0.0 fails that call and 0.99
+    succeeds; `uniform` is the simulated network wait. Chaos off, so no flag is read at all —
+    these are the endpoints as they ship.
+    """
+    return patch.multiple(
+        async_tasks,
+        get_settings=lambda: Settings(chaos_enabled=False, environment="test"),
+        random=_FixedDice(list(rolls)),
+    )
+
+
 async def test_bulk_api_sync_returns_summary() -> None:
+    """A partial failure is a completed job with its errors counted — the half WO-R3-322 did
+    NOT move. The dice are fixed so exactly one of the three endpoints fails: with the
+    all-failed outcome now raising, a random all-three-failed roll (1 in 1000) would otherwise
+    turn this into a flake."""
     log, publish = _collect_publishes()
-    result = await process_bulk_api_sync({"endpoint_count": 3}, publish)
+    with _endpoint_outcomes(0.0, 0.99, 0.99):
+        result = await process_bulk_api_sync({"endpoint_count": 3}, publish)
 
     assert result["total"] == 3
+    assert result["endpoints_synced"] == 2
+    assert result["errors"] == 1
     assert result["endpoints_synced"] + result["errors"] == 3
     assert len(log) > 0  # progress was published
     # Final progress call should be 100%
@@ -52,10 +108,56 @@ async def test_bulk_api_sync_returns_summary() -> None:
 
 async def test_bulk_api_sync_publishes_incremental_progress() -> None:
     log, publish = _collect_publishes()
-    await process_bulk_api_sync({"endpoint_count": 4}, publish)
+    with _endpoint_outcomes(0.99, 0.99, 0.99, 0.99):
+        await process_bulk_api_sync({"endpoint_count": 4}, publish)
     # Progress values should be strictly increasing (ignoring the first 0)
     pcts = [p for p, _ in log]
     assert pcts == sorted(pcts)
+
+
+async def test_bulk_api_sync_fails_the_job_when_every_endpoint_failed() -> None:
+    """A sync that synced nothing is a failed job, with no flag anywhere near it (WO-R3-322,
+    owner decision O-31 D4).
+
+    Before this it completed, reporting the errors in a result payload no operational tool
+    reads — so the job surface the agent can actually see said the sync was fine. The message
+    names the failed count, reaches `jobs.error_message`, and says nothing about the lab
+    (ADR 0012 rule 1).
+    """
+    log, publish = _collect_publishes()
+    with _endpoint_outcomes(0.0, 0.0, 0.0):
+        with pytest.raises(RuntimeError) as failure:
+            await process_bulk_api_sync({"endpoint_count": 3}, publish)
+
+    rendered = str(failure.value)
+    assert "all 3 endpoint calls failed" in rendered
+    assert "0 of 3 endpoints returned a result" in rendered
+    for word in ("chaos", "fixture", "scenario", "eval", "seed", "harness", "flag"):
+        assert word not in rendered.lower()
+    # Progress was still published up to the end before the job failed.
+    assert log[-1][0] == 100
+
+
+async def test_bulk_api_sync_breaker_still_opens_at_its_own_threshold() -> None:
+    """The breaker is untouched by WO-R3-322: three failed calls open it, on the organic path
+    exactly as under the lab's flag, and the raise is the job's outcome rather than the
+    breaker's doing."""
+    _, publish = _collect_publishes()
+    assert _bulk_api_breaker.failure_threshold == 3
+    with _endpoint_outcomes(0.0, 0.0, 0.0):
+        with pytest.raises(RuntimeError):
+            await process_bulk_api_sync({"endpoint_count": 3}, publish)
+    assert _bulk_api_breaker.state is CircuitState.OPEN
+
+
+async def test_bulk_api_sync_one_failed_endpoint_leaves_the_breaker_closed() -> None:
+    """The contrast: one failure of three is below the threshold and the job completes, so
+    neither the breaker nor the job status moves."""
+    _, publish = _collect_publishes()
+    with _endpoint_outcomes(0.0, 0.99, 0.99):
+        result = await process_bulk_api_sync({"endpoint_count": 3}, publish)
+    assert result["errors"] == 1
+    assert _bulk_api_breaker.state is CircuitState.CLOSED
 
 
 # thread_adapters
