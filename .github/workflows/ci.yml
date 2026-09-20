@@ -189,6 +189,7 @@ jobs:
               "test_postgres_health_pg",
               "test_sticky_kill_survives_restart",
               "test_agent_runs_postgres",
+              "test_pool_gauge_cross_process",
           }
 
           try:

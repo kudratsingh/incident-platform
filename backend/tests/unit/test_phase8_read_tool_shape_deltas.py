@@ -38,8 +38,10 @@ READ_TIER_AFTER = [
     "search_traces",
 ]
 
-#: `get_postgres_health`'s output after this order. The first five existed; the nine below
-#: them are the delta.
+#: `get_postgres_health`'s output after this order. The first five existed; the twelve below
+#: them are the delta. The last two are WO-R3-289's, listed here because this assertion is an
+#: exact set — the reasoning for them belongs to `test_pool_gauge_shape_delta.py`, which owns
+#: that delta and pins the `$defs` entry underneath `pools`.
 POSTGRES_HEALTH_FIELDS = {
     "ok",
     "ping_latency_ms",
@@ -58,6 +60,9 @@ POSTGRES_HEALTH_FIELDS = {
     "p95_query_ms_1m",
     "slow_query_count_1m",
     "query_stats_unknown_reason",
+    # WO-R3-289 (ADR 0033), not this order's.
+    "pools",
+    "pool_gauges_unknown_reason",
 }
 
 SLO_STATUS_FIELDS = {

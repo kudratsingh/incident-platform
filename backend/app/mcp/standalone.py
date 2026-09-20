@@ -46,12 +46,14 @@ MCP_RATE_BUCKET = "mcp:principal"
 
 @asynccontextmanager
 async def _mcp_lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
-    """Schema drift check only — no worker loop, no producer. A schema behind the
-    code fails loud rather than 500ing per tool call (v0.4.1 postmortem)."""
+    """Schema drift check, the metrics emitter and this process's pool gauge — no worker
+    loop, no producer. A schema behind the code fails loud rather than 500ing per tool
+    call (v0.4.1 postmortem)."""
     from app.config import get_settings
     from app.core.migration_check import assert_migrations_current
+    from app.core.pool_state import PROCESS_MCP, start_pool_gauge, stop_pool_gauge
     from app.core.rls_check import assert_rls_posture
-    from app.dependencies import get_session_factory
+    from app.dependencies import get_engine, get_session_factory
 
     session_factory = get_session_factory()
     await assert_migrations_current(session_factory)
@@ -60,9 +62,17 @@ async def _mcp_lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
 
     # It queues RequestLatency like the API does, and nothing else here drains it.
     await metrics.start_metrics_emitter()
+
+    # This process's pool, published where the other one can read it (ADR 0033). Started
+    # here and not on the metrics tick: that emitter is a no-op outside production, so in
+    # the environment this reading exists for it would never run.
+    await start_pool_gauge(
+        process=PROCESS_MCP, pool_getter=lambda: get_engine().pool
+    )
     try:
         yield
     finally:
+        await stop_pool_gauge()
         await metrics.stop_metrics_emitter()
 
 
