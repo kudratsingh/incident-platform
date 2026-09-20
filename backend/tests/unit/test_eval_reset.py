@@ -1023,15 +1023,42 @@ def _sql_literals(module) -> list[str]:  # type: ignore[no-untyped-def]
 
 
 def test_reset_sql_never_names_audit_logs() -> None:
-    """Static tripwire: the commander grades against `audit_logs` (invariant 6), so the reset must
-    never write, update or delete one."""
+    """Static tripwire: the commander grades against `audit_logs` (invariant 6), so no raw
+    statement here may reach that table.
+
+    Since WO-R3-327 the reset does APPEND one row to it — the `lab.world_reset` boundary —
+    and that is the only audit write it performs. It goes through `AuditRepository.log`,
+    so this tripwire keeps its whole original force: an UPDATE or DELETE against
+    `audit_logs` is still impossible to write here, and so is a second writer smuggled in
+    as SQL."""
     reset = _reset_module()
     statements = _sql_literals(reset)
     assert statements, "expected the reset to issue raw SQL; parser found none"
     offenders = [sql for sql in statements if "audit_logs" in sql]
     assert offenders == [], (
-        "reset_eval_state must not touch audit_logs — the deleted rows' "
-        "identity survives on audit_logs.resource_id (ADR 0012 amendment)"
+        "reset_eval_state must not touch audit_logs in SQL — the deleted rows' "
+        "identity survives on audit_logs.resource_id (ADR 0012 amendment), and the "
+        "one row it appends goes through the repository"
+    )
+
+
+def test_the_reset_only_ever_appends_to_the_audit_log() -> None:
+    """The other half of the tripwire above, on the ORM side: the boundary row is written
+    by `record_world_reset` and nothing in this module may mutate an existing row."""
+    reset = _reset_module()
+    source = inspect.getsource(reset)
+    tree = ast.parse(source)
+    called = {
+        node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", "")
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+    }
+    assert "record_world_reset" in called, (
+        "the boundary row must go through app.services.operator_audit, which is where "
+        "the stream's writer and its withholding rule live together"
+    )
+    assert "AuditLog" not in source, (
+        "the reset must not construct an audit row itself — one writer, one place"
     )
 
 
@@ -1975,21 +2002,45 @@ async def test_the_reset_never_deletes_an_agent_run(
 def test_the_reset_summary_names_every_counter_it_owns() -> None:
     """Static tripwire. `make eval-reset` parses this dict, so a step whose count is not
     in it is a step nobody can tell ran — which is how the hot_set gap survived long
-    enough to cost 108 unledgered fixture values."""
+    enough to cost 108 unledgered fixture values.
+
+    Since WO-R3-327 the summary is built as one `counters` literal (which is also the
+    `lab.world_reset` row's payload) and returned with `world_reset_recorded` added, so
+    the keys are gathered from every dict literal in the function and the returned
+    expression is checked separately."""
     reset = _reset_module()
     tree = ast.parse(inspect.getsource(reset.reset))
+    keys = {
+        key.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Dict)
+        for key in node.keys
+        if isinstance(key, ast.Constant) and isinstance(key.value, str)
+    }
+    assert {
+        "agent_runs_closed",
+        "breakers_reset",
+        "hot_set_reseeded",
+        "world_reset_recorded",
+    } <= keys
+
     returned = [
         node.value
         for node in ast.walk(tree)
         if isinstance(node, ast.Return) and isinstance(node.value, ast.Dict)
     ]
     assert returned, "reset() must return its summary as a dict literal"
-    keys = {
+    # The returned literal spreads the counters and adds the boundary's own count —
+    # the one number the row cannot carry about itself.
+    assert any(key is None for key in returned[0].keys), (
+        "reset() must return the counters it wrote to the boundary row, not a second "
+        "dict that can drift from it"
+    )
+    assert "world_reset_recorded" in {
         key.value
         for key in returned[0].keys
         if isinstance(key, ast.Constant) and isinstance(key.value, str)
     }
-    assert {"agent_runs_closed", "breakers_reset", "hot_set_reseeded"} <= keys
 
     awaited = {
         node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", "")
@@ -1998,6 +2049,101 @@ def test_the_reset_summary_names_every_counter_it_owns() -> None:
     }
     assert {
         "_close_open_agent_runs",
+        "_record_world_reset",
         "_reset_breaker_states",
         "_reseed_hot_set",
     } <= awaited
+
+
+# The boundary row — WO-R3-327
+
+
+async def test_the_reset_appends_one_world_reset_row_carrying_its_counters(
+    db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
+) -> None:
+    """The row the `/demo` page reads as the end of a take. Without it the newest
+    `chaos.*` row is still the previous take's, so a clean world opens the strip at
+    `agent remediating`."""
+    reset = _reset_module()
+    from app.models.audit import PRINCIPAL_TYPE_SERVICE_ACCOUNT, AuditLog
+    from app.services.operator_audit import WORLD_RESET_ACTION
+
+    counters = {"chaos_keys_cleared": 4, "dlq_reset": 5, "hot_set_reseeded": 1}
+
+    assert await reset._record_world_reset(_factory(db_session), counters) == 1
+
+    rows = (
+        await db_session.execute(
+            select(AuditLog).where(AuditLog.action == WORLD_RESET_ACTION)
+        )
+    ).scalars().all()
+    assert len(rows) == 1, "exactly one boundary per reset — it is a moment, not a log"
+    row = rows[0]
+    assert row.tenant_id == default_tenant.id
+    assert row.principal_type == PRINCIPAL_TYPE_SERVICE_ACCOUNT
+    assert row.extra_data == counters
+
+
+async def test_the_boundary_row_is_attributed_to_the_evaluator_account(
+    db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
+) -> None:
+    """Whoever may fire the lab may read the lab (ADR 0012): the principal that can read
+    this withheld row is the one the row says wrote it."""
+    reset = _reset_module()
+    from app.core.scopes import Scope
+    from app.models.audit import AuditLog
+    from app.models.service_account import ServiceAccount
+    from app.services.operator_audit import WORLD_RESET_ACTION
+
+    evaluator = ServiceAccount(
+        tenant_id=default_tenant.id,
+        name="incident-commander-chaos",
+        scopes=[Scope.CHAOS_INVOKE.value],
+        is_active=True,
+    )
+    db_session.add(evaluator)
+    await db_session.flush()
+
+    await reset._record_world_reset(_factory(db_session), {})
+
+    row = (
+        await db_session.execute(
+            select(AuditLog).where(AuditLog.action == WORLD_RESET_ACTION)
+        )
+    ).scalar_one()
+    assert row.principal_id == evaluator.id
+
+
+async def test_the_boundary_is_written_even_with_no_evaluator_account(
+    db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
+) -> None:
+    """A stack seeded for fixtures but not for the agent still gets its boundary. The
+    row is worth more than the attribution, and `principal_id` is nullable by design."""
+    reset = _reset_module()
+    from app.models.audit import AuditLog
+    from app.services.operator_audit import WORLD_RESET_ACTION
+
+    assert await reset._record_world_reset(_factory(db_session), {}) == 1
+
+    row = (
+        await db_session.execute(
+            select(AuditLog).where(AuditLog.action == WORLD_RESET_ACTION)
+        )
+    ).scalar_one()
+    assert row.principal_id is None
+
+
+async def test_the_boundary_row_is_not_in_the_chaos_stream(
+    db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
+) -> None:
+    """The console reads the newest `chaos.*` row as the FAULT. A boundary filed there
+    would read as the very thing it exists to say did not happen."""
+    reset = _reset_module()
+    from app.models.audit import AuditLog
+    from app.services.operator_audit import CHAOS_ACTION_PREFIX
+
+    await reset._record_world_reset(_factory(db_session), {})
+
+    rows = (await db_session.execute(select(AuditLog))).scalars().all()
+    assert rows
+    assert not any(row.action.startswith(CHAOS_ACTION_PREFIX) for row in rows)

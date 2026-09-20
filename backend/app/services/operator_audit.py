@@ -5,8 +5,13 @@ Every MCP tool call goes through `record_tool_invocation()`, so the row shape is
 `action` is `agent.tool_invoked`, `extra_data` carries `tool_name`, `arguments`,
 `scope_used`, `latency_ms`, `outcome` (Step 0 schema). `hidden_audit_action_prefixes` — the
 read side of the same stream — lives here so writer and reader share one file.
+
+One row here is not a tool call: `lab.world_reset`, written by `scripts/reset_eval_state.py`
+once per reset, carrying that reset's own counters. It lives in this file for the same reason
+the withholding does — the writer and the reader of a withheld stream belong together.
 """
 
+import uuid
 from typing import Any
 
 from app.core.logging import get_logger
@@ -36,6 +41,21 @@ CHAOS_ACTION_PREFIX = "chaos."
 # an operator timeline that mixed the two would colour a status report as an action.
 AGENT_RUN_REPORTED_ACTION = "agent.run_reported"
 
+# A fourth stream, and the only one no tool call writes (WO-R3-327). The environment
+# reset appends exactly one `lab.world_reset` row per run, whose `extra_data` is that
+# reset's own summary of counters. It carries its OWN prefix rather than joining
+# `chaos.` because the console reads the newest `chaos.` row as the moment the fault
+# was injected: a reset filed under that prefix would be read as a fault, which is the
+# opposite of what it means. `lab.` is the lab talking about the lab's own apparatus —
+# withheld from the agent exactly as `chaos.` is, and for a sharper reason: the payload
+# names every mechanism the reset swept.
+LAB_ACTION_PREFIX = "lab."
+WORLD_RESET_ACTION = "lab.world_reset"
+
+# What the boundary row says it is about. There is no single resource, so
+# `resource_id` stays null — the row's identity is its `created_at`.
+WORLD_RESET_RESOURCE_TYPE = "world"
+
 # Outcome values recorded on tool invocation rows. Kept as a fixed set so
 # admin filters and dashboards can rely on it.
 OUTCOME_SUCCESS = "success"
@@ -50,8 +70,12 @@ def hidden_audit_action_prefixes(principal: Principal) -> tuple[str, ...]:
     `list_logs`'s `exclude_action_prefixes`, so it lands in SQL and `total` counts only
     what the caller may see — a count is a fact about the rows.
 
-    - The `chaos.` stream is shown **only** to a principal holding `chaos:invoke`: the
-      lab is invisible to the agent under test (ADR 0012).
+    - The `chaos.` and `lab.` streams are shown **only** to a principal holding
+      `chaos:invoke`: the lab is invisible to the agent under test (ADR 0012). Two
+      prefixes, one condition — whoever may fire the lab may read the lab. `chaos.`
+      is the lab injecting a fault; `lab.` is the lab resetting the world it injected
+      into, and its `lab.world_reset` payload names every mechanism the reset swept,
+      so it leaks more than a hook name would (2026-09-20 amendment).
     - The `agent.run_reported` stream is hidden **from** a principal holding
       `agent_runs:write`: the writer of that stream is not its reader. The platform
       stores what a responder reports about itself and shows it to operators, never
@@ -62,6 +86,7 @@ def hidden_audit_action_prefixes(principal: Principal) -> tuple[str, ...]:
     hidden: list[str] = []
     if Scope.CHAOS_INVOKE.value not in principal.scopes:
         hidden.append(CHAOS_ACTION_PREFIX)
+        hidden.append(LAB_ACTION_PREFIX)
     if Scope.AGENT_RUNS_WRITE.value in principal.scopes:
         hidden.append(AGENT_RUN_REPORTED_ACTION)
     return tuple(hidden)
@@ -150,15 +175,57 @@ async def record_tool_invocation(
     return True
 
 
+async def record_world_reset(
+    audit_repo: AuditRepository,
+    *,
+    tenant_id: uuid.UUID,
+    principal_id: uuid.UUID | None,
+    counters: dict[str, Any],
+) -> None:
+    """Append the one `lab.world_reset` row that closes a take (WO-R3-327).
+
+    `counters` becomes `extra_data` verbatim — the reset's own summary, so an operator
+    reading the row knows what the boundary actually did rather than only that it
+    happened. The console reads this row's `created_at` as the boundary: rows and runs
+    older than it belong to a previous take, which is what stops the `/demo` strip
+    opening at `agent remediating` on a world that was just wiped.
+
+    **The opposite error contract to `record_tool_invocation`, deliberately.** That one
+    is savepoint-wrapped and never raises, because losing an audit row must not cost a
+    tool its response. Here there is no response to protect, and a reset whose boundary
+    was never written is a reset the console cannot see — it would keep reading the
+    previous take's fault as current. So this raises, the caller fails loudly, and the
+    operator resets again rather than recording on a page that is quietly lying.
+
+    `principal_type` is always `service_account`: no human performs a reset. The
+    evaluator's account id goes in `principal_id` when the caller can name it, and
+    `None` otherwise — nullable by ADR 0007's design, so an unseeded stack still gets
+    its boundary instead of an exception about attribution.
+    """
+    await audit_repo.log(
+        WORLD_RESET_ACTION,
+        tenant_id=tenant_id,
+        principal_type=PRINCIPAL_TYPE_SERVICE_ACCOUNT,
+        principal_id=principal_id,
+        user_id=None,
+        resource_type=WORLD_RESET_RESOURCE_TYPE,
+        extra_data=dict(counters),
+    )
+
+
 __all__ = [
     "AGENT_RUN_REPORTED_ACTION",
     "CHAOS_ACTION_PREFIX",
     "CHAOS_TOOL_DENIED_ACTION",
     "CHAOS_TOOL_INVOKED_ACTION",
+    "LAB_ACTION_PREFIX",
     "OUTCOME_ERROR",
     "OUTCOME_SUCCESS",
     "OUTCOME_UNAUTHORIZED",
     "TOOL_INVOKED_ACTION",
+    "WORLD_RESET_ACTION",
+    "WORLD_RESET_RESOURCE_TYPE",
     "hidden_audit_action_prefixes",
     "record_tool_invocation",
+    "record_world_reset",
 ]

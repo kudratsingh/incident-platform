@@ -1,10 +1,16 @@
 """Unit tests for the operator-audit helper — schema of the
 `agent.tool_invoked` row and translation of the Principal shape into
-the audit-row identity fields."""
+the audit-row identity fields.
+
+Since WO-R3-327 it also covers the `lab.` stream: the `lab.world_reset` row the
+environment reset appends, and the withholding that keeps it off the agent's own
+read surface beside `chaos.` (ADR 0012, 2026-09-20 amendment).
+"""
 
 import uuid
 from unittest.mock import AsyncMock, MagicMock
 
+from app.core.scopes import Scope
 from app.dependencies import Principal
 from app.models.audit import (
     PRINCIPAL_TYPE_SERVICE_ACCOUNT,
@@ -13,10 +19,15 @@ from app.models.audit import (
 from app.models.service_account import ServiceAccount
 from app.models.user import User
 from app.services.operator_audit import (
+    CHAOS_ACTION_PREFIX,
+    LAB_ACTION_PREFIX,
     OUTCOME_ERROR,
     OUTCOME_SUCCESS,
     TOOL_INVOKED_ACTION,
+    WORLD_RESET_ACTION,
+    hidden_audit_action_prefixes,
     record_tool_invocation,
+    record_world_reset,
 )
 
 
@@ -159,3 +170,120 @@ async def test_failing_audit_insert_does_not_propagate() -> None:
         outcome=OUTCOME_SUCCESS,
     )
     repo.log.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# `lab.world_reset` — the boundary row (WO-R3-327)
+# ---------------------------------------------------------------------------
+
+
+def _scoped_principal(*scopes: Scope) -> Principal:
+    return Principal(
+        kind="service_account",
+        tenant_id=uuid.uuid4(),
+        service_account=ServiceAccount(
+            id=uuid.uuid4(), tenant_id=uuid.uuid4(), name="p", scopes=[]
+        ),
+        scopes=frozenset(s.value for s in scopes),
+    )
+
+
+def test_the_world_reset_action_lives_under_its_own_prefix() -> None:
+    """Not `chaos.`: the console reads the newest `chaos.` row as the FAULT, and a
+    reset filed under that prefix would be read as one."""
+    assert WORLD_RESET_ACTION == "lab.world_reset"
+    assert WORLD_RESET_ACTION.startswith(LAB_ACTION_PREFIX)
+    assert not WORLD_RESET_ACTION.startswith(CHAOS_ACTION_PREFIX)
+
+
+def test_the_lab_stream_is_withheld_from_a_principal_without_the_chaos_scope() -> None:
+    """THE assertion. The payload is the reset's own counters — `chaos_keys_cleared`,
+    `seeded_dlq_deleted`, `hot_set_reseeded` — so a readable row tells the agent under
+    test that it is under test, and with what apparatus (ADR 0012)."""
+    agent = _scoped_principal(Scope.TELEMETRY_READ, Scope.INCIDENTS_READ)
+
+    hidden = hidden_audit_action_prefixes(agent)
+
+    assert LAB_ACTION_PREFIX in hidden
+    assert CHAOS_ACTION_PREFIX in hidden
+
+
+def test_the_evaluator_reads_the_lab_stream() -> None:
+    """Whoever may fire the lab may read the lab — the same condition the `chaos.`
+    rule carries, because the reset is the evaluator's own act."""
+    evaluator = _scoped_principal(
+        Scope.TELEMETRY_READ, Scope.INCIDENTS_READ, Scope.CHAOS_INVOKE
+    )
+
+    assert hidden_audit_action_prefixes(evaluator) == ()
+
+
+def test_the_lab_withholding_does_not_disturb_the_run_report_rule() -> None:
+    """The two rules point opposite ways and must stay independent: a reporter with
+    no chaos scope loses `chaos.` and `lab.` AND its own report stream."""
+    reporter = _scoped_principal(Scope.TELEMETRY_READ, Scope.AGENT_RUNS_WRITE)
+
+    hidden = hidden_audit_action_prefixes(reporter)
+
+    assert CHAOS_ACTION_PREFIX in hidden
+    assert LAB_ACTION_PREFIX in hidden
+    assert "agent.run_reported" in hidden
+
+
+async def test_record_world_reset_writes_one_row_carrying_the_counters() -> None:
+    repo = _mock_audit_repo()
+    tenant_id = uuid.uuid4()
+    principal_id = uuid.uuid4()
+    counters = {"chaos_keys_cleared": 3, "dlq_reset": 5, "hot_set_reseeded": 1}
+
+    await record_world_reset(
+        repo,
+        tenant_id=tenant_id,
+        principal_id=principal_id,
+        counters=counters,
+    )
+
+    repo.log.assert_awaited_once()
+    args, kwargs = repo.log.call_args
+    assert args[0] == WORLD_RESET_ACTION
+    assert kwargs["tenant_id"] == tenant_id
+    assert kwargs["principal_type"] == PRINCIPAL_TYPE_SERVICE_ACCOUNT
+    assert kwargs["principal_id"] == principal_id
+    # No human did this, and naming one would be a lie about who did.
+    assert kwargs["user_id"] is None
+    assert kwargs["extra_data"] == counters
+
+
+async def test_record_world_reset_accepts_an_unnamed_machine_principal() -> None:
+    """A stack whose evaluator account has not been seeded yet still gets a boundary:
+    the row is worth more than the attribution, and `principal_id` is nullable (ADR
+    0007) precisely so a missing principal does not block an audit write."""
+    repo = _mock_audit_repo()
+
+    await record_world_reset(
+        repo,
+        tenant_id=uuid.uuid4(),
+        principal_id=None,
+        counters={},
+    )
+
+    kwargs = repo.log.call_args.kwargs
+    assert kwargs["principal_type"] == PRINCIPAL_TYPE_SERVICE_ACCOUNT
+    assert kwargs["principal_id"] is None
+
+
+async def test_a_failed_boundary_write_is_loud() -> None:
+    """The opposite contract to `record_tool_invocation`. There is no response to
+    protect here, and a reset whose boundary was not recorded is a reset the console
+    reads as the previous take — so the caller must hear about it."""
+    repo = _mock_audit_repo()
+    repo.log.side_effect = RuntimeError("audit insert failed")
+
+    try:
+        await record_world_reset(
+            repo, tenant_id=uuid.uuid4(), principal_id=None, counters={}
+        )
+    except RuntimeError:
+        pass
+    else:  # pragma: no cover - the assertion is the failure path
+        raise AssertionError("record_world_reset must not swallow a failed write")

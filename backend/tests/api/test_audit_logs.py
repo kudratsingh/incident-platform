@@ -180,6 +180,48 @@ async def test_chaos_rows_are_visible_to_a_human_operator_by_prefix(
     assert [row["action"] for row in resp.json()["items"]] == ["chaos.tool_invoked"]
 
 
+async def test_the_world_reset_boundary_is_visible_to_a_human_operator(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    default_tenant,  # type: ignore[no-untyped-def]
+    admin_headers: dict[str, str],
+) -> None:
+    """The other half of WO-R3-327. The `lab.` stream is withheld from the agent's MCP
+    reads and must reach this endpoint unfiltered, payload included — the `/demo` page
+    reads the boundary from here, and an operator reading the Audit tab is entitled to
+    know what the reset did."""
+    from app.services.operator_audit import WORLD_RESET_ACTION
+
+    await _seed_rows(db_session, default_tenant.id)
+    counters = {"chaos_keys_cleared": 4, "hot_set_reseeded": 1}
+    db_session.add(
+        AuditLog(
+            tenant_id=default_tenant.id,
+            action=WORLD_RESET_ACTION,
+            principal_type=PRINCIPAL_TYPE_SERVICE_ACCOUNT,
+            principal_id=uuid.uuid4(),
+            user_id=None,
+            resource_type="world",
+            extra_data=counters,
+        )
+    )
+    await db_session.flush()
+
+    unfiltered = await client.get("/api/v1/audit/logs", headers=admin_headers)
+    assert unfiltered.status_code == 200
+    assert WORLD_RESET_ACTION in {
+        row["action"] for row in unfiltered.json()["items"]
+    }, "the boundary must be in the operator's unfiltered timeline"
+
+    resp = await client.get(
+        "/api/v1/audit/logs?action_prefix=lab.", headers=admin_headers
+    )
+    assert resp.status_code == 200
+    rows = resp.json()["items"]
+    assert [row["action"] for row in rows] == [WORLD_RESET_ACTION]
+    assert rows[0]["extra_data"] == counters
+
+
 async def test_over_long_action_prefix_returns_422(
     client: AsyncClient,
     admin_headers: dict[str, str],

@@ -1,4 +1,9 @@
-"""The `chaos.` audit stream is readable only by a principal that may fire it."""
+"""The `chaos.` and `lab.` audit streams are readable only by a principal that may fire the lab.
+
+`lab.world_reset` joined the withheld set in WO-R3-327 (ADR 0012's 2026-09-20 amendment). It
+carries a sharper leak than a hook name: its payload is the reset's own counters, which name
+every mechanism the lab swept.
+"""
 
 from __future__ import annotations
 
@@ -25,6 +30,9 @@ from app.services.operator_audit import (
     CHAOS_ACTION_PREFIX,
     CHAOS_TOOL_DENIED_ACTION,
     CHAOS_TOOL_INVOKED_ACTION,
+    LAB_ACTION_PREFIX,
+    WORLD_RESET_ACTION,
+    WORLD_RESET_RESOURCE_TYPE,
 )
 from app.services.service_account import ServiceAccountService
 from httpx import ASGITransport, AsyncClient
@@ -186,6 +194,20 @@ async def _seed_chaos_world(
                 "outcome": "unauthorized",
             },
         ),
+        # The boundary row the environment reset appends (WO-R3-327). Its payload names
+        # the apparatus, which is why it is withheld beside the rows above.
+        AuditLog(
+            tenant_id=tenant_id,
+            action=WORLD_RESET_ACTION,
+            principal_type=PRINCIPAL_TYPE_SERVICE_ACCOUNT,
+            principal_id=uuid.uuid4(),
+            resource_type=WORLD_RESET_RESOURCE_TYPE,
+            extra_data={
+                "chaos_keys_cleared": 4,
+                "seeded_dlq_deleted": 5,
+                "hot_set_reseeded": 1,
+            },
+        ),
     ]
     for row in rows:
         db_session.add(row)
@@ -205,6 +227,12 @@ def _chaos_rows(payload: dict[str, Any]) -> int:
         1
         for e in payload["events"]
         if e["action"].startswith(CHAOS_ACTION_PREFIX)
+    )
+
+
+def _lab_rows(payload: dict[str, Any]) -> int:
+    return sum(
+        1 for e in payload["events"] if e["action"].startswith(LAB_ACTION_PREFIX)
     )
 
 
@@ -233,6 +261,8 @@ async def test_chaos_principal_sees_the_chaos_stream(
     assert _CHAOS_ACTIONS <= actions
     assert _VISIBLE_ACTIONS <= actions
     assert _chaos_rows(payload) == 3
+    # And the boundary: whoever may fire the lab may read when the lab last reset it.
+    assert _lab_rows(payload) == 1
 
 
 async def test_agent_principal_sees_no_chaos_rows(
@@ -248,8 +278,14 @@ async def test_agent_principal_sees_no_chaos_rows(
     actions = {e["action"] for e in payload["events"]}
     assert _VISIBLE_ACTIONS <= actions
     assert _chaos_rows(payload) == 0
+    assert _lab_rows(payload) == 0
     _assert_total_matches_the_page(payload)
     assert "chaos" not in json.dumps(payload)
+    # The boundary's payload is the mechanism list, so its counter names must not
+    # survive either — a leak by field name rather than by action name.
+    body = json.dumps(payload)
+    for counter in ("seeded_dlq_deleted", "hot_set_reseeded"):
+        assert counter not in body
 
 
 async def test_agent_principal_prefix_filter_returns_an_empty_page(
@@ -272,8 +308,28 @@ async def test_agent_principal_prefix_filter_returns_an_empty_page(
     assert payload == {"total": 0, "events": []}
 
 
+async def test_agent_principal_lab_prefix_filter_returns_an_empty_page(
+    mcp_client: AsyncClient,
+    db_session: AsyncSession,
+    default_tenant,  # type: ignore[no-untyped-def]
+) -> None:
+    """`action_prefix='lab.'` is answered the same way — asking by name must not be the
+    one call that confirms the stream exists."""
+    await _seed_chaos_world(db_session, default_tenant.id)
+    token = await _token(db_session, default_tenant.id, AGENT_SCOPES)
+
+    body = await _call(
+        mcp_client,
+        token,
+        "list_audit_events",
+        {"action_prefix": LAB_ACTION_PREFIX},
+    )
+    assert "error" not in body, "a withheld stream is an empty page, not a refusal"
+    assert _content(body) == {"total": 0, "events": []}
+
+
 @pytest.mark.parametrize(
-    "action", sorted(_CHAOS_ACTIONS)
+    "action", sorted(_CHAOS_ACTIONS | {WORLD_RESET_ACTION})
 )
 async def test_agent_principal_exact_action_returns_an_empty_page(
     mcp_client: AsyncClient,

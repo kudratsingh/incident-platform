@@ -12,21 +12,29 @@
  *    injecting the fault; `agent.tool_invoked` rows are the agent's footprint)
  *    plus the metric the scenario is about.
  *
- * Two things this file pins hardest. A fault that has not yet shown up in the
+ * Three things this file pins hardest. A fault that has not yet shown up in the
  * metric must NOT read as recovered — the metric is inside its threshold both
  * before the fault lands and after it is fixed, so "inside the threshold" only
- * means recovered once the breach has actually been observed. And when the two
+ * means recovered once the breach has actually been observed. When the two
  * sources disagree the reading carries both, because merging them invents a
- * state neither source asserted.
+ * state neither source asserted. And since WO-R3-327, both sources are read only
+ * after the newest `lab.world_reset` row: the audit log is append-only, so without
+ * that boundary a freshly reset world still reported the previous take's fault,
+ * its remediation and its DLQ decisions as the current ones.
  */
 
 import { describe, it, expect } from 'vitest'
 import {
+  WORLD_RESET_ACTION,
   agentPhase,
   derivePhase,
   dlqDecision,
+  isResetRow,
+  newestFaultAt,
+  newestResetAt,
   phaseTimeline,
   platformPhase,
+  runSinceReset,
 } from '../utils/demoPhase'
 import type { AgentRun, AgentRunState, AuditLog, Job } from '../types'
 
@@ -65,6 +73,16 @@ const FAULT = toolRow('chaos.tool_invoked', 'kill_consumer', '2026-09-19T10:00:0
   consumer_group: 'worker-dispatcher',
   ttl_seconds: 300,
 })
+
+/** The boundary `make eval-reset` appends (WO-R3-327); its payload is the reset's counters. */
+function resetRow(at: string): AuditLog {
+  return auditRow({
+    action: WORLD_RESET_ACTION,
+    created_at: at,
+    resource_type: 'world',
+    extra_data: { chaos_keys_cleared: 4, hot_set_reseeded: 1 },
+  })
+}
 
 function run(state: AgentRunState, history: AgentRunState[] = []): AgentRun {
   return {
@@ -223,6 +241,161 @@ describe('platformPhase — what the platform itself can see', () => {
     })
     expect(reading.phase).toBe('fault_injected')
     expect(reading.metricKnown).toBe(false)
+  })
+})
+
+describe('the reset is a boundary — WO-R3-327', () => {
+  const healthyMetric = {
+    metricKnown: true,
+    metricInsideThreshold: true,
+    metricBreachedSinceFault: false,
+  }
+  /** The previous take, in full: fault, investigation, remediation, recovery. */
+  const previousTake: AuditLog[] = [
+    FAULT,
+    toolRow('agent.tool_invoked', 'get_consumer_lag', '2026-09-19T10:01:00Z'),
+    toolRow('agent.tool_invoked', 'restart_consumer_group', '2026-09-19T10:03:00Z', {
+      consumer_group: 'worker-dispatcher',
+    }),
+  ]
+  const RESET = resetRow('2026-09-19T10:05:00Z')
+
+  it('recognises the reset row, and does not mistake it for a fault', () => {
+    expect(isResetRow(RESET)).toBe(true)
+    expect(isResetRow(FAULT)).toBe(false)
+    // The bug this fixes in one line: a reset filed under `chaos.` would have BEEN
+    // the newest fault.
+    expect(newestFaultAt([...previousTake, RESET])).toBeNull()
+  })
+
+  it('finds the newest boundary when a session has several takes', () => {
+    const older = resetRow('2026-09-19T09:00:00Z')
+    expect(newestResetAt([older, RESET])).toBe('2026-09-19T10:05:00Z')
+    expect(newestResetAt(previousTake)).toBeNull()
+  })
+
+  it('reads healthy after a reset, however complete the previous take was', () => {
+    // THE assertion. Before this, the newest `chaos.*` row was still the last
+    // take's kill, so a freshly wiped world opened the strip at `agent
+    // remediating` with a clock counting from an incident that no longer existed.
+    const reading = platformPhase({ audit: [...previousTake, RESET], ...healthyMetric })
+    expect(reading.phase).toBe('healthy')
+    expect(reading.faultAt).toBeNull()
+    expect(reading.resetAt).toBe('2026-09-19T10:05:00Z')
+  })
+
+  it('reads the next take’s fault, and only its rows', () => {
+    const audit = [
+      ...previousTake,
+      RESET,
+      toolRow('chaos.tool_invoked', 'kill_consumer', '2026-09-19T10:06:00Z', {
+        consumer_group: 'worker-dispatcher',
+      }),
+    ]
+    const reading = platformPhase({ audit, ...healthyMetric })
+    expect(reading.phase).toBe('fault_injected')
+    expect(reading.faultAt).toBe('2026-09-19T10:06:00Z')
+  })
+
+  it('does not credit the previous take’s remediation to the new one', () => {
+    const audit = [
+      ...previousTake,
+      RESET,
+      toolRow('chaos.tool_invoked', 'kill_consumer', '2026-09-19T10:06:00Z'),
+    ]
+    const reading = platformPhase({
+      audit,
+      metricKnown: true,
+      metricInsideThreshold: false,
+      metricBreachedSinceFault: true,
+    })
+    // The `restart_consumer_group` row is older than the boundary, so the strip
+    // must not read `agent remediating` on a fault nobody has touched yet.
+    expect(reading.phase).toBe('fault_injected')
+  })
+
+  it('leaves today’s behaviour alone when no reset row exists', () => {
+    const reading = platformPhase({
+      audit: previousTake,
+      metricKnown: true,
+      metricInsideThreshold: false,
+      metricBreachedSinceFault: true,
+    })
+    expect(reading.phase).toBe('agent_remediating')
+    expect(reading.faultAt).toBe('2026-09-19T10:00:00Z')
+    expect(reading.resetAt).toBeNull()
+  })
+
+  it('does not badge a fresh DLQ row with the previous take’s decision', () => {
+    // The seeded rows come back under STABLE ids, so a replay from the last take names
+    // the same job id as the row this take just planted.
+    const row: Job = { id: 'job-1' } as Job
+    const audit = [
+      toolRow('agent.tool_invoked', 'replay_dlq_by_ids', '2026-09-19T10:03:00Z', {
+        job_ids: ['job-1'],
+      }),
+      resetRow('2026-09-19T10:05:00Z'),
+    ]
+    expect(dlqDecision(row, audit)).toBe('leave')
+    // And the same call after the boundary still counts.
+    expect(
+      dlqDecision(row, [
+        ...audit,
+        toolRow('agent.tool_invoked', 'replay_dlq_by_ids', '2026-09-19T10:06:00Z', {
+          job_ids: ['job-1'],
+        }),
+      ]),
+    ).toBe('replay')
+  })
+
+  it('a row exactly at the boundary belongs to the take being closed', () => {
+    const simultaneous = toolRow(
+      'chaos.tool_invoked',
+      'kill_consumer',
+      '2026-09-19T10:05:00Z',
+    )
+    expect(newestFaultAt([simultaneous, RESET])).toBeNull()
+  })
+})
+
+describe('runSinceReset — the agent card ignores a closed-out take', () => {
+  const RESET_AT = '2026-09-19T10:05:00Z'
+
+  function finished(id: string, at: string): AgentRun {
+    return { ...run('failed'), id, finished_at: at, active: false }
+  }
+
+  it('picks the newest run when there is no boundary', () => {
+    const older = { ...run('investigating'), id: 'a', started_at: '2026-09-19T10:00:00Z' }
+    const newer = { ...run('planning'), id: 'b', started_at: '2026-09-19T10:02:00Z' }
+    expect(runSinceReset([older, newer], null)?.id).toBe('b')
+  })
+
+  it('has nothing to show when every run was closed before the boundary', () => {
+    // What `make eval-reset` leaves behind: it closes open runs as `failed` with a
+    // `closed_by: reset` marker, and those are the previous take's.
+    const runs = [finished('a', '2026-09-19T10:04:00Z'), finished('b', RESET_AT)]
+    expect(runSinceReset(runs, RESET_AT)).toBeNull()
+  })
+
+  it('shows a run that started after the boundary', () => {
+    const runs = [
+      finished('old', '2026-09-19T10:04:00Z'),
+      { ...run('investigating'), id: 'new', started_at: '2026-09-19T10:06:00Z' },
+    ]
+    expect(runSinceReset(runs, RESET_AT)?.id).toBe('new')
+  })
+
+  it('keeps a still-open run the reset did not manage to close', () => {
+    // Deliberately kept rather than hidden: an open run older than the boundary is
+    // either a race with the reset's own sweep or a responder it could not reach,
+    // and on camera that disagreement is worth seeing.
+    const stillOpen = {
+      ...run('remediating'),
+      id: 'open',
+      started_at: '2026-09-19T10:01:00Z',
+    }
+    expect(runSinceReset([stillOpen], RESET_AT)?.id).toBe('open')
   })
 })
 
