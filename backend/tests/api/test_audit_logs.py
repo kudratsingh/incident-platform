@@ -226,10 +226,17 @@ async def test_over_long_action_prefix_returns_422(
     client: AsyncClient,
     admin_headers: dict[str, str],
 ) -> None:
+    """The bound is 200 characters since WO-R3-328, because the parameter is a comma
+    list of prefixes rather than one prefix — still bounded, because it reaches a LIKE."""
     resp = await client.get(
-        f"/api/v1/audit/logs?action_prefix={'x' * 200}", headers=admin_headers
+        f"/api/v1/audit/logs?action_prefix={'x' * 201}", headers=admin_headers
     )
     assert resp.status_code == 422
+
+    long_exclude = await client.get(
+        f"/api/v1/audit/logs?exclude_prefix={'x' * 201}", headers=admin_headers
+    )
+    assert long_exclude.status_code == 422
 
 
 async def test_bad_principal_type_returns_422(

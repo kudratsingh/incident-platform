@@ -9,6 +9,8 @@ from typing import Any
 
 from app.core.breaker_state import read_breaker_states
 from app.core.consumer_lag import (
+    LAG_SAMPLES_KEEP,
+    LAG_SAMPLES_WINDOW_SECONDS,
     LIVE_REFRESHED_GROUP,
     SEEDED_CONSUMER_GROUPS,
     LagReading,
@@ -40,6 +42,8 @@ from app.repositories.user import UserRepository
 from app.schemas.agent_run import (
     AgentRunListParams,
     AgentRunResponse,
+    AgentRunStepResponse,
+    AgentRunStepsResponse,
     AlertListParams,
     AlertResponse,
     CircuitBreakerResponse,
@@ -806,6 +810,70 @@ async def admin_get_agent_run(
     return AgentRunResponse.model_validate(run)
 
 
+@router.get("/agent-runs/{run_id}/steps", response_model=AgentRunStepsResponse)
+async def admin_agent_run_steps(
+    run_id: uuid.UUID,
+    after_seq: int | None = Query(
+        default=None,
+        ge=0,
+        description=(
+            "Return only steps whose `seq` is greater than this. Omit for the whole "
+            "ledger. Send back `next_after_seq` from the previous reply to poll."
+        ),
+    ),
+    tenant_id: uuid.UUID | None = None,
+    current_user: User = Depends(_require_support_or_admin),
+    db: AsyncSession = Depends(get_db),
+) -> AgentRunStepsResponse:
+    """One run's action ledger, oldest first, for a console polling it (WO-R3-328).
+
+    A tail read rather than an offset page: `?after_seq=` is the last `seq` the caller
+    already drew, so a panel updating twice a second asks for what is new instead of
+    re-reading a 200-entry ledger — and a step it has already shown cannot arrive twice.
+
+    Sorted here by `seq` rather than trusted in stored order: the responder appends in
+    the order it reports, and a report that arrived out of order would otherwise put a
+    step in the wrong place on a screen.
+    """
+    from app.core.exceptions import NotFoundError
+
+    effective_tenant = await resolve_admin_tenant(current_user, db, tenant_id)
+    run = await AgentRunRepository(db).get_for_tenant(run_id, effective_tenant)
+    if run is None:
+        # 404 for another tenant's run as well as a missing one, exactly as the
+        # single-run read keeps the id space opaque.
+        raise NotFoundError(f"Agent run {run_id} not found")
+
+    stored = sorted(run.steps or [], key=lambda s: _step_seq(s))
+    selected = [
+        s for s in stored if after_seq is None or _step_seq(s) > after_seq
+    ]
+    highest = _step_seq(stored[-1]) if stored else None
+    return AgentRunStepsResponse(
+        run_id=run.id,
+        state=run.state,
+        finished_at=run.finished_at,
+        steps=[AgentRunStepResponse.model_validate(s) for s in selected],
+        returned=len(selected),
+        total=len(stored),
+        steps_dropped=run.steps_dropped or 0,
+        after_seq=after_seq,
+        # The highest `seq` STORED, not the highest returned: a poll that finds nothing
+        # new must not hand back a cursor that re-reads the tail next time.
+        next_after_seq=highest if highest is not None else after_seq,
+    )
+
+
+def _step_seq(step: dict[str, Any]) -> int:
+    """A step's position, with an unusable one sorted to the front.
+
+    The write surface requires an integer `seq`, so this is defence against a row
+    written before that surface existed rather than an expected shape.
+    """
+    raw = step.get("seq")
+    return raw if isinstance(raw, int) and not isinstance(raw, bool) else -1
+
+
 @router.get("/consumer-lag", response_model=ConsumerLagResponse)
 async def admin_consumer_lag(
     current_user: User = Depends(_require_support_or_admin),
@@ -842,6 +910,8 @@ async def admin_consumer_lag(
         groups=groups,
         total=len(groups),
         live_group=LIVE_REFRESHED_GROUP,
+        sample_window_seconds=LAG_SAMPLES_WINDOW_SECONDS,
+        sample_interval_seconds=LAG_SAMPLES_WINDOW_SECONDS // LAG_SAMPLES_KEEP,
     )
 
 

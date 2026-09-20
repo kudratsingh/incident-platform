@@ -34,6 +34,23 @@ class AgentRunResponse(BaseModel):
     phase_history: list[dict[str, Any]] = Field(default_factory=list)
     current_hypothesis: dict[str, Any] | None = None
     last_step: dict[str, Any] | None = None
+    # The responder's ranked explanations, BEST FIRST — the order is the ranking, and
+    # `confidence` is its own number, never re-sorted here. Empty means it has reported
+    # none, not that it has none.
+    hypotheses: list[dict[str, Any]] = Field(default_factory=list)
+    # What it decided to do and why, or null before it decided.
+    plan: dict[str, Any] | None = None
+    # The newest verify verdict, and every verdict this run produced, oldest first.
+    # Bounded at 50 (`VERIFICATIONS_CAP`): past that the oldest are dropped.
+    verification: dict[str, Any] | None = None
+    verifications: list[dict[str, Any]] = Field(default_factory=list)
+    # The action ledger, in the order the responder reported it. Bounded at 200
+    # (`STEPS_CAP`) — read `steps_dropped` before describing it as the whole run, and
+    # `GET /admin/agent-runs/{id}/steps?after_seq=` to poll it without re-reading this.
+    steps: list[dict[str, Any]] = Field(default_factory=list)
+    steps_dropped: int = 0
+    # What the run has spent, on the responder's own meters. Null while it reported none.
+    budget: dict[str, Any] | None = None
     # Present only once the run reported one; written once and never revised.
     briefing: dict[str, Any] | None = None
     started_at: datetime
@@ -57,6 +74,52 @@ class AgentRunListParams(PaginationParams):
     alert_id: uuid.UUID | None = None
     # `true` = unfinished only, `false` = finished only, omitted = both.
     active: bool | None = None
+
+
+class AgentRunStepResponse(BaseModel):
+    """One entry in the action ledger, as the responder reported it.
+
+    Every field but `seq` and `kind` can be null: this is the responder's own account of
+    a call it made, and the platform fills nothing in. The excerpts are excerpts — the
+    responder truncates them to 400 characters before sending, and the write surface
+    refuses anything longer.
+    """
+
+    seq: int
+    kind: str
+    tool: str | None = None
+    arguments: dict[str, Any] | None = None
+    result_excerpt: str | None = None
+    outcome: str | None = None
+    latency_ms: float | None = None
+    at: datetime | None = None
+
+
+class AgentRunStepsResponse(BaseModel):
+    """A page of the ledger for one run, for a console polling it.
+
+    Not `PaginatedResponse`: this is a tail read, not an offset page. The console asks
+    for everything after the last `seq` it drew, so a slow poll costs one request rather
+    than a re-read of the whole run, and a step it has already shown cannot arrive twice.
+    """
+
+    run_id: uuid.UUID
+    # The run's state and closing time, so a poller knows when to stop asking.
+    state: str
+    finished_at: datetime | None = None
+    # Ascending by `seq` — the order the responder did them in, which is the order a
+    # ledger is read in. The console reverses it to show newest first.
+    steps: list[AgentRunStepResponse] = Field(default_factory=list)
+    # What this reply holds, and what the run holds now.
+    returned: int
+    total: int
+    # How many of the oldest steps the cap discarded over this run's life. Anything but
+    # 0 means `total` is the newest part of the run, not all of it.
+    steps_dropped: int = 0
+    # The `after_seq` this reply answered, echoed, and the one to send next time — the
+    # highest `seq` stored, so a poll that returns nothing still advances correctly.
+    after_seq: int | None = None
+    next_after_seq: int | None = None
 
 
 class ConsumerLagSampleResponse(BaseModel):
@@ -89,6 +152,12 @@ class ConsumerLagResponse(BaseModel):
     total: int
     # The one group whose number moves, named so a console can mark the others.
     live_group: str
+    # How much history `recent_samples` can hold, and how far apart the measurements
+    # are — so a chart can label its own axis from the reply instead of hard-coding the
+    # platform's cadence (WO-R3-328). A window with fewer samples than it could hold is
+    # missing history, never a flat line.
+    sample_window_seconds: int
+    sample_interval_seconds: int
 
 
 class CircuitBreakerResponse(BaseModel):
@@ -141,6 +210,8 @@ class AlertListParams(PaginationParams):
 __all__ = [
     "AgentRunListParams",
     "AgentRunResponse",
+    "AgentRunStepResponse",
+    "AgentRunStepsResponse",
     "AlertListParams",
     "AlertResponse",
     "CircuitBreakerResponse",

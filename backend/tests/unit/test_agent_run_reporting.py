@@ -659,6 +659,15 @@ def test_the_model_carries_every_column_the_order_names() -> None:
         "started_at",
         "updated_at",
         "finished_at",
+        # WO-R3-328's seven (ADR 0037) — the reasoning beside the state. Their own
+        # rules are tested in `test_agent_run_record.py`.
+        "hypotheses",
+        "plan",
+        "verification",
+        "verifications",
+        "steps",
+        "steps_dropped",
+        "budget",
     }
 
 

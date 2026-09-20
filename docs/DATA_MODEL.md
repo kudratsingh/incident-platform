@@ -386,8 +386,15 @@ Every alert is also the trigger for a signed webhook, so this table is the entry
 
 Written over MCP by the responder's own principal, read back only by a human operator
 ([ADR 0035](ADR/0035-the-agent-reports-its-run-and-cannot-read-it-back.md)). The platform
-stores the report and interprets none of it: `state`, `current_hypothesis`, `last_step`
-and `briefing` are the caller's words.
+stores the report and interprets none of it: every value here is the caller's words.
+
+Two shapes of column, and the difference is the design
+([ADR 0037](ADR/0037-a-run-record-carries-the-run.md)). **Latest-reading** columns hold
+the newest thing the caller said — `current_hypothesis`, `last_step`, `hypotheses`,
+`plan`, `verification`, `budget`. **Append-only** columns hold everything it said, in
+order and bounded — `phase_history`, `verifications`, `steps` — with `steps_dropped`
+counting what a bound discarded, because a silently shortened ledger reads as a run that
+did less.
 
 | Column | Type | Notes |
 |---|---|---|
@@ -400,6 +407,13 @@ and `briefing` are the caller's words.
 | `phase_history` | JSONB NOT NULL, default `[]` | Append-only list of `{"state": …, "at": …}`, oldest first, **one entry per state change**. A revisited state appends again (a responder going back to investigating is a real transition); a repeat of the current state adds nothing, or a caller reporting every loop iteration would turn a timeline into a call log. NOT NULL with a default so every row has a list to append to and no reader has to treat NULL as empty. |
 | `current_hypothesis` | JSONB NULLABLE | `{"name": …, "category": …, "confidence": …}`, or NULL while the caller has no leading explanation. The current reading, so it is **replaced** on every report — omitting it clears it. |
 | `last_step` | JSONB NULLABLE | `{"kind": "read"\|"action", "tool": …, "at": …}`, or NULL before the first step. Replaced on every report, like the hypothesis. |
+| `hypotheses` | JSONB NOT NULL, default `[]` | The responder's **ranked** explanations, best first: `[{"name", "category", "confidence", "reasoning_excerpt"}]`. The order is the ranking — the platform never re-sorts by `confidence`, which is the responder's own number. Replaced whole when a report carries it and **never cleared by a report that omits it**, which is the opposite of `current_hypothesis` and is the point: the reporter sends a step-only report after every call, and clearing on omission would blank the panel between transitions ([ADR 0037](ADR/0037-a-run-record-carries-the-run.md)). An empty list means none reported. |
+| `plan` | JSONB NULLABLE | `{"action_tool", "action_arguments", "target_hypothesis", "rationale_excerpt"}` — what the responder decided to do and why, written on the way into `remediating`. Latest wins (a re-plan is a new plan); never cleared by omission. |
+| `verification` | JSONB NULLABLE | The newest verify verdict, `{"verdict", "reasoning_excerpt", "attempt", "of"}`, for a reader that wants one line. `verdict` is deliberately **not** a closed set: the platform has no opinion about what counts as verified, and a fixed list would refuse a verdict the responder has. |
+| `verifications` | JSONB NOT NULL, default `[]` | Every verdict, oldest first. Three polls to reach `verified` is a different story from one, and the latest column cannot tell it. **Capped at 50** (`VERIFICATIONS_CAP`), oldest dropped — stated on the field, with no counter of its own, because no run in this platform's history has come near it (recorded in ADR 0037). |
+| `steps` | JSONB NOT NULL, default `[]` | The action ledger: one entry per call the responder made, `{"seq", "kind": "read"\|"action"\|"report", "tool", "arguments", "result_excerpt", "outcome", "latency_ms", "at"}`. Append-only; `seq` is the entry's identity, so a fail-open retry of a report cannot enter the same step twice. **Capped at 200** (`STEPS_CAP`), oldest dropped. `result_excerpt` is an excerpt the caller truncates to 400 characters and the wire **refuses** a longer one rather than cutting it — which is what keeps this column from becoming a copy of the responder's trace. |
+| `steps_dropped` | Integer NOT NULL, default 0 | How many of the oldest steps the cap discarded, over the run's life. Never decreases. A counter and not a flag because the cap drops from the *front*: a console rendering 200 rows without this would describe a shorter run than happened. |
+| `budget` | JSONB NULLABLE | `{"tool_calls_used", "tool_calls_max", "tokens_used", "usd_used", "wall_seconds"}` as the responder last reported them. The platform counts none of it and corrects none of it — these are the caller's own meters. `tool_calls_max` is NULL rather than 0 for "no limit", because 0 reads as "no calls left". |
 | `briefing` | JSONB NULLABLE | The caller's end-of-run write-up with its `prose` inside it, stored verbatim and validated nowhere — pinning its shape would couple two repositories' release cycles to buy nothing. Written **once**: a second write is refused 409, because an operator may already have read it. |
 | `started_at` | DateTime NOT NULL | When the first report landed, on the platform's clock. |
 | `updated_at` | DateTime NOT NULL | When the most recent report landed. |

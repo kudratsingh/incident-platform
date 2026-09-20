@@ -510,14 +510,31 @@ shape.
 |---|---|---|
 | `GET /api/v1/admin/agent-runs?alert_id=&active=&page=&page_size=` | `PaginatedResponse[AgentRunResponse]` | Newest first. `active=true` is `finished_at IS NULL` — the console's own query while a run is live; `active=false` is its complement; omitted shows both. `?tenant_id=` is honoured for a platform admin only. |
 | `GET /api/v1/admin/agent-runs/{id}` | `AgentRunResponse` | 404 for a missing run **and** for another tenant's, so the id space stays opaque. |
-| `GET /api/v1/admin/consumer-lag` | `ConsumerLagResponse` | Every group in one reading, no arguments. Not tenant-scoped — consumer groups are platform-wide. |
+| `GET /api/v1/admin/agent-runs/{id}/steps?after_seq=` | `AgentRunStepsResponse` | WO-R3-328. The run's action ledger, oldest first, sorted by `seq` rather than trusted in stored order. A **tail read, not an offset page**: `after_seq` is the last `seq` the caller already drew, so a panel polling twice a second asks for what is new and a step it has shown cannot arrive twice. Send back `next_after_seq` (the highest `seq` stored, so an empty poll still advances). Carries `returned`, `total`, `steps_dropped`, and the run's `state` / `finished_at` so a poller knows when to stop. Same 404 rule. |
+| `GET /api/v1/admin/consumer-lag` | `ConsumerLagResponse` | Every group in one reading, no arguments. Not tenant-scoped — consumer groups are platform-wide. Since WO-R3-328 it also carries `sample_window_seconds` (900) and `sample_interval_seconds` (60), so a chart labels its axis from the reply instead of hard-coding the platform's cadence. |
 | `GET /api/v1/admin/circuit-breakers` | `CircuitBreakersResponse` | Every breaker with a published record ([ADR 0030](ADR/0030-breaker-state-is-published-and-a-reading-is-never-invented.md)); absent is unknown, never closed. Not tenant-scoped. |
 | `GET /api/v1/admin/alerts?active=&severity=&page=&page_size=` | `PaginatedResponse[AlertResponse]` | The one thing the agent's `list_active_alerts` never returns: alerts that have already been resolved, which is what a human reading a timeline afterwards needs. |
 
 `AgentRunResponse` carries `id`, `tenant_id`, `alert_id`, `service_account_id`,
 `scenario`, `state`, `phase_history`, `current_hypothesis`, `last_step`, `briefing`,
 `started_at`, `updated_at`, `finished_at`, plus a computed `active` (derived from
-`finished_at`, because there is one fact here and it is the timestamp).
+`finished_at`, because there is one fact here and it is the timestamp). WO-R3-328 adds
+`hypotheses` (ranked, best first), `plan`, `verification`, `verifications`, `steps`,
+`steps_dropped` and `budget` — every one of them the responder's own words, with the
+excerpt limits enforced at the write surface
+([ADR 0037](ADR/0037-a-run-record-carries-the-run.md)). A console drawing the ledger
+should poll `/steps?after_seq=` rather than re-reading this shape: `steps` is here so one
+request can rebuild a panel from cold.
+
+### The human audit filter takes prefix lists (WO-R3-328)
+
+`GET /api/v1/audit/logs` accepts `action_prefix` as a **comma list** (`agent.,lab.,chaos.`
+— OR-ed) and a new `exclude_prefix` (`event.` — AND-ed, and it wins where the two
+overlap). Each is bounded at 200 characters and ten prefixes, blanks and duplicates
+dropped, because each becomes a `LIKE`. Nothing about withholding changes: this is the
+human path, which has always shown every stream, and `hidden_audit_action_prefixes` stays
+a rule about principals on the MCP path. One request now answers "the operator streams,
+without the job lifecycle", which before took three requests and a client-side merge.
 
 `ConsumerLagGroupResponse` carries the same numbers `get_consumer_lag` returns — from the
 same function, `app/core/consumer_lag.read_lag`, so the console and the agent cannot

@@ -115,8 +115,10 @@ class GetConsumerLagOutput(BaseModel):
     )
     recent_samples: list[LagSample] = Field(
         default_factory=list,
-        description="The last few measurements for this group, newest "
-        "first, the current one included. Comparing them is how to tell "
+        description="The measurements recorded for this group over the "
+        "last 15 minutes, newest first, the current one included — up to "
+        f"{_LAG_SAMPLES_KEEP} of them, one per ~60s measurement. "
+        "Comparing them is how to tell "
         "a climbing lag from a flat one without waiting. Empty for a "
         "group reporting a recorded constant (nothing measures it), and "
         "empty for the continuously-refreshed group when no window has "
@@ -151,7 +153,8 @@ class GetConsumerLagOutput(BaseModel):
         "groups will never be seen to grow.\n"
         "ONE CALL SHOWS THE TREND. Every response carries `measured_at` "
         "(when this number was measured), `age_seconds` (how old it is), "
-        "and `recent_samples` — the last few measurements, newest first, "
+        "and `recent_samples` — the measurements recorded over the last "
+        f"15 minutes, newest first, up to {_LAG_SAMPLES_KEEP} of them, "
         "each with its own time, the current one included. Compare those "
         "samples to decide whether lag is climbing, draining or flat. "
         "That comparison is the evidence; a second call is not, because "

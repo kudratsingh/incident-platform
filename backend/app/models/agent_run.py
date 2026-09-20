@@ -9,6 +9,18 @@ can rewrite. `briefing` lands once, at the end.
 
 `id` is supplied by the caller (its own run id), so a repeat report is an update of a
 row it already knows the key of rather than a search.
+
+Since WO-R3-328 the row carries the *reasoning* beside the state (ADR 0037): the ranked
+`hypotheses`, the `plan`, every `verification` verdict, the `steps` ledger and the
+`budget`. Two shapes of column, and the difference is the whole design:
+
+- **Latest-reading columns** (`current_hypothesis`, `last_step`, `plan`,
+  `verification`, `budget`, `hypotheses`) hold the newest thing the caller said.
+- **Append-only columns** (`phase_history`, `verifications`, `steps`) hold everything it
+  said, in order, bounded — and `steps_dropped` counts what a bound discarded, because a
+  silently shortened ledger reads as a run that did less.
+
+Nothing here is readable by the responder: there is still no read tool for this table.
 """
 
 import uuid
@@ -16,7 +28,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from app.models.base import Base, PortableJSON
-from sqlalchemy import DateTime, ForeignKey, String, func
+from sqlalchemy import DateTime, ForeignKey, Integer, String, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -73,6 +85,40 @@ class AgentRun(Base):
     last_step: Mapped[dict[str, Any] | None] = mapped_column(
         PortableJSON, nullable=True
     )
+    # The caller's ranked explanations, best first, each with a short excerpt of its own
+    # reasoning. Replaced whole when a report carries it; a report that omits it leaves
+    # it alone, unlike `current_hypothesis` — the reporter sends a step-only report after
+    # every tool call, and clearing on omission would blank the panel between them.
+    hypotheses: Mapped[list[dict[str, Any]]] = mapped_column(
+        PortableJSON, nullable=False, default=list
+    )
+    # `{"action_tool", "action_arguments", "target_hypothesis", "rationale_excerpt"}` —
+    # what the caller decided to do and why, or NULL before it decided. Latest wins: a
+    # re-plan replaces it.
+    plan: Mapped[dict[str, Any] | None] = mapped_column(PortableJSON, nullable=True)
+    # The newest verify verdict, for a console that wants one line.
+    verification: Mapped[dict[str, Any] | None] = mapped_column(
+        PortableJSON, nullable=True
+    )
+    # Every verify verdict, oldest first. A remediation that needed three polls is a
+    # different story from one that needed one, and the latest column cannot tell it.
+    verifications: Mapped[list[dict[str, Any]]] = mapped_column(
+        PortableJSON, nullable=False, default=list
+    )
+    # The action ledger: one entry per call the caller made, in the order it reported
+    # them, de-duplicated by `seq`. Append-only and capped (`STEPS_CAP`).
+    steps: Mapped[list[dict[str, Any]]] = mapped_column(
+        PortableJSON, nullable=False, default=list
+    )
+    # How many oldest steps the cap discarded. Never decreases. A console showing
+    # "200 of 214 steps" is telling the truth; one showing 200 is not.
+    steps_dropped: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    # `{"tool_calls_used", "tool_calls_max", "tokens_used", "usd_used", "wall_seconds"}`
+    # as the caller last reported them, or NULL while it reported none. The platform
+    # counts nothing here: these are the caller's own meters.
+    budget: Mapped[dict[str, Any] | None] = mapped_column(PortableJSON, nullable=True)
     # The caller's own end-of-run write-up, plus `prose` when it wrote one. Set once:
     # a second write is refused rather than merged, so what an operator read cannot
     # change under them.

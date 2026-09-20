@@ -28,6 +28,10 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 #: Spelled out rather than counted. Both are new; nothing existing moves.
 COMMANDER_TOOLS_AFTER = ["report_agent_briefing", "report_agent_run"]
 
+#: This order's fields are above the blank line; WO-R3-328 widened the same two models
+#: and pins its own delta in `test_run_record_shape_delta.py`. Listed here as well
+#: because this test asserts the EXACT set — a field this file does not know about is
+#: what makes a re-pin surprising, whichever order added it.
 REPORT_AGENT_RUN_INPUT_FIELDS = {
     "run_id",
     "state",
@@ -36,6 +40,12 @@ REPORT_AGENT_RUN_INPUT_FIELDS = {
     "run_label",
     "current_hypothesis",
     "last_step",
+    #
+    "hypotheses",
+    "plan",
+    "verification",
+    "step",
+    "budget",
 }
 
 REPORT_AGENT_RUN_OUTPUT_FIELDS = {
@@ -48,6 +58,9 @@ REPORT_AGENT_RUN_OUTPUT_FIELDS = {
     "updated_at",
     "finished_at",
     "accepted",
+    #
+    "steps_count",
+    "steps_dropped",
 }
 
 HYPOTHESIS_FIELDS = {"name", "category", "confidence"}
