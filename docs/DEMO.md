@@ -5,9 +5,10 @@ can and cannot see.
 
 An operator opens one page, records it, and narrates an incident from injection to
 resolution without switching tabs. WO-R3-313 built the first version, WO-R3-327
-added the reset boundary, and **WO-R3-330 rebuilt it around one run** after the
-owner's first live take — see "What the first take showed" at the end, which is the
-whole reason the page has the shape it does.
+added the reset boundary, **WO-R3-330 rebuilt it around one run** after the owner's
+first live take, and **WO-R3-334 made it read one TAKE** after the third — see "What
+the takes showed" at the end, which is the whole reason the page has the shape it
+does.
 
 The other half of the demo — the step machine that fires the fault, runs the agent
 and resets the world — lives in the commander repo (`scripts/demo_live.py`,
@@ -17,15 +18,16 @@ and resets the world — lives in the commander repo (`scripts/demo_live.py`,
 |---|---|
 | **Route** | `/demo`, `ProtectedRoute requiredRole="support"` — the same bar as `/admin`, because everything on it is operator-only |
 | **Mode** | `?mode=consumer_outage` (default) or `?mode=dlq_backlog`; the header buttons write the URL |
-| **Run** | `?run=<id>`; the default is the newest run since the reset boundary, and the selector lists every run of the take |
+| **Run** | `?run=<id>`; the default is **the newest run with a fault row in its own take**, and the selector lists every run the page can see, each labelled with its take |
+| **Take** | the span between two `lab.world_reset` boundaries. The selected run decides which one the whole page reads; a take that has been closed is labelled `take ended at HH:MM:SS` |
 | **Cadence** | every panel polls every **2 s** through `usePolling`, so no two panels disagree about *now*; alerts and breakers poll at 10 s |
-| **Code** | `frontend/src/pages/DemoPage.tsx`, with every derivation in `frontend/src/utils/demoPhase.ts` (the incident) and `frontend/src/utils/demoRun.ts` (the run record) — all pure functions, all driven from fixtures in `src/test/demoPhase.test.ts`, `src/test/demoRun.test.ts` and `src/test/DemoPage.test.tsx` |
+| **Code** | `frontend/src/pages/DemoPage.tsx`, with every derivation in `frontend/src/utils/demoPhase.ts` (the incident and its takes) and `frontend/src/utils/demoRun.ts` (the run record and the ledger) — all pure functions, all driven from fixtures in `src/test/demoPhase.test.ts`, `src/test/demoRun.test.ts` and `src/test/DemoPage.test.tsx` |
 | **Backend** | the shapes WO-R3-328 added to `agent_runs` and to the read endpoints (plat #230, → v0.6.16): the ranked `hypotheses`, `plan`, `verification`/`verifications`, `steps` with `steps_dropped`, `budget`; `GET /admin/agent-runs/{id}/steps?after_seq=`; the 15-minute lag window with `sample_window_seconds` / `sample_interval_seconds`; comma-list `action_prefix` and `exclude_prefix` on the human audit filter |
 
 Layout, at 1440×900 with no scroll for the top half:
 
 ```
-  header      run selector · mode · T+ since the fault
+  header      run selector · which take · mode · T+ since the fault
   PLATFORM    healthy → fault injected → agent acting → recovered
   AGENT       triage → investigating → planning → awaiting approval
               → remediating → verifying → resolved | escalated | failed
@@ -39,7 +41,7 @@ Layout, at 1440×900 with no scroll for the top half:
 
 ---
 
-## Five rules the page is built around
+## Six rules the page is built around
 
 1. **An absent reading renders as absent, with its reason — never as zero.**
    `lag_known: false` is not lag 0; a breaker with no published record is *missing
@@ -56,16 +58,23 @@ Layout, at 1440×900 with no scroll for the top half:
    A 403 on the agent-run endpoint degrades that panel and leaves the chart and the
    ledger up. A single failed poll shows the error *beside* the last good reading
    rather than blanking the panel.
-4. **A reset is a boundary and nothing older than the newest one is derived from**
-   (WO-R3-327) — see below.
+4. **A reset is a boundary, and a take is the span between two of them** (WO-R3-327,
+   WO-R3-334) — see below.
 5. **An absence is named, not filled.** A run with no `hypotheses` is not a run
    that ranked nothing: the panel says which of the two it is looking at, because
    a stack older than v0.6.16 and a commander older than WO-R3-329 are different
-   absences and both are possible.
+   absences and both are possible. And an absence a **terminal** run will never
+   fill is a sentence rather than a "not yet": "the agent handed off without
+   acting", "no verification because no action".
+6. **The whole page reads ONE take, and only this run's own calls** (WO-R3-334).
+   Every panel is scoped to the take the selected run belongs to, and every
+   `agent.tool_invoked` row is measured against that run's `service_account_id`.
+   A call by the demo runner or by the evaluator's guard probes is counted, named
+   and hidden — never drawn as the agent's work.
 
 ---
 
-## A reset ends a take, and the fault is latched inside it
+## A take is the span between two boundaries
 
 `audit_logs` is append-only by design, so a take's rows are still there after the
 world they describe is gone. That made the page confidently wrong in exactly the
@@ -90,19 +99,53 @@ counters as its payload (platform WO-R3-327).
 the fault. A boundary filed under that prefix would be read as the very thing it
 exists to say did not happen.
 
-Everything derived reads rows and runs strictly newer than the newest boundary: the
-platform row and the clock, the run selector, the metric's breach and recovery, the
-chart's markers, the DLQ badges. A row sharing the boundary's exact timestamp
-belongs to the take being **closed** — the reset writes its row last. On a stack
-older than WO-R3-327 there is no boundary row, so the page reads the whole history
-exactly as it did before; an inferred boundary would be a guess about which rows to
-throw away.
+### "Since the newest boundary" was the wrong unit (WO-R3-334)
+
+The third live take was recorded, the runner wound the world down, and the page was
+reloaded two minutes later — so the newest boundary was **after** the run. Read
+"since the newest boundary", the page then described a freshly wiped world: the
+header said *no run in this take yet*, the PLATFORM row said *healthy · since the
+reset*, and the AGENT row beside it said *escalated*. Every number was true of some
+moment and none of them were true of the same one.
+
+So a **take** is the span between two boundaries, a run belongs to exactly one of
+them, and the page reads that run's take end to end:
+
+| | |
+|---|---|
+| **Which take** | the take of the selected run. The default run is the newest one **with a fault row in its own take** — not the newest run, and not the newest boundary. `?run=` picks a run and therefore its take the same way |
+| **Its rows** | strictly after the opening boundary, up to **and including** the closing one (the reset writes its row last, so a row sharing that timestamp belongs to the take being closed). The ledger also asks for the opening boundary, because it draws a divider at each edge |
+| **Its runs** | the runs that **started** inside it; the selector still lists every run the page can see, each labelled with its own take |
+| **When it ended** | the header says `take ended at HH:MM:SS`, and adds *a newer take is running with no run yet* when that is the case. The `T+` clock stops at the boundary rather than counting on into a world that is gone |
+| **No boundary in view** | `startAt` is null and the take is open at that end — the same honest fallback a stack older than WO-R3-327 has always had. A boundary is never inferred |
+
+Everything derived reads that take: the platform row and the clock, the metric's
+breach and recovery, the chart's span and markers, the ledger, the counts and the DLQ
+badges.
+
+### Whose call was it?
+
+A second rule with the same shape, from findings F3 and F4 of the third take. The
+demo runner built two of its clients with the **agent's** token and read lag every
+three seconds; the evaluator's principal-guard probes and its world audit wear that
+token on purpose, and fired seven more calls after the boundary. Both are real calls
+the platform really served, and neither is the agent's work.
+
+| Row | How the page tells | What it does with it |
+|---|---|---|
+| `agent.tool_invoked` with the run's `service_account_id` | the run record names its own principal | the run's own call |
+| `agent.tool_invoked` with any other principal | principal comparison | hidden, counted, badged `NOT THIS RUN` on the toggle |
+| `lab.probe` (WO-R3-333) | the lab labels its own reads, because it cannot be told apart by principal | hidden, counted, badged `LAB PROBE` on the toggle |
+| no run selected | there is no principal to compare against | every row counts, which is the honest reading rather than a guess |
+
+The platform row's `agent acting` station, the chart's action markers and the
+ledger's "N calls the platform recorded" all use that rule.
 
 ### The fault is latched for the take
 
-The boundary alone was not enough. `newestFaultAt` reads the newest `chaos.*` row
-*in the page's window of rows*, and with `make traffic` running the window is mostly
-job events — so the row that states the fault fell out of it within a minute and the
+The boundary alone was not enough. The fault is the newest `chaos.*` row *in the
+page's window of rows*, and with `make traffic` running the window is mostly job
+events — so the row that states the fault fell out of it within a minute and the
 platform row dropped back to **healthy** in the middle of the run.
 
 Two fixes, both needed. The audit query asks for the operator streams only (below),
@@ -125,7 +168,7 @@ Source: `GET /api/v1/audit/logs` (the operator streams) plus the mode's metric.
 |---|---|---|
 | healthy | always — it is where every take starts | the boundary (`lab.world_reset`), which is when this world began |
 | fault injected | a `chaos.*` row exists in this take, **or the latch holds one** | the lab's own row time |
-| agent acting | an `agent.tool_invoked` row at or after the fault | the first such row; the note says how many reads, and names the Tier-1 action once one fires |
+| agent acting | an `agent.tool_invoked` row **by this run's own principal** at or after the fault | the first such row; the note says how many reads, and names the Tier-1 action once one fires |
 | recovered | the metric was breached after the fault and is back inside its bar, sustained | the sample that started the inside-the-bar run |
 
 The last station reached is the current one; earlier reached stations are `passed`
@@ -152,6 +195,23 @@ the run is in now shows `ongoing` rather than a duration. An unrecognised state 
 list can only ever be one release behind) lights nothing and the panel shows the word
 verbatim.
 
+**A late report reads as late** (WO-R3-334, finding F2). The third take's three
+stations were all stamped `08:17:59` with durations of 76 ms / 9 ms / 0 ms, so a run
+that took 41 seconds rendered as one that took 85 milliseconds: the reporter queued
+its step reports and flushed them on the next transition, in one burst carrying the
+original timestamps. The event's time is the truth about the run and stays the
+station's stamp; the arrival is the truth about the reporting, and each station now
+also says `reported HH:MM:SS` when its report landed **more than five seconds** after
+the event. The arrival comes from the `agent.run_reported` audit rows, whose
+`created_at` is the platform's own clock and whose `extra_data.arguments` carry the
+run id and the state (ADR 0035).
+
+**Stations advance one at a time.** A burst that arrives in one poll reveals one
+station per ~300 ms, because four stations lighting in a single frame does not read
+as a run advancing — it reads as a page catching up. A run the page is *opening* on
+is shown whole: it has already happened, and replaying it on every reload would be
+theatre rather than information.
+
 The line under the two rows states both readings in plain words, and adds the
 metric's own caveats: recovery pending on one sample, or no reading at all.
 
@@ -159,7 +219,7 @@ metric's own caveats: recovery pending on one sample, or no reading at all.
 
 ## The metric chart (left)
 
-One series, one axis, 15 minutes wide.
+One series, one axis, and the axis is **the take**.
 
 | Mode | Value from | Threshold | Why that number |
 |---|---|---|---|
@@ -192,18 +252,40 @@ caption says so. It is a second **chart**, never a second series on the lag axis
 two run to different magnitudes and one plot with two scales invents a relationship
 between them.
 
+**The x-axis is the take's span, not a fixed fifteen minutes** (WO-R3-334). The third
+take's fault climbed 0 → 10 → 30 in about two minutes and a fifteen-minute axis drew
+it in the last eighth of the plot, from two samples. The span is **two minutes before
+the fault to now** — or to the closing boundary on a take that has ended, where the
+right edge is labelled `take ended` rather than `now`. Two clamps: never narrower
+than five minutes (a take one tick old is not a chart of one point) and never wider
+than the history the platform actually holds (an empty stretch of axis reads as a
+flat line). The `full window` button zooms back out to that whole history, and
+`zoom to the take` returns.
+
 Drawn on the plot:
 
-- a **band** above the threshold, with the threshold line labelled;
-- **markers** for the boundary (W), the fault (F), each Tier-1 **action** (A) and the
-  **recovery** (R), each listed underneath with its glyph and its time, so identity
-  is never colour alone. Reads are deliberately *not* marked — fifteen ticks on a
-  fifteen-minute chart is a comb, and the ledger is where every call belongs;
-- a **crosshair and tooltip** on hover, and a `samples (N)` table underneath with
-  every value in it, so nothing is reachable only by hovering.
+- a **band** above the threshold, with the threshold line labelled **on the left**,
+  where the eye starts and no marker can cover it;
+- **y ticks at round numbers with zero always drawn**, because zero is the line a
+  viewer measures a recovery against;
+- **markers, and the set is closed**: the boundaries (W), the lab's fault (F), each
+  Tier-1 **action** the run took (A) and the **recovery** (R), each listed underneath
+  with its glyph and its time, so identity is never colour alone. Reads are
+  deliberately *not* marked — fifteen ticks is a comb, and the ledger is where every
+  call belongs — and neither are the runner's or the evaluator's calls: the third
+  take drew three blue `A` markers for `mark_dlq_permanent` and `get_cache_key_info`
+  calls the **evaluator's guard probes** had made, on a take where the agent never
+  acted at all;
+- a **cursor on the right edge** with the newest reading beside it, so the end of the
+  line has a number on it without hovering;
+- a **crosshair and tooltip** on hover, and a `samples (N)` table behind the caption
+  with every value in it, so nothing is reachable only by hovering.
 
-Actions come from the run's `steps` when it has them and from `agent.tool_invoked`
-audit rows when it does not.
+The plot gets the panel minus **two lines of caption**: the threshold and the zoom
+control on one, the markers and the samples toggle on the other.
+
+Actions come from the run's `steps` when it has them and from its own
+`agent.tool_invoked` audit rows when it does not.
 
 ### Recovery takes two samples, not one
 
@@ -235,9 +317,16 @@ the end.
 |---|---|---|
 | state pill, run label, finished-at | `state`, `scenario`, `finished_at` | an unrecognised state renders verbatim |
 | **budget** | `budget` — calls used against the cap, tokens, dollars, wall seconds | "not reported"; a bar with no cap is a bar with an invented denominator, so there is none |
-| **hypotheses, ranked** | `hypotheses[]` — name, category, confidence bar, reasoning excerpt (≤ 280 chars) | "None reported yet". Where only `current_hypothesis` exists it becomes a one-entry list **and the panel says so**: that is a commander older than WO-R3-329, not a run that ranked nothing |
-| **the plan** | `plan` — tool, arguments, the hypothesis it is aimed at, the rationale excerpt | "No action planned yet" |
-| **verification** | `verifications[]` — every verify poll's verdict, attempt *n* of *m*, and its reasoning; capped at 50, and the panel says so when it is full | "Nothing verified yet"; where only the latest `verification` exists, that one row |
+| **hypotheses, ranked** | `hypotheses[]` — name, category, confidence bar, reasoning excerpt (≤ 280 chars). The **top one is shown whole**; the rest truncate. The bar carries a tick at **0.7**, the confidence the loop gates a remediation on | "None reported yet". Where only `current_hypothesis` exists it becomes a one-entry list **and the panel says so**: that is a commander older than WO-R3-329, not a run that ranked nothing |
+| **the plan** | `plan` — tool, arguments, the hypothesis it is aimed at, the rationale excerpt | "No action planned yet" while the run is live; on a **terminal** run, "the agent handed off without acting" |
+| **verification** | `verifications[]` — every verify poll's verdict, attempt *n* of *m*, and its reasoning; capped at 50, and the panel says so when it is full | "Nothing verified yet" while the run is live; on a terminal run that never acted, "no verification because no action" |
+
+The third take's screenshot truncated the **top** hypothesis with "more…", so the one
+sentence explaining why the agent believed what it believed was the one sentence not
+on screen. It is shown whole now. The 0.7 tick is there for the same reading: that
+take's top hypothesis sat at 0.75–0.82 for five steps, over the bar, in a category
+with a Tier-1 fix — and the agent still did not act (`../context/INCIDENTS.md`,
+INC-004). The bar says so at a glance.
 
 **The hypothesis list is rendered in the order it arrives, not sorted.** The
 platform stores it best first and states that the order *is* the ranking;
@@ -254,9 +343,40 @@ guessed at or dropped.
 
 ## The action ledger (right)
 
-One row per **step**, newest first: sequence number, time, a kind badge
-(READ grey / ACTION blue / REPORT purple), the tool, its arguments as compact JSON,
-the outcome, the latency, and the **result excerpt** behind one click.
+One row per **step**, **one line each**, oldest first with the newest at the bottom:
+
+```
+  08:19:44  READ  get_consumer_lag → lag 30, known
+```
+
+the time, a kind badge (READ grey / ACTION blue / REPORT purple), the tool, and what
+the call **answered**. Click a row for its arguments, the whole result excerpt, its
+sequence number, its outcome and its latency. An **ACTION row is highlighted and
+never collapsed** — the action is the point of the run, so it shows its arguments and
+its result without being asked.
+
+The summary after the arrow comes from a per-tool table, because "lag 30, known" is a
+sentence and the first sixty characters of a JSON body is not:
+
+| Tool | Summary |
+|---|---|
+| `get_consumer_lag` | `lag 30, known` / `lag unknown` |
+| `list_dlq_messages` | `DLQ total 5` |
+| `get_circuit_breakers` | `bulk-api-sync open` / `3 breakers, none open` |
+| `get_cache_key_info` | `exists, 512 bytes` / `absent` |
+| `restart_consumer_group` | `accepted, kill key cleared` |
+| `replay_dlq_*` | `replayed 1, scheduled 0` |
+| `mark_dlq_permanent` | `fenced` |
+| anything else | the excerpt itself, collapsed to one line and cut — better read than hidden, and the whole thing is one click away |
+
+Each one reads the parsed excerpt where it can and the text where it cannot (a
+400-character excerpt of a longer body is usually truncated JSON, which is not
+parseable and not a defect), and falls through to the generic line rather than
+inventing a reading.
+
+**Newest at the bottom, and the panel follows it** — a live run's newest call is where
+the eye already is. Scroll up and it stops following; a `newest ↓` button brings it
+back.
 
 That excerpt is the whole reason the ledger is built from steps: an
 `agent.tool_invoked` audit row carries tool, arguments, latency and outcome but
@@ -308,6 +428,14 @@ the fault look like the agent's doing. The agent's own `agent.tool_invoked` and
 `agent.run_reported` rows are dropped while steps exist — they are the same events
 without their results, and drawing both would double every row.
 
+**The reads that are not this run's are counted and hidden** (WO-R3-334): a line
+saying *"N evaluator/traffic reads hidden — the lab's probes and other principals'
+calls"*, with a toggle that shows them badged `LAB PROBE` and `NOT THIS RUN`. The
+third take's ledger was a wall of `get_consumer_lag` every three seconds under the
+agent principal, none of it the agent's, and its count line read *"0 steps reported ·
+89 calls the platform recorded — the two do not agree"* over a four-call run. The
+comparison is only meaningful between the run's steps and the run's own rows.
+
 **The job events are the toggle that made this page watchable.** With traffic
 running, `event.job.*` was 43 of the 50 rows on screen and the four rows the demo is
 about were underneath them. The page therefore asks for
@@ -338,7 +466,9 @@ bug below.
   `attributed` / `cleared_on_its_own` / `cannot_attribute`, with the resource, the
   read tool whose readings answered it, whether the run acted on that resource, and
   the one-sentence detail. A run that read a recovery it cannot claim says so here
-  rather than in prose;
+  rather than in prose; a run that never acted reads *"no attribution because no
+  action"* rather than "none recorded", which would suggest a gap in the record
+  instead of the consequence of the run's own decision;
 - **causes**, as the three slots of commander ADR 0065 — primary, secondary,
   unresolved extra — each with category, name, confidence and whether any attempt
   aimed at it. `unresolved extra` is printed even when empty: the remainder is the
@@ -403,7 +533,37 @@ platform about itself. The operator sees both.
 
 ---
 
-## What the first take showed
+## What the takes showed
+
+### The third take (2026-09-20, $0.21)
+
+The owner recorded it, the runner wound the world down, and the page was reloaded two
+minutes later. Six findings, each a rule above:
+
+1. **The page read the wrong take.** The newest boundary was *after* the run, so the
+   header said "no run in this take yet" and the PLATFORM row said `healthy · no
+   fault yet` beside an AGENT row that said `escalated`. → a take is the span between
+   two boundaries, and the page reads the take of the run it is showing.
+2. **A 41-second run rendered as an 85-millisecond one.** The reporter queued its
+   step reports and flushed them in one burst carrying their original timestamps. →
+   each station says when its report *arrived* when that was late, and stations
+   advance one at a time.
+3. **89 calls, four of them the agent's.** The demo runner read lag every three
+   seconds under the agent's token and the evaluator's guard probes fired seven calls
+   after the boundary. → rows are matched against the run's own principal, `lab.probe`
+   rows are the lab's, and the excluded count is on screen with a toggle.
+4. **Three blue action markers on a take where the agent never acted** — the same
+   probes, read as Tier-1 actions. → the marker set is closed and principal-scoped.
+5. **The chart drew a two-minute incident in the last eighth of a fifteen-minute
+   axis**, from two samples (the reset was clearing the lag history; platform
+   WO-R3-333 keeps it). → the axis is the take, with a zoom-out to the full window.
+6. **The ledger was raw audit rows and the top hypothesis was truncated with
+   "more…".** → one line per call with what it answered, and the top hypothesis whole.
+
+`plan`, `verification` and `attribution` were all null, and all three were correct:
+the agent handed off without acting. Those absences are sentences now.
+
+### The first take
 
 The owner recorded this page live on 2026-09-20 and it was unwatchable. Six findings,
 each one a rule above rather than a tweak:

@@ -33,6 +33,15 @@
  * stated, on the platform's own clock, in the same append-only place as the rows
  * it bounds.
  *
+ * **A take is the span between two boundaries** (WO-R3-334). The rule above was
+ * "everything after the newest boundary", and the third live take proved that is not
+ * the same thing: the page was reloaded after the wind-down, so the newest boundary
+ * was AFTER the run, and the platform row read a freshly wiped world beside an agent
+ * row that read `escalated`. The page now picks the newest run with a fault in its
+ * own take and reads that take end to end — and measures every `agent.tool_invoked`
+ * row against that run's own `service_account_id`, because the demo runner and the
+ * evaluator's guard probes both make calls under the agent's token.
+ *
  * Everything here is a pure function of its inputs so the whole strip can be
  * driven from a fixture through every transition.
  */
@@ -117,6 +126,20 @@ export const AGENT_RUN_REPORT_ACTION = 'agent.run_reported'
  * a human operator, so it sees it.
  */
 export const WORLD_RESET_ACTION = 'lab.world_reset'
+/**
+ * The action a read the LAB took under the agent's own token is written as
+ * (platform WO-R3-333).
+ *
+ * The evaluator's principal-guard probes and its world audit deliberately wear the
+ * agent's token — proving what that token can and cannot do is the point of them —
+ * so they cannot be told apart by principal. They are labelled at the source
+ * instead, and this page drops them: in the third take seven of them landed AFTER
+ * the reset boundary and the page read them as a new run's work.
+ *
+ * Matched as "a `lab.` row that is not the boundary" rather than by the exact name,
+ * so a second lab label cannot arrive and be read as the agent's doing.
+ */
+export const LAB_PROBE_ACTION = 'lab.probe'
 
 /**
  * The Tier-1 action tools.
@@ -170,6 +193,28 @@ export function isResetRow(row: AuditLog): boolean {
   return row.action === WORLD_RESET_ACTION
 }
 
+/** A read the lab took while wearing the agent's token (WO-R3-333). */
+export function isLabProbeRow(row: AuditLog): boolean {
+  return row.action.startsWith('lab.') && !isResetRow(row)
+}
+
+/**
+ * An `agent.tool_invoked` row this run actually made.
+ *
+ * `principalId` is the run's own `service_account_id`. The third take's ledger was
+ * flooded with `get_consumer_lag` every three seconds because the demo runner built
+ * two of its clients with the AGENT's token, and the page could not tell those reads
+ * from the agent's (F3). With a run selected there is a principal to compare
+ * against, so it does: a row by anyone else is somebody else's read. Without a run
+ * there is nothing to compare against and every row counts, which is the honest
+ * reading rather than a guess.
+ */
+function isRunToolRow(row: AuditLog, principalId: string | null | undefined): boolean {
+  if (!isAgentToolRow(row)) return false
+  if (principalId === null || principalId === undefined) return true
+  return row.principal_id === principalId
+}
+
 function newest(rows: AuditLog[]): AuditLog | null {
   let best: AuditLog | null = null
   for (const row of rows) {
@@ -199,8 +244,176 @@ export function newestResetAt(audit: AuditLog[]): string | null {
  * anything simultaneous with it is the world it just wound up.
  */
 function sinceReset(audit: AuditLog[], resetAt: string | null): AuditLog[] {
-  if (resetAt === null) return audit
-  return audit.filter((row) => row.created_at > resetAt)
+  return rowsInTake(audit, { startAt: resetAt, endAt: null })
+}
+
+// ── a take is the span between two boundaries ────────────────────────────────
+//
+// WO-R3-334. The third take was recorded, wound down, and the page was reloaded
+// two minutes later — so the newest boundary was AFTER the run, and everything
+// that read "since the newest boundary" read an empty world while the agent panel
+// read `escalated`. The header said "no run in this take yet" beside a run that
+// had happened, and the PLATFORM row said "healthy, no fault yet" beside an AGENT
+// row that said the run had given up.
+//
+// "Newest boundary onwards" was the wrong unit. A take is the span BETWEEN two
+// boundaries, a run belongs to exactly one of them, and the page reads that run's
+// take — the boundary before it and the boundary after it — for everything: the
+// platform row, the clock, the chart's markers, the ledger and the DLQ badges.
+
+export interface Take {
+  /**
+   * The boundary that opened this take, or null when none is in view.
+   *
+   * Null is "no boundary in what I can see", which is also what a stack older than
+   * WO-R3-327 looks like — the same honest fallback the boundary rule has always
+   * had. It is never inferred.
+   */
+  startAt: string | null
+  /** The boundary that closed it, or null while it is the take now running. */
+  endAt: string | null
+}
+
+/** Every boundary in view, oldest first, de-duplicated. */
+export function takeBoundaries(audit: AuditLog[]): string[] {
+  const seen = new Set(audit.filter(isResetRow).map((r) => r.created_at))
+  return [...seen].sort()
+}
+
+/** The take now running: after the newest boundary, with no end yet. */
+export function currentTake(audit: AuditLog[]): Take {
+  const bounds = takeBoundaries(audit)
+  return { startAt: bounds[bounds.length - 1] ?? null, endAt: null }
+}
+
+/**
+ * The take an instant falls in.
+ *
+ * A row or a run sharing a boundary's exact timestamp belongs to the take being
+ * CLOSED — the reset writes its row last, after every restoring step, so anything
+ * simultaneous with it is the world it just wound up. Hence `b < at` for the start
+ * and `b >= at` for the end.
+ */
+export function takeAt(audit: AuditLog[], at: string | null): Take {
+  if (at === null) return currentTake(audit)
+  const bounds = takeBoundaries(audit)
+  const startAt = [...bounds].reverse().find((b) => b < at) ?? null
+  const endAt = bounds.find((b) => b >= at) ?? null
+  return { startAt, endAt }
+}
+
+/** The take a run belongs to, by the run's own start. */
+export function takeOfRun(audit: AuditLog[], run: AgentRun | null): Take {
+  return takeAt(audit, run?.started_at ?? null)
+}
+
+/** One string per take, so a latch or a memo can be keyed on it. */
+export function takeKey(take: Take): string {
+  return `${take.startAt ?? 'open'}→${take.endAt ?? 'now'}`
+}
+
+/** True once a boundary has closed this take. */
+export function takeHasEnded(take: Take): boolean {
+  return take.endAt !== null
+}
+
+/** The rows of one take: after its opening boundary, up to and including its closing one. */
+export function rowsInTake(audit: AuditLog[], take: Take): AuditLog[] {
+  return audit.filter(
+    (row) =>
+      (take.startAt === null || row.created_at > take.startAt) &&
+      (take.endAt === null || row.created_at <= take.endAt),
+  )
+}
+
+/**
+ * The take's rows plus the boundary row that OPENED it.
+ *
+ * That row belongs to the take it closed — the reset writes it last, after every
+ * restoring step — but the ledger has to be able to draw both edges of the take it is
+ * showing, so it asks for them explicitly. Nothing that counts calls uses this: a
+ * boundary is not a call.
+ */
+export function rowsInTakeWithEdges(audit: AuditLog[], take: Take): AuditLog[] {
+  const startAt = take.startAt
+  const opening =
+    startAt === null ? [] : audit.filter((r) => isResetRow(r) && r.created_at === startAt)
+  return [...opening, ...rowsInTake(audit, take)]
+}
+
+/** When the lab injected this take's fault, by the platform's own clock. */
+export function faultInTake(audit: AuditLog[], take: Take): string | null {
+  return newest(rowsInTake(audit, take).filter(isLabRow))?.created_at ?? null
+}
+
+/** The runs that started inside one take, newest first. */
+export function runsInTake(runs: AgentRun[], take: Take): AgentRun[] {
+  return runs
+    .filter(
+      (r) =>
+        (take.startAt === null || r.started_at > take.startAt) &&
+        (take.endAt === null || r.started_at <= take.endAt),
+    )
+    .sort((a, b) => (a.started_at < b.started_at ? 1 : -1))
+}
+
+/** Why the page is showing the take it is showing. */
+export type TakeChoice =
+  /** `?run=` named a run the page has. */
+  | 'requested'
+  /** The newest run whose own take carries a fault row — the default rule. */
+  | 'fault'
+  /** No run's take has a fault row in view, so the newest run's take. */
+  | 'newest_run'
+  /** No run at all, so the take now running. */
+  | 'current'
+
+export interface TakeSelection {
+  take: Take
+  run: AgentRun | null
+  /** Every run in view, newest first — what the selector offers. */
+  runs: AgentRun[]
+  /** The runs of the selected take, newest first. */
+  takeRuns: AgentRun[]
+  why: TakeChoice
+}
+
+/**
+ * Which run, and therefore which take, the page reads.
+ *
+ * The default is **the newest run with a fault row in its own take**, not the newest
+ * run and not the newest boundary. That is the rule the third take needed: after the
+ * wind-down the newest boundary held an empty world, and the only coherent thing on
+ * the screen was the take that had just happened.
+ *
+ * `?run=` wins over the default and selects that run's take the same way, so a deep
+ * link from `make demo-live` opens the take it belongs to however many resets have
+ * happened since. A `?run=` naming a run the page does not have falls through to the
+ * default rather than emptying the screen.
+ */
+export function selectTake(input: {
+  runs: AgentRun[]
+  audit: AuditLog[]
+  wanted?: string | null
+}): TakeSelection {
+  const runs = [...input.runs].sort((a, b) => (a.started_at < b.started_at ? 1 : -1))
+  const choose = (run: AgentRun | null, why: TakeChoice, take?: Take): TakeSelection => {
+    const chosen = take ?? takeOfRun(input.audit, run)
+    return { take: chosen, run, runs, takeRuns: runsInTake(runs, chosen), why }
+  }
+
+  const wanted = input.wanted ?? ''
+  if (wanted !== '') {
+    const found = runs.find((r) => r.id === wanted)
+    if (found) return choose(found, 'requested')
+  }
+
+  const withFault = runs.find(
+    (r) => faultInTake(input.audit, takeOfRun(input.audit, r)) !== null,
+  )
+  if (withFault) return choose(withFault, 'fault')
+  if (runs.length > 0) return choose(runs[0], 'newest_run')
+  return choose(null, 'current', currentTake(input.audit))
 }
 
 // ── the agent's own word ──────────────────────────────────────────────────────
@@ -295,6 +508,21 @@ export interface PlatformPhaseInput {
   /** The audit rows the page has, newest-first or not — order is derived. */
   audit: AuditLog[]
   /**
+   * The take this reading is about (WO-R3-334).
+   *
+   * Absent means "the newest boundary onwards", which is what every caller meant
+   * before the third take proved it insufficient: the page was reloaded after the
+   * wind-down, so the newest boundary was AFTER the run and this row read an empty
+   * world beside an agent row that said `escalated`.
+   */
+  take?: Take | null
+  /**
+   * The run's own `service_account_id`, so a read somebody else took under the
+   * agent's token is not counted as the agent acting (F3/F4). Null = count them all,
+   * which is the only honest reading when no run is selected.
+   */
+  runPrincipalId?: string | null
+  /**
    * The fault this take is about, latched by the page (WO-R3-330).
    *
    * Omit it and the fault is derived from the rows, which is what every caller
@@ -346,16 +574,23 @@ export function newestFaultAt(audit: AuditLog[]): string | null {
 }
 
 /**
- * The fault of the current take: the latch and the rows, whichever is newer,
- * and neither one if it belongs to a take the boundary has closed.
+ * The fault of the take being read: the latch and the rows, whichever is newer,
+ * and neither one if it falls outside the take.
+ *
+ * Both ends matter since WO-R3-334. A latch from the previous take was always
+ * dropped; a latch from a LATER one has to be dropped too, or a page showing a
+ * closed take would count its clock from the next take's kill.
  */
 function latchedFaultAt(
   latched: string | null | undefined,
   derived: string | null,
-  resetAt: string | null,
+  take: Take,
 ): string | null {
   const candidates = [latched ?? null, derived].filter(
-    (v): v is string => v !== null && (resetAt === null || v > resetAt),
+    (v): v is string =>
+      v !== null &&
+      (take.startAt === null || v > take.startAt) &&
+      (take.endAt === null || v <= take.endAt),
   )
   if (candidates.length === 0) return null
   return candidates.reduce((a, b) => (a > b ? a : b))
@@ -363,16 +598,17 @@ function latchedFaultAt(
 
 export function platformPhase(input: PlatformPhaseInput): PlatformPhaseReading {
   const { metricKnown, metricInsideThreshold, metricBreachedSinceFault } = input
-  // Everything below reads the current take only. A boundary discards the previous
-  // take's fault, its investigation AND its remediation together — crediting one
-  // take's `restart_consumer_group` to the next one's fault would be the same lie in
-  // a different station.
-  const resetAt = newestResetAt(input.audit)
-  const audit = sinceReset(input.audit, resetAt)
+  // Everything below reads ONE take. A boundary discards the previous take's fault,
+  // its investigation AND its remediation together — crediting one take's
+  // `restart_consumer_group` to the next one's fault would be the same lie in a
+  // different station.
+  const take = input.take ?? currentTake(input.audit)
+  const resetAt = take.startAt
+  const audit = rowsInTake(input.audit, take)
   const faultAt = latchedFaultAt(
     input.faultAt,
     newest(audit.filter(isLabRow))?.created_at ?? null,
-    resetAt,
+    take,
   )
 
   if (faultAt === null) {
@@ -388,7 +624,9 @@ export function platformPhase(input: PlatformPhaseInput): PlatformPhaseReading {
     return { phase: 'recovered', faultAt, resetAt, metricKnown }
   }
 
-  const sinceFault = audit.filter((r) => isAgentToolRow(r) && r.created_at >= faultAt)
+  const sinceFault = audit.filter(
+    (r) => isRunToolRow(r, input.runPrincipalId) && r.created_at >= faultAt,
+  )
   const acted = sinceFault.some((row) => {
     const call = toolCall(row)
     return call !== null && ACTION_TOOLS.includes(call.tool)
@@ -571,6 +809,18 @@ export interface Station<K extends string> {
   note: string | null
   /** How many times this station was entered — 2 after a hand-back. */
   visits: number
+  /**
+   * When the report that carried this station ARRIVED, set only when it arrived
+   * more than `lateAfterMs` after the event itself (WO-R3-334, F2).
+   *
+   * The third take's three agent stations were all stamped 08:17:59 with durations
+   * of 76 ms / 9 ms / 0 ms, and the whole burst reached the platform at 08:18:40
+   * carrying its original timestamps — so a run that took 41 seconds rendered as
+   * one that took 85 milliseconds. The event's time is the truth about the run and
+   * stays the station's stamp; this is the truth about the reporting, and a late
+   * burst has to read as late rather than as instantaneous.
+   */
+  reportedAt: string | null
 }
 
 export type PlatformStationKey =
@@ -631,6 +881,9 @@ function stationRow<K extends string>(
       state: i === lastReached ? 'current' : cell.reached ? 'passed' : 'pending',
       note: cell.note ?? null,
       visits: cell.reached ? 1 : 0,
+      // The platform's own stations are read off rows the platform wrote itself, so
+      // there is no reporting delay to show: the row IS the arrival.
+      reportedAt: null,
     }
   })
 }
@@ -645,13 +898,15 @@ function stationRow<K extends string>(
  */
 export function platformRow(input: PlatformRowInput): PlatformStation[] {
   const reading = platformPhase(input)
-  const audit = sinceReset(input.audit, reading.resetAt)
+  const audit = rowsInTake(input.audit, input.take ?? currentTake(input.audit))
   const faultAt = reading.faultAt
 
   const callsSinceFault =
     faultAt === null
       ? []
-      : audit.filter((r) => isAgentToolRow(r) && r.created_at >= faultAt)
+      : audit.filter(
+          (r) => isRunToolRow(r, input.runPrincipalId) && r.created_at >= faultAt,
+        )
   const actions = callsSinceFault.filter((row) => {
     const call = toolCall(row)
     return call !== null && ACTION_TOOLS.includes(call.tool)
@@ -751,6 +1006,87 @@ export function agentStateLabel(run: AgentRun | null): string {
   return run === null ? 'no run reported' : run.state
 }
 
+/** How late a report has to be before the station says when it actually arrived. */
+export const LATE_REPORT_MS = 5000
+
+export interface AgentRowOptions {
+  /**
+   * When each reported state ARRIVED at the platform, from `reportArrivals`.
+   *
+   * The run's own `phase_history` timestamps are the responder's; the arrival is the
+   * platform's. The two were 41 seconds apart in the third take and the page had no
+   * way to say so (F2).
+   */
+  arrivals?: Map<string, string> | null
+  /**
+   * How many reached stations to show, for the sequential reveal — absent shows all.
+   *
+   * A queued burst of reports arrives in one poll, and four stations lighting in one
+   * frame is not a run advancing, it is a page catching up. Revealing them one at a
+   * time is the difference between the two, on camera.
+   */
+  reveal?: number | null
+  /** Overridable for tests; the default is `LATE_REPORT_MS`. */
+  lateAfterMs?: number
+}
+
+/**
+ * When each state the run reported reached the platform.
+ *
+ * Every report writes an `agent.run_reported` audit row whose `extra_data.arguments`
+ * carries the run id and the state (ADR 0035), and whose `created_at` is the
+ * platform's own clock — so the audit log is the record of *when the page could have
+ * known*. The earliest row per state is the arrival: a state reported again later is
+ * the same station, not a second one.
+ */
+export function reportArrivals(
+  audit: AuditLog[],
+  runId: string | null,
+): Map<string, string> {
+  const arrivals = new Map<string, string>()
+  if (runId === null) return arrivals
+  for (const row of audit) {
+    if (row.action !== AGENT_RUN_REPORT_ACTION) continue
+    const args = row.extra_data?.arguments
+    if (!args || typeof args !== 'object') continue
+    const fields = args as Record<string, unknown>
+    if (fields.run_id !== runId) continue
+    const state = fields.state
+    if (typeof state !== 'string') continue
+    const seen = arrivals.get(state)
+    if (seen === undefined || row.created_at < seen) arrivals.set(state, row.created_at)
+  }
+  return arrivals
+}
+
+/**
+ * The same row with only its first `reveal` reached stations shown.
+ *
+ * The station that is last of the revealed ones becomes the current one, so a
+ * partially revealed row reads as a run that has got that far — never as one that
+ * skipped a station. Held back stations are pending with no timestamp, because a
+ * station showing a time while reading `pending` is a contradiction on screen.
+ */
+export function revealStations<K extends string>(
+  stations: Station<K>[],
+  reveal: number | null | undefined,
+): Station<K>[] {
+  if (reveal === null || reveal === undefined) return stations
+  const reached = stations.flatMap((s, i) => (s.state === 'pending' ? [] : [i]))
+  if (reveal >= reached.length) return stations
+  const shown = reached.slice(0, Math.max(0, reveal))
+  const last = shown[shown.length - 1] ?? -1
+  const keep = new Set(shown)
+  return stations.map((station, i) => {
+    if (!keep.has(i)) {
+      return { ...station, state: 'pending', at: null, durationMs: null, reportedAt: null }
+    }
+    return i === last
+      ? { ...station, state: 'current', durationMs: null }
+      : { ...station, state: 'passed' }
+  })
+}
+
 /**
  * The agent's row, from `phase_history` alone.
  *
@@ -760,7 +1096,12 @@ export function agentStateLabel(run: AgentRun | null): string {
  * look like one that walked straight through, which is the opposite of what a
  * viewer needs to see.
  */
-export function agentRow(run: AgentRun | null): AgentStation[] {
+export function agentRow(
+  run: AgentRun | null,
+  options: AgentRowOptions = {},
+): AgentStation[] {
+  const arrivals = options.arrivals ?? null
+  const lateAfterMs = options.lateAfterMs ?? LATE_REPORT_MS
   const history = [...(run?.phase_history ?? [])].sort((a, b) =>
     a.at < b.at ? -1 : a.at > b.at ? 1 : 0,
   )
@@ -773,7 +1114,7 @@ export function agentRow(run: AgentRun | null): AgentStation[] {
     (run !== null && TERMINAL_STATES.includes(run.state) ? run.state : null) ??
     AGENT_STATION_LABELS.terminal
 
-  return AGENT_ROW.map((key) => {
+  const stations = AGENT_ROW.map((key) => {
     const visits = history
       .map((entry, i) => ({ entry, i }))
       .filter(({ entry }) => STATE_TO_STATION[entry.state] === key)
@@ -786,18 +1127,28 @@ export function agentRow(run: AgentRun | null): AgentStation[] {
     const closed = durations.filter((d): d is number => d !== null)
     const reached = visits.length > 0 || currentStation === key
     const isCurrent = currentStation === key
+    const first = visits[0]?.entry ?? null
+    // The arrival of the report that carried this station, kept only when it is
+    // late enough to change what the row means.
+    const arrival = first === null ? null : (arrivals?.get(first.state) ?? null)
+    const lateBy =
+      first === null || arrival === null
+        ? null
+        : new Date(arrival).getTime() - new Date(first.at).getTime()
     return {
       key,
       label: key === 'terminal' ? terminalLabel : AGENT_STATION_LABELS[key],
-      at: visits[0]?.entry.at ?? null,
+      at: first?.at ?? null,
       // A station the run is still in has no duration: `ongoing` is the honest
       // reading, and the closed visits before it are what the sum is of.
       durationMs: closed.length > 0 ? closed.reduce((a, b) => a + b, 0) : null,
       state: isCurrent ? 'current' : reached ? 'passed' : 'pending',
       note: visits.length > 1 ? `entered ${String(visits.length)} times` : null,
       visits: visits.length,
-    }
+      reportedAt: lateBy !== null && lateBy > lateAfterMs ? arrival : null,
+    } satisfies AgentStation
   })
+  return revealStations(stations, options.reveal)
 }
 
 // ── the metric, and when it really came back ─────────────────────────────────
@@ -898,21 +1249,33 @@ export interface ChartMarker {
 export interface ChartMarkerInput {
   faultAt: string | null
   recoveredAt: string | null
-  resetAt: string | null
+  /** One boundary, kept for callers that read a single take's opening. */
+  resetAt?: string | null
+  /** Every boundary to draw — the take's own start and end (WO-R3-334). */
+  resetAts?: (string | null)[]
   /** The selected run's steps; the authority on what the agent did, and when. */
   steps: AgentRunStepRecord[]
   /** Used for the actions only where no step was reported. */
   audit: AuditLog[]
+  /**
+   * The run's own `service_account_id`. Without it the third take drew three blue
+   * `A` markers for `mark_dlq_permanent` and friends that the EVALUATOR's guard
+   * probes fired under the agent's token (F4) — the page was marking somebody
+   * else's writes as the agent acting.
+   */
+  runPrincipalId?: string | null
   windowStart: number
   windowEnd: number
 }
 
 /**
- * The vertical markers: the boundary, the fault, every Tier-1 action, the recovery.
+ * The vertical markers, and the set is closed: the boundaries, the lab's fault,
+ * the run's own Tier-1 actions, the recovery. Nothing else.
  *
- * Reads only — the bulk of any run — are deliberately not marked. Fifteen ticks
- * on a fifteen-minute chart is a comb, and the ledger is where the reads belong;
- * what the chart is for is the three or four moments that changed the line.
+ * Reads are not marked — fifteen ticks on a fifteen-minute chart is a comb, and the
+ * ledger is where every call belongs. Neither are the runner's or the evaluator's
+ * calls: a marker here says "the agent did this", so a row that is not the run's own
+ * principal, and every `lab.probe` row, is not a candidate (F3/F4).
  */
 export function chartMarkers(input: ChartMarkerInput): ChartMarker[] {
   const marks: ChartMarker[] = []
@@ -923,7 +1286,10 @@ export function chartMarkers(input: ChartMarkerInput): ChartMarker[] {
     marks.push({ at, t, kind, label, detail })
   }
 
-  add(input.resetAt, 'reset', 'world reset', 'the take begins here')
+  const boundaries = input.resetAts ?? [input.resetAt ?? null]
+  for (const at of boundaries) {
+    add(at, 'reset', 'world reset', 'a take begins and ends here')
+  }
 
   const labRow = newest(input.audit.filter(isLabRow))
   add(
@@ -942,8 +1308,9 @@ export function chartMarkers(input: ChartMarkerInput): ChartMarker[] {
     }
   } else {
     // No steps reported: the audit log still knows an action happened, it just
-    // cannot say what came back. Marking it is still right.
-    for (const row of input.audit.filter(isAgentToolRow)) {
+    // cannot say what came back. Marking it is still right — as long as it was
+    // this run that made the call.
+    for (const row of input.audit.filter((r) => isRunToolRow(r, input.runPrincipalId))) {
       const call = toolCall(row)
       if (call !== null && ACTION_TOOLS.includes(call.tool)) {
         add(row.created_at, 'action', call.tool, 'from the audit log')
@@ -954,4 +1321,89 @@ export function chartMarkers(input: ChartMarkerInput): ChartMarker[] {
   add(input.recoveredAt, 'recovery', 'recovered', 'the metric came back inside its bar')
 
   return marks.sort((a, b) => a.t - b.t)
+}
+
+// ── the chart's own axes ─────────────────────────────────────────────────────
+
+/** The span the chart draws, and what its left edge should be labelled. */
+export interface ChartWindow {
+  start: number
+  end: number
+  /** True while the span is the take's rather than the platform's whole history. */
+  zoomed: boolean
+}
+
+/** Two minutes of quiet before the fault, so the climb starts from a flat line. */
+export const PRE_FAULT_MS = 2 * 60 * 1000
+/** No span narrower than this, or a take one tick old draws a chart of one point. */
+export const MIN_SPAN_MS = 5 * 60 * 1000
+
+/**
+ * The x-axis span: the take, not a fixed fifteen minutes (WO-R3-334).
+ *
+ * A fifteen-minute axis put the third take's whole incident — a climb of 0 → 10 → 30
+ * over two minutes — into the last eighth of the plot, drawn from two samples. The
+ * span is the take now: two minutes before the fault to now, or to the boundary that
+ * closed it. `full` zooms back out to everything the platform still holds, which is
+ * the answer to "what did the rest of the window look like".
+ *
+ * Both clamps matter. Never narrower than `MIN_SPAN_MS`, so a take that started ten
+ * seconds ago is not a chart of one pixel; never wider than the platform's own
+ * history, because the samples beyond it do not exist and an empty stretch of axis
+ * reads as a flat line.
+ */
+export function chartWindow(input: {
+  faultAt: string | null
+  takeStartAt: string | null
+  takeEndAt: string | null
+  now: number
+  windowSeconds: number
+  full?: boolean
+}): ChartWindow {
+  const historyMs = Math.max(MIN_SPAN_MS, input.windowSeconds * 1000)
+  const endAt = input.takeEndAt === null ? input.now : new Date(input.takeEndAt).getTime()
+  const end = Number.isNaN(endAt) ? input.now : endAt
+  if (input.full === true) return { start: end - historyMs, end, zoomed: false }
+
+  const faultT = input.faultAt === null ? null : new Date(input.faultAt).getTime()
+  const takeT = input.takeStartAt === null ? null : new Date(input.takeStartAt).getTime()
+  const wanted =
+    faultT !== null && !Number.isNaN(faultT)
+      ? faultT - PRE_FAULT_MS
+      : takeT !== null && !Number.isNaN(takeT)
+        ? takeT - 30_000
+        : end - historyMs
+  const start = Math.max(end - historyMs, Math.min(wanted, end - MIN_SPAN_MS))
+  return { start, end, zoomed: start > end - historyMs }
+}
+
+/**
+ * A clean upper bound just above the data.
+ *
+ * The ladder is finer than 1/2/5 on purpose: a peak of 53 on a 1/2/5 ladder becomes
+ * an axis to 100, which pushes the whole incident into the bottom half of the plot
+ * and makes a lag of 42 look like nothing.
+ */
+export function niceMax(value: number): number {
+  if (value <= 1) return 1
+  const exp = Math.floor(Math.log10(value))
+  const base = Math.pow(10, exp)
+  for (const step of [1, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10]) {
+    if (value <= step * base) return step * base
+  }
+  return 10 * base
+}
+
+/**
+ * The y ticks: four gaps, round numbers, and zero always drawn.
+ *
+ * Zero is the line a viewer measures a recovery against, so it is a tick rather than
+ * wherever the axis happens to end; a fractional tick (7.5 messages behind) is
+ * rounded away rather than printed, because the metric is a count.
+ */
+export function yAxisTicks(max: number): number[] {
+  const top = niceMax(max)
+  const raw = [0, top / 4, top / 2, (top * 3) / 4, top]
+  const ticks = raw.map((t) => (top >= 4 ? Math.round(t) : t))
+  return [...new Set(ticks)].sort((a, b) => a - b)
 }
