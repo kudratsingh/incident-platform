@@ -178,6 +178,14 @@ point lands off the left edge. `live_group` names the one group whose number
 actually moves; the page reads `worker-dispatcher` by name and falls back to
 `live_group`, in that order.
 
+**And the window now survives `make eval-reset`** (WO-R3-333, [ADR 0038](ADR/0038-a-probe-by-the-lab-is-labelled-by-the-lab.md)).
+The reset used to delete it as residue, so the chart opened on nought to two points
+while the fault it exists to show was climbing 0 → 10 → 30 — the third live take's F5.
+The samples are history, each carrying its own `measured_at`, and the reset's
+`lab.world_reset` row is the boundary to read them against; `lag_samples_cleared` is
+still in the reset's summary, permanently `0`. So the first frame the operator sees can
+hold the climb rather than the two measurements that outlived the sweep.
+
 **DLQ depth has no server-side history** — the endpoint is one number — so in
 `dlq_backlog` mode the line is what *this page* has observed since it opened, and the
 caption says so. It is a second **chart**, never a second series on the lag axis: the
@@ -255,6 +263,16 @@ That excerpt is the whole reason the ledger is built from steps: an
 **no result**, so "what did the agent see" could not be shown from the audit log at
 all. Where a run reported no steps the ledger falls back to those rows, labels
 itself as doing so, and the rows say plainly that the audit log records no result.
+
+**A row the evaluator produced is no longer in that stream** (WO-R3-333,
+[ADR 0038](ADR/0038-a-probe-by-the-lab-is-labelled-by-the-lab.md)). The principal
+guards and the world audit call the platform under the agent's own token on purpose,
+and their calls used to land in `agent.tool_invoked` — which is how the third live
+take's ledger came to show seven reads the agent never made. Those calls now carry
+`lab.probe`, in the `lab.` stream beside the boundary row. The page's audit poll asks
+for `agent.,lab.,chaos.`, so the rows still arrive: excluding them from the ledger and
+from the phase strip's "agent acting" station, behind a grey **evaluator probe** toggle
+that is off by default, is WO-R3-334's half.
 
 Three things about the source, all of them WO-R3-328's rules rather than choices
 this page made:

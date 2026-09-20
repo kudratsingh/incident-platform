@@ -17,6 +17,7 @@ row saying `agent.tool_invoked`, which is the mislabel the whole order exists to
 from __future__ import annotations
 
 import json
+import pathlib
 import uuid
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -32,6 +33,8 @@ from app.mcp.lab_probe import (
     resolve_lab_probe,
 )
 from app.mcp.protocol import LAB_PROBE_FIELD, ToolCallParams, ToolInfo
+
+_REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 
 SMOKE_NAME = "incident-commander-smoke"
 _TENANT = uuid.uuid4()
@@ -308,3 +311,62 @@ def test_each_tools_list_entry_still_carries_the_same_six_fields() -> None:
         "required_scope",
         "is_idempotent",
     }
+
+
+# ---------------------------------------------------------------------------
+# The written record — the commander re-pins and the console is built off these
+# ---------------------------------------------------------------------------
+
+
+def test_adr_0038_exists_and_is_indexed() -> None:
+    adr = _REPO_ROOT / "docs" / "ADR" / "0038-a-probe-by-the-lab-is-labelled-by-the-lab.md"
+    index = (_REPO_ROOT / "docs" / "ADR" / "README.md").read_text(encoding="utf-8")
+
+    assert adr.is_file(), "ADR 0038 is missing"
+    assert adr.name in index, "ADR 0038 is not in docs/ADR/README.md"
+
+
+def test_adr_0012_records_the_amendment() -> None:
+    """This is an amendment to ADR 0012, and that ADR is where a reader looks for every
+    rule about what the agent may see."""
+    text = (
+        _REPO_ROOT / "docs" / "ADR" / "0012-the-lab-is-invisible-to-the-agent.md"
+    ).read_text(encoding="utf-8")
+
+    assert "WO-R3-333" in text
+    assert LAB_PROBE_FIELD in text
+    assert LAB_PRINCIPAL_HEADER in text
+
+
+def test_the_rebless_ledger_names_this_delta() -> None:
+    """The commander re-pins off that paragraph, and this batch's headline is that there
+    is nothing in `tools/list` to rebless — which has to be *said*, or the next re-pin
+    goes looking for the delta it cannot find."""
+    ledger = (_REPO_ROOT / "CLAUDE.md").read_text(encoding="utf-8")
+
+    assert "WO-R3-333" in ledger
+    for token in (
+        LAB_PROBE_FIELD,
+        LAB_PRINCIPAL_HEADER,
+        "lab.probe",
+        "lab_probe_refused",
+        "lag_samples_cleared",
+    ):
+        assert token in ledger, token
+
+
+def test_the_request_shape_is_documented_where_a_caller_will_look() -> None:
+    """The other repository writes the request against this section, not against the
+    diff — so the field, the header, every reason code and the placement rule are here."""
+    architecture = (_REPO_ROOT / "docs" / "ARCHITECTURE.md").read_text(encoding="utf-8")
+
+    assert LAB_PROBE_FIELD in architecture
+    assert LAB_PRINCIPAL_HEADER in architecture
+    for reason in (
+        "not_available",
+        "credential_missing",
+        "credential_invalid",
+        "credential_not_authorised",
+        "reason_invalid",
+    ):
+        assert reason in architecture, reason
