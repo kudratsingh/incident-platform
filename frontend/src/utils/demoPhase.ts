@@ -37,7 +37,13 @@
  * driven from a fixture through every transition.
  */
 
-import type { AgentRun, AgentRunState, AuditLog, Job } from '../types'
+import type {
+  AgentRun,
+  AgentRunState,
+  AgentRunStepRecord,
+  AuditLog,
+  Job,
+} from '../types'
 
 export type DemoMode = 'consumer_outage' | 'dlq_backlog'
 
@@ -252,15 +258,35 @@ export function agentPhase(run: AgentRun | null): AgentPhaseReading | null {
  * which the demo does not stage — but picking arbitrarily would be worse than picking
  * the latest.
  */
+export function runsSinceReset(runs: AgentRun[], resetAt: string | null): AgentRun[] {
+  return runs
+    .filter((r) => resetAt === null || r.finished_at === null || r.finished_at > resetAt)
+    .sort((a, b) => (a.started_at < b.started_at ? 1 : -1))
+}
+
 export function runSinceReset(
   runs: AgentRun[],
   resetAt: string | null,
 ): AgentRun | null {
-  const current = runs.filter(
-    (r) => resetAt === null || r.finished_at === null || r.finished_at > resetAt,
-  )
-  if (current.length === 0) return null
-  return [...current].sort((a, b) => (a.started_at < b.started_at ? 1 : -1))[0]
+  return runsSinceReset(runs, resetAt)[0] ?? null
+}
+
+/**
+ * Which run the page is showing — `?run=<id>` when it names one of this take's
+ * runs, the newest otherwise.
+ *
+ * A `?run=` the list does not carry falls back rather than emptying the page: a
+ * link pasted from a previous session, or one whose run the boundary has closed
+ * out, should show the current run and not a blank screen. `runs` is expected in
+ * the order `runsSinceReset` returns — newest first.
+ */
+export function selectRun(runs: AgentRun[], wanted: string | null): AgentRun | null {
+  if (runs.length === 0) return null
+  if (wanted !== null && wanted !== '') {
+    const found = runs.find((r) => r.id === wanted)
+    if (found) return found
+  }
+  return runs[0]
 }
 
 // ── the platform's own record ─────────────────────────────────────────────────
@@ -268,6 +294,18 @@ export function runSinceReset(
 export interface PlatformPhaseInput {
   /** The audit rows the page has, newest-first or not — order is derived. */
   audit: AuditLog[]
+  /**
+   * The fault this take is about, latched by the page (WO-R3-330).
+   *
+   * Omit it and the fault is derived from the rows, which is what every caller
+   * did before the first live take showed why that is not enough: the traffic
+   * loop writes `event.job.*` rows faster than anything else on the stack, so the
+   * one `chaos.*` row falls off the page of rows within a minute and the reading
+   * fell back to `healthy` in the middle of the incident. A latched value is
+   * never allowed to outlive its take — a fault at or before the boundary is
+   * dropped here, and a newer row in the rows themselves always wins.
+   */
+  faultAt?: string | null
   /** False when the metric has no reading (e.g. `lag_known: false`). */
   metricKnown: boolean
   /** True when the reading is inside the scenario's threshold right now. */
@@ -307,6 +345,22 @@ export function newestFaultAt(audit: AuditLog[]): string | null {
   return newest(sinceReset(audit, resetAt).filter(isLabRow))?.created_at ?? null
 }
 
+/**
+ * The fault of the current take: the latch and the rows, whichever is newer,
+ * and neither one if it belongs to a take the boundary has closed.
+ */
+function latchedFaultAt(
+  latched: string | null | undefined,
+  derived: string | null,
+  resetAt: string | null,
+): string | null {
+  const candidates = [latched ?? null, derived].filter(
+    (v): v is string => v !== null && (resetAt === null || v > resetAt),
+  )
+  if (candidates.length === 0) return null
+  return candidates.reduce((a, b) => (a > b ? a : b))
+}
+
 export function platformPhase(input: PlatformPhaseInput): PlatformPhaseReading {
   const { metricKnown, metricInsideThreshold, metricBreachedSinceFault } = input
   // Everything below reads the current take only. A boundary discards the previous
@@ -315,14 +369,17 @@ export function platformPhase(input: PlatformPhaseInput): PlatformPhaseReading {
   // a different station.
   const resetAt = newestResetAt(input.audit)
   const audit = sinceReset(input.audit, resetAt)
-  const fault = newest(audit.filter(isLabRow))
+  const faultAt = latchedFaultAt(
+    input.faultAt,
+    newest(audit.filter(isLabRow))?.created_at ?? null,
+    resetAt,
+  )
 
-  if (fault === null) {
+  if (faultAt === null) {
     // No lab row: nothing was injected, whatever else is happening. A healthy
     // world with an agent poking at it is still a healthy world.
     return { phase: 'healthy', faultAt: null, resetAt, metricKnown }
   }
-  const faultAt = fault.created_at
 
   // Recovery is the one thing the platform can assert over the agent, and it
   // needs all three: a reading, a breach that really happened, and the reading
@@ -477,4 +534,422 @@ export const MODE_METRICS: Record<DemoMode, ModeMetric> = {
     source: 'GET /api/v1/admin/dlq/stats',
     rationale: 'the seeded backlog is 5 rows, one of them replay-safe',
   },
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WO-R3-330 — two rows, never merged
+//
+// The strip above proved the wrong shape on camera. It had ONE row of stations
+// with two markers, so the moment a run existed the agent's word was the only
+// thing lighting a station and `fault injected` — which only the platform can
+// assert — was never shown at all. The disagreement the design was for was
+// invisible because both witnesses were competing for one row.
+//
+// So there are two rows now, always both, and each has only the stations its own
+// witness is competent to assert:
+//
+//   PLATFORM  healthy → fault injected → agent acting → recovered
+//   AGENT     triage → investigating → planning → awaiting approval
+//             → remediating → verifying → resolved | escalated | failed
+//
+// Neither row is derived from the other, neither is hidden when it has nothing
+// to say, and disagreement is therefore visible by construction rather than by a
+// rule that has to notice it.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export type StationState = 'passed' | 'current' | 'pending'
+
+export interface Station<K extends string> {
+  key: K
+  label: string
+  /** When this station was reached, by its own witness's clock. Null = not reached. */
+  at: string | null
+  /** How long it lasted. Null while it is the current station, or before it. */
+  durationMs: number | null
+  state: StationState
+  /** One line of detail the station itself can carry. */
+  note: string | null
+  /** How many times this station was entered — 2 after a hand-back. */
+  visits: number
+}
+
+export type PlatformStationKey =
+  | 'healthy'
+  | 'fault_injected'
+  | 'agent_acting'
+  | 'recovered'
+
+export const PLATFORM_ROW: readonly PlatformStationKey[] = [
+  'healthy',
+  'fault_injected',
+  'agent_acting',
+  'recovered',
+]
+
+export const PLATFORM_STATION_LABELS: Record<PlatformStationKey, string> = {
+  healthy: 'healthy',
+  fault_injected: 'fault injected',
+  agent_acting: 'agent acting',
+  recovered: 'recovered',
+}
+
+export type PlatformStation = Station<PlatformStationKey>
+
+export interface PlatformRowInput extends PlatformPhaseInput {
+  /**
+   * When the metric came back inside its bar, by the platform's own sample clock
+   * (`metricRecovery`). Null means the page cannot put a time on it, which is a
+   * different thing from the recovery not having happened — the station is still
+   * reached when the reading says `recovered`, it just has no timestamp.
+   */
+  recoveredAt?: string | null
+}
+
+/** Oldest of a set of rows, where `newest` above takes the other end. */
+function oldest(rows: AuditLog[]): AuditLog | null {
+  let best: AuditLog | null = null
+  for (const row of rows) {
+    if (best === null || row.created_at < best.created_at) best = row
+  }
+  return best
+}
+
+function stationRow<K extends string>(
+  cells: { key: K; label: string; at: string | null; reached: boolean; note?: string | null }[],
+): Station<K>[] {
+  const lastReached = cells.reduce((acc, cell, i) => (cell.reached ? i : acc), -1)
+  return cells.map((cell, i) => {
+    const nextAt = cells.slice(i + 1).find((c) => c.reached && c.at !== null)?.at ?? null
+    return {
+      key: cell.key,
+      label: cell.label,
+      at: cell.reached ? cell.at : null,
+      durationMs:
+        cell.reached && cell.at !== null && nextAt !== null
+          ? new Date(nextAt).getTime() - new Date(cell.at).getTime()
+          : null,
+      state: i === lastReached ? 'current' : cell.reached ? 'passed' : 'pending',
+      note: cell.note ?? null,
+      visits: cell.reached ? 1 : 0,
+    }
+  })
+}
+
+/**
+ * The platform's row: the four things the platform can say about the world
+ * without taking the agent's word for any of it.
+ *
+ * `healthy` is stamped with the boundary, because that is when this world began
+ * and it is the only start the page has that is not the browser's own idea of
+ * when someone opened a tab.
+ */
+export function platformRow(input: PlatformRowInput): PlatformStation[] {
+  const reading = platformPhase(input)
+  const audit = sinceReset(input.audit, reading.resetAt)
+  const faultAt = reading.faultAt
+
+  const callsSinceFault =
+    faultAt === null
+      ? []
+      : audit.filter((r) => isAgentToolRow(r) && r.created_at >= faultAt)
+  const actions = callsSinceFault.filter((row) => {
+    const call = toolCall(row)
+    return call !== null && ACTION_TOOLS.includes(call.tool)
+  })
+  const actingAt = oldest(callsSinceFault)?.created_at ?? null
+  const firstAction = oldest(actions)
+  const reads = callsSinceFault.length - actions.length
+  const note =
+    firstAction !== null
+      ? `${toolCall(firstAction)?.tool ?? 'a Tier-1 action'} fired after ${String(reads)} read${reads === 1 ? '' : 's'}`
+      : callsSinceFault.length > 0
+        ? `${String(reads)} read${reads === 1 ? '' : 's'}, no action yet`
+        : null
+
+  const recoveredReached = reading.phase === 'recovered'
+
+  return stationRow<PlatformStationKey>([
+    {
+      key: 'healthy',
+      label: PLATFORM_STATION_LABELS.healthy,
+      at: reading.resetAt,
+      reached: true,
+      note: reading.resetAt === null ? 'no reset boundary in view' : 'since the reset',
+    },
+    {
+      key: 'fault_injected',
+      label: PLATFORM_STATION_LABELS.fault_injected,
+      at: faultAt,
+      reached: faultAt !== null,
+      note: faultAt === null ? null : 'the lab’s own audit row',
+    },
+    {
+      key: 'agent_acting',
+      label: PLATFORM_STATION_LABELS.agent_acting,
+      at: actingAt,
+      reached: actingAt !== null,
+      note,
+    },
+    {
+      key: 'recovered',
+      label: PLATFORM_STATION_LABELS.recovered,
+      at: recoveredReached ? (input.recoveredAt ?? null) : null,
+      reached: recoveredReached,
+      note: reading.metricKnown ? null : 'the metric has no reading right now',
+    },
+  ])
+}
+
+export type AgentStationKey =
+  | 'triage'
+  | 'investigating'
+  | 'planning'
+  | 'awaiting_approval'
+  | 'remediating'
+  | 'verifying'
+  | 'terminal'
+
+export const AGENT_ROW: readonly AgentStationKey[] = [
+  'triage',
+  'investigating',
+  'planning',
+  'awaiting_approval',
+  'remediating',
+  'verifying',
+  'terminal',
+]
+
+/** The nine states onto seven stations; the three terminals share the last one. */
+const STATE_TO_STATION: Record<AgentRunState, AgentStationKey> = {
+  triage: 'triage',
+  investigating: 'investigating',
+  planning: 'planning',
+  awaiting_approval: 'awaiting_approval',
+  remediating: 'remediating',
+  verifying: 'verifying',
+  resolved: 'terminal',
+  escalated: 'terminal',
+  failed: 'terminal',
+}
+
+const TERMINAL_STATES: readonly AgentRunState[] = ['resolved', 'escalated', 'failed']
+
+export const AGENT_STATION_LABELS: Record<AgentStationKey, string> = {
+  triage: 'triage',
+  investigating: 'investigating',
+  planning: 'planning',
+  awaiting_approval: 'awaiting approval',
+  remediating: 'remediating',
+  verifying: 'verifying',
+  terminal: 'resolved | escalated | failed',
+}
+
+export type AgentStation = Station<AgentStationKey>
+
+/** The run's own word for where it is, verbatim — including one this build does not know. */
+export function agentStateLabel(run: AgentRun | null): string {
+  return run === null ? 'no run reported' : run.state
+}
+
+/**
+ * The agent's row, from `phase_history` alone.
+ *
+ * A station can be entered twice — `verifying` may hand back to `investigating`
+ * (commander ADR 0056) — so each one carries its visit count and the SUM of its
+ * closed visits. Hiding a second visit would make a run that went round again
+ * look like one that walked straight through, which is the opposite of what a
+ * viewer needs to see.
+ */
+export function agentRow(run: AgentRun | null): AgentStation[] {
+  const history = [...(run?.phase_history ?? [])].sort((a, b) =>
+    a.at < b.at ? -1 : a.at > b.at ? 1 : 0,
+  )
+  const currentStation =
+    run === null ? null : (STATE_TO_STATION[run.state] as AgentStationKey | undefined) ?? null
+
+  const terminalEntry = history.find((e) => TERMINAL_STATES.includes(e.state))
+  const terminalLabel =
+    terminalEntry?.state ??
+    (run !== null && TERMINAL_STATES.includes(run.state) ? run.state : null) ??
+    AGENT_STATION_LABELS.terminal
+
+  return AGENT_ROW.map((key) => {
+    const visits = history
+      .map((entry, i) => ({ entry, i }))
+      .filter(({ entry }) => STATE_TO_STATION[entry.state] === key)
+    const durations = visits.map(({ entry, i }) => {
+      const closesAt = history[i + 1]?.at ?? run?.finished_at ?? null
+      return closesAt === null
+        ? null
+        : new Date(closesAt).getTime() - new Date(entry.at).getTime()
+    })
+    const closed = durations.filter((d): d is number => d !== null)
+    const reached = visits.length > 0 || currentStation === key
+    const isCurrent = currentStation === key
+    return {
+      key,
+      label: key === 'terminal' ? terminalLabel : AGENT_STATION_LABELS[key],
+      at: visits[0]?.entry.at ?? null,
+      // A station the run is still in has no duration: `ongoing` is the honest
+      // reading, and the closed visits before it are what the sum is of.
+      durationMs: closed.length > 0 ? closed.reduce((a, b) => a + b, 0) : null,
+      state: isCurrent ? 'current' : reached ? 'passed' : 'pending',
+      note: visits.length > 1 ? `entered ${String(visits.length)} times` : null,
+      visits: visits.length,
+    }
+  })
+}
+
+// ── the metric, and when it really came back ─────────────────────────────────
+
+/** One reading of the mode's metric, at the platform's own measurement time. */
+export interface MetricSample {
+  /** Epoch ms of `at`, so samples from two sources can be compared safely. */
+  t: number
+  v: number
+  at: string
+}
+
+export interface RecoveryReading {
+  /** The first sample outside the bar at or after the fault. */
+  breachedAt: string | null
+  /** The first sample of the run of inside-the-bar samples that counted. */
+  recoveredAt: string | null
+  /**
+   * The start of an inside-the-bar run that is not long enough yet, so the page
+   * can say "1 of 2 samples back inside" instead of either lying or saying nothing.
+   */
+  insideSince: string | null
+  sustained: boolean
+  /** How many consecutive inside samples a recovery takes. */
+  required: number
+}
+
+/**
+ * Whether the world really came back, read off the platform's own samples.
+ *
+ * The first take's rule was "the reading is inside the bar and a breach was seen",
+ * evaluated on whatever single number the last poll returned — and the cached lag
+ * value reads `42 → 0 → 42` as the sample ages, so the strip announced a recovery
+ * in the middle of the incident and then took it back. Two things fix it, and both
+ * are about which numbers are being read rather than about the threshold: the
+ * samples come from the platform's 15-minute window (one per metrics tick, the
+ * same reading the agent gets) rather than from the page's own polling, and a
+ * recovery takes `required` consecutive samples inside the bar.
+ */
+export function metricRecovery(
+  samples: MetricSample[],
+  threshold: number,
+  faultAt: string | null,
+  required = 2,
+): RecoveryReading {
+  const faultT = faultAt === null ? null : new Date(faultAt).getTime()
+  const relevant = [...samples]
+    .filter((s) => faultT === null || s.t >= faultT)
+    .sort((a, b) => a.t - b.t)
+
+  const breach = relevant.find((s) => s.v > threshold) ?? null
+  if (breach === null) {
+    return {
+      breachedAt: null,
+      recoveredAt: null,
+      insideSince: null,
+      sustained: false,
+      required,
+    }
+  }
+
+  let runStart: string | null = null
+  let runLength = 0
+  let recoveredAt: string | null = null
+  for (const sample of relevant.filter((s) => s.t >= breach.t)) {
+    if (sample.v <= threshold) {
+      runLength += 1
+      if (runStart === null) runStart = sample.at
+      if (runLength >= required) {
+        recoveredAt = runStart
+        break
+      }
+    } else {
+      runLength = 0
+      runStart = null
+    }
+  }
+
+  return {
+    breachedAt: breach.at,
+    recoveredAt,
+    insideSince: recoveredAt === null ? runStart : null,
+    sustained: recoveredAt !== null,
+    required,
+  }
+}
+
+// ── what the chart draws on top of the line ──────────────────────────────────
+
+export interface ChartMarker {
+  at: string
+  t: number
+  kind: 'reset' | 'fault' | 'action' | 'recovery'
+  label: string
+  detail: string | null
+}
+
+export interface ChartMarkerInput {
+  faultAt: string | null
+  recoveredAt: string | null
+  resetAt: string | null
+  /** The selected run's steps; the authority on what the agent did, and when. */
+  steps: AgentRunStepRecord[]
+  /** Used for the actions only where no step was reported. */
+  audit: AuditLog[]
+  windowStart: number
+  windowEnd: number
+}
+
+/**
+ * The vertical markers: the boundary, the fault, every Tier-1 action, the recovery.
+ *
+ * Reads only — the bulk of any run — are deliberately not marked. Fifteen ticks
+ * on a fifteen-minute chart is a comb, and the ledger is where the reads belong;
+ * what the chart is for is the three or four moments that changed the line.
+ */
+export function chartMarkers(input: ChartMarkerInput): ChartMarker[] {
+  const marks: ChartMarker[] = []
+  const add = (at: string | null, kind: ChartMarker['kind'], label: string, detail: string | null = null) => {
+    if (at === null) return
+    const t = new Date(at).getTime()
+    if (Number.isNaN(t) || t < input.windowStart || t > input.windowEnd) return
+    marks.push({ at, t, kind, label, detail })
+  }
+
+  add(input.resetAt, 'reset', 'world reset', 'the take begins here')
+
+  const labRow = newest(input.audit.filter(isLabRow))
+  add(
+    input.faultAt,
+    'fault',
+    toolCall(labRow ?? ({} as AuditLog))?.tool ?? 'fault injected',
+    'the lab injected the fault',
+  )
+
+  const stepActions = input.steps.filter((s) => s.kind === 'action')
+  if (stepActions.length > 0) {
+    for (const step of stepActions) {
+      add(step.at, 'action', step.tool, `step ${String(step.seq)}`)
+    }
+  } else {
+    // No steps reported: the audit log still knows an action happened, it just
+    // cannot say what came back. Marking it is still right.
+    for (const row of input.audit.filter(isAgentToolRow)) {
+      const call = toolCall(row)
+      if (call !== null && ACTION_TOOLS.includes(call.tool)) {
+        add(row.created_at, 'action', call.tool, 'from the audit log')
+      }
+    }
+  }
+
+  add(input.recoveredAt, 'recovery', 'recovered', 'the metric came back inside its bar')
+
+  return marks.sort((a, b) => a.t - b.t)
 }
