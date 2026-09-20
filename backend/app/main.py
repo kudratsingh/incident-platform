@@ -89,6 +89,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     # Import here to avoid circular imports at module load time
     from app.core.migration_check import assert_migrations_current
+    from app.core.pool_state import (
+        PROCESS_API_WORKER,
+        start_pool_gauge,
+        stop_pool_gauge,
+    )
     from app.core.rls_check import assert_rls_posture
     from app.core.tenant_scope import platform_session_factory
     from app.dependencies import get_engine, get_session_factory
@@ -128,6 +133,17 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # it. No-op outside production.
     await metrics.start_metrics_emitter()
 
+    # This process's pool — the one the API handlers and every worker loop
+    # share, and the one `saturate_db_pool` holds — published where the MCP
+    # process can read it (ADR 0033). Here rather than inside `worker_loop`, so
+    # the pool is reported whether or not the loops are up, and not on the
+    # metrics tick: that emitter is a no-op outside production and the worker's
+    # own metrics loop is pausable from the lab, either of which would silence
+    # the reading in exactly the world it exists for.
+    await start_pool_gauge(
+        process=PROCESS_API_WORKER, pool_getter=lambda: get_engine().pool
+    )
+
     redis = get_redis_client()
     # Platform (cross-tenant) scope for every consumer and background loop
     # below (ADR 0026) — they are mixed-tenant by design, and
@@ -145,6 +161,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # `stop()` never raises: the previous `await worker_task` re-raised and
     # left the producer and both Redis pools open after a worker crash.
     await worker_supervisor.stop()
+
+    await stop_pool_gauge()
 
     try:
         await stop_producer()

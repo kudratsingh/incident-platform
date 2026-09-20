@@ -86,9 +86,11 @@ class SaturateDbPoolOutput(BaseModel):
         "`min_free_connections` stay acquirable, so the background loops slow "
         "down rather than stop. A repeat call replaces the hold instead of "
         "adding a second one. This is the API and worker process's pool: the "
-        "MCP server is a separate process with its own pool, so a pool "
-        "reading taken there does not show this fault. Use `saturate_redis` "
-        "for pressure on the cache instead — a different dependency."
+        "MCP server is a separate process with its own pool, so the `pool_*` "
+        "fields of a reading taken there describe that other pool, and the "
+        "`pools` group in the same reading is where this fault shows up. Use "
+        "`saturate_redis` for pressure on the cache instead — a different "
+        "dependency."
     ),
     input_model=SaturateDbPoolInput,
     output_model=SaturateDbPoolOutput,

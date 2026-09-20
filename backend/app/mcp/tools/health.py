@@ -5,14 +5,19 @@ Both fail open: never raise, set `ok=false`, message in `error`. The Postgres pr
 sits in a SAVEPOINT, so `ok=false` leaves the caller's transaction writable (R2-59).
 Both `telemetry:read`. The pool and query readings (WO-R3-217) are what lets a caller
 tell slow queries from a saturated pool; what neither can be measured from is said
-rather than guessed at (ADR 0030).
+rather than guessed at (ADR 0030). The flat `pool_*` fields still describe the process
+that answered, and the `pools` group beside them carries what every process published
+about its own pool, which is what makes a pool held in the worker visible from here
+(WO-R3-289, ADR 0033).
 """
 
 from collections.abc import Mapping
+from datetime import UTC, datetime
 from typing import Any
 
 from app.core.db_degrade import degrade_on_db_error
 from app.core.db_pool_stats import PoolStats, read_pool_stats
+from app.core.pool_state import PoolRecord, read_pool_states
 from app.core.scopes import Scope
 from app.mcp.registry import ToolContext, tool
 from pydantic import BaseModel, ConfigDict, Field
@@ -67,6 +72,50 @@ _ACTIVE_QUERY_AGES = text(
 
 class _EmptyIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+class PoolGaugeReading(BaseModel):
+    process: str = Field(
+        description="Which process this pool belongs to. `api_worker` serves the REST "
+        "API and runs the background workers, which share one pool; `mcp` serves this "
+        "tool surface. A name outside that pair is a process this release does not know "
+        "about, and is listed last."
+    )
+    size: int = Field(
+        description="How many connections that process's pool keeps open before it opens "
+        "extras."
+    )
+    checked_out: int = Field(
+        description="Connections in use in that process when it took this reading. Read "
+        "it against `size` and `max_overflow`: on its own a number here says nothing. A 0 "
+        "is a measurement — that pool was idle."
+    )
+    overflow: int = Field(
+        description="Connections open beyond `size` in that process when it took this "
+        "reading. 0 until the pool is full, then climbing to `max_overflow`, at which "
+        "point the next caller in that process waits."
+    )
+    max_overflow: int | None = Field(
+        default=None,
+        description="How many connections beyond `size` that pool may open — the ceiling "
+        "`overflow` is read against. `null` when that pool does not state one.",
+    )
+    wait_timeouts_1m: int = Field(
+        description="How many callers in that process waited for a connection and gave "
+        "up in the 60 seconds before this reading was written. A 0 is a real measurement: "
+        "nothing waited."
+    )
+    written_at: datetime = Field(
+        description="When that process wrote this reading — ISO-8601, UTC, on its own "
+        "clock, not the clock of the process answering this call."
+    )
+    reported_age_s: float = Field(
+        description="How long ago this reading was written, in seconds, against this "
+        "call's clock. **This is a sample, not a live number**: every process rewrites "
+        "its reading on a fixed cadence, so an age of a few seconds is normal and a "
+        "number here describes that moment rather than now. It compares two processes' "
+        "clocks, so treat a second either way as noise."
+    )
 
 
 class RedisHealthOutput(BaseModel):
@@ -211,6 +260,27 @@ class PostgresHealthOutput(BaseModel):
         "populated.",
     )
 
+    pools: tuple[PoolGaugeReading, ...] = Field(
+        default=(),
+        description="One entry per process that has reported its own connection pool "
+        "recently, in process order — this is where a pool that is full in a process "
+        "other than the one answering shows up, which the `pool_*` fields above cannot "
+        "show. Each process rewrites its entry on a fixed cadence, so an entry is a "
+        "recent sample and `reported_age_s` says how recent. Not a page: no cap, nothing "
+        "truncated. A process missing from this list has not reported, which says nothing "
+        "about its pool — read `pool_gauges_unknown_reason` before concluding anything "
+        "from a short or empty list. One entry describes the pool answering this call, so "
+        "the same numbers appear there and in the `pool_*` fields, up to one cadence "
+        "apart; `process` says which entry that is.",
+    )
+    pool_gauges_unknown_reason: str | None = Field(
+        default=None,
+        description="Why `pools` is empty, in plain words: nothing has reported, or the "
+        "readings could not be reached or read. `null` exactly when at least one process "
+        "reported. An empty `pools` with this set means the platform could tell you "
+        "nothing about any process's pool — which is not the same as no pool being busy.",
+    )
+
 
 @tool(
     "get_postgres_health",
@@ -229,27 +299,41 @@ class PostgresHealthOutput(BaseModel):
         "nothing is truncated.\n"
         "WHOSE POOL. The `pool_*` fields describe the connection pool of the "
         "process that answered this call, and only that one. This platform runs "
-        "the API, the worker and this read surface as separate processes, each "
-        "with its own pool, so a pool exhausted in the API or the worker does "
-        "not show up here. The query fields have no such limit: they are read "
-        "from the database server, so they cover every connection to it.\n"
+        "the API and its background workers in one process and this read "
+        "surface in another, each with its own pool, so a pool exhausted in the "
+        "API or the worker does not show up in those fields. It shows up in "
+        "`pools`: every process reports its own pool on a fixed cadence, and "
+        "that group lists each one that has, named by `process`, with "
+        "`reported_age_s` saying how recent each reading is. Read the group "
+        "when the question is where the connections went; read the flat fields "
+        "when the question is about this reading's own process. The query "
+        "fields have no such limit: they are read from the database server, so "
+        "they cover every connection to it.\n"
         "TELLING SLOW QUERIES FROM A FULL POOL. These are different faults with "
         "different fixes, and one reading separates them. Queries slow: "
         "`longest_active_query_ms` and `active_queries_over_slow_threshold` "
-        "high, pool counters normal. Pool saturated: `pool_checked_out` at "
-        "`pool_size` plus `pool_max_overflow` with `pool_wait_timeouts_1m` "
-        "climbing, while queries themselves are not slow.\n"
+        "high, pool counters normal in every process. Pool saturated: some "
+        "process's `checked_out` at its `size` plus `max_overflow` with "
+        "`wait_timeouts_1m` climbing, while queries themselves are not slow — "
+        "and the process it is saturated in need not be this one, which is what "
+        "`pools` is for.\n"
         "UNKNOWN IS NULL, NEVER 0. A `null` count is missing information; a 0 is "
-        "a measurement that found nothing. `pool_stats_unknown_reason` and "
-        "`query_stats_unknown_reason` say which case a null is. Two fields, "
-        "`p95_query_ms_1m` and `slow_query_count_1m`, are null in every "
-        "response: the platform keeps no per-minute history of query timings, "
-        "and says so rather than reporting a number it cannot stand behind.\n"
-        "WHAT THIS CANNOT SEE. It reads one database's own views and one "
-        "process's pool. It says nothing about replicas, nothing about which "
-        "statements are slow (no query text is returned), and a healthy reading "
-        "here does not mean callers are getting served — a pool full in another "
-        "process looks perfectly healthy from this one."
+        "a measurement that found nothing. `pool_stats_unknown_reason`, "
+        "`pool_gauges_unknown_reason` and `query_stats_unknown_reason` say which "
+        "case a null or an empty group is. Two fields, `p95_query_ms_1m` and "
+        "`slow_query_count_1m`, are null in every response: the platform keeps "
+        "no per-minute history of query timings, and says so rather than "
+        "reporting a number it cannot stand behind.\n"
+        "AN ABSENT PROCESS IS NOT A HEALTHY ONE. `pools` lists the processes "
+        "that reported. A process missing from it has not reported recently — "
+        "which is itself worth noticing and is not evidence its pool is fine — "
+        "and an empty group with `pool_gauges_unknown_reason` set means nothing "
+        "could be read at all.\n"
+        "WHAT THIS CANNOT SEE. It reads one database's own views, one process's "
+        "pool live, and what other processes last said about theirs. It says "
+        "nothing about replicas, nothing about which statements are slow (no "
+        "query text is returned), and a healthy reading here does not mean "
+        "callers are getting served."
     ),
     input_model=_EmptyIn,
     output_model=PostgresHealthOutput,
@@ -331,8 +415,22 @@ async def get_postgres_health(
     pool_stats, pool_unknown = read_pool_stats(
         getattr(ctx.db.bind, "pool", None) if ctx.db.bind is not None else None
     )
+
+    # What every process last published about its own pool — outside the SAVEPOINT for the
+    # same reason, and read even when the probe failed: a database refusing statements is
+    # exactly when the question "which process is holding the connections" is worth asking.
+    # `read_pool_states` never raises; it answers with a reason instead.
+    gauges, gauges_unknown = await read_pool_states(ctx.redis)
+    measured_at = datetime.now(UTC)
+    gauge_fields = {
+        "pools": tuple(_gauge_reading(record, measured_at) for record in gauges),
+        "pool_gauges_unknown_reason": gauges_unknown,
+    }
+
     if healthy is not None and not probe.failed:
-        healthy = healthy.model_copy(update=_pool_fields(pool_stats, pool_unknown))
+        healthy = healthy.model_copy(
+            update={**_pool_fields(pool_stats, pool_unknown), **gauge_fields}
+        )
 
     if probe.failed or healthy is None:
         return PostgresHealthOutput(
@@ -347,8 +445,25 @@ async def get_postgres_health(
                 else QUERY_STATS_UNKNOWN_NO_WINDOWED_HISTORY
             ),
             **_pool_fields(pool_stats, pool_unknown),
+            **gauge_fields,  # type: ignore[arg-type]
         )
     return healthy
+
+
+def _gauge_reading(record: PoolRecord, measured_at: datetime) -> PoolGaugeReading:
+    """One published record, with its age taken against this reading's clock."""
+    return PoolGaugeReading(
+        process=record.process,
+        size=record.size,
+        checked_out=record.checked_out,
+        overflow=record.overflow,
+        max_overflow=record.max_overflow,
+        wait_timeouts_1m=record.wait_timeouts_1m,
+        written_at=record.written_at,
+        reported_age_s=round(
+            max(0.0, (measured_at - record.written_at).total_seconds()), 3
+        ),
+    )
 
 
 def _pool_fields(

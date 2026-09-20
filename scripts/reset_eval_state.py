@@ -63,6 +63,13 @@ What gets cleared/reset:
      replays, and the responder's own words (`briefing`, `current_hypothesis`, `last_step`) are
      left untouched.
 
+What it deliberately does **not** touch, so nobody adds a step for it: `pool:state:*`
+(**WO-R3-289**, ADR 0033). Like `breaker:state:*` it is a platform namespace outside `chaos:*`, but
+unlike a breaker it is not state a scenario set — it is a live description of each process's
+connection pool, rewritten by that process every ten seconds under a 60 s TTL. Clearing it would
+only create a window in which the platform could say nothing about its own pools, and the reading
+already answers an absent record as *unknown with a reason* rather than as a healthy pool.
+
 ## Guardrails
 
 - **Refuses to run against a target it was not configured for.** `_assert_not_production()`
