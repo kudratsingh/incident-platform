@@ -62,6 +62,16 @@ What gets cleared/reset:
      the reset ended stays open for ever. Closed, never deleted: the rows are what a console
      replays, and the responder's own words (`briefing`, `current_hypothesis`, `last_step`) are
      left untouched.
+ 11. **The boundary** — one `lab.world_reset` audit row, appended last, carrying every counter
+     above as its payload (reported as `world_reset_recorded`; **WO-R3-327**). The only step
+     here that restores nothing: it says *when* the take ended. `audit_logs` is append-only, so
+     after a reset the newest `chaos.*` row was still the previous take's kill and the `/demo`
+     page opened a clean world at `agent remediating`, clock counting from an incident that no
+     longer existed. The console now reads rows and runs newer than this row and nothing older.
+     Its own prefix, because the newest `chaos.*` row IS the fault to that console; withheld
+     from the agent beside `chaos.` under the same `chaos:invoke` condition, because the
+     payload is the mechanism list (ADR 0012's 2026-09-20 amendment). See
+     `_record_world_reset` for the principal and why it raises rather than degrades.
 
 What it deliberately does **not** touch, so nobody adds a step for it: `pool:state:*`
 (**WO-R3-289**, ADR 0033). Like `breaker:state:*` it is a platform namespace outside `chaos:*`, but
@@ -79,10 +89,12 @@ already answers an absent record as *unknown with a reason* rather than as a hea
   passed. Pass `--i-know-what-im-doing` (CLI) or `allow_target_mismatch=True` (library).
 - Enforced on *both* entry points: `main()` turns a refusal into stderr + `exit(1)`, `reset()`
   re-raises it before any engine or Redis client exists. Gating only the CLI was D-08.
-- **Audit rows are ground truth and this script never touches them.** The job and user DELETEs
-  have one documented side effect: the FKs are `ON DELETE SET NULL`, so `audit_logs.job_id` /
-  `audit_logs.user_id` go NULL and `job_triages` CASCADEs with its job. `resource_id` survives,
-  so it — not the FK columns — is the durable join key for audit-based grading (ADR 0012).
+- **Audit rows are ground truth, and this script only ever appends to them.** It writes exactly
+  one row — step 11's `lab.world_reset` boundary — and never updates or deletes any. The job and
+  user DELETEs have one documented side effect: the FKs are `ON DELETE SET NULL`, so
+  `audit_logs.job_id` / `audit_logs.user_id` go NULL and `job_triages` CASCADEs with its job.
+  `resource_id` survives, so it — not the FK columns — is the durable join key for audit-based
+  grading (ADR 0012).
 - **Idempotent.** A second run against the same post-reset state is a no-op summary.
 
 ## Usage
@@ -162,6 +174,13 @@ _LAG_SAMPLES_KEY = "kafka:consumer_lag:worker-dispatcher:samples"
 # What the reset writes into a run it closes itself, so an operator reading the console can
 # tell a responder that gave up from a world that was taken away under it (WO-R3-315).
 AGENT_RUN_CLOSED_BY = "reset"
+
+# Who the boundary row says performed the reset (WO-R3-327). A literal mirror of
+# `scripts/seed_incident_commander.py::_CHAOS_SA_NAME`, read from the same envvar, because
+# a script must not import another script's module just to learn a name. The account is
+# looked up rather than required: an absent one costs the row its attribution, never the
+# row. `_record_world_reset` explains why this principal and not another.
+_EVALUATOR_SA_NAME = os.getenv("SA_CHAOS_NAME", "incident-commander-chaos")
 
 
 def _empty_dlq_baseline() -> bool:
@@ -324,6 +343,86 @@ async def _close_open_agent_runs(session_factory: Any) -> int:
                 run.finished_at = closed_at
                 closed += 1
     return closed
+
+
+async def _record_world_reset(session_factory: Any, counters: dict[str, Any]) -> int:
+    """Append the one `lab.world_reset` audit row that closes this take. **WO-R3-327.**
+
+    Every other step here restores a world. This one says *when* — and it exists because
+    nothing else did. The `/demo` console derives its phase strip from the newest
+    `chaos.*` audit row, and audit rows are append-only by design, so after a reset the
+    newest one was still the previous take's kill: a freshly wiped world opened the page
+    at `agent remediating`, with a fault clock counting from an incident that no longer
+    existed. The console cannot infer the boundary — it is not in the audit log, the
+    Redis keys are gone, and `agent_runs` says only that a run ended — so the reset has
+    to state it.
+
+    **A row rather than a counter.** The boundary must survive in the same append-only
+    place the rows it bounds live, must carry the platform's own clock (the console
+    compares it against `created_at` on other rows), and must be readable by an operator
+    who opened the page after the reset. That is an audit row and nothing else is.
+
+    **Its own `lab.` prefix, not `chaos.`.** The console reads the newest `chaos.*` row
+    as the moment the fault was injected. A boundary filed under that prefix would be
+    read as a fault — exactly the reading it exists to remove. `lab.` is the lab talking
+    about its own apparatus rather than about the world.
+
+    **Withheld from the agent** by `hidden_audit_action_prefixes`, beside `chaos.` and
+    under the same condition (ADR 0012's 2026-09-20 amendment). The payload is this
+    dict: `chaos_keys_cleared`, `seeded_dlq_deleted`, `hot_set_reseeded` — the mechanism
+    list, in the agent's own read surface, would be a stronger leak than any hook name.
+    Human operators read it over REST and see everything, as they always have.
+
+    **The principal is the evaluator's service account** (`SA_CHAOS_NAME`, default
+    `incident-commander-chaos`), looked up in the seed tenant so a second tenant holding
+    a copy cannot raise from the tail of the reset (the WO-R2-18 shape). Two reasons for
+    that account and not a platform identity: it is the principal that fires every
+    `chaos.*` row in the same timeline, so an operator sees one actor for the whole lab
+    rather than two; and it is the only principal the withholding rule lets read this
+    row back, so the row's author and its one machine reader are the same identity. When
+    the account is absent — a stack seeded for fixtures but not for the agent — the row
+    is still written with a null `principal_id`, because a boundary nobody signed is
+    worth more than no boundary at all.
+
+    Written LAST, after every other step, for two reasons: the payload is the summary of
+    what those steps did, and a boundary stamped before the seed finished would put the
+    restored fixtures on the far side of it.
+
+    Not idempotent, and must not be: one row per reset is the point. Two resets are two
+    boundaries and the console reads the newest. Returns 1 — the count the summary
+    carries, because this is the one step whose own row cannot report on itself.
+    """
+    from app.models.service_account import ServiceAccount
+    from app.repositories.audit import AuditRepository
+    from app.services.operator_audit import record_world_reset
+    from sqlalchemy import select
+
+    from scripts import seed_eval_fixtures  # type: ignore[import-not-found]
+
+    async with session_factory() as session:
+        async with session.begin():
+            tenant = await seed_eval_fixtures._ensure_tenant(
+                session, seed_eval_fixtures._TENANT_SLUG
+            )
+            found = (
+                (
+                    await session.execute(
+                        select(ServiceAccount.id).where(
+                            ServiceAccount.name == _EVALUATOR_SA_NAME,
+                            ServiceAccount.tenant_id == tenant.id,
+                        )
+                    )
+                )
+                .scalars()
+                .first()
+            )
+            await record_world_reset(
+                AuditRepository(session),
+                tenant_id=uuid.UUID(str(tenant.id)),
+                principal_id=None if found is None else uuid.UUID(str(found)),
+                counters=counters,
+            )
+    return 1
 
 
 async def _rebuild_read_model(session_factory: Any, redis: aioredis.Redis) -> int:
@@ -642,31 +741,43 @@ async def reset(
         # fixtures go before the sweep, so they are deleted rather than `cancelled`.
         seeded_dlq_deleted = await _delete_seeded_dlq_fixtures(factory)
         dlq_swept = await _sweep_nonfixture_dlq(factory)
-        # Last: projects the rows as every step above finally left them.
+        # Last of the restoring steps: projects the rows as every step above finally
+        # left them.
         read_model_keys = await _rebuild_read_model(factory, redis)
+        # Built here rather than at the `return` because this dict IS the boundary row's
+        # payload as well as the caller's summary — one literal, so the two cannot drift.
+        counters: dict[str, Any] = {
+            "agent_runs_closed": agent_runs_closed,
+            "breakers_reset": breakers_reset,
+            "chaos_alerts_resolved": chaos_alerts_resolved,
+            "chaos_keys_cleared": chaos_cleared,
+            "chaos_owners_deleted": chaos_owners_deleted,
+            "dag_pauses_cleared": pauses_cleared,
+            "dlq_reset": seed_summary["dlq_reset"],
+            "dlq_swept": dlq_swept,
+            "timestamps_rebaselined": seed_summary["timestamps_rebaselined"],
+            "empty_dlq_baseline": _empty_dlq_baseline(),
+            "hot_set_reseeded": hot_set_reseeded,
+            "job_cache_cleared": job_cache_cleared,
+            "lag_samples_cleared": lag_samples_cleared,
+            "organic_alerts_resolved": organic_alerts_resolved,
+            "read_model_keys_rebuilt": read_model_keys,
+            "seeded_dlq_deleted": seeded_dlq_deleted,
+            "idempotency_purged": idempotency_purged,
+            "timers_cleared": timers_cleared,
+        }
+        # Truly last: the one row that says the take above is over (WO-R3-327). It
+        # raises rather than degrading, because a reset the console cannot see is a
+        # reset that leaves the page reading the previous take's fault as current.
+        world_reset_recorded = await _record_world_reset(factory, counters)
     finally:
         await redis.aclose()
         await engine.dispose()
 
     return {
-        "agent_runs_closed": agent_runs_closed,
-        "breakers_reset": breakers_reset,
-        "chaos_alerts_resolved": chaos_alerts_resolved,
-        "chaos_keys_cleared": chaos_cleared,
-        "chaos_owners_deleted": chaos_owners_deleted,
-        "dag_pauses_cleared": pauses_cleared,
-        "dlq_reset": seed_summary["dlq_reset"],
-        "dlq_swept": dlq_swept,
-        "timestamps_rebaselined": seed_summary["timestamps_rebaselined"],
-        "empty_dlq_baseline": _empty_dlq_baseline(),
-        "hot_set_reseeded": hot_set_reseeded,
-        "job_cache_cleared": job_cache_cleared,
-        "lag_samples_cleared": lag_samples_cleared,
-        "organic_alerts_resolved": organic_alerts_resolved,
-        "read_model_keys_rebuilt": read_model_keys,
-        "seeded_dlq_deleted": seeded_dlq_deleted,
-        "idempotency_purged": idempotency_purged,
-        "timers_cleared": timers_cleared,
+        **counters,
+        # The one count the row cannot carry about itself.
+        "world_reset_recorded": world_reset_recorded,
     }
 
 

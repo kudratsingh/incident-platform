@@ -35,6 +35,7 @@ from app.services.agent_run import (
 from app.services.operator_audit import (
     AGENT_RUN_REPORTED_ACTION,
     CHAOS_ACTION_PREFIX,
+    LAB_ACTION_PREFIX,
     TOOL_INVOKED_ACTION,
     hidden_audit_action_prefixes,
 )
@@ -592,8 +593,10 @@ def test_a_principal_without_the_write_scope_still_sees_the_run_reports() -> Non
     hidden = hidden_audit_action_prefixes(reader)
 
     assert AGENT_RUN_REPORTED_ACTION not in hidden
-    # And the pre-existing rule is untouched: no chaos scope, no chaos stream.
-    assert hidden == (CHAOS_ACTION_PREFIX,)
+    # And the pre-existing rule is untouched: no chaos scope, no lab streams. Both
+    # prefixes since WO-R3-327 — `chaos.` is the fault, `lab.` is the world reset, one
+    # condition (ADR 0012's 2026-09-20 amendment).
+    assert hidden == (CHAOS_ACTION_PREFIX, LAB_ACTION_PREFIX)
 
 
 def test_the_chaos_rule_is_unchanged_for_the_evaluator() -> None:
