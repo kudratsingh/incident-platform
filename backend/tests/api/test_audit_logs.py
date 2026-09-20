@@ -226,10 +226,17 @@ async def test_over_long_action_prefix_returns_422(
     client: AsyncClient,
     admin_headers: dict[str, str],
 ) -> None:
+    """The bound is 200 characters since WO-R3-328, because the parameter is a comma
+    list of prefixes rather than one prefix — still bounded, because it reaches a LIKE."""
     resp = await client.get(
-        f"/api/v1/audit/logs?action_prefix={'x' * 200}", headers=admin_headers
+        f"/api/v1/audit/logs?action_prefix={'x' * 201}", headers=admin_headers
     )
     assert resp.status_code == 422
+
+    long_exclude = await client.get(
+        f"/api/v1/audit/logs?exclude_prefix={'x' * 201}", headers=admin_headers
+    )
+    assert long_exclude.status_code == 422
 
 
 async def test_bad_principal_type_returns_422(
@@ -306,3 +313,157 @@ async def test_audit_logs_scoped_to_caller_tenant(
     assert returned_ids <= own_ids, "every returned row must be in the caller's tenant"
     assert own_ids <= returned_ids, "caller's own rows must all be visible"
     assert resp.json()["total"] == len(own_ids)
+
+
+# --------------------------------------------------------------------------
+# Prefix lists (WO-R3-328, ADR 0037)
+# --------------------------------------------------------------------------
+
+
+async def _seed_streams(db: AsyncSession, tenant_id: uuid.UUID) -> None:
+    """One row per stream a demo timeline cares about, plus the one it drowns in."""
+    sa_id = uuid.uuid4()
+    for action in (
+        "agent.tool_invoked",
+        "agent.run_reported",
+        "chaos.tool_invoked",
+        "lab.world_reset",
+        "event.job.completed",
+        "event.job.submitted",
+        "job.created",
+    ):
+        db.add(
+            AuditLog(
+                tenant_id=tenant_id,
+                action=action,
+                principal_type=PRINCIPAL_TYPE_SERVICE_ACCOUNT,
+                principal_id=sa_id,
+                user_id=None,
+            )
+        )
+    await db.flush()
+
+
+async def test_a_comma_list_asks_for_several_streams_at_once(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    default_tenant,  # type: ignore[no-untyped-def]
+    admin_headers: dict[str, str],
+) -> None:
+    """The console's own query: the operator streams in one request rather than three it
+    would have to merge and re-sort itself."""
+    await _seed_streams(db_session, default_tenant.id)
+
+    body = (
+        await client.get(
+            "/api/v1/audit/logs?action_prefix=agent.,lab.,chaos.", headers=admin_headers
+        )
+    ).json()
+
+    actions = {item["action"] for item in body["items"]}
+    assert actions == {
+        "agent.tool_invoked",
+        "agent.run_reported",
+        "chaos.tool_invoked",
+        "lab.world_reset",
+    }
+    # `total` counts what was asked for, not the table.
+    assert body["total"] == 4
+
+
+async def test_exclude_prefix_drops_the_job_lifecycle(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    default_tenant,  # type: ignore[no-untyped-def]
+    admin_headers: dict[str, str],
+) -> None:
+    """The finding this exists for: 43 of 50 rows on the demo's first take were
+    `event.job.*` from the traffic loop, and the rows the demo was about were buried."""
+    await _seed_streams(db_session, default_tenant.id)
+
+    body = (
+        await client.get(
+            "/api/v1/audit/logs?exclude_prefix=event.", headers=admin_headers
+        )
+    ).json()
+
+    actions = {item["action"] for item in body["items"]}
+    assert not any(a.startswith("event.") for a in actions)
+    assert "job.created" in actions, "`job.` is not `event.job.`"
+    assert body["total"] == 5
+
+
+async def test_exclusion_wins_where_the_two_lists_overlap(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    default_tenant,  # type: ignore[no-untyped-def]
+    admin_headers: dict[str, str],
+) -> None:
+    """A row the caller named in `exclude_prefix` is a row it said it did not want, even
+    if a broader `action_prefix` would have matched it."""
+    await _seed_streams(db_session, default_tenant.id)
+
+    body = (
+        await client.get(
+            "/api/v1/audit/logs?action_prefix=agent.&exclude_prefix=agent.run_reported",
+            headers=admin_headers,
+        )
+    ).json()
+
+    assert {item["action"] for item in body["items"]} == {"agent.tool_invoked"}
+    assert body["total"] == 1
+
+
+async def test_a_single_prefix_still_behaves_exactly_as_before(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    default_tenant,  # type: ignore[no-untyped-def]
+    admin_headers: dict[str, str],
+) -> None:
+    await _seed_streams(db_session, default_tenant.id)
+
+    body = (
+        await client.get("/api/v1/audit/logs?action_prefix=chaos.", headers=admin_headers)
+    ).json()
+
+    assert {item["action"] for item in body["items"]} == {"chaos.tool_invoked"}
+
+
+async def test_blanks_and_duplicates_in_a_list_are_dropped(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    default_tenant,  # type: ignore[no-untyped-def]
+    admin_headers: dict[str, str],
+) -> None:
+    """A list that is all separators reads as no filter rather than as a filter nothing
+    matches: the caller asked for nothing, not for an empty page."""
+    await _seed_streams(db_session, default_tenant.id)
+
+    spaced = (
+        await client.get(
+            "/api/v1/audit/logs?action_prefix= agent. , agent. ,,lab.",
+            headers=admin_headers,
+        )
+    ).json()
+    empty_list = (
+        await client.get("/api/v1/audit/logs?action_prefix=,,,", headers=admin_headers)
+    ).json()
+
+    assert {item["action"] for item in spaced["items"]} == {
+        "agent.tool_invoked",
+        "agent.run_reported",
+        "lab.world_reset",
+    }
+    assert empty_list["total"] == 7, "no filter, not an impossible one"
+
+
+def test_the_prefix_list_is_bounded() -> None:
+    """Each prefix becomes a LIKE, so the count is bounded as well as the length."""
+    from app.schemas.audit import MAX_ACTION_PREFIXES, AuditListParams
+
+    params = AuditListParams(
+        action_prefix=",".join(f"p{i}." for i in range(MAX_ACTION_PREFIXES + 5))
+    )
+
+    assert len(params.action_prefixes()) == MAX_ACTION_PREFIXES
+    assert params.exclude_prefixes() == ()

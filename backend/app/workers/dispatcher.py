@@ -8,7 +8,6 @@ Concurrency by type: bulk_api_sync asyncio (concurrent I/O), csv_upload threadin
 """
 
 import asyncio
-import json
 import time
 import uuid
 from collections.abc import Callable
@@ -19,6 +18,19 @@ from typing import Any
 from app.config import get_settings
 from app.core import metrics
 from app.core.circuit_breaker import record_registered_breakers
+from app.core.consumer_lag import (
+    LAG_SAMPLES_KEEP as _LAG_SAMPLES_KEEP,
+)
+from app.core.consumer_lag import (
+    LAG_SAMPLES_TTL as _LAG_SAMPLES_TTL,
+)
+from app.core.consumer_lag import (
+    LIVE_REFRESHED_GROUP,
+    record_lag_sample,
+)
+from app.core.consumer_lag import (
+    samples_key as _samples_key,
+)
 from app.core.leader_lock import OUTBOX_RELAY_LOCK_KEY, advisory_leader_lock
 from app.core.logging import get_logger, job_id_var, trace_id_var
 from app.core.outbox_heartbeat import record_relay_tick
@@ -1642,41 +1654,26 @@ async def _outbox_relay_loop(
 BACKPRESSURE_LAG_KEY = "kafka:consumer_lag:worker-dispatcher"
 BACKPRESSURE_LAG_TTL = 90  # seconds — must exceed metrics loop interval (60s)
 
-# The same number with its measurement time, kept for the last few passes:
+# The same number with its measurement time, kept for the last several passes:
 # `BACKPRESSURE_LAG_KEY` is one undated integer overwritten every ~60s, so a climbing
 # lag was unverifiable (WO-R3-254). A SECOND key, because `check_backpressure` fixes
 # the value key's shape. JSON list, newest first:
-# [{"lag": int, "measured_at": ISO-8601 UTC}], same TTL so the pair is fresh together.
-LAG_SAMPLES_KEY = f"{BACKPRESSURE_LAG_KEY}:samples"
-# Five at ~60s apart is ~5 minutes of trend. Mirrored by the reader
-# (`app/mcp/tools/consumer_lag.py`); `test_consumer_lag_history.py` pins the pair.
-LAG_SAMPLES_KEEP = 5
+# [{"lag": int, "measured_at": ISO-8601 UTC}].
+#
+# The key, the cap and the TTL are now imported from `app/core/consumer_lag.py`
+# (WO-R3-328) rather than mirrored here: the window is fifteen minutes of history at one
+# sample per pass, and the reader bounds what it returns by the same cap. They were two
+# literals in two files and drifting them would have shortened the chart without
+# shortening the axis. `test_consumer_lag_history.py` still pins the pair.
+LAG_SAMPLES_KEY = _samples_key(LIVE_REFRESHED_GROUP)
+LAG_SAMPLES_KEEP = _LAG_SAMPLES_KEEP
+LAG_SAMPLES_TTL = _LAG_SAMPLES_TTL
 
 
 async def _record_lag_sample(redis: Any, lag: int) -> None:
-    """Prepend one timestamped measurement to the capped sample window.
-
-    Read-modify-write on purpose: the window is a diagnostic aid, not a correctness
-    input, so a lost race costs one sample. Anything stored that is not a JSON list
-    is replaced rather than parsed around.
-    """
-    measured_at = datetime.now(UTC).isoformat()
-    samples: list[Any] = []
-    raw = await redis.get(LAG_SAMPLES_KEY)
-    if raw is not None:
-        if isinstance(raw, bytes | bytearray):
-            raw = raw.decode()
-        try:
-            loaded = json.loads(raw)
-        except (TypeError, ValueError):
-            loaded = None
-        if isinstance(loaded, list):
-            samples = [s for s in loaded if isinstance(s, dict)]
-    samples.insert(0, {"lag": int(lag), "measured_at": measured_at})
-    del samples[LAG_SAMPLES_KEEP:]
-    await redis.set(
-        LAG_SAMPLES_KEY, json.dumps(samples), ex=BACKPRESSURE_LAG_TTL
-    )
+    """Record one measurement for this worker's own group. See
+    `app.core.consumer_lag.record_lag_sample` for what it writes and why."""
+    await record_lag_sample(redis, lag, group=LIVE_REFRESHED_GROUP)
 
 
 async def _digest_loop(session_factory: async_sessionmaker[AsyncSession]) -> None:

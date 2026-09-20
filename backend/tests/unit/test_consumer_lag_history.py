@@ -9,6 +9,10 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from app.core.consumer_lag import (
+    LAG_SAMPLES_WINDOW_SECONDS,
+    record_lag_sample,
+)
 from app.mcp.registry import ToolContext
 from app.mcp.tools.consumer_lag import (
     _LAG_SAMPLES_KEEP,
@@ -23,6 +27,7 @@ from app.workers.dispatcher import (
     BACKPRESSURE_LAG_TTL,
     LAG_SAMPLES_KEEP,
     LAG_SAMPLES_KEY,
+    LAG_SAMPLES_TTL,
     _metrics_loop,
     _record_lag_sample,
 )
@@ -109,21 +114,25 @@ async def test_the_loop_records_the_value_and_the_time_it_measured_it() -> None:
     measured_at = datetime.fromisoformat(window[0]["measured_at"])
     assert measured_at.tzinfo is not None, "a stamp with no offset is ambiguous"
     assert abs((datetime.now(UTC) - measured_at).total_seconds()) < 5
-    # Same TTL as the value, so the pair is fresh-or-absent together.
-    assert redis.ttls[LAG_SAMPLES_KEY] == BACKPRESSURE_LAG_TTL
+    # NOT the value's TTL since WO-R3-328: the value must be fresh-or-absent because
+    # backpressure reads it, and the window is history an operator needs to still be
+    # there when the pass that would have refreshed it is the thing that stopped.
+    assert redis.ttls[LAG_SAMPLES_KEY] == LAG_SAMPLES_TTL
+    assert LAG_SAMPLES_TTL > BACKPRESSURE_LAG_TTL
 
 
 async def test_the_window_is_capped_and_newest_first() -> None:
-    """Five is the whole window; the sixth pass drops the oldest."""
+    """The cap is the whole window; the pass after it drops the oldest."""
     redis = _RedisStub()
+    passes = LAG_SAMPLES_KEEP + 3
 
-    for lag in range(LAG_SAMPLES_KEEP + 3):
+    for lag in range(passes):
         await _one_loop_pass(redis, lag)
 
     window = _window(redis)
     assert len(window) == LAG_SAMPLES_KEEP
     assert [s["lag"] for s in window] == list(
-        range(LAG_SAMPLES_KEEP + 2, LAG_SAMPLES_KEEP - 3, -1)
+        range(passes - 1, passes - 1 - LAG_SAMPLES_KEEP, -1)
     ), "newest first, oldest dropped"
 
 
@@ -384,6 +393,29 @@ async def test_age_seconds_is_never_negative() -> None:
 
 
 # The three literals that must not drift
+
+
+def test_the_window_spans_the_fifteen_minutes_it_advertises() -> None:
+    """The cap is not a taste: it is the window divided by the pass interval, and the
+    tool's description quotes the window. One sample per pass is the assumption that
+    makes the three numbers one number (WO-R3-328)."""
+    from app.workers.dispatcher import _METRICS_LOOP_INTERVAL
+
+    assert LAG_SAMPLES_KEEP * int(_METRICS_LOOP_INTERVAL) == (
+        LAG_SAMPLES_WINDOW_SECONDS
+    )
+    assert LAG_SAMPLES_WINDOW_SECONDS == 15 * 60
+
+
+async def test_the_writer_keys_the_window_by_group() -> None:
+    """One ring buffer per group. Only the continuously-refreshed group has a writer
+    today, but the key is the group's — a second writer needs no new shape."""
+    redis = _RedisStub()
+
+    await record_lag_sample(redis, 11, group="billing-consumer")
+
+    assert LAG_SAMPLES_KEY not in redis.store
+    assert json.loads(redis.store[_samples_key("billing-consumer")])[0]["lag"] == 11
 
 
 def test_the_reader_and_the_writer_name_the_same_window_key() -> None:

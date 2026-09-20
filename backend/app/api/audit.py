@@ -21,6 +21,14 @@ async def list_audit_logs(
     current_user: User = Depends(_require_support_or_admin),
     db: AsyncSession = Depends(get_db),
 ) -> PaginatedResponse[AuditLogResponse]:
+    """Audit rows for a human operator, newest first.
+
+    `action_prefix` and `exclude_prefix` are comma lists (WO-R3-328): the operator
+    streams are three prefixes (`agent.,lab.,chaos.`) and the job-lifecycle stream is one
+    an operator timeline usually wants left out (`event.`). No prefix is withheld here —
+    this is the human path, and unlike the agent's audit tool it shows every stream
+    (ADR 0012's withholding is a rule about principals, not about rows).
+    """
     # Tenant scope is applied in the app layer (F1-02); `?tenant_id=` is
     # honoured only for platform admins.
     effective_tenant = await resolve_admin_tenant(current_user, db, tenant_id)
@@ -31,7 +39,8 @@ async def list_audit_logs(
         user_id=params.user_id,
         job_id=params.job_id,
         action=params.action,
-        action_prefix=params.action_prefix,
+        action_prefixes=params.action_prefixes(),
+        exclude_action_prefixes=params.exclude_prefixes(),
         principal_type=params.principal_type,
         tenant_id=effective_tenant,
     )

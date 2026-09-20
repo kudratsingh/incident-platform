@@ -12,7 +12,7 @@ from app.models.audit import (
     AuditLog,
 )
 from app.repositories.base import BaseRepository
-from sqlalchemy import and_, select
+from sqlalchemy import and_, or_, select
 
 logger = get_logger(__name__)
 
@@ -86,6 +86,7 @@ class AuditRepository(BaseRepository[AuditLog]):
         job_id: uuid.UUID | None = None,
         action: str | None = None,
         action_prefix: str | None = None,
+        action_prefixes: Sequence[str] = (),
         exclude_action_prefixes: Sequence[str] = (),
         principal_type: str | None = None,
         tenant_id: uuid.UUID | None = None,
@@ -95,18 +96,28 @@ class AuditRepository(BaseRepository[AuditLog]):
 
         `total` uses the same `WHERE`, exclusions included: a caller is told only about
         rows it may read (`hidden_audit_action_prefixes`).
+
+        `action_prefix` (one stream) and `action_prefixes` (several, OR-ed) are both
+        accepted and combine into one OR — the agent's audit tool names one prefix, the
+        operator console names three. Exclusions are AND-ed over the result either way,
+        so a prefix that is both asked for and excluded is excluded.
         """
         filters = []
+        wanted = [*([action_prefix] if action_prefix is not None else []), *action_prefixes]
         if user_id is not None:
             filters.append(AuditLog.user_id == user_id)
         if job_id is not None:
             filters.append(AuditLog.job_id == job_id)
         if action is not None:
             filters.append(AuditLog.action == action)
-        if action_prefix is not None:
-            # `agent.*` / `chaos.*` grouping — used by the MCP audit
-            # tool to isolate machine-principal activity streams.
-            filters.append(AuditLog.action.like(f"{action_prefix}%"))
+        if wanted:
+            # `agent.*` / `chaos.*` grouping — used by the MCP audit tool to isolate one
+            # machine-principal activity stream, and by the console to ask for the three
+            # operator streams at once. OR-ed: they are alternatives, not a conjunction
+            # no row could satisfy.
+            filters.append(
+                or_(*(AuditLog.action.like(f"{prefix}%") for prefix in wanted))
+            )
         for excluded in exclude_action_prefixes:
             # Whole streams a caller may not see. A predicate, so `_count` reports
             # only readable rows — a `total` counting withheld rows would disclose

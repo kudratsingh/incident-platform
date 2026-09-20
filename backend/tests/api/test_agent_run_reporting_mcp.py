@@ -446,3 +446,162 @@ async def test_the_reporting_tools_are_absent_from_nothing_the_agent_can_read(
         assert reported[name]["description"].startswith("[commander: telemetry] ")
         assert reported[name]["required_scope"] == "agent_runs:write"
         assert reported[name]["is_idempotent"] is False
+
+
+# --------------------------------------------------------------------------
+# The run record over the envelope (WO-R3-328, ADR 0037)
+# --------------------------------------------------------------------------
+
+
+async def test_one_report_carries_the_whole_reasoning_and_answers_with_the_ledger(
+    mcp_client: AsyncClient, db_session: AsyncSession, default_tenant
+) -> None:
+    """The shape the reporter actually sends on a transition into `remediating`, over the
+    real envelope — and the receipt that lets it log the ledger's size without a read."""
+    token, _ = await _token(db_session, default_tenant.id, AGENT_SCOPES)
+    run_id = str(uuid.uuid4())
+
+    out = _payload(
+        await _call(
+            mcp_client,
+            token,
+            "report_agent_run",
+            {
+                "run_id": run_id,
+                "state": "remediating",
+                "hypotheses": [
+                    {
+                        "name": "a stalled consumer",
+                        "category": "queue",
+                        "confidence": 0.82,
+                        "reasoning_excerpt": "one group climbing, the others flat",
+                    },
+                    {"name": "a slow downstream", "confidence": 0.1},
+                ],
+                "plan": {
+                    "action_tool": "restart_consumer_group",
+                    "action_arguments": {"consumer_group": "worker-dispatcher"},
+                    "target_hypothesis": "a stalled consumer",
+                    "rationale_excerpt": "cheapest test of the leading explanation",
+                },
+                "step": {
+                    "seq": 7,
+                    "kind": "action",
+                    "tool": "restart_consumer_group",
+                    "arguments": {"consumer_group": "worker-dispatcher"},
+                    "result_excerpt": '{"accepted": true, "kill_key_cleared": true}',
+                    "outcome": "success",
+                    "latency_ms": 41.0,
+                },
+                "budget": {"tool_calls_used": 7, "tool_calls_max": 13, "usd_used": 0.4},
+            },
+        )
+    )
+
+    assert out["steps_count"] == 1
+    assert out["steps_dropped"] == 0
+    assert out["accepted"] is True
+
+    row = (
+        await db_session.execute(
+            select(AgentRun).where(AgentRun.id == uuid.UUID(run_id))
+        )
+    ).scalar_one()
+    assert [h["name"] for h in row.hypotheses] == [
+        "a stalled consumer",
+        "a slow downstream",
+    ]
+    assert row.plan["action_arguments"] == {"consumer_group": "worker-dispatcher"}
+    assert row.steps[0]["seq"] == 7
+    assert row.budget["tool_calls_max"] == 13
+
+
+async def test_a_verify_poll_lands_twice_and_a_step_only_report_keeps_the_rest(
+    mcp_client: AsyncClient, db_session: AsyncSession, default_tenant
+) -> None:
+    token, _ = await _token(db_session, default_tenant.id, AGENT_SCOPES)
+    run_id = str(uuid.uuid4())
+    await _call(
+        mcp_client,
+        token,
+        "report_agent_run",
+        {
+            "run_id": run_id,
+            "state": "verifying",
+            "hypotheses": [{"name": "a stalled consumer", "confidence": 0.9}],
+        },
+    )
+
+    for attempt, verdict in enumerate(["not_verified", "verified"], start=1):
+        _payload(
+            await _call(
+                mcp_client,
+                token,
+                "report_agent_run",
+                {
+                    "run_id": run_id,
+                    "state": "verifying",
+                    "verification": {
+                        "verdict": verdict,
+                        "attempt": attempt,
+                        "of": 3,
+                        "reasoning_excerpt": "lag reading after the restart",
+                    },
+                },
+            )
+        )
+    out = _payload(
+        await _call(
+            mcp_client,
+            token,
+            "report_agent_run",
+            {
+                "run_id": run_id,
+                "state": "verifying",
+                "step": {"seq": 1, "kind": "read", "tool": "get_consumer_lag"},
+            },
+        )
+    )
+
+    assert out["steps_count"] == 1
+    row = (
+        await db_session.execute(
+            select(AgentRun).where(AgentRun.id == uuid.UUID(run_id))
+        )
+    ).scalar_one()
+    assert [v["verdict"] for v in row.verifications] == ["not_verified", "verified"]
+    assert row.verification["verdict"] == "verified"
+    # The step-only report left both the ranking and the verdicts alone.
+    assert [h["name"] for h in row.hypotheses] == ["a stalled consumer"]
+
+
+async def test_an_over_long_excerpt_is_refused_at_the_envelope(
+    mcp_client: AsyncClient, db_session: AsyncSession, default_tenant
+) -> None:
+    """The limit is a refusal on the wire, not a truncation in the service — so the
+    caller finds out, and no row is written."""
+    token, _ = await _token(db_session, default_tenant.id, AGENT_SCOPES)
+    run_id = str(uuid.uuid4())
+
+    reply = await _call(
+        mcp_client,
+        token,
+        "report_agent_run",
+        {
+            "run_id": run_id,
+            "state": "investigating",
+            "step": {"seq": 1, "kind": "read", "result_excerpt": "x" * 401},
+        },
+    )
+
+    assert "error" in reply, reply
+    rows = (
+        (
+            await db_session.execute(
+                select(AgentRun).where(AgentRun.id == uuid.UUID(run_id))
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert rows == []
