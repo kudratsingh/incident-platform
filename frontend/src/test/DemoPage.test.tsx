@@ -103,6 +103,14 @@ const FAULT_ROW = toolRow('chaos.tool_invoked', 'kill_consumer', '2026-09-19T10:
   consumer_group: 'worker-dispatcher',
 })
 
+/** The boundary `make eval-reset` appends; payload = that reset's counters (WO-R3-327). */
+const RESET_ROW = auditRow({
+  action: 'lab.world_reset',
+  created_at: '2026-09-19T10:05:00Z',
+  resource_type: 'world',
+  extra_data: { chaos_keys_cleared: 4, hot_set_reseeded: 1 },
+})
+
 function job(overrides: Partial<Job> = {}): Job {
   return {
     id: '44444444-4444-4444-4444-444444444444',
@@ -490,6 +498,92 @@ describe('DemoPage — the audit timeline', () => {
         expect.objectContaining({ action_prefix: 'chaos.' }),
       ),
     )
+  })
+
+  it('draws the reset as a grey divider, not as an event', async () => {
+    stub({ audit: [RESET_ROW, ...rows] })
+    renderDemo()
+    const panel = await screen.findByTestId('audit-timeline')
+    const divider = within(panel).getByTestId('audit-reset-divider')
+    expect(divider.textContent).toMatch(/world reset/i)
+    // And not a second time as a row: the action name is nowhere in the list.
+    expect(within(panel).queryByText(/lab\.world_reset/)).toBeNull()
+  })
+
+  it('keeps the divider on screen under every chip', async () => {
+    // The lab chip narrows the API query to `chaos.`, so the boundary row is not in
+    // that response — the line comes from the unfiltered stream the page always has.
+    stub({ audit: [RESET_ROW, ...rows] })
+    renderDemo()
+    const panel = await screen.findByTestId('audit-timeline')
+    await userEvent.click(within(panel).getByRole('button', { name: /^lab$/i }))
+    await waitFor(() =>
+      expect(within(panel).getByTestId('audit-reset-divider')).toBeTruthy(),
+    )
+  })
+})
+
+describe('DemoPage — a reset is a boundary (WO-R3-327)', () => {
+  /** A complete previous take: fault, investigation, remediation. */
+  const previousTake = [
+    toolRow('agent.tool_invoked', 'restart_consumer_group', '2026-09-19T10:03:00Z', {
+      consumer_group: 'worker-dispatcher',
+    }),
+    toolRow('agent.tool_invoked', 'get_consumer_lag', '2026-09-19T10:02:00Z'),
+    FAULT_ROW,
+  ]
+
+  it('opens on a healthy world after a reset, not on the last take’s fault', async () => {
+    // THE regression. Audit rows are append-only, so before the boundary existed the
+    // newest `chaos.*` row was still the previous take's kill: the strip opened at
+    // `agent remediating` and the header counted a clock from an incident that was
+    // over.
+    stub({ audit: [RESET_ROW, ...previousTake] })
+    renderDemo()
+    await screen.findByTestId('audit-timeline')
+    expect(await screen.findByText(/no fault injected yet/i)).toBeTruthy()
+    expect(screen.queryByTestId('fault-clock')).toBeNull()
+
+    const strip = screen.getByRole('list', { name: /phase/i })
+    const lit = within(strip)
+      .getAllByRole('listitem')
+      .filter((li) => li.getAttribute('aria-current') === 'step')
+    expect(lit).toHaveLength(1)
+    expect(lit[0].textContent).toMatch(/healthy/i)
+  })
+
+  it('shows the next take’s fault once one is injected after the boundary', async () => {
+    stub({
+      audit: [
+        toolRow('chaos.tool_invoked', 'kill_consumer', '2026-09-19T10:06:00Z', {
+          consumer_group: 'worker-dispatcher',
+        }),
+        RESET_ROW,
+        ...previousTake,
+      ],
+    })
+    renderDemo()
+    expect(await screen.findByTestId('fault-clock')).toBeTruthy()
+    // 10:06, the new one — not 10:00.
+    expect(screen.getByTestId('fault-clock').textContent).not.toMatch(/10:00/)
+  })
+
+  it('does not show the agent card a run the reset closed out', async () => {
+    // `make eval-reset` closes every open run as `failed` with a `closed_by: reset`
+    // marker, and those belong to the take that just ended.
+    stub({
+      runs: [
+        agentRun({
+          state: 'failed',
+          finished_at: '2026-09-19T10:04:50Z',
+          active: false,
+        }),
+      ],
+      audit: [RESET_ROW, ...previousTake],
+    })
+    renderDemo()
+    expect(await screen.findByText(/waiting for the agent/i)).toBeTruthy()
+    expect(screen.queryByTestId('agent-card')).toBeNull()
   })
 })
 

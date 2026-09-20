@@ -64,13 +64,16 @@ const AUDIT_REFRESH_MS = 5000
  * everything the lab did, meant reading pages by eye. The empty value is "all
  * actions" and must send no parameter at all rather than an empty one.
  *
- * `chaos.` is here because a human operator reading the REST audit API sees the
- * lab's rows — it is the AGENT's own MCP reads that withhold them (ADR 0012).
+ * `chaos.` and `lab.` are here because a human operator reading the REST audit API
+ * sees the lab's rows — it is the AGENT's own MCP reads that withhold them (ADR 0012).
+ * They are two streams, not one: `chaos.` is a fault going in, `lab.` is the world
+ * being reset afterwards, and the `/demo` page reads the second as a boundary.
  */
 const ACTION_PREFIXES: ReadonlyArray<{ value: string; label: string }> = [
   { value: '', label: 'All actions' },
   { value: 'agent.', label: 'agent. — the agent’s MCP calls and run reports' },
   { value: 'chaos.', label: 'chaos. — the lab’s fault injection' },
+  { value: 'lab.', label: 'lab. — the world reset that ends a run' },
   { value: 'job.', label: 'job. — job lifecycle' },
   { value: 'event.', label: 'event. — the event-sourced mirror' },
   { value: 'saga.', label: 'saga. — saga lifecycle' },

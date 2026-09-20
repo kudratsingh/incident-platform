@@ -23,6 +23,16 @@
  * the disagreement is the interesting part: it is the shape of every incident
  * where the agent believes it fixed something it did not (INC-001..003).
  *
+ * **A reset is a boundary, and both witnesses are read only after it**
+ * (WO-R3-327). The audit log is append-only, so the rows of a previous take
+ * never go away: after `make eval-reset` the newest `chaos.*` row was still the
+ * last take's kill, and a freshly wiped world opened this page at `agent
+ * remediating` with a clock counting from an incident that no longer existed.
+ * The reset now appends one `lab.world_reset` row, and everything here reads
+ * rows and runs newer than the newest one. Nothing infers the boundary: it is
+ * stated, on the platform's own clock, in the same append-only place as the rows
+ * it bounds.
+ *
  * Everything here is a pure function of its inputs so the whole strip can be
  * driven from a fixture through every transition.
  */
@@ -85,12 +95,22 @@ export const PHASE_LABELS: Record<DemoPhase, string> = {
   escalated: 'escalated',
 }
 
-/** The audit action prefix the lab writes under. Withheld from the agent's own MCP reads (ADR 0012); a human operator reads it over REST. */
+/** The audit action prefix the lab injects faults under. Withheld from the agent's own MCP reads (ADR 0012); a human operator reads it over REST. */
 export const LAB_ACTION_PREFIX = 'chaos.'
 /** Every MCP call the agent makes, read or action alike. */
 export const AGENT_TOOL_ACTION = 'agent.tool_invoked'
 /** What the commander reports about its own run (ADR 0035). */
 export const AGENT_RUN_REPORT_ACTION = 'agent.run_reported'
+/**
+ * The boundary `make eval-reset` appends — one row per reset, payload = its counters
+ * (platform WO-R3-327, ADR 0012's 2026-09-20 amendment).
+ *
+ * Its own prefix rather than `chaos.` for the reason this page is the reason: the
+ * newest `chaos.*` row IS the fault here, so a reset filed under that prefix would
+ * be read as one. Withheld from the agent beside `chaos.`; this page reads REST as
+ * a human operator, so it sees it.
+ */
+export const WORLD_RESET_ACTION = 'lab.world_reset'
 
 /**
  * The Tier-1 action tools.
@@ -139,12 +159,42 @@ function isAgentToolRow(row: AuditLog): boolean {
   return row.action === AGENT_TOOL_ACTION
 }
 
+/** The one row that says a take is over. */
+export function isResetRow(row: AuditLog): boolean {
+  return row.action === WORLD_RESET_ACTION
+}
+
 function newest(rows: AuditLog[]): AuditLog | null {
   let best: AuditLog | null = null
   for (const row of rows) {
     if (best === null || row.created_at > best.created_at) best = row
   }
   return best
+}
+
+/**
+ * When the world was last reset, by the platform's own clock — or null on a stack
+ * that has not reset since the page's window of rows began.
+ *
+ * Null is "no boundary in what I can see", which is also what a pre-WO-R3-327 stack
+ * looks like: the page then behaves exactly as it did before, reading the whole
+ * history. That is the honest fallback — an inferred boundary would be a guess about
+ * which rows to discard.
+ */
+export function newestResetAt(audit: AuditLog[]): string | null {
+  return newest(audit.filter(isResetRow))?.created_at ?? null
+}
+
+/**
+ * The rows of the current take: strictly newer than the boundary.
+ *
+ * Strictly, not at-or-after, so a row sharing the boundary's timestamp belongs to the
+ * take being closed. The reset writes its row last, after every restoring step, so
+ * anything simultaneous with it is the world it just wound up.
+ */
+function sinceReset(audit: AuditLog[], resetAt: string | null): AuditLog[] {
+  if (resetAt === null) return audit
+  return audit.filter((row) => row.created_at > resetAt)
 }
 
 // ── the agent's own word ──────────────────────────────────────────────────────
@@ -188,6 +238,31 @@ export function agentPhase(run: AgentRun | null): AgentPhaseReading | null {
   return { phase, state: run.state }
 }
 
+/**
+ * The run this take is about: the newest one the boundary has not already closed out.
+ *
+ * `make eval-reset` closes every open run as `failed` with a `closed_by: reset` marker
+ * (platform WO-R3-315), so the previous take's runs are finished at or before the
+ * boundary and are dropped here. A run that is still OPEN and older than the boundary
+ * is deliberately KEPT: it is either a race with the reset's own sweep or a responder
+ * the reset could not reach, and on camera that is a disagreement worth seeing rather
+ * than a row to hide.
+ *
+ * Newest by `started_at`. More than one live run would mean two incidents at once,
+ * which the demo does not stage — but picking arbitrarily would be worse than picking
+ * the latest.
+ */
+export function runSinceReset(
+  runs: AgentRun[],
+  resetAt: string | null,
+): AgentRun | null {
+  const current = runs.filter(
+    (r) => resetAt === null || r.finished_at === null || r.finished_at > resetAt,
+  )
+  if (current.length === 0) return null
+  return [...current].sort((a, b) => (a.started_at < b.started_at ? 1 : -1))[0]
+}
+
 // ── the platform's own record ─────────────────────────────────────────────────
 
 export interface PlatformPhaseInput {
@@ -210,28 +285,42 @@ export interface PlatformPhaseReading {
   phase: DemoPhase
   /** When the lab injected the fault, by the platform's own clock. */
   faultAt: string | null
+  /** When the world was last reset — the boundary this reading was taken after. */
+  resetAt: string | null
   metricKnown: boolean
 }
 
 /**
- * When the lab last injected a fault, by the platform's own clock.
+ * When the lab last injected a fault *in the current take*, by the platform's own
+ * clock.
+ *
+ * Rows older than the newest `lab.world_reset` are a previous take and are not
+ * candidates, which is the whole of WO-R3-327: without that, a reset world still
+ * reported the last take's kill as its fault, and the header counted a clock from it.
  *
  * Exported because the page needs it BEFORE it can decide whether a breach has
  * been observed — the breach latch is per-fault, so a second take in one session
  * starts clean rather than inheriting the first take's recovery.
  */
 export function newestFaultAt(audit: AuditLog[]): string | null {
-  return newest(audit.filter(isLabRow))?.created_at ?? null
+  const resetAt = newestResetAt(audit)
+  return newest(sinceReset(audit, resetAt).filter(isLabRow))?.created_at ?? null
 }
 
 export function platformPhase(input: PlatformPhaseInput): PlatformPhaseReading {
-  const { audit, metricKnown, metricInsideThreshold, metricBreachedSinceFault } = input
+  const { metricKnown, metricInsideThreshold, metricBreachedSinceFault } = input
+  // Everything below reads the current take only. A boundary discards the previous
+  // take's fault, its investigation AND its remediation together — crediting one
+  // take's `restart_consumer_group` to the next one's fault would be the same lie in
+  // a different station.
+  const resetAt = newestResetAt(input.audit)
+  const audit = sinceReset(input.audit, resetAt)
   const fault = newest(audit.filter(isLabRow))
 
   if (fault === null) {
     // No lab row: nothing was injected, whatever else is happening. A healthy
     // world with an agent poking at it is still a healthy world.
-    return { phase: 'healthy', faultAt: null, metricKnown }
+    return { phase: 'healthy', faultAt: null, resetAt, metricKnown }
   }
   const faultAt = fault.created_at
 
@@ -239,7 +328,7 @@ export function platformPhase(input: PlatformPhaseInput): PlatformPhaseReading {
   // needs all three: a reading, a breach that really happened, and the reading
   // back inside the bar.
   if (metricKnown && metricBreachedSinceFault && metricInsideThreshold) {
-    return { phase: 'recovered', faultAt, metricKnown }
+    return { phase: 'recovered', faultAt, resetAt, metricKnown }
   }
 
   const sinceFault = audit.filter((r) => isAgentToolRow(r) && r.created_at >= faultAt)
@@ -247,11 +336,11 @@ export function platformPhase(input: PlatformPhaseInput): PlatformPhaseReading {
     const call = toolCall(row)
     return call !== null && ACTION_TOOLS.includes(call.tool)
   })
-  if (acted) return { phase: 'agent_remediating', faultAt, metricKnown }
+  if (acted) return { phase: 'agent_remediating', faultAt, resetAt, metricKnown }
   if (sinceFault.length > 0) {
-    return { phase: 'agent_investigating', faultAt, metricKnown }
+    return { phase: 'agent_investigating', faultAt, resetAt, metricKnown }
   }
-  return { phase: 'fault_injected', faultAt, metricKnown }
+  return { phase: 'fault_injected', faultAt, resetAt, metricKnown }
 }
 
 // ── the two together ─────────────────────────────────────────────────────────
@@ -311,12 +400,18 @@ export type DlqDecision = 'replay' | 'fence' | 'leave'
  * world, and attributing its seeding to the agent would badge every row the lab
  * planted as something the agent decided.
  *
+ * Rows older than the newest boundary are excluded for a sharper version of the same
+ * reason (WO-R3-327). The seeded dead-letter rows come back with *stable* ids, so a
+ * replay from the previous take names the same job id as the row this take just
+ * planted — and the badge would say the agent had already decided about a row it has
+ * not seen.
+ *
  * `leave` is the honest default. A row nothing touched has not been judged, and
  * for the `dlq_backlog` scenario leaving four of five rows alone is the correct
  * answer — so `leave` is a result, not a blank.
  */
 export function dlqDecision(job: Job, audit: AuditLog[]): DlqDecision {
-  const calls = audit
+  const calls = sinceReset(audit, newestResetAt(audit))
     .filter(isAgentToolRow)
     .map(toolCall)
     .filter((c): c is ToolCall => c !== null)

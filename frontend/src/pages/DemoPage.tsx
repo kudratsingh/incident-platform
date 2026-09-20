@@ -26,11 +26,18 @@
  *
  * What the two principals can see differs, and that difference is the demo's
  * point: this page reads the REST surface as a HUMAN operator, so it sees the
- * `chaos.*` rows the agent's own MCP reads withhold (ADR 0012) and the
- * `agent_runs` the agent cannot read at all (ADR 0035).
+ * `chaos.*` rows the agent's own MCP reads withhold (ADR 0012), the
+ * `lab.world_reset` boundary withheld beside them, and the `agent_runs` the agent
+ * cannot read at all (ADR 0035).
+ *
+ * A fourth rule joined the three above in WO-R3-327: **a reset is a boundary, and
+ * this page reads nothing older than the newest one.** `audit_logs` is append-only,
+ * so the previous take's rows never leave — and the strip, the clock, the agent card,
+ * the metric latch and the DLQ badges were all reading them. The reset states its own
+ * boundary; everything here is derived after it.
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import Layout from '../components/Layout'
 import ErrorState from '../components/ErrorState'
@@ -51,8 +58,11 @@ import {
   derivePhase,
   dlqDecision,
   isDemoMode,
+  isResetRow,
   newestFaultAt,
+  newestResetAt,
   phaseTimeline,
+  runSinceReset,
   toolCall,
 } from '../utils/demoPhase'
 import type { DemoMode, DemoPhase, DlqDecision, PhaseReading } from '../utils/demoPhase'
@@ -619,17 +629,28 @@ function AgentCard({
 
 // ──────────────────────────────────────────────────── the audit timeline (right)
 
-type AuditLane = 'lab' | 'agent_action' | 'agent_read' | 'agent_report' | 'human'
+type AuditLane =
+  | 'reset'
+  | 'lab'
+  | 'agent_action'
+  | 'agent_read'
+  | 'agent_report'
+  | 'human'
 type AuditFilter = 'all' | 'agent' | 'lab' | 'human'
 
 /**
  * Which stream a row belongs to.
  *
- * `chaos.*` is checked first and on the ACTION, not the principal: the
+ * The reset is checked before anything else: it is lab activity, but it is the one
+ * row that is not *about* the world — it is about the timeline itself, so the
+ * timeline draws it as a line rather than as an event.
+ *
+ * `chaos.*` is checked next and on the ACTION, not the principal: the
  * evaluator is a service account too, so a principal-only test would file the
  * lab's own rows under "agent" and make the fault look like the agent's doing.
  */
 export function auditLane(row: AuditLog): AuditLane {
+  if (isResetRow(row)) return 'reset'
   if (row.action.startsWith(LAB_ACTION_PREFIX)) return 'lab'
   if (row.action === AGENT_RUN_REPORT_ACTION) return 'agent_report'
   if (row.action === AGENT_TOOL_ACTION) {
@@ -645,11 +666,23 @@ export function auditLane(row: AuditLog): AuditLane {
 const LANE_OF_FILTER: Record<AuditFilter, AuditLane[] | null> = {
   all: null,
   agent: ['agent_action', 'agent_read', 'agent_report'],
-  lab: ['lab'],
+  // `reset` is here because the boundary IS lab activity, and this table is where
+  // that belongs. The timeline lifts reset rows out before it filters lanes, so the
+  // entry is not what puts the divider on screen — it is what keeps this table
+  // truthful if that ever changes.
+  lab: ['lab', 'reset'],
   human: ['human'],
 }
 
-/** What the chip asks the API for, so a filtered view does not page through rows it will drop. */
+/**
+ * What the chip asks the API for, so a filtered view does not page through rows it
+ * will drop.
+ *
+ * The `lab` chip narrows to `chaos.` — the faults. The boundary has a different
+ * prefix and one server-side filter cannot carry both, but it is drawn from the
+ * unfiltered stream this page always fetches, so the line is on screen under every
+ * chip.
+ */
 export function auditQuery(filter: AuditFilter): AuditListParams {
   switch (filter) {
     case 'lab':
@@ -664,6 +697,9 @@ export function auditQuery(filter: AuditFilter): AuditListParams {
 }
 
 const LANE_STYLES: Record<AuditLane, string> = {
+  // Grey, and the only lane with no colour: a boundary is not something that
+  // happened to the world, it is where one take stops and the next begins.
+  reset: 'border-gray-700 bg-gray-800/30',
   lab: 'border-amber-600/50 bg-amber-900/15',
   agent_action: 'border-blue-600/50 bg-blue-900/15',
   agent_read: 'border-gray-700 bg-gray-800/30',
@@ -759,8 +795,34 @@ function CollapsedGroup({ group }: { group: AuditGroup }) {
   )
 }
 
+/**
+ * The boundary, drawn as a line rather than an event.
+ *
+ * Grey and unlabelled by any actor: nothing happened to the world here, this is
+ * where the previous take ends. Everything below it on screen is a take that is over
+ * — which is exactly what the page needed to be able to say, because the rows are
+ * append-only and never stop being there.
+ */
+function ResetDivider({ at }: { at: string }) {
+  return (
+    <div
+      data-testid="audit-reset-divider"
+      role="separator"
+      aria-label="world reset"
+      className="flex items-center gap-2 py-1"
+    >
+      <span className="flex-1 border-t border-gray-700" />
+      <span className="text-[10px] uppercase tracking-wider font-mono text-gray-500 whitespace-nowrap">
+        world reset · {clockTime(at)}
+      </span>
+      <span className="flex-1 border-t border-gray-700" />
+    </div>
+  )
+}
+
 function AuditTimeline({
   rows,
+  resetAt,
   filter,
   onFilter,
   loading,
@@ -768,6 +830,8 @@ function AuditTimeline({
   onRetry,
 }: {
   rows: AuditLog[]
+  /** From the UNFILTERED stream, so the line is on screen whatever chip is on. */
+  resetAt: string | null
   filter: AuditFilter
   onFilter: (f: AuditFilter) => void
   loading: boolean
@@ -775,11 +839,34 @@ function AuditTimeline({
   onRetry: () => void
 }) {
   const lanes = LANE_OF_FILTER[filter]
-  const shown = useMemo(() => {
-    const sorted = [...rows].sort((a, b) => (a.created_at < b.created_at ? 1 : -1))
-    return lanes === null ? sorted : sorted.filter((r) => lanes.includes(auditLane(r)))
-  }, [rows, lanes])
-  const groups = useMemo(() => groupAuditRows(shown), [shown])
+  // Split at the boundary BEFORE grouping, so a run of collapsible reads cannot
+  // straddle it and hide the line inside a "N reads" group.
+  const { after, before } = useMemo(() => {
+    const sorted = [...rows]
+      .sort((a, b) => (a.created_at < b.created_at ? 1 : -1))
+      // The boundary row itself is the divider; rendering both would draw it twice.
+      .filter((r) => !isResetRow(r))
+    const visible =
+      lanes === null ? sorted : sorted.filter((r) => lanes.includes(auditLane(r)))
+    if (resetAt === null) return { after: visible, before: [] as AuditLog[] }
+    return {
+      after: visible.filter((r) => r.created_at > resetAt),
+      before: visible.filter((r) => r.created_at <= resetAt),
+    }
+  }, [rows, lanes, resetAt])
+  const afterGroups = useMemo(() => groupAuditRows(after), [after])
+  const beforeGroups = useMemo(() => groupAuditRows(before), [before])
+
+  function renderGroup(group: AuditGroup, i: number) {
+    return group.lane === 'agent_read' || group.lane === 'agent_report' ? (
+      <CollapsedGroup key={`${group.lane}-${i}`} group={group} />
+    ) : (
+      <AuditRow key={group.rows[0].id} row={group.rows[0]} lane={group.lane} />
+    )
+  }
+
+  const empty =
+    afterGroups.length === 0 && beforeGroups.length === 0 && resetAt === null
 
   return (
     <div
@@ -805,22 +892,28 @@ function AuditTimeline({
         <ErrorState message={error} onRetry={onRetry} className="py-3" />
       ) : loading && rows.length === 0 ? (
         <p className="text-[11px] text-gray-600">Loading…</p>
-      ) : groups.length === 0 ? (
+      ) : empty ? (
         <p className="text-[11px] text-gray-600">No audit rows yet for this filter.</p>
       ) : (
         <div className="space-y-1 max-h-[32rem] overflow-y-auto pr-1">
-          {groups.map((group, i) =>
-            group.lane === 'agent_read' || group.lane === 'agent_report' ? (
-              <CollapsedGroup key={`${group.lane}-${i}`} group={group} />
-            ) : (
-              <AuditRow key={group.rows[0].id} row={group.rows[0]} lane={group.lane} />
-            ),
-          )}
+          {afterGroups.map((group, i) => (
+            <Fragment key={`after-${group.lane}-${i}`}>{renderGroup(group, i)}</Fragment>
+          ))}
+          {/* Newest first, so the line sits between this take and the last one. With
+              nothing above it yet, a reset world opens on the boundary alone — which
+              is the truthful first frame of a recording. */}
+          {resetAt !== null && <ResetDivider at={resetAt} />}
+          {beforeGroups.map((group, i) => (
+            <Fragment key={`before-${group.lane}-${i}`}>
+              {renderGroup(group, i)}
+            </Fragment>
+          ))}
         </div>
       )}
       <p className="text-[10px] text-gray-700 font-mono mt-2">
         GET /api/v1/audit/logs — a human operator sees the lab's rows here; the
-        agent's own MCP reads do not (ADR 0012).
+        agent's own MCP reads do not (ADR 0012). Rows below the grey line are a
+        previous take.
       </p>
     </div>
   )
@@ -1051,16 +1144,9 @@ export default function DemoPage() {
   const runs = usePolling(loadRuns, POLL_MS, {
     errorMessage: 'Could not read the agent’s run.',
   })
-  // Newest active run. The endpoint already answers newest first; the sort is
-  // here because "newest" is the only thing that makes this a single-run panel,
-  // and more than one active run would mean two incidents at once — which the
-  // demo does not stage, but which must not silently pick an arbitrary one.
-  const run: AgentRun | null = useMemo(() => {
-    const items = runs.data?.items ?? []
-    return items.length === 0
-      ? null
-      : [...items].sort((a, b) => (a.started_at < b.started_at ? 1 : -1))[0]
-  }, [runs.data])
+  // The run this take is about is derived further down, once the boundary is known:
+  // the reset closes the previous take's runs, and the card must not show them
+  // (WO-R3-327).
 
   const loadLag = useCallback(() => adminApi.consumerLag(), [])
   const lag = usePolling(loadLag, POLL_MS, {
@@ -1112,6 +1198,21 @@ export default function DemoPage() {
   // Memoized because the phase strip and the DLQ badges derive from it: a fresh
   // `[]` on every render would re-run every downstream useMemo every render.
   const auditRows = useMemo(() => audit.data?.items ?? [], [audit.data])
+
+  // The boundary. Everything derived below reads the current take only: rows and runs
+  // older than the newest `lab.world_reset` belong to a take that is over, and before
+  // WO-R3-327 they were what a freshly reset world opened this page with.
+  const resetAt = useMemo(() => newestResetAt(auditRows), [auditRows])
+
+  // Newest run of the current take. The endpoint already answers newest first; the
+  // sort inside `runSinceReset` is there because "newest" is the only thing that makes
+  // this a single-run panel, and more than one live run would mean two incidents at
+  // once — which the demo does not stage, but which must not silently pick an
+  // arbitrary one.
+  const run: AgentRun | null = useMemo(
+    () => runSinceReset(runs.data?.items ?? [], resetAt),
+    [runs.data, resetAt],
+  )
 
   // The filtered view, narrowed server-side. Only fetched when a chip is on;
   // the render filters as well, so the two can never show different rows.
@@ -1167,13 +1268,15 @@ export default function DemoPage() {
   // take's recovery. Mutating the ref during render is safe here: the update is
   // idempotent, schedules nothing, and the render that flips it already reads
   // the flipped value.
+  //
+  // Keyed on the boundary as well as the fault (WO-R3-327). A reset with no new fault
+  // yet leaves `faultAt` null, so keying on the fault alone would hold a latch set in
+  // the previous take across a world that no longer has the breach in it.
   const faultAt = useMemo(() => newestFaultAt(auditRows), [auditRows])
-  const breach = useRef<{ faultAt: string | null; seen: boolean }>({
-    faultAt: null,
-    seen: false,
-  })
-  if (breach.current.faultAt !== faultAt) {
-    breach.current = { faultAt, seen: false }
+  const takeKey = `${resetAt ?? ''}|${faultAt ?? ''}`
+  const breach = useRef<{ take: string; seen: boolean }>({ take: '', seen: false })
+  if (breach.current.take !== takeKey) {
+    breach.current = { take: takeKey, seen: false }
   }
   if (faultAt !== null && metricKnown && metricValue !== null && !metricInside) {
     breach.current.seen = true
@@ -1333,6 +1436,7 @@ export default function DemoPage() {
           </h2>
           <AuditTimeline
             rows={viewRows}
+            resetAt={resetAt}
             filter={auditFilter}
             onFilter={setAuditFilter}
             loading={
