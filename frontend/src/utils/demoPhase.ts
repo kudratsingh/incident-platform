@@ -936,7 +936,9 @@ export function chartMarkers(input: ChartMarkerInput): ChartMarker[] {
   const stepActions = input.steps.filter((s) => s.kind === 'action')
   if (stepActions.length > 0) {
     for (const step of stepActions) {
-      add(step.at, 'action', step.tool, `step ${String(step.seq)}`)
+      // A step with no tool name is still a Tier-1 action the run reported; the
+      // marker names it by its sequence rather than inventing a tool.
+      add(step.at, 'action', step.tool ?? `step ${String(step.seq)}`, `step ${String(step.seq)}`)
     }
   } else {
     // No steps reported: the audit log still knows an action happened, it just

@@ -134,15 +134,19 @@ describe('rankedHypotheses — the panel the first take could not fill', () => {
     expect(hypothesesSource(null)).toBe('none')
   })
 
-  it('carries the ranked list, highest confidence first', () => {
+  it('carries the list in the order the responder sent it — the order IS the ranking', () => {
+    // Deliberately not in confidence order. The platform stores the list best
+    // first (WO-R3-328) and `confidence` is a number the responder attached, so
+    // re-sorting here would silently disagree with the run about what it thought
+    // most likely.
     const run = baseRun({
       hypotheses: [
         { name: 'b', category: 'cache', confidence: 0.2, reasoning_excerpt: 'weak' },
         { name: 'a', category: 'consumer', confidence: 0.7, reasoning_excerpt: 'lag is 42' },
       ],
     })
-    expect(rankedHypotheses(run).map((h) => h.name)).toEqual(['a', 'b'])
-    expect(rankedHypotheses(run)[0].reasoning_excerpt).toBe('lag is 42')
+    expect(rankedHypotheses(run).map((h) => h.name)).toEqual(['b', 'a'])
+    expect(rankedHypotheses(run)[1].reasoning_excerpt).toBe('lag is 42')
     expect(hypothesesSource(run)).toBe('ranked')
   })
 
@@ -299,6 +303,18 @@ describe('buildLedger — the run’s own actions, with the lab interleaved', ()
     })
     const ledger = buildLedger({ steps: [], audit: [invoked, reported, fault] })
     expect(ledger.map((e) => e.kind)).toEqual(['agent_report', 'agent_audit', 'lab'])
+  })
+
+  it('places a step with no time of its own by the steps around it', () => {
+    // Every field but `seq` and `kind` can be null. `seq` is the order it
+    // happened in, which is what a ledger is for, so a step with no timestamp is
+    // placed rather than dropped.
+    const timeless = [
+      step(1, 'read', 'get_consumer_lag', '2026-09-19T10:01:00Z'),
+      { ...step(2, 'action', 'restart_consumer_group', '2026-09-19T10:02:00Z'), at: null },
+    ]
+    const ledger = buildLedger({ steps: timeless, audit: [fault] })
+    expect(ledger.map((e) => e.step?.seq ?? null)).toEqual([2, 1, null])
   })
 
   it('keeps a human’s own row, which is neither the lab nor the agent', () => {

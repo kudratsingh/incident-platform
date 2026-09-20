@@ -210,6 +210,10 @@ interface Fixture {
   lag?: number
   /** Newest-first, as the endpoint promises. */
   samples?: LagSample[]
+  /** The platform's own window, which the chart labels its axis from. */
+  windowSeconds?: number
+  intervalSeconds?: number
+  stepsDropped?: number
   dlqTotal?: number
 }
 
@@ -227,16 +231,25 @@ function stub(f: Fixture = {}) {
   listAgentRuns.mockResolvedValue(page(runs))
   if (f.detailError) getAgentRun.mockRejectedValue(f.detailError)
   else getAgentRun.mockResolvedValue((f.detail ?? runs[0] ?? null) as AgentRun)
+  const steps = f.steps ?? []
   agentRunSteps.mockResolvedValue({
     run_id: runs[0]?.id ?? 'run-1',
-    items: f.steps ?? [],
-    max_seq: (f.steps ?? []).length,
-    steps_dropped: 0,
+    state: runs[0]?.state ?? 'investigating',
+    finished_at: runs[0]?.finished_at ?? null,
+    // Ascending by seq, as the endpoint promises.
+    steps: [...steps].sort((a, b) => a.seq - b.seq),
+    returned: steps.length,
+    total: steps.length,
+    steps_dropped: f.stepsDropped ?? 0,
+    after_seq: null,
+    next_after_seq: steps.length === 0 ? null : Math.max(...steps.map((s) => s.seq)),
   })
   consumerLag.mockResolvedValue({
     measured_at: '2026-09-19T10:02:00Z',
     total: 1,
     live_group: 'worker-dispatcher',
+    sample_window_seconds: f.windowSeconds ?? 900,
+    sample_interval_seconds: f.intervalSeconds ?? 60,
     groups: [
       {
         consumer_group: 'worker-dispatcher',
@@ -776,6 +789,140 @@ describe('DemoPage — the action ledger', () => {
     })
     const kinds = screen.getAllByTestId('ledger-entry').map((e) => e.dataset.kind)
     expect(kinds).toContain('agent_audit')
+  })
+})
+
+describe('DemoPage — the shapes WO-R3-328 actually ships', () => {
+  const steps = [
+    step(1, 'read', 'get_consumer_lag', '2026-09-19T10:01:00Z'),
+    step(2, 'action', 'restart_consumer_group', '2026-09-19T10:02:00Z'),
+  ]
+
+  it('never reads the ledger from a list row', async () => {
+    // The LISTING omits `steps` — absent, not emptied, because an empty list
+    // there would read as "this run made no calls". A row that carried them
+    // anyway must not reach the ledger: the detail and the tail read are the
+    // only sources.
+    const listRow = {
+      ...agentRun(),
+      steps: [step(99, 'action', 'replay_dlq_by_ids', '2026-09-19T10:09:00Z')],
+    }
+    stub({ runs: [listRow], detail: agentRun(), steps })
+    renderDemo()
+    await screen.findByTestId('action-ledger')
+    await waitFor(() => {
+      expect(screen.getAllByTestId('ledger-entry').length).toBeGreaterThan(0)
+    })
+    expect(screen.getByTestId('action-ledger').textContent).not.toContain(
+      'replay_dlq_by_ids',
+    )
+  })
+
+  it('polls the tail with the platform’s own cursor, not one it computed', async () => {
+    // `next_after_seq` is the highest seq STORED, so a poll that returns nothing
+    // still advances; recomputing it from what arrived would re-read the tail.
+    vi.useFakeTimers()
+    stub({ runs: [agentRun()], steps })
+    agentRunSteps.mockResolvedValue({
+      run_id: 'run-1',
+      state: 'investigating',
+      finished_at: null,
+      steps,
+      returned: 2,
+      total: 2,
+      steps_dropped: 0,
+      after_seq: null,
+      next_after_seq: 7,
+    })
+    renderDemo()
+    await vi.waitFor(() => {
+      expect(agentRunSteps).toHaveBeenCalledWith('run-1', null)
+    })
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3000)
+    })
+    expect(agentRunSteps).toHaveBeenCalledWith('run-1', 7)
+  })
+
+  it('reports the cap’s dropped steps from the ledger reply', async () => {
+    stub({ runs: [agentRun()], steps, stepsDropped: 12 })
+    renderDemo()
+    await screen.findByTestId('action-ledger')
+    await waitFor(() => {
+      expect(screen.getByTestId('action-ledger').textContent).toMatch(
+        /12 earlier steps dropped/,
+      )
+    })
+  })
+
+  it('keeps the responder’s own hypothesis order — the order IS the ranking', async () => {
+    // Deliberately out of confidence order: the platform stores what the
+    // responder sent, best first, and a reader that re-sorted would disagree
+    // with the run about what it thought most likely.
+    const run = agentRun({
+      hypotheses: [
+        { name: 'first as sent', category: 'consumer', confidence: 0.4 },
+        { name: 'second as sent', category: 'cache', confidence: 0.9 },
+      ],
+    })
+    stub({ runs: [run], detail: run })
+    renderDemo()
+    await screen.findByTestId('agent-panel')
+    await waitFor(() => {
+      expect(screen.getAllByTestId('hypothesis-row')).toHaveLength(2)
+    })
+    const names = screen.getAllByTestId('hypothesis-row').map((r) => r.textContent)
+    expect(names[0]).toContain('first as sent')
+    expect(names[1]).toContain('second as sent')
+  })
+
+  it('labels the chart’s axis from the reply’s own window', async () => {
+    stub({ windowSeconds: 600, intervalSeconds: 30 })
+    renderDemo()
+    const chart = await screen.findByTestId('metric-chart-lag')
+    await waitFor(() => {
+      expect(chart.textContent).toMatch(/10 minutes/)
+    })
+    expect(chart.textContent).toMatch(/one every 30s/)
+    expect(chart.textContent).toMatch(/−10 min/)
+  })
+
+  it('renders a step with no tool and no time rather than dropping it', async () => {
+    // Every field but `seq` and `kind` can be null: the step is the responder's
+    // own account of its call and the platform fills nothing in.
+    const bare: AgentRunStepRecord = {
+      seq: 1,
+      kind: 'read',
+      tool: null,
+      at: null,
+      arguments: null,
+      result_excerpt: null,
+      outcome: null,
+      latency_ms: null,
+    }
+    stub({ runs: [agentRun()], steps: [bare] })
+    renderDemo()
+    await screen.findByTestId('action-ledger')
+    await waitFor(() => {
+      expect(screen.getAllByTestId('ledger-entry').length).toBe(1)
+    })
+    const entry = screen.getAllByTestId('ledger-entry')[0]
+    expect(entry.textContent).toMatch(/no tool reported/)
+    expect(entry.textContent).toMatch(/no time reported/)
+  })
+
+  it('renders an unknown verify verdict verbatim', async () => {
+    const run = agentRun({
+      verifications: [{ verdict: 'verified_unresolved', attempt: 1, of: 2 }],
+    })
+    stub({ runs: [run], detail: run })
+    renderDemo()
+    await screen.findByTestId('agent-panel')
+    await waitFor(() => {
+      expect(screen.getAllByTestId('verification-row')[0].textContent).toContain(
+        'verified_unresolved',
+      )
+    })
   })
 })
 

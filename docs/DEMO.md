@@ -20,7 +20,7 @@ and resets the world — lives in the commander repo (`scripts/demo_live.py`,
 | **Run** | `?run=<id>`; the default is the newest run since the reset boundary, and the selector lists every run of the take |
 | **Cadence** | every panel polls every **2 s** through `usePolling`, so no two panels disagree about *now*; alerts and breakers poll at 10 s |
 | **Code** | `frontend/src/pages/DemoPage.tsx`, with every derivation in `frontend/src/utils/demoPhase.ts` (the incident) and `frontend/src/utils/demoRun.ts` (the run record) — all pure functions, all driven from fixtures in `src/test/demoPhase.test.ts`, `src/test/demoRun.test.ts` and `src/test/DemoPage.test.tsx` |
-| **Backend** | the shapes WO-R3-328 added to `agent_runs` and to the read endpoints (→ platform v0.6.16) |
+| **Backend** | the shapes WO-R3-328 added to `agent_runs` and to the read endpoints (plat #230, → v0.6.16): the ranked `hypotheses`, `plan`, `verification`/`verifications`, `steps` with `steps_dropped`, `budget`; `GET /admin/agent-runs/{id}/steps?after_seq=`; the 15-minute lag window with `sample_window_seconds` / `sample_interval_seconds`; comma-list `action_prefix` and `exclude_prefix` on the human audit filter |
 
 Layout, at 1440×900 with no scroll for the top half:
 
@@ -166,13 +166,17 @@ One series, one axis, 15 minutes wide.
 | `consumer_outage` | `GET /admin/consumer-lag`, the `worker-dispatcher` group (only when `lag_known`) | **20** | `remediate_consumer_lag_success` polls until lag ≥ 20 before the agent starts, so below 20 is the world back inside its bar |
 | `dlq_backlog` | `GET /admin/dlq/stats`, `total` | **4** | `remediate_dlq_backlog_success` seeds 5 dead letters of which exactly one is replay-safe and grades on `replayed == 1`; four rows left is the fixed world |
 
-**The lag window is the platform's own.** Since WO-R3-328 `recent_samples` carries
-the last 15 minutes — one sample per metrics tick, the same reading the agent gets —
-so the line is the platform's history rather than whatever this browser happened to
-observe. It arrives **newest first** and is reversed before it is drawn; fed in as
-given, the series' own span goes negative and every point lands off the left edge.
-`live_group` names the one group whose number actually moves; the page reads
-`worker-dispatcher` by name and falls back to `live_group`, in that order.
+**The lag window is the platform's own, and so is the axis.** Since WO-R3-328
+`recent_samples` carries about 15 minutes — one sample per metrics pass, the same
+reading the agent gets — and the reply states its own shape in
+`sample_window_seconds` (900) and `sample_interval_seconds` (60). The chart takes
+both from the answer rather than hard-coding them, so the axis says "−10 min, one
+every 30s" if the platform's cadence ever changes, instead of mislabelling a
+window it no longer has. `recent_samples` arrives **newest first** and is reversed
+before it is drawn; fed in as given, the series' own span goes negative and every
+point lands off the left edge. `live_group` names the one group whose number
+actually moves; the page reads `worker-dispatcher` by name and falls back to
+`live_group`, in that order.
 
 **DLQ depth has no server-side history** — the endpoint is one number — so in
 `dlq_backlog` mode the line is what *this page* has observed since it opened, and the
@@ -225,11 +229,18 @@ the end.
 | **budget** | `budget` — calls used against the cap, tokens, dollars, wall seconds | "not reported"; a bar with no cap is a bar with an invented denominator, so there is none |
 | **hypotheses, ranked** | `hypotheses[]` — name, category, confidence bar, reasoning excerpt (≤ 280 chars) | "None reported yet". Where only `current_hypothesis` exists it becomes a one-entry list **and the panel says so**: that is a commander older than WO-R3-329, not a run that ranked nothing |
 | **the plan** | `plan` — tool, arguments, the hypothesis it is aimed at, the rationale excerpt | "No action planned yet" |
-| **verification** | `verifications[]` — every verify poll's verdict, attempt *n* of *m*, and its reasoning | "Nothing verified yet"; where only the latest `verification` exists, that one row |
+| **verification** | `verifications[]` — every verify poll's verdict, attempt *n* of *m*, and its reasoning; capped at 50, and the panel says so when it is full | "Nothing verified yet"; where only the latest `verification` exists, that one row |
+
+**The hypothesis list is rendered in the order it arrives, not sorted.** The
+platform stores it best first and states that the order *is* the ranking;
+`confidence` is a number the responder attached to each entry. A reader that
+re-sorted by it would silently disagree with the run about what it thought most
+likely, and it is the run's opinion this panel exists to show.
 
 The verdict vocabulary the commander writes today is `verified`, `not_verified`,
-`verified_stabilizer` and `verified_unresolved`; an unknown verdict renders verbatim
-in a neutral badge rather than being guessed at.
+`verified_stabilizer` and `verified_unresolved`, but `verdict` is an **open string**
+on the wire: an unknown one renders verbatim in a neutral badge rather than being
+guessed at or dropped.
 
 ---
 
@@ -244,6 +255,25 @@ That excerpt is the whole reason the ledger is built from steps: an
 **no result**, so "what did the agent see" could not be shown from the audit log at
 all. Where a run reported no steps the ledger falls back to those rows, labels
 itself as doing so, and the rows say plainly that the audit log records no result.
+
+Three things about the source, all of them WO-R3-328's rules rather than choices
+this page made:
+
+- **The ledger is never read from a list row.** `GET /admin/agent-runs` returns a
+  summary that *omits* `steps` — absent, not emptied, because a page of 100 runs ×
+  200 entries is megabytes and an empty list would read as "this run made no
+  calls". It comes from `GET /admin/agent-runs/{id}` (the whole ledger, once) and
+  `.../steps?after_seq=` (the tail, every two seconds), merged by `seq`.
+- **The tail read's cursor is the platform's.** `next_after_seq` is the highest
+  `seq` *stored*, not the highest returned, so a poll that finds nothing still
+  advances; recomputing it from what arrived would re-read the tail forever.
+- **Every field but `seq` and `kind` can be null.** A step is the responder's own
+  account of a call it made and the platform fills nothing in, so a step with no
+  tool name or no timestamp is rendered as such — and placed in the ledger by its
+  `seq`, which is the order it happened in.
+
+The ledger holds the newest **200** steps; `steps_dropped` says how many the cap
+discarded, and the panel reports it above the rows.
 
 Interleaved by time, from the same audit stream the rest of the page derives from:
 
@@ -270,8 +300,7 @@ crowd out a derivation.
 **Both witnesses are counted**, in one line above the rows: *N steps reported · M
 calls the platform recorded*. The reporter is fail-open by design (commander
 invariant 5), so it can stop reporting without the run noticing; when the two counts
-disagree the line says so. `steps_dropped` (the platform's 200-step cap) is reported
-the same way.
+disagree the line says so.
 
 ---
 

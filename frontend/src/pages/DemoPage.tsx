@@ -99,8 +99,16 @@ const POLL_MS = 2000
 const SLOW_POLL_MS = 10_000
 /** The group the `consumer_outage` scenario is about. */
 const DISPATCHER_GROUP = 'worker-dispatcher'
-/** The chart's window — the platform's own, since WO-R3-328. */
+/**
+ * The chart's window when the reply does not state one.
+ *
+ * `/admin/consumer-lag` carries `sample_window_seconds` and
+ * `sample_interval_seconds` since WO-R3-328, and the chart labels its axis from
+ * those; this is the fallback for an older stack, not the number to trust.
+ */
 const WINDOW_MS = 15 * 60 * 1000
+/** The platform's cap on `verifications` — past it the oldest are dropped. */
+const VERIFICATIONS_CAP = 50
 /** Enough rows for a whole take once the job events are out of the way. */
 const AUDIT_ROWS = 100
 /**
@@ -546,7 +554,8 @@ function MetricChart({
             className="fill-gray-500"
             style={{ fontSize: '11px' }}
           >
-            {clockTime(new Date(windowStart).toISOString())} (−15 min)
+            {clockTime(new Date(windowStart).toISOString())} (−
+            {Math.round((windowEnd - windowStart) / 60_000)} min)
           </text>
           <text
             x={PAD.l + plotW}
@@ -966,13 +975,21 @@ function AgentPanel({
             ))}
           </ul>
         )}
+        {verifications.length >= VERIFICATIONS_CAP && (
+          <p className="text-xs text-amber-300/90 mt-1">
+            The oldest verdicts past {VERIFICATIONS_CAP} are dropped by the platform&rsquo;s
+            cap, so this list is the newest part of the run.
+          </p>
+        )}
       </div>
 
       <p className="text-xs text-gray-600 font-mono">
         GET /admin/agent-runs/{shortId(run.id)} — last step{' '}
         {lastStep === null
           ? 'none reported'
-          : `#${String(lastStep.seq)} ${lastStep.tool} at ${clockTime(lastStep.at)}`}
+          : `#${String(lastStep.seq)} ${lastStep.tool ?? lastStep.kind}${
+              lastStep.at === null ? '' : ` at ${clockTime(lastStep.at)}`
+            }`}
       </p>
     </section>
   )
@@ -1001,7 +1018,12 @@ const LEDGER_TONE: Record<LedgerKind, string> = {
 
 function StepEntry({ step }: { step: AgentRunStepRecord }) {
   const [open, setOpen] = useState(false)
-  const badge = KIND_BADGE[step.kind] ?? KIND_BADGE.read
+  // `kind` is an open string on the wire; an unrecognised one is shown verbatim
+  // rather than dressed up as a read.
+  const badge = KIND_BADGE[step.kind] ?? {
+    label: step.kind.toUpperCase(),
+    className: 'bg-gray-700/50 text-gray-300 border-gray-600',
+  }
   const args = compactJson(step.arguments)
   const excerpt = step.result_excerpt
   const failed = step.outcome != null && step.outcome !== 'success'
@@ -1019,10 +1041,14 @@ function StepEntry({ step }: { step: AgentRunStepRecord }) {
           {badge.label}
         </span>
         <span className="text-xs font-mono text-gray-600">#{step.seq}</span>
-        <span className="text-xs font-mono text-gray-500 ml-auto">{clockTime(step.at)}</span>
+        <span className="text-xs font-mono text-gray-500 ml-auto">
+          {/* Every field but `seq` and `kind` can be null: this is the
+              responder's account of its own call and the platform fills nothing in. */}
+          {step.at === null ? 'no time reported' : clockTime(step.at)}
+        </span>
       </div>
       <p className="text-sm font-mono text-gray-100 break-all leading-snug mt-0.5">
-        {step.tool}
+        {step.tool ?? 'no tool reported'}
       </p>
       {args !== null && (
         <pre className="text-xs font-mono text-gray-400 whitespace-pre-wrap break-all mt-1">
@@ -1707,7 +1733,8 @@ export default function DemoPage() {
   const listedRun = useMemo(() => selectRun(takeRuns, wantedRun), [takeRuns, wantedRun])
   const runId = listedRun?.id ?? null
 
-  // The detail carries everything the list summary does not.
+  // The detail carries everything the list summary does not — the ledger above
+  // all, which the LISTING omits rather than empties (WO-R3-328).
   const loadRunDetail = useCallback(
     () => (runId === null ? Promise.resolve(null) : adminApi.getAgentRun(runId)),
     [runId],
@@ -1716,25 +1743,30 @@ export default function DemoPage() {
     enabled: runId !== null,
     errorMessage: 'Could not read the run.',
   })
-  // The list row is the fallback: on a stack whose detail endpoint predates
-  // WO-R3-328 the summary is all there is, and the panels degrade rather than empty.
+  // The list row is the fallback for the run's own fields while the first detail
+  // answer is in flight. It never contributes steps: the listing has none, and an
+  // empty list there means "not sent", not "this run made no calls".
   const run: AgentRun | null = runDetail.data ?? listedRun
 
-  // The steps, merged from both sources and reset when the run changes.
-  const [stepStore, setStepStore] = useState<{ runId: string | null; steps: AgentRunStepRecord[] }>(
-    { runId: null, steps: [] },
-  )
+  // The steps, merged from the two reads that carry them, reset on a run change.
+  const [stepStore, setStepStore] = useState<{
+    runId: string | null
+    steps: AgentRunStepRecord[]
+    /** The platform's own cursor, echoed back on the next poll. */
+    cursor: number | null
+    dropped: number
+  }>({ runId: null, steps: [], cursor: null, dropped: 0 })
   // Memoized on the store so the panels' own memos do not re-run every render
   // while a run switch is still in flight.
   const steps = useMemo(
     () => (stepStore.runId === runId ? stepStore.steps : []),
     [stepStore, runId],
   )
-  const maxSeq = steps.length === 0 ? 0 : steps[steps.length - 1].seq
+  const cursor = stepStore.runId === runId ? stepStore.cursor : null
 
   const loadSteps = useCallback(
-    () => (runId === null ? Promise.resolve(null) : adminApi.agentRunSteps(runId, maxSeq)),
-    [runId, maxSeq],
+    () => (runId === null ? Promise.resolve(null) : adminApi.agentRunSteps(runId, cursor)),
+    [runId, cursor],
   )
   const stepPoll = usePolling(loadSteps, POLL_MS, {
     enabled: runId !== null,
@@ -1742,12 +1774,19 @@ export default function DemoPage() {
   })
 
   useEffect(() => {
-    const incoming = [...(runDetail.data?.steps ?? []), ...(stepPoll.data?.items ?? [])]
     if (runId === null) return
+    const tail = stepPoll.data
+    const incoming = [...(runDetail.data?.steps ?? []), ...(tail?.steps ?? [])]
+    // The platform's cursor, not one computed from what arrived: `next_after_seq`
+    // is the highest `seq` STORED, so a poll that returns nothing still advances.
+    const nextCursor = tail?.next_after_seq ?? null
+    const dropped = tail?.steps_dropped ?? runDetail.data?.steps_dropped ?? 0
     setStepStore((prev) => {
       const base = prev.runId === runId ? prev.steps : []
       if (incoming.length === 0) {
-        return prev.runId === runId ? prev : { runId, steps: [] }
+        return prev.runId === runId && prev.cursor === nextCursor && prev.dropped === dropped
+          ? prev
+          : { runId, steps: base, cursor: nextCursor, dropped }
       }
       const merged = mergeSteps(base, incoming)
       // The detail poll re-sends the whole list every two seconds, so compare
@@ -1755,6 +1794,8 @@ export default function DemoPage() {
       // with an equal array and re-runs every panel's memo for nothing.
       const unchanged =
         prev.runId === runId &&
+        prev.cursor === nextCursor &&
+        prev.dropped === dropped &&
         merged.length === base.length &&
         merged.every(
           (s, i) =>
@@ -1763,7 +1804,7 @@ export default function DemoPage() {
             s.result_excerpt === base[i].result_excerpt &&
             s.outcome === base[i].outcome,
         )
-      return unchanged ? prev : { runId, steps: merged }
+      return unchanged ? prev : { runId, steps: merged, cursor: nextCursor, dropped }
     })
   }, [runId, runDetail.data, stepPoll.data])
 
@@ -1818,6 +1859,8 @@ export default function DemoPage() {
         (s) => Date.now() - s.t <= WINDOW_MS,
       ),
     )
+    // Trimmed to the same nominal window as the lag chart so the two read alike;
+    // this one is the page's own observation either way.
   }, [dlq.data, dlqDepth])
 
   const metric = MODE_METRICS[mode]
@@ -1859,8 +1902,14 @@ export default function DemoPage() {
   const agentCurrent = agentStations.find((s) => s.state === 'current') ?? null
 
   // ── the chart's markers and the ledger ──────────────────────────────────
+  // The window is the platform's, taken from the reply rather than assumed: the
+  // reading says how much history it can hold and how far apart the samples are
+  // (900 / 60 today), so the axis is labelled from the answer and a change of
+  // cadence on the platform does not silently mislabel this chart.
+  const windowSeconds = lag.data?.sample_window_seconds ?? WINDOW_MS / 1000
+  const sampleInterval = lag.data?.sample_interval_seconds ?? null
   const windowEnd = now
-  const windowStart = windowEnd - WINDOW_MS
+  const windowStart = windowEnd - windowSeconds * 1000
   const markers = useMemo(
     () =>
       chartMarkers({
@@ -2010,7 +2059,11 @@ export default function DemoPage() {
               title="worker-dispatcher consumer lag"
               unit="messages behind"
               source="GET /admin/consumer-lag"
-              caption="The platform's own samples, one per metrics tick, last 15 minutes (WO-R3-328)."
+              caption={`The platform's own samples: ${String(Math.round(windowSeconds / 60))} minutes${
+                sampleInterval === null
+                  ? ''
+                  : `, one every ${String(sampleInterval)}s`
+              }, from the reply's own window (WO-R3-328).`}
               value={lagValue}
               known={dispatcher !== null && dispatcher.lag_known}
               unknownReason={
@@ -2109,7 +2162,9 @@ export default function DemoPage() {
           <ActionLedger
             entries={ledger}
             counts={counts}
-            stepsDropped={run?.steps_dropped ?? 0}
+            stepsDropped={
+              stepStore.runId === runId ? stepStore.dropped : (run?.steps_dropped ?? 0)
+            }
             usingAudit={steps.length === 0 && run !== null}
             showJobEvents={showJobEvents}
             onToggleJobEvents={setShowJobEvents}

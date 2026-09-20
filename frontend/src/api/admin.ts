@@ -167,20 +167,24 @@ export const adminApi = {
     return api.get<PaginatedResponse<AgentRun>>(`/admin/agent-runs?${qs.toString()}`)
   },
 
-  /** One run with everything on it: hypotheses, plan, verifications, steps, budget. */
+  /**
+   * One run with everything on it: hypotheses, plan, verifications, budget — and
+   * `steps`, which the LISTING deliberately omits. The ledger is read from here
+   * or from the tail read below, never from a list row.
+   */
   getAgentRun: (id: string) => api.get<AgentRun>(`/admin/agent-runs/${id}`),
 
   /**
    * The steps after `after_seq` (WO-R3-328) — the ledger's incremental poll.
    *
-   * The detail endpoint carries the whole list, which is up to 200 rows with a
-   * 400-character excerpt each; re-fetching that every two seconds for the length
-   * of a run is wasteful where the list is append-only and monotonic in `seq`.
-   * Both sources merge through `mergeSteps`, so either one alone is correct.
+   * A tail read rather than an offset page: the ledger grows from the end, so an
+   * offset would hand a poller duplicates. Omit `afterSeq` for the whole ledger
+   * and send back the reply's `next_after_seq` after that; it is the highest
+   * `seq` stored, so a poll that finds nothing still advances correctly.
    */
-  agentRunSteps: (id: string, afterSeq = 0) =>
+  agentRunSteps: (id: string, afterSeq: number | null = null) =>
     api.get<AgentRunStepsResponse>(
-      `/admin/agent-runs/${id}/steps?after_seq=${String(afterSeq)}`,
+      `/admin/agent-runs/${id}/steps${afterSeq === null ? '' : `?after_seq=${String(afterSeq)}`}`,
     ),
 
   /**

@@ -64,10 +64,15 @@ export function hypothesesSource(run: AgentRun | null): HypothesesSource {
 }
 
 /**
- * The ranked list, highest confidence first.
+ * The ranked list, **in the order the responder sent it**.
  *
- * Sorted here rather than trusted: the platform stores what the reporter sent, and
- * a panel whose bars are not in order reads as a bug even when the data is right.
+ * Not re-sorted by confidence, deliberately: the platform stores the list best
+ * first and states that the order IS the ranking (WO-R3-328), so `confidence` is
+ * a number the responder attached rather than the key the list is in. A reader
+ * that re-sorted would silently disagree with the run about what it thought most
+ * likely whenever the two ever differed — and it is the run's opinion the panel
+ * exists to show.
+ *
  * Where only `current_hypothesis` exists it becomes a one-entry list with a null
  * excerpt — the top hypothesis IS the list's head, so the panel shape does not
  * have to change for a commander that sends one.
@@ -75,9 +80,7 @@ export function hypothesesSource(run: AgentRun | null): HypothesesSource {
 export function rankedHypotheses(run: AgentRun | null): AgentRunRankedHypothesis[] {
   if (run === null) return []
   const ranked = run.hypotheses ?? []
-  if (ranked.length > 0) {
-    return [...ranked].sort((a, b) => b.confidence - a.confidence)
-  }
+  if (ranked.length > 0) return [...ranked]
   const top = run.current_hypothesis
   if (top === null) return []
   return [
@@ -209,9 +212,18 @@ export interface LedgerInput {
  */
 export function buildLedger(input: LedgerInput): LedgerEntry[] {
   const haveSteps = input.steps.length > 0
+  // A step's `at` is the responder's own and can be null — every field but `seq`
+  // and `kind` can be. One with no time is placed by its neighbours rather than
+  // dropped: `seq` is the order it happened in, which is what a ledger is for.
+  const stepTimes = new Map<number, string>()
+  let carried: string | null = null
+  for (const step of [...input.steps].sort((a, b) => a.seq - b.seq)) {
+    if (step.at !== null && step.at !== undefined) carried = step.at
+    if (carried !== null) stepTimes.set(step.seq, carried)
+  }
   const entries: LedgerEntry[] = input.steps.map((step) => ({
     id: `step-${String(step.seq)}`,
-    at: step.at,
+    at: step.at ?? stepTimes.get(step.seq) ?? '',
     kind: 'step' as const,
     step,
   }))
@@ -303,7 +315,7 @@ export function dlqDecisionFromSteps(
   steps: AgentRunStepRecord[],
 ): DlqDecision {
   const actions = steps
-    .filter((s) => s.kind === 'action' && ACTION_TOOLS.includes(s.tool))
+    .filter((s) => s.kind === 'action' && s.tool !== null && ACTION_TOOLS.includes(s.tool))
     // Newest first: the last thing the run decided about this row wins.
     .sort((a, b) => b.seq - a.seq)
 

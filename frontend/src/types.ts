@@ -366,17 +366,22 @@ export interface AgentRunVerification {
  *
  * `result_excerpt` is the whole reason this shape exists — the audit log records
  * that a call happened and with what arguments, never what it answered.
+ *
+ * **Every field but `seq` and `kind` can be null.** This is the responder's own
+ * account of a call it made and the platform fills nothing in, so a console that
+ * assumes a tool name or a timestamp is assuming something no writer promised.
+ * `kind` is an open string for the same reason the verify verdict is.
  */
 export interface AgentRunStepRecord {
   seq: number
-  kind: 'read' | 'action' | 'report'
-  tool: string
+  kind: string
+  tool: string | null
   arguments?: Record<string, unknown> | null
-  /** Truncated to 400 chars by the reporter. Null when nothing came back. */
+  /** Truncated to 400 chars by the reporter; longer is refused, not cut. */
   result_excerpt?: string | null
   outcome?: string | null
   latency_ms?: number | null
-  at: string
+  at: string | null
 }
 
 /** What the run has spent. `null` where the ledger has no reading. */
@@ -476,26 +481,56 @@ export interface AgentRun {
   active: boolean
 
   // ── WO-R3-328, all additive and all absent on an older stack ──────────────
-  /** The ranked list. `current_hypothesis` is its top entry, kept as it was. */
+  /**
+   * The responder's explanations, **best first — the order IS the ranking.**
+   * Never re-sorted by a reader: `confidence` is its own number and the platform
+   * stores what the responder sent, so re-ordering by it would silently disagree
+   * with the run about what it thought most likely.
+   */
   hypotheses?: AgentRunRankedHypothesis[]
   plan?: AgentRunPlan | null
-  /** The latest verdict; `verifications` is every one, in order. */
+  /** The latest verdict; `verifications` is every one, oldest first, capped at 50. */
   verification?: AgentRunVerification | null
   verifications?: AgentRunVerification[]
-  /** Append-only, capped at 200 by the platform. */
+  /**
+   * The action ledger — **present on `GET /admin/agent-runs/{id}` only.**
+   *
+   * The LISTING omits it rather than emptying it (a page of 100 runs × 200 steps
+   * with 400-character excerpts is megabytes nobody asked for), so an empty list
+   * here would read as "this run made no calls". Read it from the single-run
+   * endpoint or poll `.../steps?after_seq=`, never from the list.
+   */
   steps?: AgentRunStepRecord[]
-  /** How many steps the cap dropped. Non-zero means the ledger is incomplete. */
+  /**
+   * How many of the oldest steps the 200-entry cap discarded. Carried on the
+   * listing as well, because it is one integer and it is the field that says the
+   * ledger is not the whole run.
+   */
   steps_dropped?: number
   budget?: AgentRunBudget | null
 }
 
-/** `GET /admin/agent-runs/{id}/steps?after_seq=` — incremental polling. */
+/**
+ * `GET /admin/agent-runs/{id}/steps?after_seq=` — a tail read, not a page.
+ *
+ * The caller asks for everything after the last `seq` it drew, so a panel
+ * polling twice a second costs one small request instead of re-reading a
+ * 200-entry ledger, and a step it has already shown cannot arrive twice.
+ * `next_after_seq` is the highest `seq` STORED, not the highest returned, so a
+ * poll that finds nothing still advances the cursor correctly.
+ */
 export interface AgentRunStepsResponse {
   run_id: string
-  items: AgentRunStepRecord[]
-  /** The highest `seq` the run holds, so a caller knows it is caught up. */
-  max_seq?: number | null
-  steps_dropped?: number
+  /** The run's state and closing time, so a poller knows when to stop asking. */
+  state: AgentRunState
+  finished_at: string | null
+  /** Ascending by `seq`; the console reverses it to show newest first. */
+  steps: AgentRunStepRecord[]
+  returned: number
+  total: number
+  steps_dropped: number
+  after_seq: number | null
+  next_after_seq: number | null
 }
 
 // ---------------------------------------------------------------------------
@@ -537,6 +572,14 @@ export interface ConsumerLagResponse {
   total: number
   /** The one group whose number actually moves; the rest are recorded constants. */
   live_group: string
+  /**
+   * How much history `recent_samples` can hold and how far apart the samples
+   * are (900 / 60 today), so a chart labels its axis from the reply rather than
+   * hard-coding the platform's cadence. A window holding fewer samples than it
+   * could is missing history, never a flat line.
+   */
+  sample_window_seconds?: number
+  sample_interval_seconds?: number
 }
 
 export interface CircuitBreakerReading {
