@@ -144,6 +144,12 @@ async def _run_the_resets_redis_steps(redis: Redis) -> None:
     await reset_eval_state._clear_job_read_cache(redis)
     await reset_eval_state._clear_scheduled_replays(redis)
     await reset_eval_state._clear_dag_pauses(redis)
+    # The step WO-R3-333 removed, called here when the tree still has one. Without this
+    # the test would go green on the version it is meant to be red on, by simply not
+    # calling the function that broke the chart.
+    clear_window = getattr(reset_eval_state, "_clear_lag_samples", None)
+    if clear_window is not None:  # pragma: no cover - absent since WO-R3-333
+        await clear_window(redis)
     await reset_eval_state._reseed_hot_set(redis)
     await reset_eval_state._reset_breaker_states(redis)
 
