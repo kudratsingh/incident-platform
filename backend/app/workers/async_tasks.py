@@ -171,13 +171,21 @@ async def process_bulk_api_sync(
 
     ok = sum(1 for r in results if r["status"] == "ok")
     errors = len(results) - ok
-    if degraded is not None and ok == 0:
+    if ok == 0:
         # A sync that synced nothing is a failed job, so the failure reaches the job surface —
         # retries, then the dead-letter queue — rather than completing with an error count no
-        # operational tool reads. Only while the flag is set: the organic path has always
-        # reported per-endpoint errors in its result and left the job completed.
+        # operational tool reads.
+        #
+        # Unconditional since WO-R3-322 (owner decision O-31 D4): whatever made the endpoints
+        # fail is not what decides whether a job that synced nothing succeeded. The flag still
+        # chooses the injection (`fail` raises per call, `slow` answers late), never the
+        # failure semantics. A partial failure is unchanged — still a completed job with its
+        # errors counted. The SLO consequence is accepted rather than hidden: such a job
+        # spends `job_completion_rate` budget once it dead-letters (ADR 0031, 2026-09-19
+        # amendment).
         raise RuntimeError(
-            f"bulk api sync failed: 0 of {endpoint_count} endpoints returned a result"
+            f"bulk api sync failed: all {errors} endpoint calls failed "
+            f"(0 of {endpoint_count} endpoints returned a result)"
         )
     return {
         "endpoints_synced": ok,
