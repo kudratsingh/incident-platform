@@ -41,6 +41,27 @@ What gets cleared/reset:
      (`read_model.rebuild_read_model`), last, so it projects the rows as this reset leaves them.
      The projection only moves on a Kafka event, so anything `saturate_redis` evicted stayed
      missing from the admin overview for every later scenario (WO-R2-56).
+  8. **The stale-cache fixture key** — `cache:jobs:worker-dispatcher:hot_set`, restored with the
+     Redis sweeps above and reported as `hot_set_reseeded` (**WO-R3-310**). The seed writes it
+     too, but nothing said so in the summary, so an evicted key was invisible until a later
+     world read `exists: false` — 108 unledgered fixture values, recovered by hand. It is also
+     the one fixture written with a TTL, which is exactly what a `volatile-*` eviction policy
+     takes first, so it is the one most likely to be gone. Read before the seed, so the count
+     reports the world the reset *found*.
+  9. **Circuit breakers** — `breaker:state:*` back to closed with the failure fields null, plus
+     the `breaker:reset:at` signal that makes the worker's in-memory registry forget
+     (`breaker_state.reset_breaker_states`, reported as `breakers_reset`; **WO-R3-311**, ADR
+     0036). Outside `chaos:*` and therefore not swept by step 1, so one `degrade_downstream`
+     used to contaminate every later reading for the record's 24 h TTL. Deleting the key is not
+     the fix twice over: the registry writes the same failure back, and an absent record reads
+     as *unknown* rather than closed (ADR 0030).
+ 10. **Open agent runs** — every `agent_runs` row with no `finished_at` is closed as `failed`
+     with a `closed_by: reset` entry appended to `phase_history` (reported as
+     `agent_runs_closed`; **WO-R3-315**, the gap ADR 0035 recorded). Only the responder reports
+     a terminal state, and this reset is what just took its world away, so without this a run
+     the reset ended stays open for ever. Closed, never deleted: the rows are what a console
+     replays, and the responder's own words (`briefing`, `current_hypothesis`, `last_step`) are
+     left untouched.
 
 ## Guardrails
 
@@ -73,6 +94,7 @@ import json
 import os
 import sys
 import uuid
+from datetime import UTC, datetime
 from typing import Any
 
 # `../backend` for `import app...`, `..` for `from scripts import seed_eval_fixtures` (without
@@ -129,6 +151,10 @@ _INFLIGHT_REPLAY_KEY = "jobs:dlq_replay_inflight"
 # under a 90s TTL. The window spans minutes, so measurements from before a reset would be the
 # first "trend" the next run sees. Cleared, not rebuilt — the loop records a fresh one within 60s.
 _LAG_SAMPLES_KEY = "kafka:consumer_lag:worker-dispatcher:samples"
+
+# What the reset writes into a run it closes itself, so an operator reading the console can
+# tell a responder that gave up from a world that was taken away under it (WO-R3-315).
+AGENT_RUN_CLOSED_BY = "reset"
 
 
 def _empty_dlq_baseline() -> bool:
@@ -200,6 +226,97 @@ async def _clear_dag_pauses(redis: aioredis.Redis) -> int:
     """Delete every `dag:paused:*` flag: since ADR 0011 the resolver enforces it, so a pause
     left by one scenario holds the next one's DAG in WAITING."""
     return await _scan_delete(redis, "dag:paused:*")
+
+
+async def _reseed_hot_set(redis: aioredis.Redis) -> int:
+    """Restore `cache:jobs:worker-dispatcher:hot_set`, and say whether it had to be written.
+
+    `remediate_stale_cache_success` opens on this key, and `saturate_redis` evicts it — it is
+    the one fixture written with a TTL, so a `volatile-*` policy takes it first, and a stack up
+    longer than a day loses it to the TTL itself. Every later world then reads `exists: false`,
+    which is a world nobody graded (**WO-R3-310**).
+
+    The seed writes the same key a few lines further on. This step exists anyway, for the reason
+    the finding was filed: the summary said nothing either way, so nobody could tell an intact
+    world from a restored one, and the commander's Makefile comment claimed a re-seed that
+    nothing here asserted. Returns 1 when the key was absent or held something other than the
+    seeded payload — compared against `seed_eval_fixtures.hot_set_payload()` rather than a
+    restated id set (D-14) — and 0 on a world that was already right.
+    """
+    from scripts import seed_eval_fixtures  # type: ignore[import-not-found]
+
+    expected = seed_eval_fixtures.hot_set_payload()
+    found = await redis.get(seed_eval_fixtures._HOT_SET_KEY)
+    await seed_eval_fixtures._seed_hot_set(redis)
+    return 0 if found == expected else 1
+
+
+async def _reset_breaker_states(redis: aioredis.Redis) -> int:
+    """Close every published circuit breaker and tell the registries that own them.
+
+    The step's whole content is in `app/core/breaker_state.reset_breaker_states` — the record
+    shape and the signal belong beside the code that writes them — and it is called from here
+    because `breaker:state:*` is a platform namespace outside `chaos:*` (ADR 0030), so step 1's
+    sweep never carried it and one `degrade_downstream` contaminated every later recording for
+    24 h (**WO-R3-311**). Runs after that sweep, so the fault is gone before the breaker that
+    the fault opened is closed. Returns how many records were rewritten.
+    """
+    from app.core.breaker_state import reset_breaker_states
+
+    return await reset_breaker_states(redis)
+
+
+async def _close_open_agent_runs(session_factory: Any) -> int:
+    """Close every `agent_runs` row this reset leaves open, as `failed`. **WO-R3-315.**
+
+    ADR 0035 recorded the gap rather than solving it: a run is closed only by the responder
+    reporting a terminal state, so a run this reset ends — and ending it is exactly what a reset
+    does — stays open for ever, and the rows accumulate across every scenario.
+
+    `failed`, not `resolved` or `escalated`: those two are claims about what the responder
+    concluded, and it concluded nothing. The marker goes in `phase_history`, which is the row's
+    own timeline and already append-only, so no column is added and a console draws "failed,
+    closed by reset" from what is there. Never DELETEd — the rows are what the demo replays, and
+    the responder's own words (`briefing`, `current_hypothesis`, `last_step`, `scenario`) are
+    left byte-identical. A run still reporting will get `agent_run_already_finished` on its next
+    call, which is the truth: its world is gone. The reporter is fail-open, so it logs and
+    carries on.
+
+    Idempotent — a second run finds nothing open. Environment-wide, like every other step here,
+    and safe for the same reason (`_assert_not_production()` on both entry points).
+    """
+    from app.models.agent_run import AgentRun  # type: ignore[import-not-found]
+    from app.models.enums import AgentRunState
+    from sqlalchemy import select
+
+    closed_at = datetime.now(UTC)
+    closed = 0
+    async with session_factory() as session:
+        async with session.begin():
+            open_runs = (
+                (
+                    await session.execute(
+                        select(AgentRun).where(AgentRun.finished_at.is_(None))
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            for run in open_runs:
+                # Reassigned rather than appended in place: a JSON column only travels if the
+                # attribute is set (the same trap `PortableJSON` has everywhere else).
+                run.phase_history = [
+                    *(run.phase_history or []),
+                    {
+                        "state": AgentRunState.FAILED.value,
+                        "at": closed_at.isoformat(),
+                        "closed_by": AGENT_RUN_CLOSED_BY,
+                    },
+                ]
+                run.state = AgentRunState.FAILED.value
+                run.finished_at = closed_at
+                closed += 1
+    return closed
 
 
 async def _rebuild_read_model(session_factory: Any, redis: aioredis.Redis) -> int:
@@ -490,11 +607,20 @@ async def reset(
         timers_cleared = await _clear_scheduled_replays(redis)
         pauses_cleared = await _clear_dag_pauses(redis)
         lag_samples_cleared = await _clear_lag_samples(redis)
+        # Before the seed's own write, so the count reports the world this reset found
+        # (WO-R3-310) rather than the one it leaves.
+        hot_set_reseeded = await _reseed_hot_set(redis)
+        # After the chaos sweep above: the fault goes first, then the breaker it opened
+        # (WO-R3-311).
+        breakers_reset = await _reset_breaker_states(redis)
         # Order-independent of the seed: the fixture alerts use non-chaos sources.
         chaos_alerts_resolved = await _resolve_chaos_alerts(factory)
         # Everything else active outside the five seeded alerts; spared by stable() id
         # (WO-R2-131).
         organic_alerts_resolved = await _resolve_organic_alerts(factory)
+        # Beside the alert sweep, because it is the same kind of step: close out what the
+        # last run left open (WO-R3-315).
+        agent_runs_closed = await _close_open_agent_runs(factory)
         seed_summary = await seed_eval_fixtures.seed(
             database_url=database_url,
             redis_url=redis_url,
@@ -516,6 +642,8 @@ async def reset(
         await engine.dispose()
 
     return {
+        "agent_runs_closed": agent_runs_closed,
+        "breakers_reset": breakers_reset,
         "chaos_alerts_resolved": chaos_alerts_resolved,
         "chaos_keys_cleared": chaos_cleared,
         "chaos_owners_deleted": chaos_owners_deleted,
@@ -524,6 +652,7 @@ async def reset(
         "dlq_swept": dlq_swept,
         "timestamps_rebaselined": seed_summary["timestamps_rebaselined"],
         "empty_dlq_baseline": _empty_dlq_baseline(),
+        "hot_set_reseeded": hot_set_reseeded,
         "job_cache_cleared": job_cache_cleared,
         "lag_samples_cleared": lag_samples_cleared,
         "organic_alerts_resolved": organic_alerts_resolved,

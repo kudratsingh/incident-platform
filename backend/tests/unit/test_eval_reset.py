@@ -1777,3 +1777,227 @@ async def test_the_hot_set_reading_is_not_healthy_by_construction(
     )
     assert referenced and referenced > 0
     assert found == 0
+
+
+# _reseed_hot_set — WO-R3-310: the reset owns the key, and says so
+
+
+async def test_reseed_hot_set_restores_an_evicted_key_and_reports_it() -> None:
+    """`saturate_redis` evicts this key — it is the one fixture written with a TTL, which
+    is exactly what a `volatile-*` policy evicts first — and every later world then reads
+    `exists: false`. The reset writes it back and the count is how the caller can tell."""
+    reset = _reset_module()
+    seed = _seed_module()
+    redis = _TinyRedis()
+
+    assert await reset._reseed_hot_set(redis) == 1
+    assert redis.store[seed._HOT_SET_KEY] == seed.hot_set_payload()
+
+
+async def test_reseed_hot_set_reports_nothing_to_do_on_an_intact_world() -> None:
+    """The reset's standing promise is that a second run is a no-op summary."""
+    reset = _reset_module()
+    seed = _seed_module()
+    redis = _TinyRedis()
+    await seed._seed_hot_set(redis)
+
+    assert await reset._reseed_hot_set(redis) == 0
+
+
+async def test_reseed_hot_set_repairs_a_payload_that_drifted() -> None:
+    """Present is not correct: the scenario reads the members, so a key holding something
+    else is a world that opens on a reading nobody graded."""
+    reset = _reset_module()
+    seed = _seed_module()
+    redis = _TinyRedis()
+    await redis.set(seed._HOT_SET_KEY, '["not-a-seeded-job"]')
+
+    assert await reset._reseed_hot_set(redis) == 1
+    assert redis.store[seed._HOT_SET_KEY] == seed.hot_set_payload()
+
+
+def test_the_hot_set_payload_is_read_from_the_seed_not_restated() -> None:
+    """D-14 again: a hardcoded id set drifted once and left phantom UUIDs, so the reset
+    compares against the seeder's own payload."""
+    seed = _seed_module()
+    assert json.loads(seed.hot_set_payload()) == [
+        str(spec["job_id"]) for spec in seed._dlq_specs()[:3]
+    ]
+
+
+# _close_open_agent_runs — WO-R3-315
+
+
+async def _sa_id(session: AsyncSession, tenant_id: uuid.UUID) -> uuid.UUID:
+    from app.core.scopes import Scope
+    from app.models.service_account import ServiceAccount
+
+    sa = ServiceAccount(
+        tenant_id=tenant_id,
+        name=f"reporter-{uuid.uuid4().hex[:8]}",
+        scopes=[Scope.AGENT_RUNS_WRITE.value],
+        is_active=True,
+    )
+    session.add(sa)
+    await session.flush()
+    return uuid.UUID(str(sa.id))
+
+
+async def _agent_run(
+    session: AsyncSession, tenant_id: uuid.UUID, **overrides: object
+):  # type: ignore[no-untyped-def]
+    from app.models.agent_run import AgentRun
+    from app.models.enums import AgentRunState
+
+    fields: dict[str, object] = {
+        "id": uuid.uuid4(),
+        "tenant_id": tenant_id,
+        "service_account_id": await _sa_id(session, tenant_id),
+        "scenario": "remediate_consumer_lag_success",
+        "state": AgentRunState.INVESTIGATING.value,
+        "phase_history": [
+            {"state": "triage", "at": "2026-09-19T05:00:00+00:00"},
+            {"state": "investigating", "at": "2026-09-19T05:00:09+00:00"},
+        ],
+        "current_hypothesis": {"name": "consumer_saturation", "confidence": 0.75},
+        "last_step": {"kind": "read", "tool": "get_consumer_lag"},
+    }
+    fields.update(overrides)
+    run = AgentRun(**fields)
+    session.add(run)
+    await session.flush()
+    return run
+
+
+async def test_open_agent_runs_are_closed_as_failed_and_marked_by_the_reset(
+    db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
+) -> None:
+    """A run the reset ends stays open for ever otherwise: only the responder reports a
+    terminal state, and the reset is the thing that just took its world away (ADR 0035
+    recorded this gap; ADR 0036 closes it)."""
+    reset = _reset_module()
+    from app.models.agent_run import AgentRun
+    from app.models.enums import AgentRunState
+
+    run = await _agent_run(db_session, default_tenant.id)
+
+    assert await reset._close_open_agent_runs(_factory(db_session)) == 1
+
+    closed = (
+        await db_session.execute(select(AgentRun).where(AgentRun.id == run.id))
+    ).scalar_one()
+    assert closed.state == AgentRunState.FAILED.value
+    assert closed.finished_at is not None
+    assert closed.phase_history[:2] == [
+        {"state": "triage", "at": "2026-09-19T05:00:00+00:00"},
+        {"state": "investigating", "at": "2026-09-19T05:00:09+00:00"},
+    ]
+    last = closed.phase_history[-1]
+    assert last["state"] == AgentRunState.FAILED.value
+    assert last["closed_by"] == reset.AGENT_RUN_CLOSED_BY
+    assert last["at"]
+
+
+async def test_closing_a_run_leaves_the_responders_own_words_alone(
+    db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
+) -> None:
+    """The rows are evidence, like `audit_logs` (ADR 0012): the reset says who closed the
+    run and changes nothing the responder wrote."""
+    reset = _reset_module()
+    from app.models.agent_run import AgentRun
+
+    briefing = {"final_state": "escalated", "escalation_reason": "budget spent"}
+    run = await _agent_run(db_session, default_tenant.id, briefing=briefing)
+
+    await reset._close_open_agent_runs(_factory(db_session))
+
+    closed = (
+        await db_session.execute(select(AgentRun).where(AgentRun.id == run.id))
+    ).scalar_one()
+    assert closed.briefing == briefing
+    assert closed.current_hypothesis == {
+        "name": "consumer_saturation",
+        "confidence": 0.75,
+    }
+    assert closed.last_step == {"kind": "read", "tool": "get_consumer_lag"}
+    assert closed.scenario == "remediate_consumer_lag_success"
+
+
+async def test_a_finished_run_is_left_alone_and_a_second_sweep_is_a_no_op(
+    db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
+) -> None:
+    reset = _reset_module()
+    from app.models.agent_run import AgentRun
+    from app.models.enums import AgentRunState
+
+    finished_at = datetime.now(UTC) - timedelta(minutes=5)
+    done = await _agent_run(
+        db_session,
+        default_tenant.id,
+        state=AgentRunState.RESOLVED.value,
+        finished_at=finished_at,
+        phase_history=[{"state": "resolved", "at": "2026-09-19T05:02:00+00:00"}],
+    )
+    await _agent_run(db_session, default_tenant.id)
+
+    assert await reset._close_open_agent_runs(_factory(db_session)) == 1
+    assert await reset._close_open_agent_runs(_factory(db_session)) == 0
+
+    untouched = (
+        await db_session.execute(select(AgentRun).where(AgentRun.id == done.id))
+    ).scalar_one()
+    assert untouched.state == AgentRunState.RESOLVED.value
+    assert untouched.phase_history == [
+        {"state": "resolved", "at": "2026-09-19T05:02:00+00:00"}
+    ]
+
+
+async def test_the_reset_never_deletes_an_agent_run(
+    db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
+) -> None:
+    """The order offered deleting lab-labelled rows; declined. A console read this, and a
+    row that vanishes is a demo that cannot be replayed."""
+    reset = _reset_module()
+    from app.models.agent_run import AgentRun
+
+    await _agent_run(db_session, default_tenant.id)
+    await _agent_run(db_session, default_tenant.id)
+
+    await reset._close_open_agent_runs(_factory(db_session))
+
+    rows = (await db_session.execute(select(AgentRun))).scalars().all()
+    assert len(rows) == 2
+
+
+# The summary the commander prints — WO-R3-310's real cost
+
+
+def test_the_reset_summary_names_every_counter_it_owns() -> None:
+    """Static tripwire. `make eval-reset` parses this dict, so a step whose count is not
+    in it is a step nobody can tell ran — which is how the hot_set gap survived long
+    enough to cost 108 unledgered fixture values."""
+    reset = _reset_module()
+    tree = ast.parse(inspect.getsource(reset.reset))
+    returned = [
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Return) and isinstance(node.value, ast.Dict)
+    ]
+    assert returned, "reset() must return its summary as a dict literal"
+    keys = {
+        key.value
+        for key in returned[0].keys
+        if isinstance(key, ast.Constant) and isinstance(key.value, str)
+    }
+    assert {"agent_runs_closed", "breakers_reset", "hot_set_reseeded"} <= keys
+
+    awaited = {
+        node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", "")
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+    }
+    assert {
+        "_close_open_agent_runs",
+        "_reset_breaker_states",
+        "_reseed_hot_set",
+    } <= awaited

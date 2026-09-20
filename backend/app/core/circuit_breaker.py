@@ -10,6 +10,7 @@ from app.core.breaker_state import (
     BREAKER_REFRESH_INTERVAL_SECONDS,
     classify_failure,
     publish_breaker_state,
+    read_breaker_reset_at,
 )
 
 logger = logging.getLogger(__name__)
@@ -36,7 +37,8 @@ class CircuitBreaker:
     HALF_OPEN admits exactly one probe; concurrent arrivals get CircuitOpenError,
     so a recovering upstream sees one request rather than the whole backlog. Every state
     change is also recorded outside the process, because the reader is in another one
-    (ADR 0030).
+    (ADR 0030) — and every breaker forgets a fault the environment reset has since
+    cleared, because this registry outlives the world it opened on (ADR 0036).
     """
 
     def __init__(
@@ -61,6 +63,10 @@ class CircuitBreaker:
         self._last_failure_at: datetime | None = None
         self._last_failure_reason_class: str | None = None
         self._recorded_at_monotonic: float | None = None
+
+        # The reset this breaker has already honoured, so one signal clears it once and a
+        # fault it takes afterwards stands (ADR 0036).
+        self._observed_reset_at: datetime | None = None
 
     @property
     def state(self) -> CircuitState:
@@ -87,6 +93,45 @@ class CircuitBreaker:
         self._state = state
         self._last_state_change_at = datetime.now(UTC)
 
+    async def _honour_reset(self, redis: Any | None = None) -> bool:
+        """Forget what this breaker remembers from before the world was last reset.
+
+        Clearing the published record is not a reset: this registry is a module-level dict
+        in a process `make eval-reset` cannot restart (ADR 0006), so the breaker would write
+        the same failure straight back and one lab fault contaminated every later reading
+        for a day (WO-R3-311).
+
+        The signal carries *when* the reset happened, so the comparison is against this
+        breaker's own failure rather than against a count: a fault that arrived after the
+        reset belongs to the world now running and is kept. Returns whether anything was
+        cleared. ADR 0036.
+        """
+        signal = await read_breaker_reset_at(redis)
+        if signal is None or signal == self._observed_reset_at:
+            return False
+        async with self._lock:
+            # Adopted even when nothing is cleared, so one signal is weighed once.
+            self._observed_reset_at = signal
+            if self._last_failure_at is not None and self._last_failure_at > signal:
+                return False
+            already_clean = (
+                self._state is CircuitState.CLOSED
+                and self._failure_count == 0
+                and self._last_state_change_at is None
+                and self._last_failure_at is None
+            )
+            # Assigned rather than `_set_state`: a reset leaves a breaker as it was at boot,
+            # and stamping a state change would leave a reading with a `null` failure beside
+            # a state that changed for no reason anyone can read.
+            self._state = CircuitState.CLOSED
+            self._failure_count = 0
+            self._opened_at = None
+            self._probe_in_flight = False
+            self._last_state_change_at = None
+            self._last_failure_at = None
+            self._last_failure_reason_class = None
+        return not already_clean
+
     async def _record(self, *, changed: bool, redis: Any | None = None) -> None:
         """Record this breaker's state outside the process; throttled unless it changed."""
         now = time.monotonic()
@@ -96,7 +141,11 @@ class CircuitBreaker:
             and now - self._recorded_at_monotonic < BREAKER_REFRESH_INTERVAL_SECONDS
         ):
             return
-        self._recorded_at_monotonic = now
+        # Asked here, where a write was going to happen anyway: it keeps Redis out of the
+        # hot path (ADR 0030) — one GET beside an existing SET — and it makes publishing a
+        # state from before the reset over the reset's clean record impossible.
+        await self._honour_reset(redis)
+        self._recorded_at_monotonic = time.monotonic()
         await publish_breaker_state(
             redis,
             name=self.name,
@@ -112,6 +161,13 @@ class CircuitBreaker:
     async def call(self, fn: Callable[[], Awaitable[T]]) -> T:
         # This caller owns the probe and must clear _probe_in_flight.
         is_probe = False
+
+        # Only a breaker holding a fault asks whether the world was reset under it, so the
+        # healthy path — every breaker in a healthy world, on every call — adds no I/O at
+        # all. Without this the record would be clean while the registry kept refusing work
+        # until its next recovery window, which is not a reset (ADR 0036).
+        if self._state is not CircuitState.CLOSED:
+            await self._honour_reset()
 
         async with self._lock:
             if self._state == CircuitState.OPEN:
