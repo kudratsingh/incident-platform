@@ -151,6 +151,17 @@ delete a fresh world would open the console showing the previous take's fault dr
 The key did not move, so that step needed no edit — which is the argument for the shared
 constants restated as a fact.
 
+> **Superseded (2026-09-20, WO-R3-333 / [ADR 0038](0038-a-probe-by-the-lab-is-labelled-by-the-lab.md)) — this paragraph only.**
+> The delete is gone: the reset preserves the window. Everything above it about the
+> window's shape, its cap and its longer TTL stands, and this paragraph is the half that
+> read the TTL backwards. A window that outlives the pass which wrote it is what lets the
+> console draw the fault that is climbing *right now*; deleting it on the reset boundary
+> meant the chart opened on two points in a fifteen-minute frame, which the demo's third
+> live take made visible. The fear the delete addressed — a trend from the previous take
+> read as this one's — is answered by the `lab.world_reset` boundary row instead: every
+> sample carries its own `measured_at`, so a reader that must not cross the boundary
+> compares against the row's timestamp.
+
 ### The audit filter takes lists
 
 `action_prefix` accepts a comma list (OR-ed) and `exclude_prefix` is new (AND-ed, and it

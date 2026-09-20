@@ -468,51 +468,66 @@ async def test_clear_dag_pauses_removes_pause_flags() -> None:
     assert await reset._clear_dag_pauses(redis) == 2
 
 
-# Recorded consumer-lag measurements — WO-R3-254
+# Recorded consumer-lag measurements — WO-R3-254, reversed by WO-R3-333
 
 
-async def test_clear_lag_samples_drops_the_recorded_window() -> None:
-    """Carried across a reset, the lag window `get_consumer_lag` returns as `recent_samples` makes
-    the next run read the previous run's trend."""
-    reset = _reset_module()
-    redis = AsyncMock()
-    redis.delete = AsyncMock(return_value=1)
+def test_the_reset_no_longer_clears_the_recorded_lag_window() -> None:
+    """WO-R3-333: the window is history, not residue.
 
-    assert await reset._clear_lag_samples(redis) == 1
-    assert [c.args[0] for c in redis.delete.await_args_list] == [
-        reset._LAG_SAMPLES_KEY
-    ]
-
-
-async def test_clear_lag_samples_is_a_noop_when_nothing_was_recorded() -> None:
-    reset = _reset_module()
-    redis = AsyncMock()
-    redis.delete = AsyncMock(return_value=0)
-
-    assert await reset._clear_lag_samples(redis) == 0
-
-
-def test_the_reset_clears_the_window_the_metrics_loop_writes() -> None:
-    """Asserted against the worker's constant: the script duplicates the literal, so this test is
-    all that stands between it and a silent divergence (WO-R3-254, R2-76's lesson)."""
+    Clearing it opened the demo's fifteen-minute lag chart on two points while the fault it was
+    drawn to show was climbing — and the window's TTL is longer than the value key's precisely so
+    it outlives the pass that wrote it (ADR 0037). Asserted on the source rather than on a call,
+    because the way this comes back is a helper somebody re-adds.
+    """
     from app.workers.dispatcher import LAG_SAMPLES_KEY
 
-    assert _reset_module()._LAG_SAMPLES_KEY == LAG_SAMPLES_KEY
+    reset = _reset_module()
+    source = inspect.getsource(reset)
+    assert f'"{LAG_SAMPLES_KEY}"' not in source, (
+        "reset_eval_state names the lag WINDOW key — since WO-R3-333 the reset "
+        "preserves the window and must not delete it"
+    )
+    assert not hasattr(reset, "_clear_lag_samples"), (
+        "the window-clearing helper is back; the counter is a permanent 0"
+    )
 
 
-def test_the_reset_leaves_the_lag_value_key_alone() -> None:
-    """Deliberate asymmetry: the value key is loop-owned under a 90s TTL and deleting it would blind
-    backpressure, while the window is the state that bleeds. Nothing in the script may name the
-    value key."""
+def test_the_reset_still_reports_the_window_counter_as_zero() -> None:
+    """The count stays in the summary (`make eval-reset` parses it, and the boundary row carries
+    it), and it is now a claim: this reset preserved the window."""
+    reset = _reset_module()
+    assert reset._LAG_SAMPLES_CLEARED == 0
+
+    tree = ast.parse(inspect.getsource(reset.reset))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Dict):
+            continue
+        for key, value in zip(node.keys, node.values, strict=False):
+            if isinstance(key, ast.Constant) and key.value == "lag_samples_cleared":
+                assert isinstance(value, ast.Name), (
+                    "lag_samples_cleared must report the named constant, so the "
+                    "reason it is always 0 is one hop from the number"
+                )
+                assert value.id == "_LAG_SAMPLES_CLEARED"
+                return
+    raise AssertionError("lag_samples_cleared is no longer in the reset summary")
+
+
+def test_the_reset_names_neither_consumer_lag_key() -> None:
+    """The value key was already untouched — loop-owned under a 90 s TTL, so it is fresh-or-absent
+    without help, and deleting it would only blind backpressure. Since WO-R3-333 the window is
+    untouched as well, so the script may name neither."""
+    from app.core.consumer_lag import LIVE_REFRESHED_GROUP, samples_key
     from app.utils.backpressure import BACKPRESSURE_LAG_KEY
 
     source = inspect.getsource(_reset_module())
     # Quoted on both sides: the window key starts with the value key, so an unquoted search would
     # match it.
-    assert f'"{BACKPRESSURE_LAG_KEY}"' not in source, (
-        "reset_eval_state names the lag VALUE key — the metrics loop owns "
-        "it under a TTL and the reset must not touch it"
-    )
+    for key in (BACKPRESSURE_LAG_KEY, samples_key(LIVE_REFRESHED_GROUP)):
+        assert f'"{key}"' not in source, (
+            f"reset_eval_state names {key} — the metrics loop owns both consumer-lag "
+            "keys and the reset must touch neither"
+        )
 
 
 # Empty-DLQ baseline mode — commander ADR 0010 / platform ADR 0012
