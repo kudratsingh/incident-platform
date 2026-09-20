@@ -508,7 +508,7 @@ shape.
 
 | Route | Answers | Notes |
 |---|---|---|
-| `GET /api/v1/admin/agent-runs?alert_id=&active=&page=&page_size=` | `PaginatedResponse[AgentRunResponse]` | Newest first. `active=true` is `finished_at IS NULL` — the console's own query while a run is live; `active=false` is its complement; omitted shows both. `?tenant_id=` is honoured for a platform admin only. |
+| `GET /api/v1/admin/agent-runs?alert_id=&active=&page=&page_size=` | `PaginatedResponse[AgentRunSummaryResponse]` | Newest first. `active=true` is `finished_at IS NULL` — the console's own query while a run is live; `active=false` is its complement; omitted shows both. `?tenant_id=` is honoured for a platform admin only. Since WO-R3-328 the item shape is the summary: every field of `AgentRunResponse` **except `steps`**, which is absent rather than emptied (a page of 100 ledgers is megabytes, and an empty list would read as "this run made no calls"). |
 | `GET /api/v1/admin/agent-runs/{id}` | `AgentRunResponse` | 404 for a missing run **and** for another tenant's, so the id space stays opaque. |
 | `GET /api/v1/admin/agent-runs/{id}/steps?after_seq=` | `AgentRunStepsResponse` | WO-R3-328. The run's action ledger, oldest first, sorted by `seq` rather than trusted in stored order. A **tail read, not an offset page**: `after_seq` is the last `seq` the caller already drew, so a panel polling twice a second asks for what is new and a step it has shown cannot arrive twice. Send back `next_after_seq` (the highest `seq` stored, so an empty poll still advances). Carries `returned`, `total`, `steps_dropped`, and the run's `state` / `finished_at` so a poller knows when to stop. Same 404 rule. |
 | `GET /api/v1/admin/consumer-lag` | `ConsumerLagResponse` | Every group in one reading, no arguments. Not tenant-scoped — consumer groups are platform-wide. Since WO-R3-328 it also carries `sample_window_seconds` (900) and `sample_interval_seconds` (60), so a chart labels its axis from the reply instead of hard-coding the platform's cadence. |
@@ -524,7 +524,7 @@ shape.
 excerpt limits enforced at the write surface
 ([ADR 0037](ADR/0037-a-run-record-carries-the-run.md)). A console drawing the ledger
 should poll `/steps?after_seq=` rather than re-reading this shape: `steps` is here so one
-request can rebuild a panel from cold.
+request can rebuild a panel from cold, and it is the one field the listing leaves out.
 
 ### The human audit filter takes prefix lists (WO-R3-328)
 

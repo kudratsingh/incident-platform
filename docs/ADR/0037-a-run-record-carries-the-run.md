@@ -102,6 +102,15 @@ report constant. `seq` is the caller's own position and it is the step's identit
   cannot arrive twice. Offset pagination over a list that grows from the end would have
   handed it duplicates.
 
+The listing (`GET /admin/agent-runs`) therefore returns the run **without** its ledger,
+and the single-run read returns it with. A page of 100 runs each carrying 200 entries with
+400-character excerpts is megabytes an operator's browser never asked for. The field is
+*absent* from the summary rather than emptied, because an empty list would read as "this
+run made no calls" — the same class of lie as a fabricated zero lag
+([ADR 0030](0030-breaker-state-is-published-and-a-reading-is-never-invented.md)).
+`steps_dropped` stays on both, because it is one integer and it is the field that says the
+ledger is not the whole run.
+
 ### A reading is filled in, never cleared — unlike the two fields before it
 
 `hypotheses`, `plan`, `verification` and `budget` are replaced when a report carries them
@@ -134,6 +143,13 @@ The window's key, cap and TTL now live in `app/core/consumer_lag.py` and the wor
 imports them, instead of a set of literals in the worker mirrored by a set in the reader.
 A cap that drifted from the reader's would have shortened the chart without shortening the
 axis — invisible until someone counted the points.
+
+`scripts/reset_eval_state.py::_clear_lag_samples` already deletes the window between runs,
+and the longer TTL is what makes that step load-bearing rather than tidy: a window that
+used to survive a stopped pass by 90 seconds now survives it by 18 minutes, so without the
+delete a fresh world would open the console showing the previous take's fault draining.
+The key did not move, so that step needed no edit — which is the argument for the shared
+constants restated as a fact.
 
 ### The audit filter takes lists
 

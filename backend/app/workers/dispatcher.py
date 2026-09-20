@@ -8,7 +8,6 @@ Concurrency by type: bulk_api_sync asyncio (concurrent I/O), csv_upload threadin
 """
 
 import asyncio
-import json
 import time
 import uuid
 from collections.abc import Callable

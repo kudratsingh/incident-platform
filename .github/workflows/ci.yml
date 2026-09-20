@@ -190,6 +190,7 @@ jobs:
               "test_sticky_kill_survives_restart",
               "test_agent_runs_postgres",
               "test_pool_gauge_cross_process",
+              "test_agent_run_record_postgres",
           }
 
           try:

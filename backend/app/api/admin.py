@@ -44,6 +44,7 @@ from app.schemas.agent_run import (
     AgentRunResponse,
     AgentRunStepResponse,
     AgentRunStepsResponse,
+    AgentRunSummaryResponse,
     AlertListParams,
     AlertResponse,
     CircuitBreakerResponse,
@@ -763,17 +764,21 @@ async def resolve_incident(
 # ---------------------------------------------------------------------------
 
 
-@router.get("/agent-runs", response_model=PaginatedResponse[AgentRunResponse])
+@router.get("/agent-runs", response_model=PaginatedResponse[AgentRunSummaryResponse])
 async def admin_list_agent_runs(
     params: AgentRunListParams = Depends(),
     tenant_id: uuid.UUID | None = None,
     current_user: User = Depends(_require_support_or_admin),
     db: AsyncSession = Depends(get_db),
-) -> PaginatedResponse[AgentRunResponse]:
+) -> PaginatedResponse[AgentRunSummaryResponse]:
     """Runs reported by an autonomous responder, newest first.
 
     `?active=true` narrows to runs nobody has closed — the console's own query while a
     demo is running. `?alert_id=` narrows to one alert's runs.
+
+    The items carry everything but the step ledger (WO-R3-328): a page of 100 runs with
+    200 steps each is megabytes nobody asked for, so the ledger is absent here — not
+    emptied — and lives on the single-run read and `.../steps`.
     """
     effective_tenant = await resolve_admin_tenant(current_user, db, tenant_id)
     runs, total = await AgentRunRepository(db).list_for_tenant(
@@ -784,7 +789,7 @@ async def admin_list_agent_runs(
         limit=params.page_size,
     )
     return PaginatedResponse.build(
-        items=[AgentRunResponse.model_validate(r) for r in runs],
+        items=[AgentRunSummaryResponse.model_validate(r) for r in runs],
         total=total,
         page=params.page,
         page_size=params.page_size,

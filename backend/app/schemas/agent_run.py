@@ -17,7 +17,18 @@ from app.schemas.common import PaginationParams
 from pydantic import BaseModel, ConfigDict, Field, computed_field
 
 
-class AgentRunResponse(BaseModel):
+class AgentRunSummaryResponse(BaseModel):
+    """A run without its step ledger — the shape the LISTING returns.
+
+    Everything WO-R3-312 shipped, plus WO-R3-328's reasoning columns, minus `steps`. The
+    ledger is up to 200 entries with 400-character excerpts, and a page of 100 runs
+    carrying all of theirs is megabytes an operator's browser never asked for. It is
+    **absent** here rather than emptied, so nobody can read an empty list as "this run
+    made no calls": read one run (`GET /admin/agent-runs/{id}`) or poll its ledger
+    (`.../steps?after_seq=`). `steps_dropped` stays, because it is one integer and it is
+    the field that says the ledger is not the whole run.
+    """
+
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
@@ -44,10 +55,8 @@ class AgentRunResponse(BaseModel):
     # Bounded at 50 (`VERIFICATIONS_CAP`): past that the oldest are dropped.
     verification: dict[str, Any] | None = None
     verifications: list[dict[str, Any]] = Field(default_factory=list)
-    # The action ledger, in the order the responder reported it. Bounded at 200
-    # (`STEPS_CAP`) — read `steps_dropped` before describing it as the whole run, and
-    # `GET /admin/agent-runs/{id}/steps?after_seq=` to poll it without re-reading this.
-    steps: list[dict[str, Any]] = Field(default_factory=list)
+    # How many of the oldest steps the ledger's cap discarded. Anything but 0 means the
+    # ledger is the newest part of the run rather than all of it.
     steps_dropped: int = 0
     # What the run has spent, on the responder's own meters. Null while it reported none.
     budget: dict[str, Any] | None = None
@@ -67,6 +76,20 @@ class AgentRunResponse(BaseModel):
     @property
     def active(self) -> bool:
         return self.finished_at is None
+
+
+class AgentRunResponse(AgentRunSummaryResponse):
+    """One run, whole — the shape `GET /admin/agent-runs/{id}` returns.
+
+    The summary above plus the step ledger, so one request paints a panel from cold.
+    Keeping it up to date is `.../steps?after_seq=`, which is a tail read; re-reading this
+    twice a second would send the whole ledger every tick.
+    """
+
+    # The action ledger, in the order the responder reported it. Bounded at 200
+    # (`STEPS_CAP`), oldest dropped — read `steps_dropped` beside it before describing
+    # this as the whole run.
+    steps: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class AgentRunListParams(PaginationParams):
@@ -212,6 +235,7 @@ __all__ = [
     "AgentRunResponse",
     "AgentRunStepResponse",
     "AgentRunStepsResponse",
+    "AgentRunSummaryResponse",
     "AlertListParams",
     "AlertResponse",
     "CircuitBreakerResponse",

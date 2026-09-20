@@ -9,6 +9,7 @@ and an unknown reading says **why** it is unknown instead of reading as a health
 
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -699,3 +700,311 @@ async def test_a_dead_lettered_job_with_no_triage_row_keeps_a_null_triage(
 
     assert body["triage"] is None
     assert body["dead_lettered_at"] is not None
+
+
+# --------------------------------------------------------------------------
+# GET /admin/agent-runs/{id}/steps (WO-R3-328, ADR 0037)
+# --------------------------------------------------------------------------
+
+
+def _ledger(count: int, *, start: int = 1) -> list[dict[str, Any]]:
+    return [
+        {
+            "seq": seq,
+            "kind": "action" if seq % 3 == 0 else "read",
+            "tool": "restart_consumer_group" if seq % 3 == 0 else "get_consumer_lag",
+            "arguments": {"consumer_group": "worker-dispatcher"},
+            "result_excerpt": f"reading {seq}",
+            "outcome": "success",
+            "latency_ms": float(seq),
+            "at": (_NOW + timedelta(seconds=seq)).isoformat(),
+        }
+        for seq in range(start, start + count)
+    ]
+
+
+async def _run_with_steps(
+    db_session: AsyncSession,
+    tenant_id: uuid.UUID,
+    *,
+    steps: list[dict[str, Any]],
+    steps_dropped: int = 0,
+    finished: bool = False,
+) -> AgentRun:
+    run = await _run(db_session, tenant_id, finished=finished)
+    run.steps = steps
+    run.steps_dropped = steps_dropped
+    run.hypotheses = [
+        {"name": "a stalled consumer", "confidence": 0.8, "reasoning_excerpt": "lag up"}
+    ]
+    run.plan = {"action_tool": "restart_consumer_group"}
+    run.verification = {"verdict": "verified", "attempt": 1}
+    run.verifications = [{"verdict": "verified", "attempt": 1}]
+    run.budget = {"tool_calls_used": 5, "tool_calls_max": 13}
+    await db_session.flush()
+    await db_session.refresh(run)
+    return run
+
+
+async def test_the_whole_ledger_comes_back_oldest_first(
+    app_client: AsyncClient, db_session: AsyncSession, default_tenant
+) -> None:
+    run = await _run_with_steps(db_session, default_tenant.id, steps=_ledger(4))
+    support = await _user(db_session, default_tenant.id, UserRole.SUPPORT)
+
+    body = (
+        await app_client.get(
+            f"/api/v1/admin/agent-runs/{run.id}/steps", headers=_headers(support)
+        )
+    ).json()
+
+    assert [s["seq"] for s in body["steps"]] == [1, 2, 3, 4]
+    assert body["returned"] == body["total"] == 4
+    assert body["steps_dropped"] == 0
+    assert body["after_seq"] is None
+    assert body["next_after_seq"] == 4
+    assert body["state"] == "investigating"
+    assert body["finished_at"] is None
+    first = body["steps"][0]
+    assert first["tool"] == "get_consumer_lag"
+    assert first["arguments"] == {"consumer_group": "worker-dispatcher"}
+    assert first["result_excerpt"] == "reading 1"
+    assert first["outcome"] == "success"
+
+
+async def test_after_seq_returns_only_what_is_new(
+    app_client: AsyncClient, db_session: AsyncSession, default_tenant
+) -> None:
+    """The polling contract: a console that has drawn up to `seq` 3 asks for 4 onwards
+    and is never handed a step it has already shown."""
+    run = await _run_with_steps(db_session, default_tenant.id, steps=_ledger(5))
+    support = await _user(db_session, default_tenant.id, UserRole.SUPPORT)
+
+    body = (
+        await app_client.get(
+            f"/api/v1/admin/agent-runs/{run.id}/steps?after_seq=3",
+            headers=_headers(support),
+        )
+    ).json()
+
+    assert [s["seq"] for s in body["steps"]] == [4, 5]
+    assert (body["returned"], body["total"]) == (2, 5)
+    assert body["after_seq"] == 3
+    assert body["next_after_seq"] == 5
+
+
+async def test_a_poll_that_finds_nothing_new_keeps_the_cursor_moving(
+    app_client: AsyncClient, db_session: AsyncSession, default_tenant
+) -> None:
+    """An empty page must not hand back a cursor that re-reads the tail next tick."""
+    run = await _run_with_steps(db_session, default_tenant.id, steps=_ledger(2))
+    support = await _user(db_session, default_tenant.id, UserRole.SUPPORT)
+
+    body = (
+        await app_client.get(
+            f"/api/v1/admin/agent-runs/{run.id}/steps?after_seq=2",
+            headers=_headers(support),
+        )
+    ).json()
+
+    assert body["steps"] == []
+    assert body["returned"] == 0
+    assert body["next_after_seq"] == 2
+
+
+async def test_the_ledger_is_sorted_by_seq_not_trusted_in_stored_order(
+    app_client: AsyncClient, db_session: AsyncSession, default_tenant
+) -> None:
+    """The row is appended in the order the responder reported; a report that arrived
+    out of order would otherwise draw in the wrong place on a screen."""
+    stored = _ledger(1, start=3) + _ledger(1, start=1) + _ledger(1, start=2)
+    run = await _run_with_steps(db_session, default_tenant.id, steps=stored)
+    support = await _user(db_session, default_tenant.id, UserRole.SUPPORT)
+
+    body = (
+        await app_client.get(
+            f"/api/v1/admin/agent-runs/{run.id}/steps", headers=_headers(support)
+        )
+    ).json()
+
+    assert [s["seq"] for s in body["steps"]] == [1, 2, 3]
+
+
+async def test_a_capped_ledger_says_what_it_dropped(
+    app_client: AsyncClient, db_session: AsyncSession, default_tenant
+) -> None:
+    """`total` is what is stored and `steps_dropped` is what is gone: a console showing
+    the newest 200 calls as the whole run is the thing this field prevents."""
+    run = await _run_with_steps(
+        db_session, default_tenant.id, steps=_ledger(3, start=12), steps_dropped=11
+    )
+    support = await _user(db_session, default_tenant.id, UserRole.SUPPORT)
+
+    body = (
+        await app_client.get(
+            f"/api/v1/admin/agent-runs/{run.id}/steps", headers=_headers(support)
+        )
+    ).json()
+
+    assert body["total"] == 3
+    assert body["steps_dropped"] == 11
+    assert [s["seq"] for s in body["steps"]] == [12, 13, 14]
+
+
+async def test_a_run_with_no_steps_is_an_empty_ledger_not_a_404(
+    app_client: AsyncClient, db_session: AsyncSession, default_tenant
+) -> None:
+    run = await _run(db_session, default_tenant.id)
+    support = await _user(db_session, default_tenant.id, UserRole.SUPPORT)
+
+    resp = await app_client.get(
+        f"/api/v1/admin/agent-runs/{run.id}/steps", headers=_headers(support)
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["steps"] == []
+    assert (body["total"], body["steps_dropped"]) == (0, 0)
+    assert body["next_after_seq"] is None
+
+
+async def test_another_tenants_ledger_is_a_404(
+    app_client: AsyncClient, db_session: AsyncSession, default_tenant
+) -> None:
+    other = Tenant(
+        id=uuid.uuid4(), slug=f"other-{uuid.uuid4().hex[:6]}", name="Other", is_active=True
+    )
+    db_session.add(other)
+    await db_session.flush()
+    foreign = await _run_with_steps(db_session, other.id, steps=_ledger(2))
+    support = await _user(db_session, default_tenant.id, UserRole.SUPPORT)
+
+    resp = await app_client.get(
+        f"/api/v1/admin/agent-runs/{foreign.id}/steps", headers=_headers(support)
+    )
+
+    assert resp.status_code == 404
+
+
+async def test_a_plain_user_may_not_read_a_ledger(
+    app_client: AsyncClient, db_session: AsyncSession, default_tenant
+) -> None:
+    run = await _run_with_steps(db_session, default_tenant.id, steps=_ledger(1))
+    plain = await _user(db_session, default_tenant.id, UserRole.USER)
+
+    resp = await app_client.get(
+        f"/api/v1/admin/agent-runs/{run.id}/steps", headers=_headers(plain)
+    )
+    anonymous = await app_client.get(f"/api/v1/admin/agent-runs/{run.id}/steps")
+
+    assert resp.status_code == 403
+    assert anonymous.status_code == 401
+
+
+async def test_a_negative_after_seq_is_refused(
+    app_client: AsyncClient, db_session: AsyncSession, default_tenant
+) -> None:
+    run = await _run_with_steps(db_session, default_tenant.id, steps=_ledger(1))
+    support = await _user(db_session, default_tenant.id, UserRole.SUPPORT)
+
+    resp = await app_client.get(
+        f"/api/v1/admin/agent-runs/{run.id}/steps?after_seq=-1",
+        headers=_headers(support),
+    )
+
+    assert resp.status_code == 422
+
+
+async def test_the_run_shape_carries_the_reasoning_columns(
+    app_client: AsyncClient, db_session: AsyncSession, default_tenant
+) -> None:
+    """One request rebuilds a panel from cold; the ledger endpoint above is for keeping
+    it up to date, not for the first paint."""
+    run = await _run_with_steps(db_session, default_tenant.id, steps=_ledger(2))
+    support = await _user(db_session, default_tenant.id, UserRole.SUPPORT)
+
+    body = (
+        await app_client.get(
+            f"/api/v1/admin/agent-runs/{run.id}", headers=_headers(support)
+        )
+    ).json()
+
+    assert body["hypotheses"][0]["name"] == "a stalled consumer"
+    assert body["plan"]["action_tool"] == "restart_consumer_group"
+    assert body["verification"]["verdict"] == "verified"
+    assert [v["attempt"] for v in body["verifications"]] == [1]
+    assert [s["seq"] for s in body["steps"]] == [1, 2]
+    assert body["steps_dropped"] == 0
+    assert body["budget"]["tool_calls_max"] == 13
+
+
+async def test_the_lag_reading_says_how_wide_its_window_is(
+    app_client: AsyncClient,
+    db_session: AsyncSession,
+    default_tenant,
+    redis_stub: _RedisStub,
+) -> None:
+    """15 minutes, from the platform rather than from a chart's own assumption — the
+    first take stitched the window together client-side and lost it on every reload."""
+    from app.core.consumer_lag import LAG_SAMPLES_KEEP, LAG_SAMPLES_WINDOW_SECONDS
+
+    support = await _user(db_session, default_tenant.id, UserRole.SUPPORT)
+    redis_stub.store[lag_key(LIVE_REFRESHED_GROUP)] = "42"
+    redis_stub.store[samples_key(LIVE_REFRESHED_GROUP)] = json.dumps(
+        [
+            {
+                "lag": 42 - i,
+                "measured_at": (_NOW - timedelta(seconds=60 * i)).isoformat(),
+            }
+            for i in range(LAG_SAMPLES_KEEP + 4)
+        ]
+    )
+
+    body = (
+        await app_client.get("/api/v1/admin/consumer-lag", headers=_headers(support))
+    ).json()
+
+    assert body["sample_window_seconds"] == LAG_SAMPLES_WINDOW_SECONDS == 900
+    assert body["sample_interval_seconds"] == 60
+    live = next(
+        g for g in body["groups"] if g["consumer_group"] == LIVE_REFRESHED_GROUP
+    )
+    # The reader bounds what it hands back at the window's own cap, whatever is stored.
+    assert len(live["recent_samples"]) == LAG_SAMPLES_KEEP
+    assert [s["lag"] for s in live["recent_samples"]] == sorted(
+        (s["lag"] for s in live["recent_samples"]), reverse=True
+    ), "newest first"
+
+
+async def test_the_listing_omits_the_ledger_and_the_single_read_carries_it(
+    app_client: AsyncClient, db_session: AsyncSession, default_tenant
+) -> None:
+    """A page of 100 runs with 200 steps each is megabytes an operator never asked for, so
+    the ledger is ABSENT from the listing rather than emptied — an empty list would read
+    as "this run made no calls". Everything else about the run is on both shapes."""
+    run = await _run_with_steps(db_session, default_tenant.id, steps=_ledger(3))
+    support = await _user(db_session, default_tenant.id, UserRole.SUPPORT)
+
+    listed = (
+        await app_client.get("/api/v1/admin/agent-runs", headers=_headers(support))
+    ).json()["items"][0]
+    single = (
+        await app_client.get(
+            f"/api/v1/admin/agent-runs/{run.id}", headers=_headers(support)
+        )
+    ).json()
+
+    assert "steps" not in listed
+    assert [s["seq"] for s in single["steps"]] == [1, 2, 3]
+    # The small columns are on both, so a run selector needs one request.
+    for field in (
+        "hypotheses",
+        "plan",
+        "verification",
+        "verifications",
+        "steps_dropped",
+        "budget",
+        "phase_history",
+        "active",
+    ):
+        assert field in listed, field
