@@ -3,9 +3,16 @@
 The registry is in-process and the only breaker is created in the worker, while the MCP
 reader is a separate process from the same image (ADR 0006) — so a reader walking the
 registry reads its own empty one and reports every breaker closed (ADR 0030). The record is a
-platform key outside `chaos:*`, so the world reset leaves it alone. The write fails open (a
+platform key outside `chaos:*`, so no `chaos:*` sweep carries it. The write fails open (a
 diagnostic must never cost a call); the read fails *known*, so an unreachable store is a
 reason and never an empty listing that reads as "nothing is open".
+
+The second half of the file is how the environment reset undoes a breaker the lab opened
+(WO-R3-311, ADR 0036). Clearing the record is not enough and deleting it is wrong: the
+registry that opened the breaker would write the same failure back, and an absent record is
+an unknown rather than a closed breaker. So the reset raises `breaker:reset:at` and rewrites
+each record closed, and every breaker honours that signal before it publishes again — which
+is what makes `make eval-reset` work without restarting the worker.
 """
 
 import json
@@ -19,6 +26,18 @@ logger = get_logger(__name__)
 
 #: One key per breaker. Plain platform namespace, catalogued in `docs/REDIS.md`.
 BREAKER_STATE_KEY_PREFIX = "breaker:state:"
+
+#: Where the environment reset says it happened, so a registry in another process can forget
+#: what it remembers from before it (ADR 0036). Its value is a *time*, not a counter: the
+#: question a breaker has to answer is whether its own remembered failure is older than the
+#: reset, and a counter cannot say. One fixed key rather than a key per reset, so reading it
+#: is a GET and not a scan, and so two resets cannot both look current.
+BREAKER_RESET_AT_KEY = "breaker:reset:at"
+
+#: The state a reset restores a breaker to. Pinned against `CircuitState.CLOSED.value` by
+#: `tests/unit/test_breaker_reset.py`, because the reset writes this string into a record the
+#: registry also writes.
+BREAKER_STATE_CLOSED = "closed"
 
 #: Generous like the relay heartbeat's (ADR 0028): an expired key downgrades a real state to
 #: "absent", and a day covers any outage worth investigating.
@@ -151,6 +170,105 @@ async def publish_breaker_state(
         )
 
 
+async def publish_breaker_reset(
+    redis: Any | None = None, *, now: datetime | None = None
+) -> datetime | None:
+    """Say that the environment was reset at this instant, and return that instant.
+
+    The reset raises this before it touches a single state record: raised afterwards, a
+    breaker that publishes in between writes its remembered failure over the clean record
+    and the reset has made the world worse than leaving the key alone (WO-R3-311).
+
+    Best-effort like the state write — `None` means nothing was recorded, and the caller
+    reports having reset nothing rather than claiming a reset it could not signal.
+    """
+    at = now or datetime.now(UTC)
+    try:
+        client = redis if redis is not None else _client()
+        await client.set(
+            BREAKER_RESET_AT_KEY,
+            at.isoformat(),
+            ex=BREAKER_STATE_TTL_SECONDS,
+        )
+    except Exception as exc:
+        logger.warning("breaker reset not signalled", extra={"error": str(exc)})
+        return None
+    return at
+
+
+async def read_breaker_reset_at(redis: Any | None = None) -> datetime | None:
+    """When the environment was last reset, or `None` when that is not known.
+
+    Fails open in both directions — an absent key, an unparseable value and an unreachable
+    store are all "no reset" — because a breaker that cannot ask must keep the state it
+    has. The alternative is a diagnostic that closes a breaker during a Redis outage.
+    """
+    try:
+        client = redis if redis is not None else _client()
+        raw = await client.get(BREAKER_RESET_AT_KEY)
+    except Exception as exc:
+        logger.warning("breaker reset signal unreadable", extra={"error": str(exc)})
+        return None
+    if isinstance(raw, bytes | bytearray):
+        raw = raw.decode(errors="replace")
+    return _parse(raw)
+
+
+def _is_reset_clean(record: BreakerRecord) -> bool:
+    """Whether this record already reads as a breaker that has never failed.
+
+    The shape a world audit asserts after a reset: closed, nothing counted, and every
+    failure field null. A breaker that opened and closed again on its own is *not* clean —
+    it still carries the failure that opened it.
+    """
+    return (
+        record.state == BREAKER_STATE_CLOSED
+        and record.failure_count == 0
+        and record.last_failure_at is None
+        and record.last_failure_reason_class is None
+        and record.last_state_change_at is None
+    )
+
+
+async def reset_breaker_states(redis: Any | None = None) -> int:
+    """Restore every published breaker to closed, and tell the owning processes to forget.
+
+    Two halves, in this order. The signal goes first, for the reason
+    `publish_breaker_reset` gives. Then every record that is not already clean is rewritten
+    *closed with the failure fields null*, rather than deleted: a deleted record makes the
+    breaker **absent** from `get_circuit_breakers`, and an absence is not a reading (ADR
+    0030) — a world audit cannot assert "every breaker closed" about a breaker that is
+    missing. The breaker's own yardsticks (`failure_threshold`, `recovery_timeout_s`) are
+    carried over, because `failure_count` means nothing without them.
+
+    Returns how many records had to be rewritten; 0 on a world already clean, and 0 when the
+    store could not be reached — nothing is claimed that was not done. ADR 0036.
+    """
+    client = redis if redis is not None else _client()
+    at = await publish_breaker_reset(client)
+    if at is None:
+        return 0
+
+    records, _unknown = await read_breaker_states(client)
+    reset = 0
+    for record in records:
+        if _is_reset_clean(record):
+            continue
+        await publish_breaker_state(
+            client,
+            name=record.name,
+            state=BREAKER_STATE_CLOSED,
+            failure_count=0,
+            failure_threshold=record.failure_threshold,
+            recovery_timeout_s=record.recovery_timeout_s,
+            last_state_change_at=None,
+            last_failure_at=None,
+            last_failure_reason_class=None,
+        )
+        reset += 1
+    return reset
+
+
 async def read_breaker_states(
     redis: Any,
 ) -> tuple[tuple[BreakerRecord, ...], str | None]:
@@ -241,6 +359,8 @@ __all__ = [
     "BREAKERS_UNKNOWN_UNREACHABLE",
     "BREAKERS_UNKNOWN_UNREADABLE",
     "BREAKER_REFRESH_INTERVAL_SECONDS",
+    "BREAKER_RESET_AT_KEY",
+    "BREAKER_STATE_CLOSED",
     "BREAKER_STATE_KEY_PREFIX",
     "BREAKER_STATE_TTL_SECONDS",
     "FAILURE_CLASSES",
@@ -250,6 +370,9 @@ __all__ = [
     "BreakerRecord",
     "breaker_key_for",
     "classify_failure",
+    "publish_breaker_reset",
     "publish_breaker_state",
+    "read_breaker_reset_at",
     "read_breaker_states",
+    "reset_breaker_states",
 ]

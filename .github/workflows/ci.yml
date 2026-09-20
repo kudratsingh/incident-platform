@@ -172,6 +172,7 @@ jobs:
           EXPECTED = {
               "test_rls_enforcement",
               "test_eval_reset_postgres",
+              "test_eval_reset_breakers",
               "test_kafka_e2e",
               "test_migration_lock_pg",
               "test_outbox_relay_concurrency",

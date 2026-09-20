@@ -455,18 +455,24 @@ async def _seed_consumer_lag(redis: aioredis.Redis) -> None:
         await redis.set(f"{_LAG_KEY_PREFIX}{group}", str(lag))
 
 
+def hot_set_payload() -> str:
+    """The exact value `_seed_hot_set` writes.
+
+    Public so the reset can tell an intact key from a drifted one without restating the id
+    set — hardcoded names drifted once and left phantom UUIDs (D-14), and after WO-R3-310
+    a second reader needs the same answer.
+    """
+    import json as _json
+
+    # From `_dlq_specs()`, so every member names a real seeded job.
+    return _json.dumps([str(spec["job_id"]) for spec in _dlq_specs()[:3]])
+
+
 async def _seed_hot_set(redis: aioredis.Redis) -> None:
     """Populate the `remediate_stale_cache_success` scenario's fixture
     (FIX_PLAN #19). Value is stable + recognisably fake so an operator
     inspecting Redis doesn't confuse it with production cache."""
-    import json as _json
-
-    # From `_dlq_specs()`, so every member names a real seeded job;
-    # hardcoded names drifted once, leaving phantom UUIDs (D-14).
-    payload = _json.dumps(
-        [str(spec["job_id"]) for spec in _dlq_specs()[:3]]
-    )
-    await redis.set(_HOT_SET_KEY, payload, ex=_HOT_SET_TTL_SECONDS)
+    await redis.set(_HOT_SET_KEY, hot_set_payload(), ex=_HOT_SET_TTL_SECONDS)
 
 
 async def _reset_dlq_state(session: AsyncSession) -> int:
