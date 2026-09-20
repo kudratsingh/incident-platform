@@ -729,6 +729,34 @@ Two reasons it is a substitution and not a trim. `audit_logs.request_id` is `Str
 
 `record_tool_invocation` still never raises — the savepoint means a failed audit insert costs the row and nothing else. What changed is who decides what a missing row is worth. `app/mcp/handlers.py` now treats it as fatal: `AuditWriteFailedError` is the one exception the `tools/call` envelope deliberately lets escape, so `get_db` rolls the request back and the standalone app's catch-all returns a JSON-RPC internal error. A 200 for a Tier-1 action with no record that it ran is not an outcome this surface offers. Non-DB side effects (a Redis `DEL`) have already happened and cannot be unwound; retrying under the same idempotency key is safe, because every path that does not complete a claim releases it.
 
+### `_lab_probe`: a call the lab makes on the agent's token says so (WO-R3-333)
+
+Two evaluator callers use the agent's own bearer token on purpose, because that token is what they are asserting about: the principal guards (a Tier-1 attempt and a chaos attempt that must both be refused) and the world audit (reads taken exactly as the agent would take them). Their rows were `agent.tool_invoked`, indistinguishable from the agent's own investigation — so the `/demo` ledger showed reads nobody made. The envelope now takes a label, and [ADR 0038](ADR/0038-a-probe-by-the-lab-is-labelled-by-the-lab.md) has the reasoning.
+
+**The request shape.** `_lab_probe` is a member of `params`, a **sibling of `arguments`**, plus one header:
+
+```http
+POST /mcp
+Authorization: Bearer <PLATFORM_TOKEN>            # the agent's token — the call is the agent's
+X-Lab-Principal: Bearer <PLATFORM_CHAOS_TOKEN>    # or the read-only smoke token
+Content-Type: application/json
+
+{"jsonrpc": "2.0", "id": "1", "method": "tools/call",
+ "params": {"name": "get_consumer_lag",
+            "arguments": {"consumer_group": "worker-dispatcher"},
+            "_lab_probe": "world audit read"}}
+```
+
+Inside `arguments` it would be an argument: the tool's own `extra="forbid"` refuses it, and it would be on the wire in `tools/list` for anything that accepted it. Beside `arguments` it reaches the envelope and stops — **`tools/list` is byte-identical**, so there is no contract delta to rebless, and the only spelling accepted is `_lab_probe` (`lab_probe` is an unknown key that changes nothing).
+
+**What it does.** The audit row for that call becomes `lab.probe` instead of `agent.tool_invoked`, with `extra_data.lab_probe_reason` (the caller's string, ≤ 200 characters, refused rather than truncated if longer) and `extra_data.lab_probe_principal` (the lab account that vouched for it). It replaces `agent.tool_invoked` and nothing else: a `chaos.` row or an `agent.run_reported` row keeps its action and carries the reason in `extra_data`.
+
+**What it requires.** `X-Lab-Principal` must verify to a service-account principal that holds `chaos:invoke` **or** is the read-only smoke account (`lab_probe_smoke_account_name`, default `incident-commander-smoke`, re-checked to hold no write scope, because it holds the agent's scopes exactly and nothing else tells them apart), in the caller's own tenant, on a stack with `CHAOS_ENABLED=true`. Anything else is a JSON-RPC invalid-params refusal carrying `error_code: lab_probe_refused` and a closed `reason_code` — `not_available`, `credential_missing`, `credential_invalid`, `credential_not_authorised`, `reason_invalid` — and **the call does not run**: a silent ignore would leave the row mislabelled while the caller believed otherwise. The credential is verified, not adopted; the tool's own scope check still runs against the calling principal, and nothing about the request's tenant or context moves.
+
+The refusal names the field, the header and a reason code, and never the scope behind the rule — it can reach the agent's own client, and ADR 0012 rule 1 covers response bodies.
+
+`lab.probe` is withheld from any principal without `chaos:invoke`, by the `lab.` prefix rule the boundary row already established. Human operators see it unfiltered on `GET /api/v1/audit/logs`, under the Audit tab's existing `lab.` stream filter.
+
 ---
 
 ## Cost model (LLM features)

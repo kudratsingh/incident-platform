@@ -222,6 +222,56 @@ async def test_the_world_reset_boundary_is_visible_to_a_human_operator(
     assert rows[0]["extra_data"] == counters
 
 
+async def test_an_evaluator_probe_is_visible_to_a_human_operator(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    default_tenant,  # type: ignore[no-untyped-def]
+    admin_headers: dict[str, str],
+) -> None:
+    """The other half of WO-R3-333. `lab.probe` is withheld from the agent's MCP reads —
+    that is the point of it — and an operator must see both the row and why it carries the
+    label, because the question the label answers ("who actually made this call?") is the
+    operator's question. Filed under `lab.` beside the boundary row, so the Audit tab's
+    existing stream filter finds it with no new option."""
+    from app.services.operator_audit import LAB_PROBE_ACTION
+
+    await _seed_rows(db_session, default_tenant.id)
+    probe_extra = {
+        "tool_name": "get_consumer_lag",
+        "arguments": {"consumer_group": "worker-dispatcher"},
+        "scope_used": "telemetry:read",
+        "latency_ms": 2.1,
+        "outcome": "success",
+        "lab_probe_reason": "world audit read",
+        "lab_probe_principal": "incident-commander-smoke",
+    }
+    db_session.add(
+        AuditLog(
+            tenant_id=default_tenant.id,
+            action=LAB_PROBE_ACTION,
+            principal_type=PRINCIPAL_TYPE_SERVICE_ACCOUNT,
+            principal_id=uuid.uuid4(),
+            user_id=None,
+            resource_type="mcp_tool",
+            resource_id="get_consumer_lag",
+            extra_data=probe_extra,
+        )
+    )
+    await db_session.flush()
+
+    unfiltered = await client.get("/api/v1/audit/logs", headers=admin_headers)
+    assert unfiltered.status_code == 200
+    assert LAB_PROBE_ACTION in {row["action"] for row in unfiltered.json()["items"]}
+
+    resp = await client.get(
+        "/api/v1/audit/logs?action_prefix=lab.", headers=admin_headers
+    )
+    assert resp.status_code == 200
+    rows = resp.json()["items"]
+    assert [row["action"] for row in rows] == [LAB_PROBE_ACTION]
+    assert rows[0]["extra_data"] == probe_extra
+
+
 async def test_over_long_action_prefix_returns_422(
     client: AsyncClient,
     admin_headers: dict[str, str],

@@ -3,18 +3,29 @@
 `lab.world_reset` joined the withheld set in WO-R3-327 (ADR 0012's 2026-09-20 amendment). It
 carries a sharper leak than a hook name: its payload is the reset's own counters, which name
 every mechanism the lab swept.
+
+`lab.probe` joined it in WO-R3-333 (ADR 0038), and it arrives by a different route: not a row
+some script appended, but the label a real `tools/call` carries when the lab made it **under
+the agent's own token**. The second half of this file is that end to end — who may apply the
+label, what the agent gets when it tries, and that the row lands on the operator's side of the
+withholding and not the agent's.
 """
 
 from __future__ import annotations
 
 import json
 import uuid
+from contextlib import contextmanager
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 import pytest_asyncio
+from app.config import Settings
 from app.core.scopes import Scope
 from app.dependencies import get_db, get_redis
+from app.mcp.lab_probe import LAB_PRINCIPAL_HEADER, LAB_PROBE_REASON_MAX_LENGTH
+from app.mcp.protocol import LAB_PROBE_FIELD
 from app.mcp.standalone import create_mcp_app
 from app.models.audit import (
     PRINCIPAL_TYPE_SERVICE_ACCOUNT,
@@ -31,11 +42,14 @@ from app.services.operator_audit import (
     CHAOS_TOOL_DENIED_ACTION,
     CHAOS_TOOL_INVOKED_ACTION,
     LAB_ACTION_PREFIX,
+    LAB_PROBE_ACTION,
+    TOOL_INVOKED_ACTION,
     WORLD_RESET_ACTION,
     WORLD_RESET_RESOURCE_TYPE,
 )
 from app.services.service_account import ServiceAccountService
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 # The two principals the token split creates. Spelled out rather than
@@ -49,8 +63,27 @@ EVALUATOR_SCOPES = [
     Scope.INCIDENTS_READ.value,
     Scope.CHAOS_INVOKE.value,
 ]
+# The third: read-only, and holding the agent's scopes exactly, which is why the rule has to
+# know it by name (ADR 0038).
+SMOKE_SCOPES = [Scope.TELEMETRY_READ.value, Scope.INCIDENTS_READ.value]
+SMOKE_ACCOUNT_NAME = "incident-commander-smoke"
 
 _TRACE_ID = "11111111-2222-3333-4444-555555555555"
+
+
+@contextmanager
+def lab_enabled(smoke_name: str = SMOKE_ACCOUNT_NAME):  # type: ignore[no-untyped-def]
+    """A stack with a lab on it. The label is gated on `CHAOS_ENABLED` (ADR 0008), so
+    every honoured-probe test says so out loud; the refusal without it has its own test."""
+    with patch(
+        "app.mcp.lab_probe.get_settings",
+        return_value=Settings(
+            chaos_enabled=True,
+            environment="test",
+            lab_probe_smoke_account_name=smoke_name,
+        ),
+    ):
+        yield
 
 
 class _RedisStub:
@@ -81,7 +114,11 @@ async def mcp_client(  # type: ignore[no-untyped-def]
 
 
 async def _token(
-    db_session: AsyncSession, tenant_id: uuid.UUID, scopes: list[str]
+    db_session: AsyncSession,
+    tenant_id: uuid.UUID,
+    scopes: list[str],
+    *,
+    name: str | None = None,
 ) -> str:
     svc = ServiceAccountService(
         ServiceAccountRepository(db_session),
@@ -90,7 +127,7 @@ async def _token(
     )
     sa = await svc.create_service_account(
         tenant_id=tenant_id,
-        name=f"probe-{uuid.uuid4().hex[:8]}",
+        name=name or f"probe-{uuid.uuid4().hex[:8]}",
         scopes=scopes,
         created_by_user_id=None,
     )
@@ -104,19 +141,34 @@ async def _token(
 
 
 async def _call(
-    ac: AsyncClient, token: str, tool: str, arguments: dict[str, Any]
+    ac: AsyncClient,
+    token: str,
+    tool: str,
+    arguments: dict[str, Any],
+    *,
+    lab_probe: str | None = None,
+    lab_credential: str | None = None,
 ) -> dict[str, Any]:
+    params: dict[str, Any] = {"name": tool, "arguments": arguments}
+    if lab_probe is not None:
+        # Beside `arguments`, never inside it — that placement is the contract.
+        params[LAB_PROBE_FIELD] = lab_probe
+    headers = {"Authorization": f"Bearer {token}"}
+    if lab_credential is not None:
+        headers[LAB_PRINCIPAL_HEADER] = f"Bearer {lab_credential}"
     resp = await ac.post(
         "/mcp",
-        json={
-            "jsonrpc": "2.0",
-            "id": "1",
-            "method": "tools/call",
-            "params": {"name": tool, "arguments": arguments},
-        },
-        headers={"Authorization": f"Bearer {token}"},
+        json={"jsonrpc": "2.0", "id": "1", "method": "tools/call", "params": params},
+        headers=headers,
     )
     return resp.json()
+
+
+async def _rows(db_session: AsyncSession, action: str) -> list[AuditLog]:
+    result = await db_session.execute(
+        select(AuditLog).where(AuditLog.action == action)
+    )
+    return list(result.scalars().all())
 
 
 def _content(body: dict[str, Any]) -> dict[str, Any]:
@@ -426,3 +478,257 @@ async def test_get_trace_shows_chaos_rows_to_the_evaluator(
     actions = {e["action"] for e in payload["audit_events"]}
     assert CHAOS_TOOL_INVOKED_ACTION in actions
     assert payload["total_audit_events"] == 4
+
+
+# ---------------------------------------------------------------------------
+# `lab.probe` — the label, the credential it needs, and who reads the row
+# (WO-R3-333, ADR 0038)
+# ---------------------------------------------------------------------------
+
+_PROBED_TOOL = "get_consumer_lag"
+_PROBED_ARGS = {"consumer_group": "worker-dispatcher"}
+_REASON = "principal guard: the agent token must be refused here"
+
+
+async def test_an_agent_token_alone_cannot_relabel_its_own_read(
+    mcp_client: AsyncClient,
+    db_session: AsyncSession,
+    default_tenant,  # type: ignore[no-untyped-def]
+) -> None:
+    """THE assertion on this side. If the field were honoured on the agent's token alone,
+    the agent could lift its own reads out of the ledger by adding one key — the audit
+    trail would be something the subject under test writes."""
+    agent = await _token(db_session, default_tenant.id, AGENT_SCOPES)
+
+    with lab_enabled():
+        body = await _call(
+            mcp_client, agent, _PROBED_TOOL, _PROBED_ARGS, lab_probe=_REASON
+        )
+
+    assert body["error"]["code"] == -32602, body
+    assert body["error"]["data"]["error_code"] == "lab_probe_refused"
+    assert body["error"]["data"]["reason_code"] == "credential_missing"
+    assert LAB_PRINCIPAL_HEADER in body["error"]["message"]
+
+    # Refused, never ignored: no labelled row, and the call itself did not run.
+    assert await _rows(db_session, LAB_PROBE_ACTION) == []
+    refused = await _rows(db_session, TOOL_INVOKED_ACTION)
+    assert len(refused) == 1
+    assert refused[0].extra_data["outcome"] == "error"
+    assert LAB_PROBE_FIELD in refused[0].extra_data["error_message"]
+
+
+async def test_the_agents_own_credential_in_the_header_buys_nothing(
+    mcp_client: AsyncClient,
+    db_session: AsyncSession,
+    default_tenant,  # type: ignore[no-untyped-def]
+) -> None:
+    """The obvious next try: present the same token twice."""
+    agent = await _token(
+        db_session, default_tenant.id, AGENT_SCOPES, name="incident-commander"
+    )
+
+    with lab_enabled():
+        body = await _call(
+            mcp_client,
+            agent,
+            _PROBED_TOOL,
+            _PROBED_ARGS,
+            lab_probe=_REASON,
+            lab_credential=agent,
+        )
+
+    assert body["error"]["data"]["reason_code"] == "credential_not_authorised"
+    assert await _rows(db_session, LAB_PROBE_ACTION) == []
+
+
+async def test_the_evaluator_credential_labels_a_call_made_on_the_agents_token(
+    mcp_client: AsyncClient,
+    db_session: AsyncSession,
+    default_tenant,  # type: ignore[no-untyped-def]
+) -> None:
+    """The shape the principal guards need: the call is the agent's, because what that
+    token can do is the thing being proved, and the row says the lab made it."""
+    agent = await _token(db_session, default_tenant.id, AGENT_SCOPES)
+    evaluator = await _token(
+        db_session,
+        default_tenant.id,
+        EVALUATOR_SCOPES,
+        name="incident-commander-chaos",
+    )
+
+    with lab_enabled():
+        body = await _call(
+            mcp_client,
+            agent,
+            _PROBED_TOOL,
+            _PROBED_ARGS,
+            lab_probe=_REASON,
+            lab_credential=evaluator,
+        )
+
+    assert "error" not in body, body
+    labelled = await _rows(db_session, LAB_PROBE_ACTION)
+    assert len(labelled) == 1
+    row = labelled[0]
+    assert row.extra_data["tool_name"] == _PROBED_TOOL
+    assert row.extra_data["lab_probe_reason"] == _REASON
+    assert row.extra_data["lab_probe_principal"] == "incident-commander-chaos"
+    # The one thing the label must not do: leave a second row in the agent's stream.
+    assert await _rows(db_session, TOOL_INVOKED_ACTION) == []
+
+
+async def test_the_read_only_smoke_credential_labels_a_call(
+    mcp_client: AsyncClient,
+    db_session: AsyncSession,
+    default_tenant,  # type: ignore[no-untyped-def]
+) -> None:
+    """The world audit's credential — it holds no write scope at all, so it is matched by
+    name and the read-only claim is re-checked."""
+    agent = await _token(db_session, default_tenant.id, AGENT_SCOPES)
+    smoke = await _token(
+        db_session, default_tenant.id, SMOKE_SCOPES, name=SMOKE_ACCOUNT_NAME
+    )
+
+    with lab_enabled():
+        body = await _call(
+            mcp_client,
+            agent,
+            _PROBED_TOOL,
+            _PROBED_ARGS,
+            lab_probe="world audit read",
+            lab_credential=smoke,
+        )
+
+    assert "error" not in body, body
+    labelled = await _rows(db_session, LAB_PROBE_ACTION)
+    assert len(labelled) == 1
+    assert labelled[0].extra_data["lab_probe_principal"] == SMOKE_ACCOUNT_NAME
+
+
+async def test_the_field_inside_arguments_is_refused_by_the_tool_and_labels_nothing(
+    mcp_client: AsyncClient,
+    db_session: AsyncSession,
+    default_tenant,  # type: ignore[no-untyped-def]
+) -> None:
+    """The placement is the contract. Inside `arguments` the field is an argument: the
+    tool's own `extra="forbid"` refuses it, and the row stays the agent's."""
+    agent = await _token(db_session, default_tenant.id, AGENT_SCOPES)
+    evaluator = await _token(db_session, default_tenant.id, EVALUATOR_SCOPES)
+
+    with lab_enabled():
+        body = await _call(
+            mcp_client,
+            agent,
+            _PROBED_TOOL,
+            {**_PROBED_ARGS, LAB_PROBE_FIELD: _REASON},
+            lab_credential=evaluator,
+        )
+
+    assert body["error"]["code"] == -32602, body
+    assert body["error"]["message"] == "invalid tool arguments"
+    assert await _rows(db_session, LAB_PROBE_ACTION) == []
+    assert len(await _rows(db_session, TOOL_INVOKED_ACTION)) == 1
+
+
+async def test_an_over_long_reason_is_refused_with_a_valid_credential(
+    mcp_client: AsyncClient,
+    db_session: AsyncSession,
+    default_tenant,  # type: ignore[no-untyped-def]
+) -> None:
+    agent = await _token(db_session, default_tenant.id, AGENT_SCOPES)
+    evaluator = await _token(db_session, default_tenant.id, EVALUATOR_SCOPES)
+
+    with lab_enabled():
+        body = await _call(
+            mcp_client,
+            agent,
+            _PROBED_TOOL,
+            _PROBED_ARGS,
+            lab_probe="x" * (LAB_PROBE_REASON_MAX_LENGTH + 1),
+            lab_credential=evaluator,
+        )
+
+    assert body["error"]["data"]["reason_code"] == "reason_invalid"
+    assert await _rows(db_session, LAB_PROBE_ACTION) == []
+
+
+async def test_a_stack_with_no_lab_on_it_refuses_the_label(
+    mcp_client: AsyncClient,
+    db_session: AsyncSession,
+    default_tenant,  # type: ignore[no-untyped-def]
+) -> None:
+    """No `lab_enabled()` here, so `chaos_enabled` is off — a production deployment has no
+    lab and therefore no way to relabel an audit row, whatever credential arrives."""
+    agent = await _token(db_session, default_tenant.id, AGENT_SCOPES)
+    evaluator = await _token(db_session, default_tenant.id, EVALUATOR_SCOPES)
+
+    body = await _call(
+        mcp_client,
+        agent,
+        _PROBED_TOOL,
+        _PROBED_ARGS,
+        lab_probe=_REASON,
+        lab_credential=evaluator,
+    )
+
+    assert body["error"]["data"]["reason_code"] == "not_available"
+    assert await _rows(db_session, LAB_PROBE_ACTION) == []
+
+
+async def test_a_labelled_row_is_withheld_from_the_agent_and_read_by_the_evaluator(
+    mcp_client: AsyncClient,
+    db_session: AsyncSession,
+    default_tenant,  # type: ignore[no-untyped-def]
+) -> None:
+    """F4 closed at the read surface too. A read the agent did not make must not come back
+    to it as its own — otherwise the label only moves the confusion one layer down."""
+    agent = await _token(db_session, default_tenant.id, AGENT_SCOPES)
+    evaluator = await _token(db_session, default_tenant.id, EVALUATOR_SCOPES)
+
+    with lab_enabled():
+        assert "error" not in await _call(
+            mcp_client,
+            agent,
+            _PROBED_TOOL,
+            _PROBED_ARGS,
+            lab_probe=_REASON,
+            lab_credential=evaluator,
+        )
+
+    as_agent = _content(await _call(mcp_client, agent, "list_audit_events", {}))
+    assert _lab_rows(as_agent) == 0
+    _assert_total_matches_the_page(as_agent)
+    body = json.dumps(as_agent)
+    assert LAB_PROBE_ACTION not in body
+    assert _REASON not in body
+
+    as_evaluator = _content(await _call(mcp_client, evaluator, "list_audit_events", {}))
+    assert LAB_PROBE_ACTION in {e["action"] for e in as_evaluator["events"]}
+
+
+async def test_the_agent_asking_for_the_probe_stream_by_name_gets_an_empty_page(
+    mcp_client: AsyncClient,
+    db_session: AsyncSession,
+    default_tenant,  # type: ignore[no-untyped-def]
+) -> None:
+    """Withholding is not refusing: an error would confirm the stream exists, which is
+    the fact being withheld."""
+    agent = await _token(db_session, default_tenant.id, AGENT_SCOPES)
+    evaluator = await _token(db_session, default_tenant.id, EVALUATOR_SCOPES)
+
+    with lab_enabled():
+        await _call(
+            mcp_client,
+            agent,
+            _PROBED_TOOL,
+            _PROBED_ARGS,
+            lab_probe=_REASON,
+            lab_credential=evaluator,
+        )
+
+    body = await _call(
+        mcp_client, agent, "list_audit_events", {"action": LAB_PROBE_ACTION}
+    )
+    assert "error" not in body
+    assert _content(body) == {"total": 0, "events": []}

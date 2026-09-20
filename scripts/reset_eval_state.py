@@ -17,13 +17,16 @@ What gets cleared/reset:
      `kill_consumer('dependency-resolver')` and `pause_control_loop('resume_unblocked_waiting')`
      — ADR 0029, ADR 0027's 2026-09-17 amendment, pinned by
      `backend/tests/unit/test_stranded_chain_and_lab_pause.py`.
-  3. **Tier-1 action residue** — delayed-replay timers on `jobs:dlq_replay_delayed`, any
-     `dag:paused:*` flag, and the recent-lag window
-     (`kafka:consumer_lag:worker-dispatcher:samples`). Each bleeds into the next scenario: a timer
-     shrinks the DLQ unprompted, a stale pause holds a DAG in WAITING (ADR 0011), a carried window
-     shows a lag trend from the previous run. `pause_dag_chaos` (WO-R3-275, ADR 0029) writes the
-     same `dag:paused:*` key the agent's `pause_dag` does, so `dag_pauses_cleared` counts both and
-     a leftover pause is no longer evidence the agent acted.
+  3. **Tier-1 action residue** — delayed-replay timers on `jobs:dlq_replay_delayed` and any
+     `dag:paused:*` flag. Each bleeds into the next scenario: a timer shrinks the DLQ unprompted,
+     a stale pause holds a DAG in WAITING (ADR 0011). `pause_dag_chaos` (WO-R3-275, ADR 0029)
+     writes the same `dag:paused:*` key the agent's `pause_dag` does, so `dag_pauses_cleared`
+     counts both and a leftover pause is no longer evidence the agent acted.
+
+     **Not the recent-lag window, since WO-R3-333** (ADR 0038). It used to be cleared here as
+     residue; it is history, and clearing it opened the demo's lag chart on two points while the
+     fault it was drawn to show was climbing 0 → 10 → 30. `lag_samples_cleared` stays in the
+     summary as a permanent 0 — see `_LAG_SAMPLES_CLEARED` for why the counter stays at all.
   4. **Declared fixtures and non-fixture DLQ rows** — two disposal classes on purpose (ADR 0012
      rule 2). A row carrying the top-level `seeded_fixture` payload marker is hard-DELETEd;
      everything else still in `dead_letter` outside the `_dlq_specs()` stable-ID set is moved to
@@ -162,14 +165,23 @@ _JOB_CACHE_PATTERN = "cache:job:*"
 _SCHEDULED_REPLAY_KEY = "jobs:dlq_replay_delayed"
 _INFLIGHT_REPLAY_KEY = "jobs:dlq_replay_inflight"
 
-# The metrics loop's window of recent lag measurements for the refreshed group (WO-R3-254). A
-# literal mirror of `app/workers/dispatcher.py:LAG_SAMPLES_KEY`, pinned against it by
-# `tests/unit/test_consumer_lag_history.py`.
+# The reset touches NEITHER consumer-lag key, and the counter stays to say so (WO-R3-333,
+# ADR 0038). It is reported rather than dropped for two reasons: `make eval-reset` and the
+# `lab.world_reset` boundary row both carry this summary, so a key that disappears reads as a
+# step that stopped being reported rather than one that stopped being needed — and the number
+# is now a claim worth making, that this reset preserved the window it used to delete.
 #
-# The lag VALUE key beside it is deliberately untouched, in the seeder too: the loop owns it
-# under a 90s TTL. The window spans minutes, so measurements from before a reset would be the
-# first "trend" the next run sees. Cleared, not rebuilt — the loop records a fresh one within 60s.
-_LAG_SAMPLES_KEY = "kafka:consumer_lag:worker-dispatcher:samples"
+# WO-R3-254 cleared the window as residue, on the reading that a lag trend from the previous
+# run is the first thing the next run sees. The demo's third live take (2026-09-20) showed the
+# cost: the operator opens the page on a freshly reset world, and the chart that is supposed
+# to show the fault climbing has two points in a fifteen-minute window. The window is history,
+# under a TTL deliberately longer than the value key's (ADR 0037) precisely so it outlives the
+# pass that wrote it; deleting it on the boundary contradicted the reason it is kept.
+#
+# The lag VALUE key is untouched as it always was, here and in the seeder: the metrics loop
+# owns it under a 90 s TTL, so it is already fresh-or-absent — which is what `check_backpressure`
+# needs and what makes deleting it pointless as well as blinding.
+_LAG_SAMPLES_CLEARED = 0
 
 # What the reset writes into a run it closes itself, so an operator reading the console can
 # tell a responder that gave up from a world that was taken away under it (WO-R3-315).
@@ -238,14 +250,6 @@ async def _clear_scheduled_replays(redis: aioredis.Redis) -> int:
             await redis.delete(key)
             pending += held
     return pending
-
-
-async def _clear_lag_samples(redis: aioredis.Redis) -> int:
-    """Drop the recorded consumer-lag measurement window.
-
-    `get_consumer_lag` returns it as `recent_samples`, so one carried across a reset shows the
-    next run a trend from the previous one. The value key beside it is left alone."""
-    return int(await redis.delete(_LAG_SAMPLES_KEY) or 0)
 
 
 async def _clear_dag_pauses(redis: aioredis.Redis) -> int:
@@ -712,7 +716,6 @@ async def reset(
         job_cache_cleared = await _clear_job_read_cache(redis)
         timers_cleared = await _clear_scheduled_replays(redis)
         pauses_cleared = await _clear_dag_pauses(redis)
-        lag_samples_cleared = await _clear_lag_samples(redis)
         # Before the seed's own write, so the count reports the world this reset found
         # (WO-R3-310) rather than the one it leaves.
         hot_set_reseeded = await _reseed_hot_set(redis)
@@ -759,7 +762,8 @@ async def reset(
             "empty_dlq_baseline": _empty_dlq_baseline(),
             "hot_set_reseeded": hot_set_reseeded,
             "job_cache_cleared": job_cache_cleared,
-            "lag_samples_cleared": lag_samples_cleared,
+            # Always 0, on purpose, and reported anyway — `_LAG_SAMPLES_CLEARED`.
+            "lag_samples_cleared": _LAG_SAMPLES_CLEARED,
             "organic_alerts_resolved": organic_alerts_resolved,
             "read_model_keys_rebuilt": read_model_keys,
             "seeded_dlq_deleted": seeded_dlq_deleted,

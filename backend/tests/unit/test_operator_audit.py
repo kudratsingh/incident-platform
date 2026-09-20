@@ -5,6 +5,11 @@ the audit-row identity fields.
 Since WO-R3-327 it also covers the `lab.` stream: the `lab.world_reset` row the
 environment reset appends, and the withholding that keeps it off the agent's own
 read surface beside `chaos.` (ADR 0012, 2026-09-20 amendment).
+
+Since WO-R3-333 that stream has a second member, `lab.probe` — one MCP call the lab made
+under the agent's own token, labelled so the console can tell it from the agent's work
+(ADR 0038). The credential that authorises the label is tested in `test_lab_probe.py`;
+what is tested here is the row it produces and which rows it may not move.
 """
 
 import uuid
@@ -19,8 +24,11 @@ from app.models.audit import (
 from app.models.service_account import ServiceAccount
 from app.models.user import User
 from app.services.operator_audit import (
+    AGENT_RUN_REPORTED_ACTION,
     CHAOS_ACTION_PREFIX,
+    CHAOS_TOOL_INVOKED_ACTION,
     LAB_ACTION_PREFIX,
+    LAB_PROBE_ACTION,
     OUTCOME_ERROR,
     OUTCOME_SUCCESS,
     TOOL_INVOKED_ACTION,
@@ -287,3 +295,123 @@ async def test_a_failed_boundary_write_is_loud() -> None:
         pass
     else:  # pragma: no cover - the assertion is the failure path
         raise AssertionError("record_world_reset must not swallow a failed write")
+
+
+# ---------------------------------------------------------------------------
+# `lab.probe` — a call the lab made on the agent's token (WO-R3-333, ADR 0038)
+# ---------------------------------------------------------------------------
+
+
+def test_the_probe_action_joins_the_lab_stream() -> None:
+    """Same prefix as the boundary row, so it is withheld by the rule that already
+    exists — and not `chaos.`, because a read is not a fault and the console reads the
+    newest `chaos.` row as one."""
+    assert LAB_PROBE_ACTION == "lab.probe"
+    assert LAB_PROBE_ACTION.startswith(LAB_ACTION_PREFIX)
+    assert not LAB_PROBE_ACTION.startswith(CHAOS_ACTION_PREFIX)
+    assert LAB_PROBE_ACTION != WORLD_RESET_ACTION
+
+
+def test_the_probe_stream_is_withheld_from_a_principal_without_the_chaos_scope() -> None:
+    """THE assertion for F4's other half: the agent must not read back a call it never
+    made as its own. No second rule was added for it — one prefix, one condition."""
+    agent = _scoped_principal(Scope.TELEMETRY_READ, Scope.ACTIONS_EXECUTE)
+    evaluator = _scoped_principal(Scope.TELEMETRY_READ, Scope.CHAOS_INVOKE)
+
+    hidden_from_agent = hidden_audit_action_prefixes(agent)
+    assert any(LAB_PROBE_ACTION.startswith(prefix) for prefix in hidden_from_agent)
+    assert not any(
+        LAB_PROBE_ACTION.startswith(prefix)
+        for prefix in hidden_audit_action_prefixes(evaluator)
+    )
+
+
+async def test_an_honoured_probe_is_recorded_as_lab_probe() -> None:
+    repo = _mock_audit_repo()
+    principal = _sa_principal()
+
+    await record_tool_invocation(
+        repo,
+        principal=principal,
+        tool_name="get_consumer_lag",
+        arguments={"consumer_group": "worker-dispatcher"},
+        scope_used="telemetry:read",
+        latency_ms=2.0,
+        outcome=OUTCOME_SUCCESS,
+        lab_probe_reason="world audit read",
+        lab_probe_principal="incident-commander-smoke",
+    )
+
+    args, kwargs = repo.log.call_args
+    assert args[0] == LAB_PROBE_ACTION
+    # The row is still the agent's token making the call — that is the truth of it, and
+    # it is what the label exists to qualify rather than to hide.
+    assert kwargs["principal_id"] == principal.id
+    extra = kwargs["extra_data"]
+    assert extra["lab_probe_reason"] == "world audit read"
+    assert extra["lab_probe_principal"] == "incident-commander-smoke"
+    assert extra["tool_name"] == "get_consumer_lag"
+    assert extra["outcome"] == OUTCOME_SUCCESS
+
+
+async def test_a_row_with_no_probe_keeps_the_agent_action_and_no_extra_fields() -> None:
+    repo = _mock_audit_repo()
+
+    await record_tool_invocation(
+        repo,
+        principal=_sa_principal(),
+        tool_name="get_consumer_lag",
+        arguments={},
+        scope_used="telemetry:read",
+        latency_ms=1.0,
+        outcome=OUTCOME_SUCCESS,
+    )
+
+    args, kwargs = repo.log.call_args
+    assert args[0] == TOOL_INVOKED_ACTION
+    assert "lab_probe_reason" not in kwargs["extra_data"]
+    assert "lab_probe_principal" not in kwargs["extra_data"]
+
+
+async def test_a_probe_does_not_relabel_a_chaos_row() -> None:
+    """The label replaces `agent.tool_invoked` and nothing else. A chaos row already
+    says the lab did it, and the `/demo` console reads the newest one as the fault —
+    moving it under `lab.` would take a fact away. The reason still rides along."""
+    repo = _mock_audit_repo()
+
+    await record_tool_invocation(
+        repo,
+        principal=_sa_principal(),
+        tool_name="kill_consumer",
+        arguments={},
+        scope_used="chaos:invoke",
+        latency_ms=1.0,
+        outcome=OUTCOME_SUCCESS,
+        is_chaos=True,
+        lab_probe_reason="guard probe",
+        lab_probe_principal="incident-commander-chaos",
+    )
+
+    args, kwargs = repo.log.call_args
+    assert args[0] == CHAOS_TOOL_INVOKED_ACTION
+    assert kwargs["extra_data"]["lab_probe_reason"] == "guard probe"
+
+
+async def test_a_probe_does_not_relabel_a_run_report() -> None:
+    """Same rule from the other side (ADR 0035): a status report is not a probe, and the
+    stream it writes is withheld from its own writer already."""
+    repo = _mock_audit_repo()
+
+    await record_tool_invocation(
+        repo,
+        principal=_sa_principal(),
+        tool_name="report_agent_run",
+        arguments={},
+        scope_used="agent_runs:write",
+        latency_ms=1.0,
+        outcome=OUTCOME_SUCCESS,
+        is_commander=True,
+        lab_probe_reason="guard probe",
+    )
+
+    assert repo.log.call_args.args[0] == AGENT_RUN_REPORTED_ACTION

@@ -16,6 +16,7 @@ from app.core.exceptions import (
 )
 from app.core.logging import get_logger, request_id_var
 from app.mcp import protocol as p
+from app.mcp.lab_probe import LabProbeLabel, LabProbeRefused, resolve_lab_probe
 from app.mcp.registry import ToolContext, get_tool, list_tools
 from app.repositories.audit import AuditRepository
 from app.repositories.idempotency import IdempotencyRepository
@@ -137,15 +138,22 @@ async def handle_tools_call(
     params: dict[str, Any],
     *,
     ctx: ToolContext,
+    lab_principal_header: str | None = None,
 ) -> p.JsonRpcResponse:
     """Transaction envelope around a single tool call.
 
     Nothing escapes except `AuditWriteFailedError`, which must, so the request rolls
     back rather than committing an action nothing recorded. The work is in
     `_run_tool_call`; this wrapper covers every step of it under one handler.
+
+    `lab_principal_header` is the raw `X-Lab-Principal` value the transport read. It is
+    passed down rather than looked up here — this layer holds no request object — and it
+    is consulted only when `params` carries `_lab_probe`.
     """
     try:
-        return await _run_tool_call(request_id, params, ctx=ctx)
+        return await _run_tool_call(
+            request_id, params, ctx=ctx, lab_principal_header=lab_principal_header
+        )
     except AuditWriteFailedError:
         # The one exception this envelope does not convert: returning a response
         # would commit a transaction whose audit row is missing (`get_db` rolls back).
@@ -164,6 +172,7 @@ async def _run_tool_call(
     params: dict[str, Any],
     *,
     ctx: ToolContext,
+    lab_principal_header: str | None = None,
 ) -> p.JsonRpcResponse:
     """Dispatch a tool by name. Scope is enforced here, not in the handler, and
     every branch writes an audit row."""
@@ -180,6 +189,51 @@ async def _run_tool_call(
             {"errors": exc.errors()},
         )
 
+    # `_lab_probe` is settled before the tool is even looked up, so every audit row this
+    # call can write already carries the label — including the one for a tool that does
+    # not exist, which is a call the lab is as capable of making as the agent is. A field
+    # that cannot be honoured refuses the whole call: ignoring it would leave the row
+    # labelled `agent.tool_invoked`, which is the mislabel it exists to remove
+    # (WO-R3-333, ADR 0038).
+    lab_label: LabProbeLabel | None = None
+    if call_params.lab_probe is not None:
+        try:
+            lab_label = await resolve_lab_probe(
+                call_params.lab_probe,
+                header=lab_principal_header,
+                db=ctx.db,
+                caller_tenant_id=ctx.principal.tenant_id,
+            )
+        except LabProbeRefused as refusal:
+            await _audit(
+                audit_repo,
+                principal=ctx.principal,
+                tool_name=call_params.name,
+                arguments=call_params.arguments,
+                scope_used=None,
+                latency_ms=(time.perf_counter() - start) * 1000,
+                outcome=OUTCOME_ERROR,
+                error_message=refusal.audit_message,
+                request_id=request_id_var.get("") or None,
+            )
+            return _error(
+                request_id,
+                p.JSONRPC_INVALID_PARAMS,
+                refusal.message,
+                refusal.error_data,
+            )
+
+    # Spread into every `_audit` call below, so the label cannot be attached on one path
+    # and forgotten on another.
+    lab_fields: dict[str, Any] = (
+        {}
+        if lab_label is None
+        else {
+            "lab_probe_reason": lab_label.reason,
+            "lab_probe_principal": lab_label.principal_name,
+        }
+    )
+
     tool_def = get_tool(call_params.name)
     if tool_def is None:
         # Audit even unknown tool attempts — useful for spotting a
@@ -194,6 +248,7 @@ async def _run_tool_call(
             outcome=OUTCOME_ERROR,
             error_message="tool not registered",
             request_id=request_id_var.get("") or None,
+            **lab_fields,
         )
         return _error(
             request_id,
@@ -223,6 +278,7 @@ async def _run_tool_call(
                 is_chaos=is_chaos,
                 is_commander=is_commander,
                 denied_by="scope_check" if is_chaos else None,
+                **lab_fields,
             )
             return _error(
                 request_id,
@@ -246,6 +302,7 @@ async def _run_tool_call(
             request_id=request_id_var.get("") or None,
             is_chaos=is_chaos,
             is_commander=is_commander,
+            **lab_fields,
         )
         return _error(
             request_id,
@@ -280,6 +337,7 @@ async def _run_tool_call(
                 request_id=request_id_var.get("") or None,
                 is_chaos=is_chaos,
                 is_commander=is_commander,
+                **lab_fields,
             )
             return _error(
                 request_id,
@@ -310,6 +368,7 @@ async def _run_tool_call(
                 request_id=request_id_var.get("") or None,
                 is_chaos=is_chaos,
                 is_commander=is_commander,
+                **lab_fields,
             )
             return _error(
                 request_id,
@@ -330,6 +389,7 @@ async def _run_tool_call(
                 request_id=request_id_var.get("") or None,
                 is_chaos=is_chaos,
                 is_commander=is_commander,
+                **lab_fields,
             )
             result = p.ToolCallResult(
                 content=[
@@ -364,6 +424,7 @@ async def _run_tool_call(
             request_id=request_id_var.get("") or None,
             is_chaos=is_chaos,
             is_commander=is_commander,
+            **lab_fields,
         )
         return _error(request_id, p.MCP_UNAUTHORIZED, exc.message)
     except AuthorizationError as exc:
@@ -380,6 +441,7 @@ async def _run_tool_call(
             request_id=request_id_var.get("") or None,
             is_chaos=is_chaos,
             is_commander=is_commander,
+            **lab_fields,
         )
         return _error(request_id, p.MCP_FORBIDDEN, exc.message)
     except AppError as exc:
@@ -396,6 +458,7 @@ async def _run_tool_call(
             request_id=request_id_var.get("") or None,
             is_chaos=is_chaos,
             is_commander=is_commander,
+            **lab_fields,
         )
         return _error(
             request_id,
@@ -421,6 +484,7 @@ async def _run_tool_call(
             request_id=request_id_var.get("") or None,
             is_chaos=is_chaos,
             is_commander=is_commander,
+            **lab_fields,
         )
         return _error(
             request_id, p.JSONRPC_INTERNAL_ERROR, "internal tool error"
@@ -449,6 +513,7 @@ async def _run_tool_call(
         request_id=request_id_var.get("") or None,
         is_chaos=is_chaos,
         is_commander=is_commander,
+        **lab_fields,
     )
 
     # Attach the response to the claim we hold so a repeat call replays it:
@@ -546,11 +611,15 @@ async def dispatch(
     db: AsyncSession,
     redis: Redis,
     principal_or_error: Any,
+    lab_principal_header: str | None = None,
 ) -> p.JsonRpcResponse:
     """Route a parsed JSON-RPC request to the right handler.
 
     `initialize` is allowed unauthenticated; every other method needs a
     `Principal` in `principal_or_error`.
+
+    `lab_principal_header` reaches `tools/call` and nothing else: `initialize` and
+    `tools/list` write no audit row, so there is nothing for a label to name.
     """
 
     method = request.method
@@ -571,7 +640,12 @@ async def dispatch(
 
     if method == "tools/call":
         ctx = ToolContext(db=db, redis=redis, principal=principal_or_error)
-        return await handle_tools_call(request.id, request.params, ctx=ctx)
+        return await handle_tools_call(
+            request.id,
+            request.params,
+            ctx=ctx,
+            lab_principal_header=lab_principal_header,
+        )
 
     return _error(
         request.id, p.JSONRPC_METHOD_NOT_FOUND, f"unknown method: {method}"
