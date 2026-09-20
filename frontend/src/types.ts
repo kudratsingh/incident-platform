@@ -312,6 +312,106 @@ export interface AgentRunStep {
   at: string
 }
 
+// ---------------------------------------------------------------------------
+// What a run record carries since WO-R3-328 (→ platform v0.6.16).
+//
+// The first live take failed because none of this existed: `report_agent_run`
+// sent `current_hypothesis: null` and `last_step: null` on every transition, so
+// the console's agent panel was empty for the whole run, and `agent.tool_invoked`
+// audit rows carry no result, so "what the agent saw" could not be shown at all.
+//
+// Every field below is ADDITIVE and optional here on purpose. A stack older than
+// v0.6.16 omits them, and a commander older than WO-R3-329 sends them empty on a
+// current stack — two different absences, and the page says which it is looking
+// at rather than rendering a blank panel. `?? []` / `?? null` at every read.
+// ---------------------------------------------------------------------------
+
+/** One entry of the ranked list, which is what a hypothesis panel is about. */
+export interface AgentRunRankedHypothesis {
+  name: string
+  category: string
+  confidence: number
+  /** The responder's own reasoning, truncated to 280 chars by the reporter. */
+  reasoning_excerpt?: string | null
+}
+
+/** The action the run decided on, written when it enters `remediating`. */
+export interface AgentRunPlan {
+  action_tool: string
+  action_arguments: Record<string, unknown>
+  /** The hypothesis this action is aimed at, by name. */
+  target_hypothesis?: string | null
+  rationale_excerpt?: string | null
+}
+
+/**
+ * One verify poll's verdict.
+ *
+ * The four values the commander writes today are `verified`, `not_verified`,
+ * `verified_stabilizer` and `verified_unresolved`; the type stays open because
+ * this console can only ever be one commander release behind, and an unknown
+ * verdict must render verbatim rather than as a guess.
+ */
+export interface AgentRunVerification {
+  verdict: string
+  reasoning_excerpt?: string | null
+  /** Which poll this was, of how many the run allows. */
+  attempt?: number | null
+  of?: number | null
+  at?: string | null
+}
+
+/**
+ * One step: a single tool call, in order, with what came back.
+ *
+ * `result_excerpt` is the whole reason this shape exists — the audit log records
+ * that a call happened and with what arguments, never what it answered.
+ *
+ * **Every field but `seq` and `kind` can be null.** This is the responder's own
+ * account of a call it made and the platform fills nothing in, so a console that
+ * assumes a tool name or a timestamp is assuming something no writer promised.
+ * `kind` is an open string for the same reason the verify verdict is.
+ */
+export interface AgentRunStepRecord {
+  seq: number
+  kind: string
+  tool: string | null
+  arguments?: Record<string, unknown> | null
+  /** Truncated to 400 chars by the reporter; longer is refused, not cut. */
+  result_excerpt?: string | null
+  outcome?: string | null
+  latency_ms?: number | null
+  at: string | null
+}
+
+/** What the run has spent. `null` where the ledger has no reading. */
+export interface AgentRunBudget {
+  tool_calls_used?: number | null
+  tool_calls_max?: number | null
+  tokens_used?: number | null
+  usd_used?: number | null
+  wall_seconds?: number | null
+}
+
+/**
+ * ADR 0071's structural verdict on the recovery the run read.
+ *
+ * Carried on the briefing (`EscalationBriefing.attribution`) rather than left to
+ * prose, so the handoff states whether the run may claim the recovery.
+ */
+export interface AgentBriefingAttribution {
+  /** `attributed` | `cleared_on_its_own` | `cannot_attribute`. */
+  verdict: string
+  /** The resource the verdict is about. */
+  resource: string
+  /** The read tool whose readings answered it. */
+  probe_tool: string
+  /** Whether a Tier-1 action in this run touched that resource. */
+  acted: boolean
+  /** The readings behind the verdict, in one sentence. */
+  detail: string
+}
+
 /** One cause the run named (ADR 0065's slot shape). */
 export interface AgentBriefingSlot {
   category: string
@@ -348,6 +448,8 @@ export interface AgentBriefing {
   incidents?: AgentBriefingSlots
   findings?: string
   recommendation?: string
+  /** ADR 0071. Null on a run whose trajectory predates the projection. */
+  attribution?: AgentBriefingAttribution | null
   /** Present only when the run was enriched (live); null on a canned run. */
   prose?: string | null
 }
@@ -377,6 +479,58 @@ export interface AgentRun {
   finished_at: string | null
   /** Computed server-side: `finished_at === null`. One fact, not two. */
   active: boolean
+
+  // ── WO-R3-328, all additive and all absent on an older stack ──────────────
+  /**
+   * The responder's explanations, **best first — the order IS the ranking.**
+   * Never re-sorted by a reader: `confidence` is its own number and the platform
+   * stores what the responder sent, so re-ordering by it would silently disagree
+   * with the run about what it thought most likely.
+   */
+  hypotheses?: AgentRunRankedHypothesis[]
+  plan?: AgentRunPlan | null
+  /** The latest verdict; `verifications` is every one, oldest first, capped at 50. */
+  verification?: AgentRunVerification | null
+  verifications?: AgentRunVerification[]
+  /**
+   * The action ledger — **present on `GET /admin/agent-runs/{id}` only.**
+   *
+   * The LISTING omits it rather than emptying it (a page of 100 runs × 200 steps
+   * with 400-character excerpts is megabytes nobody asked for), so an empty list
+   * here would read as "this run made no calls". Read it from the single-run
+   * endpoint or poll `.../steps?after_seq=`, never from the list.
+   */
+  steps?: AgentRunStepRecord[]
+  /**
+   * How many of the oldest steps the 200-entry cap discarded. Carried on the
+   * listing as well, because it is one integer and it is the field that says the
+   * ledger is not the whole run.
+   */
+  steps_dropped?: number
+  budget?: AgentRunBudget | null
+}
+
+/**
+ * `GET /admin/agent-runs/{id}/steps?after_seq=` — a tail read, not a page.
+ *
+ * The caller asks for everything after the last `seq` it drew, so a panel
+ * polling twice a second costs one small request instead of re-reading a
+ * 200-entry ledger, and a step it has already shown cannot arrive twice.
+ * `next_after_seq` is the highest `seq` STORED, not the highest returned, so a
+ * poll that finds nothing still advances the cursor correctly.
+ */
+export interface AgentRunStepsResponse {
+  run_id: string
+  /** The run's state and closing time, so a poller knows when to stop asking. */
+  state: AgentRunState
+  finished_at: string | null
+  /** Ascending by `seq`; the console reverses it to show newest first. */
+  steps: AgentRunStepRecord[]
+  returned: number
+  total: number
+  steps_dropped: number
+  after_seq: number | null
+  next_after_seq: number | null
 }
 
 // ---------------------------------------------------------------------------
@@ -418,6 +572,14 @@ export interface ConsumerLagResponse {
   total: number
   /** The one group whose number actually moves; the rest are recorded constants. */
   live_group: string
+  /**
+   * How much history `recent_samples` can hold and how far apart the samples
+   * are (900 / 60 today), so a chart labels its axis from the reply rather than
+   * hard-coding the platform's cadence. A window holding fewer samples than it
+   * could is missing history, never a flat line.
+   */
+  sample_window_seconds?: number
+  sample_interval_seconds?: number
 }
 
 export interface CircuitBreakerReading {

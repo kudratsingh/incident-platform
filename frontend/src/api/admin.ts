@@ -1,6 +1,7 @@
 import { api } from './client'
 import type {
   AgentRun,
+  AgentRunStepsResponse,
   AuditLog,
   CircuitBreakersResponse,
   ConsumerLagResponse,
@@ -130,8 +131,14 @@ export const adminApi = {
     if (params.user_id) qs.set('user_id', params.user_id)
     if (params.action) qs.set('action', params.action)
     // A whole stream (`agent.`, `chaos.`, `job.`), where `action` is one row's
-    // exact name. Added to the endpoint by WO-R3-313.
+    // exact name. Added to the endpoint by WO-R3-313; a comma-separated LIST of
+    // prefixes since WO-R3-328, so the console asks for the three operator
+    // streams in one request instead of three.
     if (params.action_prefix) qs.set('action_prefix', params.action_prefix)
+    // The other half of that pair: `event.` is the job lifecycle, which on a
+    // stack with traffic running is 40-odd rows out of every 50 and buried every
+    // row the demo is about (WO-R3-328).
+    if (params.exclude_prefix) qs.set('exclude_prefix', params.exclude_prefix)
     if (params.principal_type) qs.set('principal_type', params.principal_type)
     const q = qs.toString()
     return api.get<PaginatedResponse<AuditLog>>(`/audit/logs${q ? `?${q}` : ''}`)
@@ -142,9 +149,15 @@ export const adminApi = {
   /**
    * The agent runs the commander has reported (ADR 0035), newest first.
    *
-   * `active=true` narrows to runs nobody has closed — the console's own query
-   * while a demo is running. The agent's principal cannot read any of this:
-   * there is no MCP tool for `agent_runs`, deliberately.
+   * `active` is deliberately NOT set by the /demo page any more. Narrowing to
+   * `active=true` was how the first take lost its own ending: the run's terminal
+   * report stamps `finished_at`, the briefing lands in the same breath, and an
+   * active-only query drops the run from the list within one poll — so the
+   * briefing card could never render and the finished run vanished off screen
+   * mid-recording. The console reads every run and picks by the reset boundary.
+   *
+   * The agent's principal cannot read any of this: there is no MCP tool for
+   * `agent_runs`, deliberately.
    */
   listAgentRuns: (params: { alert_id?: string; active?: boolean } = {}) => {
     const qs = new URLSearchParams()
@@ -154,7 +167,25 @@ export const adminApi = {
     return api.get<PaginatedResponse<AgentRun>>(`/admin/agent-runs?${qs.toString()}`)
   },
 
+  /**
+   * One run with everything on it: hypotheses, plan, verifications, budget — and
+   * `steps`, which the LISTING deliberately omits. The ledger is read from here
+   * or from the tail read below, never from a list row.
+   */
   getAgentRun: (id: string) => api.get<AgentRun>(`/admin/agent-runs/${id}`),
+
+  /**
+   * The steps after `after_seq` (WO-R3-328) — the ledger's incremental poll.
+   *
+   * A tail read rather than an offset page: the ledger grows from the end, so an
+   * offset would hand a poller duplicates. Omit `afterSeq` for the whole ledger
+   * and send back the reply's `next_after_seq` after that; it is the highest
+   * `seq` stored, so a poll that finds nothing still advances correctly.
+   */
+  agentRunSteps: (id: string, afterSeq: number | null = null) =>
+    api.get<AgentRunStepsResponse>(
+      `/admin/agent-runs/${id}/steps${afterSeq === null ? '' : `?after_seq=${String(afterSeq)}`}`,
+    ),
 
   /**
    * Every consumer group's lag in one reading.
@@ -188,6 +219,9 @@ export interface AuditListParams {
   job_id?: string
   user_id?: string
   action?: string
+  /** One prefix, or a comma-separated list of them (`agent.,lab.,chaos.`). */
   action_prefix?: string
+  /** One prefix to drop from the answer (`event.`). */
+  exclude_prefix?: string
   principal_type?: 'user' | 'service_account'
 }
