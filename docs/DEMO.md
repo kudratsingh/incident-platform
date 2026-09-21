@@ -6,9 +6,10 @@ can and cannot see.
 An operator opens one page, records it, and narrates an incident from injection to
 resolution without switching tabs. WO-R3-313 built the first version, WO-R3-327
 added the reset boundary, **WO-R3-330 rebuilt it around one run** after the owner's
-first live take, and **WO-R3-334 made it read one TAKE** after the third — see "What
-the takes showed" at the end, which is the whole reason the page has the shape it
-does.
+first live take, **WO-R3-334 made it read one TAKE** after the third, and
+**WO-R3-336 made it start each take at zero and read the run as it happens** after
+the fourth — see "What the takes showed" at the end, which is the whole reason the
+page has the shape it does.
 
 The other half of the demo — the step machine that fires the fault, runs the agent
 and resets the world — lives in the commander repo (`scripts/demo_live.py`,
@@ -18,8 +19,8 @@ and resets the world — lives in the commander repo (`scripts/demo_live.py`,
 |---|---|
 | **Route** | `/demo`, `ProtectedRoute requiredRole="support"` — the same bar as `/admin`, because everything on it is operator-only |
 | **Mode** | `?mode=consumer_outage` (default) or `?mode=dlq_backlog`; the header buttons write the URL |
-| **Run** | `?run=<id>`; the default is **the newest run with a fault row in its own take**, and the selector lists every run the page can see, each labelled with its take |
-| **Take** | the span between two `lab.world_reset` boundaries. The selected run decides which one the whole page reads; a take that has been closed is labelled `take ended at HH:MM:SS` |
+| **Take** | the span between two `lab.world_reset` boundaries, and **the default is the take now running** (WO-R3-336). The take selector offers it first and the earlier takes as **history**, each labelled `start → end · scenario · outcome`; a closed take is labelled `take ended at HH:MM:SS` and, when it is on screen, `history, chosen from the take selector` |
+| **Run** | `?run=<id>` pins a run and therefore its take. Without it the page reads the **newest run of the take now running**, or none — and adopts a run on the poll after its first report. The run selector lists that take's own runs |
 | **Cadence** | every panel polls every **2 s** through `usePolling`, so no two panels disagree about *now*; alerts and breakers poll at 10 s |
 | **Code** | `frontend/src/pages/DemoPage.tsx`, with every derivation in `frontend/src/utils/demoPhase.ts` (the incident and its takes) and `frontend/src/utils/demoRun.ts` (the run record and the ledger) — all pure functions, all driven from fixtures in `src/test/demoPhase.test.ts`, `src/test/demoRun.test.ts` and `src/test/DemoPage.test.tsx` |
 | **Backend** | the shapes WO-R3-328 added to `agent_runs` and to the read endpoints (plat #230, → v0.6.16): the ranked `hypotheses`, `plan`, `verification`/`verifications`, `steps` with `steps_dropped`, `budget`; `GET /admin/agent-runs/{id}/steps?after_seq=`; the 15-minute lag window with `sample_window_seconds` / `sample_interval_seconds`; comma-list `action_prefix` and `exclude_prefix` on the human audit filter |
@@ -27,21 +28,21 @@ and resets the world — lives in the commander repo (`scripts/demo_live.py`,
 Layout, at 1440×900 with no scroll for the top half:
 
 ```
-  header      run selector · which take · mode · T+ since the fault
-  PLATFORM    healthy → fault injected → agent acting → recovered
+  header      take selector · run selector · which take · mode · T+ since the fault
+  PLATFORM    healthy → fault injected → paged → agent acting → recovered
   AGENT       triage → investigating → planning → awaiting approval
               → remediating → verifying → resolved | escalated | failed
   ┌───────────────┬─────────────────────────┬──────────────────┐
   │ metric chart  │ the agent               │ action ledger    │
-  │ (15 min)      │ hypotheses · plan       │ one row per step │
-  │ + readings    │ verifications · budget  │ + lab + reset    │
+  │ (the take)    │ what it thinks NOW      │ newest at the TOP│
+  │ + readings    │ plan · verify · budget  │ THINK + lab + W  │
   └───────────────┴─────────────────────────┴──────────────────┘
   briefing (when it lands) · DLQ table (dlq mode)
 ```
 
 ---
 
-## Six rules the page is built around
+## Seven rules the page is built around
 
 1. **An absent reading renders as absent, with its reason — never as zero.**
    `lag_known: false` is not lag 0; a breaker with no published record is *missing
@@ -58,8 +59,8 @@ Layout, at 1440×900 with no scroll for the top half:
    A 403 on the agent-run endpoint degrades that panel and leaves the chart and the
    ledger up. A single failed poll shows the error *beside* the last good reading
    rather than blanking the panel.
-4. **A reset is a boundary, and a take is the span between two of them** (WO-R3-327,
-   WO-R3-334) — see below.
+4. **A reset is a boundary, a take is the span between two of them, and a fresh take
+   starts at zero** (WO-R3-327, WO-R3-334, WO-R3-336) — see below.
 5. **An absence is named, not filled.** A run with no `hypotheses` is not a run
    that ranked nothing: the panel says which of the two it is looking at, because
    a stack older than v0.6.16 and a commander older than WO-R3-329 are different
@@ -71,6 +72,9 @@ Layout, at 1440×900 with no scroll for the top half:
    `agent.tool_invoked` row is measured against that run's `service_account_id`.
    A call by the demo runner or by the evaluator's guard probes is counted, named
    and hidden — never drawn as the agent's work.
+7. **The fault is the take's FIRST successful injection, and a probe is never a
+   fault** (WO-R3-336) — see below. Everything measured from the fault is measured
+   from that one row.
 
 ---
 
@@ -123,6 +127,77 @@ Everything derived reads that take: the platform row and the clock, the metric's
 breach and recovery, the chart's span and markers, the ledger, the counts and the DLQ
 badges.
 
+### A fresh take starts at zero (WO-R3-336)
+
+WO-R3-334's default — *the newest run with a fault row in its own take* — is the right
+answer to "the page was reloaded after the wind-down" and the wrong answer to what the
+demo actually does: **start a take.** On the owner's fourth take the page opened on the
+take before the one running, so the first thing on screen was history.
+
+| | |
+|---|---|
+| **The default** | the take **now running**: the span after the newest `lab.world_reset` row, run or no run |
+| **With no run yet** | the PLATFORM row reads this take's own rows (healthy, then fault injected, then paged), the AGENT row is empty with *waiting for this take's run*, the panel says what it is waiting for and since when, the chart's axis starts at the boundary and the ledger holds this take's lab rows and nothing else |
+| **Adoption** | the choice is re-evaluated on **every poll**, not latched at load, so the page picks the run up on the poll after its first report — and moves on to the next take the moment a new boundary appears |
+| **History** | the take selector lists the earlier takes with runs as `history · HH:MM:SS → HH:MM:SS · scenario · outcome`. Choosing one pins its newest run (`?run=`), which is what makes it a deliberate act; choosing the live take clears the pin |
+| **`?run=`** | still wins, and still opens that run's take. A `?run=` naming a run the page does not have falls back to the current take rather than emptying the screen |
+
+One bug this closed on the way: the run-detail poll parks when the selection has no
+run, and a parked poll keeps its last answer — so the page went on rendering the
+previous take's run in the agent row. The detail is used only when its id is the
+selected run's.
+
+### The fault is the take's FIRST successful injection (WO-R3-336, item 7)
+
+The fourth take's chaos rows, from the platform's own audit stream:
+
+```
+  03:18:05.952  chaos.tool_invoked  kill_consumer   success              ← THE fault
+  03:19:48.552  chaos.tool_denied   inject_latency  (guard, labelled)
+  03:19:48.573  chaos.tool_invoked  inject_latency  error, labelled
+  03:19:48.592  chaos.tool_invoked  kill_consumer   success              ← a re-arm
+```
+
+The page anchored on the **newest** `chaos.*` row, so `injected 08:19:48`, `T+ 43.9 s`,
+`fault injected · 17 ms`, the chart's F marker and `agent acting · 58 s` were all
+measured from a re-arm that happened **1 m 43 s after the fault** — and the two
+refusals were drawn in amber as if the lab had injected them.
+
+A **fault row** is now all three of:
+
+- `chaos.tool_invoked` — a refusal (`chaos.tool_denied`) is not a fault, the hook never ran;
+- carrying no `lab_probe_reason` — a hook the evaluator fired to prove a guard refuses it
+  is the lab probing, not the lab injecting ([ADR 0038](ADR/0038-a-probe-by-the-lab-is-labelled-by-the-lab.md)
+  lets a chaos row carry that label);
+- not a failed invocation — `outcome` present and anything but `success` means it raised.
+  An **absent** `outcome` is a row that did not say, and is read as an injection: the
+  other reading would let a stack that stops writing the field report a healthy world
+  through a fault.
+
+The take's **first** such row is the anchor for the fault station, `injected HH:MM:SS`,
+the `T+` clock, the chart's F marker and `agent acting fired after N reads`. Later ones
+are extra F markers, labelled `<hook> re-armed` when the hook and its arguments match
+and named plainly when they do not — a re-arm is not a new incident, and the world was
+already broken. Every other chaos row is hidden behind the *other reads* toggle and
+badged `LAB PROBE`.
+
+### The platform pages, and the row says so (WO-R3-336, item 8)
+
+Until v0.6.18 the alert the agent triaged was synthesized by the scenario's YAML
+(`alert:` block, fingerprint `consumer_stalled`) and the platform's own alert stream
+never moved — `list_active_alerts` read the same three seeded rows before, during and
+after the fourth take. The platform raises it itself now, on its own metric and its own
+clock (platform WO-R3-338, owner decision O-36), and audits one `alert.raised` row per
+episode.
+
+So the PLATFORM row has a fifth station, **paged**, between `fault injected` and
+`agent acting`: stamped with the take's first `alert.raised` row, carrying that alert's
+fingerprint and summary under it, and reading `not paged` when the platform raised
+nothing. The `T+` clock stays anchored on the **fault** — the page is how long the
+platform took to notice, not a second incident. The row is drawn in the ledger too,
+badged `PAGED`. The audit query asks for `alert.` beside the other three streams; that
+prefix is **not** withheld from the agent, because the agent may see its own alert.
+
 ### Whose call was it?
 
 A second rule with the same shape, from findings F3 and F4 of the third take. The
@@ -159,15 +234,16 @@ dropped, so a latch can never outlive its take.
 
 ## The two rows
 
-### PLATFORM — `healthy → fault injected → agent acting → recovered`
+### PLATFORM — `healthy → fault injected → paged → agent acting → recovered`
 
-Four stations, each carrying its own timestamp and, once passed, its duration.
+Five stations, each carrying its own timestamp and, once passed, its duration.
 Source: `GET /api/v1/audit/logs` (the operator streams) plus the mode's metric.
 
 | Station | Reached when | Stamped with |
 |---|---|---|
 | healthy | always — it is where every take starts | the boundary (`lab.world_reset`), which is when this world began |
-| fault injected | a `chaos.*` row exists in this take, **or the latch holds one** | the lab's own row time |
+| fault injected | a **fault row** exists in this take, **or the latch holds one** | the take's first injection (above), never a probe and never a re-arm |
+| paged | an `alert.raised` row exists in this take | its first one; the note is the alert's fingerprint and summary, or `not paged` |
 | agent acting | an `agent.tool_invoked` row **by this run's own principal** at or after the fault | the first such row; the note says how many reads, and names the Tier-1 action once one fires |
 | recovered | the metric was breached after the fault and is back inside its bar, sustained | the sample that started the inside-the-bar run |
 
@@ -317,9 +393,20 @@ the end.
 |---|---|---|
 | state pill, run label, finished-at | `state`, `scenario`, `finished_at` | an unrecognised state renders verbatim |
 | **budget** | `budget` — calls used against the cap, tokens, dollars, wall seconds | "not reported"; a bar with no cap is a bar with an invented denominator, so there is none |
-| **hypotheses, ranked** | `hypotheses[]` — name, category, confidence bar, reasoning excerpt (≤ 280 chars). The **top one is shown whole**; the rest truncate. The bar carries a tick at **0.7**, the confidence the loop gates a remediation on | "None reported yet". Where only `current_hypothesis` exists it becomes a one-entry list **and the panel says so**: that is a commander older than WO-R3-329, not a run that ranked nothing |
+| **what the agent thinks now** | the newest ranking on top — `hypotheses[]` (name, category, confidence bar, reasoning excerpt ≤ 280 chars), stamped with the newest planner call's time and `seq`, with its chosen next action and reason under it. The **top one is shown whole**; the rest truncate. The bar carries a tick at **0.7**, the confidence the loop gates a remediation on. Below it a **confidence sparkline** (one point per planner call, with the 0.7 line and every value printed) and the **earlier rankings**, collapsed, each with its own timestamp | "None reported yet". Where only `current_hypothesis` exists it becomes a one-entry list **and the panel says so**: that is a commander older than WO-R3-329, not a run that ranked nothing. A ranking entry with no confidence gets a sentence, never a bar at zero |
 | **the plan** | `plan` — tool, arguments, the hypothesis it is aimed at, the rationale excerpt | "No action planned yet" while the run is live; on a **terminal** run, "the agent handed off without acting" |
 | **verification** | `verifications[]` — every verify poll's verdict, attempt *n* of *m*, and its reasoning; capped at 50, and the panel says so when it is full | "Nothing verified yet" while the run is live; on a terminal run that never acted, "no verification because no action" |
+
+**The panel is a timeline since WO-R3-336.** The fourth take's run called its planner
+three times during a 22-second investigation and the platform saw the first two rankings
+only at the end: `hypotheses` rode on transition reports and no transition happens inside
+an investigation, so the panel went from empty to finished in one poll. The commander now
+reports one `report`-kind step per planner call (WO-R3-337, `tool` =
+`investigation_planner` / `reflection` / `verify_judge`, `arguments` = the ranking, the
+chosen `next_action` and a reason), and this panel reads them: the newest ranking with its
+reasoning whole, the confidence over the planner's own calls, and the older rankings
+underneath with their times. The run record's `hypotheses` is still the head of the list —
+it is the latest reading by definition and the only one carrying the reasoning excerpts.
 
 The third take's screenshot truncated the **top** hypothesis with "more…", so the one
 sentence explaining why the agent believed what it believed was the one sentence not
@@ -343,14 +430,16 @@ guessed at or dropped.
 
 ## The action ledger (right)
 
-One row per **step**, **one line each**, oldest first with the newest at the bottom:
+One row per **step**, **one line each**, **newest at the top** (the owner's rule from
+the fourth take, reversing WO-R3-334's transcript order):
 
 ```
-  08:19:44  READ  get_consumer_lag → lag 30, known
+  08:19:52  THINK   planner            → top consumer_saturation 0.85 → probe get_consumer_lag
+  08:19:44  READ    get_consumer_lag   → lag 30, known
 ```
 
-the time, a kind badge (READ grey / ACTION blue / REPORT purple), the tool, and what
-the call **answered**. Click a row for its arguments, the whole result excerpt, its
+the time, a kind badge (READ grey / ACTION blue / THINK purple / REPORT purple), the
+tool, and what the call **answered**. Click a row for its arguments, the whole result excerpt, its
 sequence number, its outcome and its latency. An **ACTION row is highlighted and
 never collapsed** — the action is the point of the run, so it shows its arguments and
 its result without being asked.
@@ -374,9 +463,26 @@ Each one reads the parsed excerpt where it can and the text where it cannot (a
 parseable and not a defect), and falls through to the generic line rather than
 inventing a reading.
 
-**Newest at the bottom, and the panel follows it** — a live run's newest call is where
-the eye already is. Scroll up and it stops following; a `newest ↓` button brings it
-back.
+**Newest at the top, and the panel pins there** — the newest row is the one the eye
+wants first. Scroll down into the history and it stops following; a `newest ↑` button
+brings it back.
+
+**A planner call is a THINK row** (WO-R3-336, item 3). The `report`-kind steps whose
+tool is `investigation_planner`, `reflection` or `verify_judge` are the agent thinking,
+not calls it made: the row shows the one readable sentence the step carries, a click
+opens the ranking it accepted (name, category, confidence bar) and the next action it
+chose with its reason, and the expanded row says *the agent thinking, not a call* —
+because a planner call spends no budget and writes no `agent.tool_invoked` row.
+
+**The ledger pages back to the take's opening boundary** (item 2). The fourth take's
+ledger showed a `kill_consumer` from the take *before* the one on screen and the header
+said `take start not in view`: the boundary was past the end of the single page of 100
+rows the page asked for, so there was no boundary to cut the rows at. The audit read now
+asks for another page whenever the selected take has no opening boundary and the server
+says there are more rows, up to **five pages**; past that it says so in a line above the
+rows rather than drawing them as if they were this take's. The page count only ever
+grows within a session — dropping back to one page would lose the row that found the
+boundary and the page would oscillate between two takes on a two-second cadence.
 
 That excerpt is the whole reason the ledger is built from steps: an
 `agent.tool_invoked` audit row carries tool, arguments, latency and outcome but
@@ -417,7 +523,9 @@ Interleaved by time, from the same audit stream the rest of the page derives fro
 
 | Row | Colour | Rendering |
 |---|---|---|
-| `chaos.*` | amber | the lab's tool and arguments — exactly what was fired |
+| a **fault row** (`chaos.tool_invoked`, successful, unlabelled) | amber | the lab's tool and arguments — exactly what was fired |
+| any other `chaos.*` row — a refusal, a hook that raised, a labelled probe | grey | **hidden**, counted, badged `LAB PROBE` on the toggle |
+| `alert.raised` | red | badged `PAGED`, named by the alert's fingerprint with its summary beside it |
 | `lab.world_reset` | grey | a **divider** across the ledger, `world reset · HH:MM:SS`, not an event. Every boundary in the window gets one, so two takes' rows are never silently mixed |
 | `principal_type: user` | green | a human's own action |
 | `event.*` | grey | **off by default**, one toggle |
@@ -443,10 +551,19 @@ about were underneath them. The page therefore asks for
 `action_prefix=event.` only while the toggle is on — so the job stream can never
 crowd out a derivation.
 
-**Both witnesses are counted**, in one line above the rows: *N steps reported · M
-calls the platform recorded*. The reporter is fail-open by design (commander
-invariant 5), so it can stop reporting without the run noticing; when the two counts
-disagree the line says so.
+**Both witnesses are counted**, in one line above the rows: *N steps reported · M calls
+the platform recorded*, where N is the run's `read` and `action` steps and M is its own
+principal's `agent.tool_invoked` rows. The planner's reports are counted **beside** them
+(*K planner calls, which make none*), never in them.
+
+**The disagreement warning has to earn itself** (item 4). The fourth take's page said
+*"4 steps reported · 5 calls the platform recorded — the two do not agree"* about a run
+that had reported everything it did: the fifth call was the eval runner's own
+precondition probe, unlabelled at the time (WO-R3-337 labels it). The warning now needs
+all three of **more rows than steps**, a **terminal** run, and **ten seconds** of
+silence since its last report. More steps than rows is a report the audit page has not
+caught up with; a live run is always one report behind; a run that finished a second ago
+is still flushing. On camera a false warning is worse than none.
 
 ---
 
@@ -522,6 +639,7 @@ This difference *is* the demo's point, and the page is on the human side of it.
 | | The agent (`incident-commander`, MCP) | A human operator (this page, REST) |
 |---|---|---|
 | `chaos.*` audit rows | **withheld** — `list_audit_events` and `get_trace` exclude the prefix in SQL and out of `total` for any principal without `chaos:invoke` ([ADR 0012](ADR/0012-the-lab-is-invisible-to-the-agent.md), 2026-09-15 amendment) | visible |
+| `alert.raised` — the platform paging on its own metric | **visible**, deliberately: the agent may see its own alert, and the `alert.` prefix is not withheld (platform WO-R3-338) | visible |
 | `lab.world_reset` — the boundary | **withheld**, same mechanism and condition (2026-09-20 amendment) | visible, payload included |
 | `agent_runs` — its own reported run, steps, plan, budget | **not readable at all**. There is no read tool, by design ([ADR 0035](ADR/0035-the-agent-reports-its-run-and-cannot-read-it-back.md)); the write tools are called by the loop's checkpoint hook, not chosen by the model, and are excluded from the planner surface | visible |
 | Consumer lag | `get_consumer_lag` (one group per call) | `GET /admin/consumer-lag` (every group, same 15-minute samples) |
@@ -534,6 +652,40 @@ platform about itself. The operator sees both.
 ---
 
 ## What the takes showed
+
+### The fourth take (2026-09-20, $0.25) — green, and still not watchable live
+
+The run resolved and every number on the page was measured from the wrong moment or
+arrived in a burst. Eight findings, each a rule above:
+
+1. **The page opened on the take before the one running**, because the default was "the
+   newest run with a fault in its own take" and that run was in the previous take. → a
+   fresh take starts at zero and adopts its run on the next poll; earlier takes are
+   history, chosen explicitly.
+2. **The ledger showed a `kill_consumer` from the take before**, and the header said
+   `take start not in view`: the boundary was past the end of the one page of rows the
+   page read. → the audit read pages back to the take's opening boundary, and says so
+   when it cannot reach it. The ledger is also **newest at the top** now, which is the
+   owner's rule.
+3. **Three planner rankings existed during a 22-second investigation and none was
+   visible until the last**, because `hypotheses` rode on transition reports. → each
+   planner call is a `report` step (WO-R3-337), a purple THINK row in the ledger, and
+   the hypotheses panel is *what the agent thinks now* with a confidence sparkline and
+   the older rankings underneath.
+4. **"4 steps reported · 5 calls the platform recorded — the two do not agree" was
+   false**; the fifth call was the runner's own precondition probe. → the warning needs
+   more rows than steps, a terminal run, and ten seconds of silence.
+5. **The stations read `investigating · 10 ms` and `planning · 21.9 s`** for a run that
+   investigated for 22 seconds, because every transition stamped the *iteration's* start
+   time. → fixed at the source by WO-R3-337; the console's durations, late-report labels
+   and one-at-a-time reveal are unchanged and now describe real times.
+6. **Everything fault-relative was measured from a re-arm** 1 m 43 s after the real
+   injection, and two refused guard probes were drawn as faults. → a fault row is a
+   successful, unlabelled `chaos.tool_invoked`, and the take's **first** one is the
+   anchor; later ones are extra markers labelled `re-armed`.
+7. **The platform never paged.** The alert was canned in the scenario's YAML. → the
+   platform raises it itself (WO-R3-338) and the PLATFORM row has a `paged` station
+   between the fault and the agent.
 
 ### The third take (2026-09-20, $0.21)
 

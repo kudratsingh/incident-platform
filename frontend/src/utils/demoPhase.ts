@@ -33,6 +33,13 @@
  * stated, on the platform's own clock, in the same append-only place as the rows
  * it bounds.
  *
+ * **A fresh take starts at zero** (WO-R3-336, the owner's rule from the fourth take).
+ * WO-R3-334's default — the newest run with a fault in its own take — was right for a
+ * page reloaded after a wind-down and wrong for what the demo does: the fourth take
+ * opened on the take before it, so the first thing on screen was history. The default
+ * is now the take NOW RUNNING, `selectTake` is re-evaluated on every poll so the page
+ * adopts a run the moment it reports, and the earlier takes are offered as history.
+ *
  * **A take is the span between two boundaries** (WO-R3-334). The rule above was
  * "everything after the newest boundary", and the third live take proved that is not
  * the same thing: the page was reloaded after the wind-down, so the newest boundary
@@ -112,6 +119,17 @@ export const PHASE_LABELS: Record<DemoPhase, string> = {
 
 /** The audit action prefix the lab injects faults under. Withheld from the agent's own MCP reads (ADR 0012); a human operator reads it over REST. */
 export const LAB_ACTION_PREFIX = 'chaos.'
+/** The one chaos action that is a hook actually running: `chaos.tool_denied` is a refusal. */
+export const CHAOS_INVOKE_ACTION = 'chaos.tool_invoked'
+/**
+ * The field `_lab_probe` leaves on the row (platform WO-R3-333, ADR 0038).
+ *
+ * A chaos row can carry it — the label replaces `agent.tool_invoked` and nothing else,
+ * so a hook the evaluator fired as a *probe* keeps `chaos.tool_invoked` as its action
+ * and says what it was for in here. Which is exactly how the fourth take came to draw
+ * two refused `inject_latency` guard probes as faults.
+ */
+export const LAB_PROBE_REASON_FIELD = 'lab_probe_reason'
 /** Every MCP call the agent makes, read or action alike. */
 export const AGENT_TOOL_ACTION = 'agent.tool_invoked'
 /** What the commander reports about its own run (ADR 0035). */
@@ -140,6 +158,16 @@ export const WORLD_RESET_ACTION = 'lab.world_reset'
  * so a second lab label cannot arrive and be read as the agent's doing.
  */
 export const LAB_PROBE_ACTION = 'lab.probe'
+/**
+ * The platform paging, on its own metric and its own clock (platform WO-R3-338, O-36).
+ *
+ * Until v0.6.18 the alert the agent triaged was synthesized by the scenario's YAML and
+ * the platform's own alert stream never moved, so "jobs pile up, the platform pages,
+ * the agent responds" was a story the console could not show any part of. The rule
+ * raises one alert per episode and audits it here; **not** withheld from the agent,
+ * because the agent may see its own alert (ADR 0012's rule 1 is about the lab).
+ */
+export const ALERT_RAISED_ACTION = 'alert.raised'
 
 /**
  * The Tier-1 action tools.
@@ -196,6 +224,93 @@ export function isResetRow(row: AuditLog): boolean {
 /** A read the lab took while wearing the agent's token (WO-R3-333). */
 export function isLabProbeRow(row: AuditLog): boolean {
   return row.action.startsWith('lab.') && !isResetRow(row)
+}
+
+/**
+ * A row that is the lab **injecting this take's fault** (WO-R3-336 item 7).
+ *
+ * Three conditions, and the fourth take needed all three. Its chaos rows were:
+ *
+ *   03:18:05.952  chaos.tool_invoked  kill_consumer    success                ← THE fault
+ *   03:19:48.552  chaos.tool_denied   inject_latency   (guard, lab_probe_reason)
+ *   03:19:48.573  chaos.tool_invoked  inject_latency   error, lab_probe_reason
+ *   03:19:48.592  chaos.tool_invoked  kill_consumer    success                ← a re-arm
+ *
+ * and the page anchored on the newest of them, so `injected`, the `T+` clock, the fault
+ * station, the chart's F marker and "agent acting after N reads" were all measured from
+ * a re-arm 1 m 43 s after the fault — while two refusals were drawn as faults.
+ *
+ *  - **`chaos.tool_invoked`**, so a refusal (`chaos.tool_denied`) is not a fault: the
+ *    hook did not run;
+ *  - **no `lab_probe_reason`**, so a hook the evaluator fired to prove a guard refuses it
+ *    is the lab probing, not the lab injecting;
+ *  - **not a failed invocation.** `outcome` present and anything but `success` means the
+ *    hook raised. An ABSENT `outcome` is not a failure — it is a row that did not say —
+ *    and reading it as one would let a stack that stops writing the field report a
+ *    healthy world through an injected fault, which is the worse of the two mistakes.
+ */
+export function isFaultRow(row: AuditLog): boolean {
+  if (row.action !== CHAOS_INVOKE_ACTION) return false
+  const extra = row.extra_data
+  if (extra && extra[LAB_PROBE_REASON_FIELD] !== undefined) return false
+  const outcome = extra?.outcome
+  return !(typeof outcome === 'string' && outcome !== 'success')
+}
+
+/** A chaos row that is not a fault: a refusal, a hook that raised, or one the lab labelled. */
+export function isChaosProbeRow(row: AuditLog): boolean {
+  return isLabRow(row) && !isFaultRow(row)
+}
+
+/**
+ * Every row the ledger files as the lab probing rather than as the agent's work or the
+ * lab's fault — hidden behind the "other reads" toggle, counted, never drawn as a fault.
+ */
+export function isProbeRow(row: AuditLog): boolean {
+  return isLabProbeRow(row) || isChaosProbeRow(row)
+}
+
+/** The platform raising an alert of its own. */
+export function isAlertRow(row: AuditLog): boolean {
+  return row.action === ALERT_RAISED_ACTION
+}
+
+/** What an `alert.raised` row says, for the station that draws it. */
+export interface RaisedAlert {
+  at: string
+  fingerprint: string | null
+  summary: string | null
+  severity: string | null
+  alertId: string | null
+}
+
+/**
+ * The alert that paged this take — its **first**, for the same reason the fault is the
+ * take's first injection: a second episode is not the moment the platform noticed.
+ */
+export function alertInTake(audit: AuditLog[], take: Take): RaisedAlert | null {
+  const rows = rowsInTake(audit, take)
+    .filter(isAlertRow)
+    .sort((a, b) => (a.created_at < b.created_at ? -1 : a.created_at > b.created_at ? 1 : 0))
+  const row = rows[0]
+  if (row === undefined) return null
+  const extra = row.extra_data ?? {}
+  const text = (key: string): string | null =>
+    typeof extra[key] === 'string' && extra[key] !== '' ? (extra[key] as string) : null
+  return {
+    at: row.created_at,
+    fingerprint: text('fingerprint'),
+    summary: text('summary'),
+    severity: text('severity'),
+    alertId: text('alert_id'),
+  }
+}
+
+/** The same rows a marker or a header caption should never name as the fault, in time order. */
+export function faultRowsInTake(audit: AuditLog[], take: Take): AuditLog[] {
+  return rowsInTake(audit, take)
+    .filter(isFaultRow)
+    .sort((a, b) => (a.created_at < b.created_at ? -1 : a.created_at > b.created_at ? 1 : 0))
 }
 
 /**
@@ -341,9 +456,17 @@ export function rowsInTakeWithEdges(audit: AuditLog[], take: Take): AuditLog[] {
   return [...opening, ...rowsInTake(audit, take)]
 }
 
-/** When the lab injected this take's fault, by the platform's own clock. */
+/**
+ * When the lab injected this take's fault, by the platform's own clock — the **first**
+ * successful injection in the take (WO-R3-336 item 7).
+ *
+ * First, not newest. The fourth take fired `kill_consumer` twice (the demo runner and
+ * then the eval runner's own chaos setup, 1 m 43 s apart) and anchoring on the newest
+ * made every fault-relative reading on the page 103 seconds wrong. A re-arm does not
+ * restart an incident: the world was already broken.
+ */
 export function faultInTake(audit: AuditLog[], take: Take): string | null {
-  return newest(rowsInTake(audit, take).filter(isLabRow))?.created_at ?? null
+  return faultRowsInTake(audit, take)[0]?.created_at ?? null
 }
 
 /** The runs that started inside one take, newest first. */
@@ -359,37 +482,45 @@ export function runsInTake(runs: AgentRun[], take: Take): AgentRun[] {
 
 /** Why the page is showing the take it is showing. */
 export type TakeChoice =
-  /** `?run=` named a run the page has. */
+  /** `?run=` named a run the page has — the operator pinned it, or `make demo-live` did. */
   | 'requested'
-  /** The newest run whose own take carries a fault row — the default rule. */
-  | 'fault'
-  /** No run's take has a fault row in view, so the newest run's take. */
-  | 'newest_run'
-  /** No run at all, so the take now running. */
-  | 'current'
+  /** The take now running, and a run has reported inside it. */
+  | 'current_run'
+  /** The take now running, which has reported no run yet — a fresh take at zero. */
+  | 'current_empty'
 
 export interface TakeSelection {
   take: Take
   run: AgentRun | null
-  /** Every run in view, newest first — what the selector offers. */
+  /** Every run in view, newest first. */
   runs: AgentRun[]
   /** The runs of the selected take, newest first. */
   takeRuns: AgentRun[]
   why: TakeChoice
+  /** True while the take on screen is the take now running. */
+  current: boolean
 }
 
 /**
- * Which run, and therefore which take, the page reads.
+ * Which take, and therefore which run, the page reads (WO-R3-336, owner's rule from
+ * the fourth take).
  *
- * The default is **the newest run with a fault row in its own take**, not the newest
- * run and not the newest boundary. That is the rule the third take needed: after the
- * wind-down the newest boundary held an empty world, and the only coherent thing on
- * the screen was the take that had just happened.
+ * **The default is the take now running** — the span after the newest
+ * `lab.world_reset` boundary — and the run it reads is the newest run that started
+ * inside it, or none. WO-R3-334's rule was "the newest run with a fault in its own
+ * take", which was right for a page reloaded after a wind-down and wrong for the
+ * thing the demo actually does: start a fresh take. On the fourth take that rule
+ * opened the page on the take before, so the first thing on screen was history.
  *
- * `?run=` wins over the default and selects that run's take the same way, so a deep
- * link from `make demo-live` opens the take it belongs to however many resets have
- * happened since. A `?run=` naming a run the page does not have falls through to the
- * default rather than emptying the screen.
+ * A fresh take therefore starts at **zero**: the platform's own rows, an empty agent
+ * row, and the ledger of this take alone. Because the choice is re-evaluated on every
+ * poll rather than latched at load, the page **adopts** the run the moment it reports
+ * — and moves on to the next take the moment a new boundary appears.
+ *
+ * `?run=` still wins, and selects that run's take the same way, so a deep link opens
+ * the take it belongs to however many resets have happened since. A `?run=` naming a
+ * run the page does not have falls through to the default rather than emptying the
+ * screen. Everything else — the earlier takes — is history, reached by choosing it.
  */
 export function selectTake(input: {
   runs: AgentRun[]
@@ -397,23 +528,92 @@ export function selectTake(input: {
   wanted?: string | null
 }): TakeSelection {
   const runs = [...input.runs].sort((a, b) => (a.started_at < b.started_at ? 1 : -1))
-  const choose = (run: AgentRun | null, why: TakeChoice, take?: Take): TakeSelection => {
-    const chosen = take ?? takeOfRun(input.audit, run)
-    return { take: chosen, run, runs, takeRuns: runsInTake(runs, chosen), why }
-  }
+  const current = currentTake(input.audit)
 
   const wanted = input.wanted ?? ''
   if (wanted !== '') {
     const found = runs.find((r) => r.id === wanted)
-    if (found) return choose(found, 'requested')
+    if (found) {
+      const take = takeOfRun(input.audit, found)
+      return {
+        take,
+        run: found,
+        runs,
+        takeRuns: runsInTake(runs, take),
+        why: 'requested',
+        current: takeKey(take) === takeKey(current),
+      }
+    }
   }
 
-  const withFault = runs.find(
-    (r) => faultInTake(input.audit, takeOfRun(input.audit, r)) !== null,
-  )
-  if (withFault) return choose(withFault, 'fault')
-  if (runs.length > 0) return choose(runs[0], 'newest_run')
-  return choose(null, 'current', currentTake(input.audit))
+  const takeRuns = runsInTake(runs, current)
+  const run = takeRuns[0] ?? null
+  return {
+    take: current,
+    run,
+    runs,
+    takeRuns,
+    why: run === null ? 'current_empty' : 'current_run',
+    current: true,
+  }
+}
+
+/**
+ * Every take in view, oldest first — the spans the boundaries cut the window into.
+ *
+ * The span before the oldest boundary is a take too, open at its start: its own
+ * opening boundary is simply older than the rows the page holds.
+ */
+export function takeSpans(audit: AuditLog[]): Take[] {
+  const bounds = takeBoundaries(audit)
+  if (bounds.length === 0) return [{ startAt: null, endAt: null }]
+  const spans: Take[] = [{ startAt: null, endAt: bounds[0] }]
+  for (let i = 0; i < bounds.length - 1; i += 1) {
+    spans.push({ startAt: bounds[i], endAt: bounds[i + 1] })
+  }
+  spans.push({ startAt: bounds[bounds.length - 1], endAt: null })
+  return spans
+}
+
+/** One take the selector can offer, with the runs that belong to it. */
+export interface TakeOption {
+  key: string
+  take: Take
+  /** The take's own runs, newest first. */
+  runs: AgentRun[]
+  /** The run choosing this take selects — its newest, or none. */
+  run: AgentRun | null
+  /** True for the take now running; every other one is history. */
+  current: boolean
+}
+
+/**
+ * What the take selector offers: the take now running first, then the earlier takes
+ * as **history**, newest first.
+ *
+ * An earlier take with no run of its own is not offered — there is nothing to show
+ * about it that the current take does not already say better, and "outcome" is a
+ * run's word. The take now running is always offered, run or no run, because it is
+ * the one the page defaults to.
+ */
+export function takeOptions(input: {
+  runs: AgentRun[]
+  audit: AuditLog[]
+}): TakeOption[] {
+  const runs = [...input.runs].sort((a, b) => (a.started_at < b.started_at ? 1 : -1))
+  return takeSpans(input.audit)
+    .map((take) => {
+      const takeRuns = runsInTake(runs, take)
+      return {
+        key: takeKey(take),
+        take,
+        runs: takeRuns,
+        run: takeRuns[0] ?? null,
+        current: take.endAt === null,
+      }
+    })
+    .reverse()
+    .filter((option) => option.current || option.runs.length > 0)
 }
 
 // ── the agent's own word ──────────────────────────────────────────────────────
@@ -557,29 +757,32 @@ export interface PlatformPhaseReading {
 }
 
 /**
- * When the lab last injected a fault *in the current take*, by the platform's own
- * clock.
+ * The fault of the take now running, by the platform's own clock.
  *
  * Rows older than the newest `lab.world_reset` are a previous take and are not
  * candidates, which is the whole of WO-R3-327: without that, a reset world still
  * reported the last take's kill as its fault, and the header counted a clock from it.
  *
- * Exported because the page needs it BEFORE it can decide whether a breach has
- * been observed — the breach latch is per-fault, so a second take in one session
- * starts clean rather than inheriting the first take's recovery.
+ * The take's FIRST successful injection since WO-R3-336 item 7 — see `isFaultRow` for
+ * what the fourth take's re-arm and its two refused guard probes did to a page that
+ * took the newest `chaos.*` row instead.
  */
-export function newestFaultAt(audit: AuditLog[]): string | null {
-  const resetAt = newestResetAt(audit)
-  return newest(sinceReset(audit, resetAt).filter(isLabRow))?.created_at ?? null
+export function currentTakeFaultAt(audit: AuditLog[]): string | null {
+  return faultInTake(audit, currentTake(audit))
 }
 
 /**
- * The fault of the take being read: the latch and the rows, whichever is newer,
+ * The fault of the take being read: the latch and the rows, whichever is **earlier**,
  * and neither one if it falls outside the take.
  *
- * Both ends matter since WO-R3-334. A latch from the previous take was always
- * dropped; a latch from a LATER one has to be dropped too, or a page showing a
- * closed take would count its clock from the next take's kill.
+ * Earlier since WO-R3-336 item 7. The latch exists because the row that states the fault
+ * falls out of the page's window of rows long before the incident is over; it is not a
+ * reason to move the anchor when a second injection arrives, and taking the newer of the
+ * two is exactly how the fourth take ended up counting from a re-arm.
+ *
+ * Both ends of the take matter since WO-R3-334. A latch from the previous take was always
+ * dropped; a latch from a LATER one has to be dropped too, or a page showing a closed
+ * take would count its clock from the next take's kill.
  */
 function latchedFaultAt(
   latched: string | null | undefined,
@@ -593,7 +796,7 @@ function latchedFaultAt(
       (take.endAt === null || v <= take.endAt),
   )
   if (candidates.length === 0) return null
-  return candidates.reduce((a, b) => (a > b ? a : b))
+  return candidates.reduce((a, b) => (a < b ? a : b))
 }
 
 export function platformPhase(input: PlatformPhaseInput): PlatformPhaseReading {
@@ -607,13 +810,14 @@ export function platformPhase(input: PlatformPhaseInput): PlatformPhaseReading {
   const audit = rowsInTake(input.audit, take)
   const faultAt = latchedFaultAt(
     input.faultAt,
-    newest(audit.filter(isLabRow))?.created_at ?? null,
+    oldest(audit.filter(isFaultRow))?.created_at ?? null,
     take,
   )
 
   if (faultAt === null) {
-    // No lab row: nothing was injected, whatever else is happening. A healthy
-    // world with an agent poking at it is still a healthy world.
+    // No successful injection: nothing was injected, whatever else is happening. A
+    // healthy world with an agent poking at it is still a healthy world, and so is one
+    // where the lab's guard probes were refused exactly as they were supposed to be.
     return { phase: 'healthy', faultAt: null, resetAt, metricKnown }
   }
 
@@ -826,12 +1030,14 @@ export interface Station<K extends string> {
 export type PlatformStationKey =
   | 'healthy'
   | 'fault_injected'
+  | 'paged'
   | 'agent_acting'
   | 'recovered'
 
 export const PLATFORM_ROW: readonly PlatformStationKey[] = [
   'healthy',
   'fault_injected',
+  'paged',
   'agent_acting',
   'recovered',
 ]
@@ -839,6 +1045,7 @@ export const PLATFORM_ROW: readonly PlatformStationKey[] = [
 export const PLATFORM_STATION_LABELS: Record<PlatformStationKey, string> = {
   healthy: 'healthy',
   fault_injected: 'fault injected',
+  paged: 'paged',
   agent_acting: 'agent acting',
   recovered: 'recovered',
 }
@@ -898,8 +1105,10 @@ function stationRow<K extends string>(
  */
 export function platformRow(input: PlatformRowInput): PlatformStation[] {
   const reading = platformPhase(input)
-  const audit = rowsInTake(input.audit, input.take ?? currentTake(input.audit))
+  const take = input.take ?? currentTake(input.audit)
+  const audit = rowsInTake(input.audit, take)
   const faultAt = reading.faultAt
+  const alert = alertInTake(input.audit, take)
 
   const callsSinceFault =
     faultAt === null
@@ -937,6 +1146,21 @@ export function platformRow(input: PlatformRowInput): PlatformStation[] {
       at: faultAt,
       reached: faultAt !== null,
       note: faultAt === null ? null : 'the lab’s own audit row',
+    },
+    {
+      // The platform noticing, on its own metric and its own clock (WO-R3-338). Its own
+      // station between the fault and the agent, because "the platform pages and the
+      // agent responds" is the demo's story and until v0.6.18 the alert was canned in
+      // the scenario's YAML — nothing on this page could show that half of it.
+      key: 'paged',
+      label: PLATFORM_STATION_LABELS.paged,
+      at: alert?.at ?? null,
+      reached: alert !== null,
+      note:
+        alert === null
+          ? 'not paged'
+          : [alert.fingerprint, alert.summary].filter((v) => v !== null).join(' · ') ||
+            'the alert carried no fingerprint or summary',
     },
     {
       key: 'agent_acting',
@@ -1291,13 +1515,37 @@ export function chartMarkers(input: ChartMarkerInput): ChartMarker[] {
     add(at, 'reset', 'world reset', 'a take begins and ends here')
   }
 
-  const labRow = newest(input.audit.filter(isLabRow))
-  add(
-    input.faultAt,
-    'fault',
-    toolCall(labRow ?? ({} as AuditLog))?.tool ?? 'fault injected',
-    'the lab injected the fault',
+  // The fault, and then every LATER successful injection as a marker of its own — a
+  // re-arm where the same hook fired with the same arguments, a second fault otherwise.
+  // The fourth take's page drew one F, on the re-arm, and nothing on the fault
+  // (WO-R3-336 item 7).
+  const faultRows = [...input.audit.filter(isFaultRow)].sort((a, b) =>
+    a.created_at < b.created_at ? -1 : a.created_at > b.created_at ? 1 : 0,
   )
+  const first = faultRows[0] ?? null
+  const anchorAt = input.faultAt ?? first?.created_at ?? null
+  const firstCall = first === null ? null : toolCall(first)
+  add(anchorAt, 'fault', firstCall?.tool ?? 'fault injected', 'the lab injected the fault')
+  for (const row of faultRows) {
+    if (anchorAt !== null && row.created_at <= anchorAt) continue
+    const call = toolCall(row)
+    // Same hook, same arguments = the world was re-armed. A key-order difference would
+    // read as a second fault, which is the safe way round to be wrong: it says "another
+    // injection happened here", which is true either way.
+    const sameHook =
+      call !== null &&
+      firstCall !== null &&
+      call.tool === firstCall.tool &&
+      JSON.stringify(call.args) === JSON.stringify(firstCall.args)
+    add(
+      row.created_at,
+      'fault',
+      sameHook ? `${call.tool} re-armed` : (call?.tool ?? 'fault injected'),
+      sameHook
+        ? 'the same hook fired again — the world was re-armed, not a new incident'
+        : 'a second injection in this take',
+    )
+  }
 
   const stepActions = input.steps.filter((s) => s.kind === 'action')
   if (stepActions.length > 0) {

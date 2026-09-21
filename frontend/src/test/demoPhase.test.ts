@@ -30,15 +30,19 @@ import {
   agentPhase,
   agentRow,
   agentStateLabel,
+  alertInTake,
   chartMarkers,
   chartWindow,
   currentTake,
+  currentTakeFaultAt,
   derivePhase,
   dlqDecision,
   faultInTake,
+  faultRowsInTake,
+  isFaultRow,
+  isProbeRow,
   isResetRow,
   metricRecovery,
-  newestFaultAt,
   newestResetAt,
   phaseTimeline,
   platformPhase,
@@ -57,6 +61,8 @@ import {
   takeHasEnded,
   takeKey,
   takeOfRun,
+  takeOptions,
+  takeSpans,
   yAxisTicks,
 } from '../utils/demoPhase'
 import type { AgentRun, AgentRunState, AuditLog, Job } from '../types'
@@ -291,7 +297,7 @@ describe('the reset is a boundary — WO-R3-327', () => {
     expect(isResetRow(FAULT)).toBe(false)
     // The bug this fixes in one line: a reset filed under `chaos.` would have BEEN
     // the newest fault.
-    expect(newestFaultAt([...previousTake, RESET])).toBeNull()
+    expect(currentTakeFaultAt([...previousTake, RESET])).toBeNull()
   })
 
   it('finds the newest boundary when a session has several takes', () => {
@@ -380,7 +386,7 @@ describe('the reset is a boundary — WO-R3-327', () => {
       'kill_consumer',
       '2026-09-19T10:05:00Z',
     )
-    expect(newestFaultAt([simultaneous, RESET])).toBeNull()
+    expect(currentTakeFaultAt([simultaneous, RESET])).toBeNull()
   })
 })
 
@@ -624,19 +630,23 @@ describe('dlqDecision — what the agent decided about one row', () => {
 // from the platform's own 15-minute window.
 // ───────────────────────────────────────────────────────────────────────────────
 
-describe('platformRow — four stations the platform can assert for itself', () => {
+describe('platformRow — the stations the platform can assert for itself', () => {
   const FAULT_AT = '2026-09-19T10:00:00Z'
   const metric = {
     metricKnown: true,
     metricInsideThreshold: false,
     metricBreachedSinceFault: true,
   }
+  /** By key, not by index: the row gained `paged` between two of them (WO-R3-336). */
+  const at = (row: ReturnType<typeof platformRow>, key: string) =>
+    row.find((s) => s.key === key)
 
-  it('is four stations, always, whatever the agent is doing', () => {
+  it('is five stations, always, whatever the agent is doing', () => {
     const row = platformRow({ audit: [], faultAt: null, ...metric })
     expect(row.map((s) => s.key)).toEqual([
       'healthy',
       'fault_injected',
+      'paged',
       'agent_acting',
       'recovered',
     ])
@@ -656,9 +666,9 @@ describe('platformRow — four stations the platform can assert for itself', () 
 
   it('lights fault injected from the lab’s own row, with its timestamp', () => {
     const row = platformRow({ audit: [FAULT], faultAt: FAULT_AT, ...metric })
-    expect(row[1].state).toBe('current')
-    expect(row[1].at).toBe(FAULT_AT)
-    expect(row[2].state).toBe('pending')
+    expect(at(row, 'fault_injected')?.state).toBe('current')
+    expect(at(row, 'fault_injected')?.at).toBe(FAULT_AT)
+    expect(at(row, 'agent_acting')?.state).toBe('pending')
   })
 
   it('keeps the fault latched when the row has scrolled out of the window', () => {
@@ -666,8 +676,8 @@ describe('platformRow — four stations the platform can assert for itself', () 
     // pushed off the page of audit rows within a minute and the station fell back
     // to `healthy` mid-run. The latch is the page's, and this row honours it.
     const row = platformRow({ audit: [], faultAt: FAULT_AT, ...metric })
-    expect(row[1].state).toBe('current')
-    expect(row[1].at).toBe(FAULT_AT)
+    expect(at(row, 'fault_injected')?.state).toBe('current')
+    expect(at(row, 'fault_injected')?.at).toBe(FAULT_AT)
   })
 
   it('moves to agent acting on the agent’s first call after the fault, and names it', () => {
@@ -678,16 +688,16 @@ describe('platformRow — four stations the platform can assert for itself', () 
       '2026-09-19T10:02:00Z',
     )
     const reads = platformRow({ audit: [FAULT, read], faultAt: FAULT_AT, ...metric })
-    expect(reads[2].state).toBe('current')
-    expect(reads[2].at).toBe('2026-09-19T10:01:00Z')
-    expect(reads[2].note).toMatch(/read/i)
+    expect(at(reads, 'agent_acting')?.state).toBe('current')
+    expect(at(reads, 'agent_acting')?.at).toBe('2026-09-19T10:01:00Z')
+    expect(at(reads, 'agent_acting')?.note).toMatch(/read/i)
 
     const actions = platformRow({
       audit: [FAULT, read, acted],
       faultAt: FAULT_AT,
       ...metric,
     })
-    expect(actions[2].note).toContain('restart_consumer_group')
+    expect(at(actions, 'agent_acting')?.note).toContain('restart_consumer_group')
   })
 
   it('reaches recovered with the sample’s own time, and keeps the fault passed', () => {
@@ -699,10 +709,10 @@ describe('platformRow — four stations the platform can assert for itself', () 
       metricInsideThreshold: true,
       metricBreachedSinceFault: true,
     })
-    expect(row[3].state).toBe('current')
-    expect(row[3].at).toBe('2026-09-19T10:03:00Z')
-    expect(row[1].state).toBe('passed')
-    expect(row[2].state).toBe('passed')
+    expect(at(row, 'recovered')?.state).toBe('current')
+    expect(at(row, 'recovered')?.at).toBe('2026-09-19T10:03:00Z')
+    expect(at(row, 'fault_injected')?.state).toBe('passed')
+    expect(at(row, 'agent_acting')?.state).toBe('passed')
   })
 
   it('measures each passed station against the next one’s clock', () => {
@@ -713,10 +723,10 @@ describe('platformRow — four stations the platform can assert for itself', () 
       ...metric,
     })
     // The boundary is when this world began, so `healthy` has a start to measure from.
-    expect(row[0].at).toBe('2026-09-19T09:59:00Z')
-    expect(row[0].durationMs).toBe(60_000)
-    expect(row[1].durationMs).toBe(60_000)
-    expect(row[2].durationMs).toBeNull()
+    expect(at(row, 'healthy')?.at).toBe('2026-09-19T09:59:00Z')
+    expect(at(row, 'healthy')?.durationMs).toBe(60_000)
+    expect(at(row, 'fault_injected')?.durationMs).toBe(60_000)
+    expect(at(row, 'agent_acting')?.durationMs).toBeNull()
   })
 
   it('will not claim recovery the metric cannot confirm', () => {
@@ -728,8 +738,8 @@ describe('platformRow — four stations the platform can assert for itself', () 
       metricInsideThreshold: true,
       metricBreachedSinceFault: true,
     })
-    expect(row[3].state).toBe('pending')
-    expect(row[3].at).toBeNull()
+    expect(at(row, 'recovered')?.state).toBe('pending')
+    expect(at(row, 'recovered')?.at).toBeNull()
   })
 })
 
@@ -1092,50 +1102,309 @@ describe('takes — the span between two boundaries', () => {
   })
 })
 
-describe('selectTake — the newest run with a fault in its OWN take', () => {
+// ─────────────────────────────────────────────────────────────────────────────
+// WO-R3-336 item 1 — a fresh take starts at zero.
+//
+// WO-R3-334's default was "the newest run with a fault in its own take", which is the
+// right answer to "the page was reloaded after the wind-down" and the wrong answer to
+// the thing the demo actually does: start a take. On the owner's fourth take it opened
+// the page on the take before, so the first thing on screen was history.
+//
+// The default is now the take NOW RUNNING, whether or not it has a run yet.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('selectTake — the take now running, and the run it adopts', () => {
   const rows = windDownRows()
 
-  it('shows the closed take the run belongs to, not the empty one after it', () => {
+  it('shows the take now running, not the closed take that has the run', () => {
     const chosen = selectTake({ runs: [windDownRun()], audit: rows, wanted: null })
+    expect(chosen.take).toEqual({ startAt: B2, endAt: null })
+    expect(chosen.run).toBeNull()
+    expect(chosen.why).toBe('current_empty')
+    expect(chosen.current).toBe(true)
+  })
+
+  it('adopts a run that has reported inside the current take', () => {
+    // The same rows one poll later: the take's own run has reported. Nothing else
+    // changes, and the page is on it — which is what "adopts it on the next poll" is.
+    const adopted = { ...run('triage'), id: 'run-take-4', started_at: '2026-09-19T10:06:00Z' }
+    const chosen = selectTake({ runs: [windDownRun(), adopted], audit: rows, wanted: null })
+    expect(chosen.run?.id).toBe('run-take-4')
+    expect(chosen.take).toEqual({ startAt: B2, endAt: null })
+    expect(chosen.why).toBe('current_run')
+    expect(chosen.current).toBe(true)
+  })
+
+  it('does not reach back for an older run when the current take has none', () => {
+    // The fourth take's own failure: the run of the take before was the newest run in
+    // view, and it had a fault in its take, so the old rule chose it.
+    const chosen = selectTake({ runs: [windDownRun()], audit: rows, wanted: null })
+    expect(chosen.takeRuns).toEqual([])
+    expect(chosen.runs.map((r) => r.id)).toEqual(['run-take-3'])
+  })
+
+  it('honours ?run= and reads that run’s take, marked as not the current one', () => {
+    const chosen = selectTake({
+      runs: [windDownRun()],
+      audit: rows,
+      wanted: 'run-take-3',
+    })
     expect(chosen.run?.id).toBe('run-take-3')
     expect(chosen.take).toEqual({ startAt: B1, endAt: B2 })
-    expect(chosen.why).toBe('fault')
-  })
-
-  it('prefers a run whose take has a fault over a newer run whose take has none', () => {
-    const newer = { ...run('investigating'), id: 'quiet', started_at: '2026-09-19T10:06:00Z' }
-    const chosen = selectTake({ runs: [windDownRun(), newer], audit: rows, wanted: null })
-    expect(chosen.run?.id).toBe('run-take-3')
-  })
-
-  it('honours ?run= and reads that run’s take the same way', () => {
-    const newer = { ...run('investigating'), id: 'quiet', started_at: '2026-09-19T10:06:00Z' }
-    const chosen = selectTake({ runs: [windDownRun(), newer], audit: rows, wanted: 'quiet' })
-    expect(chosen.run?.id).toBe('quiet')
-    expect(chosen.take).toEqual({ startAt: B2, endAt: null })
     expect(chosen.why).toBe('requested')
+    expect(chosen.current).toBe(false)
   })
 
-  it('falls back to the newest run when no take in view has a fault', () => {
-    const quiet = [resetRow(B1), resetRow(B2)]
-    const newer = { ...run('investigating'), id: 'quiet', started_at: '2026-09-19T10:06:00Z' }
-    const chosen = selectTake({ runs: [windDownRun(), newer], audit: quiet, wanted: null })
-    expect(chosen.run?.id).toBe('quiet')
-    expect(chosen.why).toBe('newest_run')
-  })
-
-  it('shows the take now running when no run has been reported at all', () => {
-    const chosen = selectTake({ runs: [], audit: rows, wanted: null })
-    expect(chosen.run).toBeNull()
+  it('falls back to the current take when ?run= names nothing it has', () => {
+    const chosen = selectTake({ runs: [windDownRun()], audit: rows, wanted: 'gone' })
+    expect(chosen.why).toBe('current_empty')
     expect(chosen.take).toEqual({ startAt: B2, endAt: null })
-    expect(chosen.why).toBe('current')
+  })
+
+  it('reads the whole window as one open take on a stack with no boundary', () => {
+    const older = { ...run('resolved'), id: 'older', started_at: '2026-09-19T10:00:00Z' }
+    const newer = { ...run('investigating'), id: 'newer', started_at: '2026-09-19T10:06:00Z' }
+    const chosen = selectTake({ runs: [older, newer], audit: [], wanted: null })
+    expect(chosen.take).toEqual({ startAt: null, endAt: null })
+    expect(chosen.run?.id).toBe('newer')
+    expect(chosen.takeRuns.map((r) => r.id)).toEqual(['newer', 'older'])
   })
 
   it('offers every run it can see, newest first, whatever take they are in', () => {
     const newer = { ...run('investigating'), id: 'quiet', started_at: '2026-09-19T10:06:00Z' }
     const chosen = selectTake({ runs: [windDownRun(), newer], audit: rows, wanted: null })
     expect(chosen.runs.map((r) => r.id)).toEqual(['quiet', 'run-take-3'])
-    expect(chosen.takeRuns.map((r) => r.id)).toEqual(['run-take-3'])
+    expect(chosen.takeRuns.map((r) => r.id)).toEqual(['quiet'])
+  })
+})
+
+describe('takeSpans and takeOptions — earlier takes are history', () => {
+  const rows = windDownRows()
+
+  it('cuts the window into one span per boundary, oldest first', () => {
+    expect(takeSpans(rows)).toEqual([
+      { startAt: null, endAt: B1 },
+      { startAt: B1, endAt: B2 },
+      { startAt: B2, endAt: null },
+    ])
+  })
+
+  it('reads a window with no boundary as one open take', () => {
+    expect(takeSpans([])).toEqual([{ startAt: null, endAt: null }])
+  })
+
+  it('offers the take now running first, then the takes with runs as history', () => {
+    const options = takeOptions({ runs: [windDownRun()], audit: rows })
+    expect(options.map((o) => o.key)).toEqual([
+      takeKey({ startAt: B2, endAt: null }),
+      takeKey({ startAt: B1, endAt: B2 }),
+    ])
+    expect(options[0].current).toBe(true)
+    expect(options[0].run).toBeNull()
+    // History carries the run that says what happened in it — the outcome the selector
+    // labels it with.
+    expect(options[1].current).toBe(false)
+    expect(options[1].run?.id).toBe('run-take-3')
+  })
+
+  it('does not offer an earlier take that never had a run', () => {
+    // The span before the oldest boundary in view is a take, and with no run of its own
+    // there is nothing to say about it that the current take does not say better.
+    const options = takeOptions({ runs: [windDownRun()], audit: rows })
+    expect(options.map((o) => o.take.startAt)).not.toContain(null)
+  })
+
+  it('always offers the take now running, even with nothing in it at all', () => {
+    const options = takeOptions({ runs: [], audit: [resetRow(B2)] })
+    expect(options).toHaveLength(1)
+    expect(options[0].current).toBe(true)
+    expect(options[0].runs).toEqual([])
+  })
+
+  it('carries every run of a take, newest first', () => {
+    const second = {
+      ...run('resolved'),
+      id: 'run-take-3b',
+      started_at: '2026-09-19T10:02:00Z',
+    }
+    const options = takeOptions({ runs: [windDownRun(), second], audit: rows })
+    const history = options.find((o) => !o.current)
+    expect(history?.runs.map((r) => r.id)).toEqual(['run-take-3b', 'run-take-3'])
+    expect(history?.run?.id).toBe('run-take-3b')
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WO-R3-336 item 7 — the fault is the take's FIRST successful injection.
+//
+// The fourth take's chaos rows, from the platform's own audit stream:
+//
+//   03:18:05.952  chaos.tool_invoked  kill_consumer   success               ← THE fault
+//   03:19:48.552  chaos.tool_denied   inject_latency  (guard, labelled)
+//   03:19:48.573  chaos.tool_invoked  inject_latency  error, labelled
+//   03:19:48.592  chaos.tool_invoked  kill_consumer   success               ← a re-arm
+//
+// The page anchored on the NEWEST of them, so `injected 08:19:48`, `T+ 43.9 s`,
+// `fault injected · 17 ms`, the chart's F marker and `agent acting · 58 s` were all
+// measured from a re-arm that happened 1 m 43 s after the fault — and two refusals were
+// drawn in amber as faults.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('isFaultRow — an injection, not a probe and not a refusal', () => {
+  const FAULT_AT = '2026-09-19T10:00:00Z'
+  const REARM_AT = '2026-09-19T10:01:43Z'
+
+  const fault = toolRow('chaos.tool_invoked', 'kill_consumer', FAULT_AT, {
+    consumer_group: 'worker-dispatcher',
+  })
+  const rearm = toolRow('chaos.tool_invoked', 'kill_consumer', REARM_AT, {
+    consumer_group: 'worker-dispatcher',
+  })
+  const denied = auditRow({
+    action: 'chaos.tool_denied',
+    created_at: '2026-09-19T10:01:42Z',
+    extra_data: {
+      tool_name: 'inject_latency',
+      arguments: {},
+      lab_probe_reason: 'precondition: the agent token may not inject',
+    },
+  })
+  const raised = auditRow({
+    action: 'chaos.tool_invoked',
+    created_at: '2026-09-19T10:01:42.5Z',
+    extra_data: {
+      tool_name: 'inject_latency',
+      arguments: {},
+      outcome: 'error',
+      lab_probe_reason: 'precondition: the agent token may not inject',
+    },
+  })
+
+  it('is the successful, unlabelled invocation', () => {
+    expect(isFaultRow(fault)).toBe(true)
+    expect(isFaultRow(rearm)).toBe(true)
+  })
+
+  it('is not a refusal — the hook never ran', () => {
+    expect(isFaultRow(denied)).toBe(false)
+    expect(isProbeRow(denied)).toBe(true)
+  })
+
+  it('is not a hook the lab fired as a probe, even a successful one', () => {
+    const probe = auditRow({
+      action: 'chaos.tool_invoked',
+      created_at: '2026-09-19T10:01:41Z',
+      extra_data: {
+        tool_name: 'kill_consumer',
+        arguments: {},
+        outcome: 'success',
+        lab_probe_reason: 'precondition: prove the premise',
+      },
+    })
+    expect(isFaultRow(probe)).toBe(false)
+    expect(isProbeRow(probe)).toBe(true)
+  })
+
+  it('is not an invocation that raised', () => {
+    expect(isFaultRow(raised)).toBe(false)
+    expect(isProbeRow(raised)).toBe(true)
+  })
+
+  it('treats a row that did not state an outcome as an injection', () => {
+    // An absent field is a row that did not say. Reading it as a failure would let a
+    // stack that stops writing `outcome` report a healthy world through a fault, which
+    // is the worse of the two mistakes.
+    const quiet = auditRow({
+      action: 'chaos.tool_invoked',
+      created_at: FAULT_AT,
+      extra_data: { tool_name: 'kill_consumer', arguments: {} },
+    })
+    expect(isFaultRow(quiet)).toBe(true)
+  })
+
+  it('is never the boundary row, whatever else it carries', () => {
+    expect(isFaultRow(resetRow(FAULT_AT))).toBe(false)
+    expect(isProbeRow(resetRow(FAULT_AT))).toBe(false)
+  })
+
+  it('anchors the take on the FIRST injection, with the re-arm still in the list', () => {
+    const rows = [resetRow(B1), fault, denied, raised, rearm]
+    const take = { startAt: B1, endAt: null }
+    expect(faultInTake(rows, take)).toBe(FAULT_AT)
+    expect(faultRowsInTake(rows, take).map((r) => r.created_at)).toEqual([
+      FAULT_AT,
+      REARM_AT,
+    ])
+  })
+
+  it('reads the platform row from the first injection, not the re-arm', () => {
+    const reading = platformPhase({
+      audit: [resetRow(B1), fault, denied, raised, rearm],
+      take: { startAt: B1, endAt: null },
+      metricKnown: true,
+      metricInsideThreshold: false,
+      metricBreachedSinceFault: true,
+    })
+    expect(reading.faultAt).toBe(FAULT_AT)
+  })
+
+  it('will not let a later injection move a latched fault forward', () => {
+    const reading = platformPhase({
+      audit: [resetRow(B1), rearm],
+      take: { startAt: B1, endAt: null },
+      // The first injection's row has scrolled out of the window; the latch holds it.
+      faultAt: FAULT_AT,
+      metricKnown: true,
+      metricInsideThreshold: false,
+      metricBreachedSinceFault: true,
+    })
+    expect(reading.faultAt).toBe(FAULT_AT)
+  })
+
+  it('reads healthy through a take whose only chaos rows were refused probes', () => {
+    const reading = platformPhase({
+      audit: [resetRow(B1), denied, raised],
+      take: { startAt: B1, endAt: null },
+      metricKnown: true,
+      metricInsideThreshold: true,
+      metricBreachedSinceFault: false,
+    })
+    expect(reading.phase).toBe('healthy')
+    expect(reading.faultAt).toBeNull()
+  })
+
+  it('draws the fault and the re-arm as two markers, the second labelled', () => {
+    const marks = chartMarkers({
+      faultAt: FAULT_AT,
+      recoveredAt: null,
+      resetAts: [B1],
+      steps: [],
+      audit: [resetRow(B1), fault, denied, raised, rearm],
+      windowStart: new Date(B1).getTime() - 60_000,
+      windowEnd: new Date(REARM_AT).getTime() + 60_000,
+    })
+    const faults = marks.filter((m) => m.kind === 'fault')
+    expect(faults.map((m) => m.at)).toEqual([FAULT_AT, REARM_AT])
+    expect(faults[0].label).toBe('kill_consumer')
+    expect(faults[1].label).toBe('kill_consumer re-armed')
+    // And neither refusal is a marker of any kind.
+    expect(marks.filter((m) => m.at === denied.created_at)).toEqual([])
+  })
+
+  it('calls a different hook a second injection rather than a re-arm', () => {
+    const second = toolRow('chaos.tool_invoked', 'saturate_redis', REARM_AT)
+    const marks = chartMarkers({
+      faultAt: FAULT_AT,
+      recoveredAt: null,
+      resetAts: [],
+      steps: [],
+      audit: [fault, second],
+      windowStart: new Date(FAULT_AT).getTime() - 60_000,
+      windowEnd: new Date(REARM_AT).getTime() + 60_000,
+    })
+    const faults = marks.filter((m) => m.kind === 'fault')
+    expect(faults[1].label).toBe('saturate_redis')
+    expect(faults[1].detail).toMatch(/second injection/)
   })
 })
 
@@ -1451,5 +1720,119 @@ describe('yAxisTicks — round numbers, and zero always drawn', () => {
 
   it('never prints a fractional count of messages', () => {
     expect(yAxisTicks(30).every((t) => Number.isInteger(t))).toBe(true)
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WO-R3-336 item 8 — the platform pages, and the row says so.
+//
+// Until v0.6.18 the alert the agent triaged came from the scenario's YAML and the
+// platform's own alert stream never moved: `list_active_alerts` read the same three
+// seeded rows before, during and after the fourth take. The platform now raises the
+// alert itself on its own metric (WO-R3-338, owner decision O-36) and audits it as
+// `alert.raised` — so the half of the story that was missing ("the platform pages")
+// has a station of its own, between the fault and the agent.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('the paged station — the platform noticing, on its own clock', () => {
+  const B = '2026-09-19T09:59:00Z'
+  const PAGED_AT = '2026-09-19T10:00:12Z'
+
+  function alertRow(at: string, extra: Record<string, unknown> = {}): AuditLog {
+    return auditRow({
+      action: 'alert.raised',
+      created_at: at,
+      resource_type: 'alert',
+      extra_data: {
+        alert_id: 'alert-77',
+        fingerprint: 'consumer_stalled',
+        severity: 'critical',
+        summary: 'worker-dispatcher is 30 messages behind',
+        ...extra,
+      },
+    })
+  }
+
+  const metric = {
+    metricKnown: true,
+    metricInsideThreshold: false,
+    metricBreachedSinceFault: true,
+  }
+
+  it('sits between the fault and the agent, in that order', () => {
+    const stations = platformRow({
+      audit: [resetRow(B), FAULT, alertRow(PAGED_AT)],
+      take: { startAt: B, endAt: null },
+      ...metric,
+    })
+    expect(stations.map((s) => s.key)).toEqual([
+      'healthy',
+      'fault_injected',
+      'paged',
+      'agent_acting',
+      'recovered',
+    ])
+  })
+
+  it('is stamped with the alert’s own row and carries its fingerprint and summary', () => {
+    const stations = platformRow({
+      audit: [resetRow(B), FAULT, alertRow(PAGED_AT)],
+      take: { startAt: B, endAt: null },
+      ...metric,
+    })
+    const paged = stations.find((s) => s.key === 'paged')
+    expect(paged?.at).toBe(PAGED_AT)
+    expect(paged?.state).toBe('current')
+    expect(paged?.note).toBe('consumer_stalled · worker-dispatcher is 30 messages behind')
+  })
+
+  it('says "not paged" where the platform raised nothing', () => {
+    const stations = platformRow({
+      audit: [resetRow(B), FAULT],
+      take: { startAt: B, endAt: null },
+      ...metric,
+    })
+    const paged = stations.find((s) => s.key === 'paged')
+    expect(paged?.state).toBe('pending')
+    expect(paged?.at).toBeNull()
+    expect(paged?.note).toBe('not paged')
+  })
+
+  it('takes the take’s FIRST alert, and none from another take', () => {
+    const rows = [
+      resetRow(B),
+      FAULT,
+      alertRow(PAGED_AT),
+      alertRow('2026-09-19T10:02:00Z', { fingerprint: 'dlq_depth_warning' }),
+      resetRow('2026-09-19T10:04:00Z'),
+      alertRow('2026-09-19T10:05:00Z', { fingerprint: 'next take' }),
+    ]
+    const take = { startAt: B, endAt: '2026-09-19T10:04:00Z' }
+    expect(alertInTake(rows, take)?.at).toBe(PAGED_AT)
+    expect(alertInTake(rows, take)?.fingerprint).toBe('consumer_stalled')
+    expect(alertInTake(rows, { startAt: '2026-09-19T10:04:00Z', endAt: null })?.fingerprint).toBe(
+      'next take',
+    )
+  })
+
+  it('names the absence rather than guessing when the row carries nothing', () => {
+    const bare = auditRow({ action: 'alert.raised', created_at: PAGED_AT, extra_data: {} })
+    const stations = platformRow({
+      audit: [resetRow(B), FAULT, bare],
+      take: { startAt: B, endAt: null },
+      ...metric,
+    })
+    const paged = stations.find((s) => s.key === 'paged')
+    expect(paged?.state).toBe('current')
+    expect(paged?.note).toBe('the alert carried no fingerprint or summary')
+  })
+
+  it('leaves the fault clock anchored on the fault, not on the page', () => {
+    const reading = platformPhase({
+      audit: [resetRow(B), FAULT, alertRow(PAGED_AT)],
+      take: { startAt: B, endAt: null },
+      ...metric,
+    })
+    expect(reading.faultAt).toBe('2026-09-19T10:00:00Z')
   })
 })
