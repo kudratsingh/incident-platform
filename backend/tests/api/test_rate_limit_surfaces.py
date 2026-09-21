@@ -390,6 +390,108 @@ async def test_paid_endpoints_have_independent_buckets(
     assert resp.status_code == 200
 
 
+# Job creation — one bucket for two endpoints, and a ceiling read per request
+
+
+class _CountingClientRedis(_CountingRedis):
+    """`_CountingRedis` plus a no-op answer for the rest of the create-job path."""
+
+    def __getattr__(self, name: str) -> AsyncMock:
+        return AsyncMock(return_value=None)
+
+
+def _use_counting_redis(client: AsyncClient) -> _CountingClientRedis:
+    redis = _CountingClientRedis()
+
+    async def _override_redis():  # type: ignore[no-untyped-def]
+        yield redis
+
+    client._transport.app.dependency_overrides[get_redis] = _override_redis  # type: ignore[attr-defined]
+    return redis
+
+
+@pytest.fixture
+def job_create_limit_of_two(monkeypatch: pytest.MonkeyPatch):  # type: ignore[no-untyped-def]
+    """Two instead of the default 30, so the test is about the setting being read
+    rather than about issuing 31 requests."""
+    monkeypatch.setenv("JOB_CREATE_RATE_LIMIT", "2")
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
+
+
+async def test_job_create_refuses_past_the_configured_ceiling(
+    client: AsyncClient,
+    auth_headers: dict[str, str],
+    job_create_limit_of_two,  # type: ignore[no-untyped-def]
+) -> None:
+    """`JOB_CREATE_RATE_LIMIT` is what `POST /jobs` enforces — it was a literal 30
+    in the route, which no deployment could raise (WO-R3-343)."""
+    _use_counting_redis(client)
+
+    for n in range(2):
+        resp = await client.post(
+            "/api/v1/jobs", json={"type": "csv_upload"}, headers=auth_headers
+        )
+        assert resp.status_code == 201, f"call {n + 1} of 2 should pass"
+
+    resp = await client.post(
+        "/api/v1/jobs", json={"type": "csv_upload"}, headers=auth_headers
+    )
+    assert resp.status_code == 429
+    assert resp.json()["error_code"] == "rate_limit_exceeded"
+
+
+async def test_sagas_spend_the_same_allowance_as_jobs(
+    client: AsyncClient,
+    auth_headers: dict[str, str],
+    job_create_limit_of_two,  # type: ignore[no-untyped-def]
+) -> None:
+    """Both endpoints share the `jobs:create` bucket, so they must also share the
+    setting: one ceiling, or a caller refused by one keeps creating rows through
+    the other."""
+    _use_counting_redis(client)
+
+    for _ in range(2):
+        resp = await client.post(
+            "/api/v1/jobs", json={"type": "csv_upload"}, headers=auth_headers
+        )
+        assert resp.status_code == 201
+
+    resp = await client.post(
+        "/api/v1/sagas",
+        json={"name": "import-pipeline", "steps": [{"type": "csv_upload"}]},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 429
+    assert resp.json()["error_code"] == "rate_limit_exceeded"
+
+
+async def test_job_create_bucket_is_still_per_address(
+    client: AsyncClient,
+    auth_headers: dict[str, str],
+    job_create_limit_of_two,  # type: ignore[no-untyped-def]
+) -> None:
+    """The key did not move: a second address has its own allowance, and one
+    caller's refusal does not follow the authenticated user around."""
+    redis = _use_counting_redis(client)
+
+    for _ in range(3):
+        await client.post(
+            "/api/v1/jobs",
+            json={"type": "csv_upload"},
+            headers={**auth_headers, "X-Forwarded-For": "198.51.100.7"},
+        )
+    resp = await client.post(
+        "/api/v1/jobs",
+        json={"type": "csv_upload"},
+        headers={**auth_headers, "X-Forwarded-For": "203.0.113.9"},
+    )
+    assert resp.status_code == 201
+    buckets = {k for k in redis.counters if k.startswith("rate:jobs:create:")}
+    assert len(buckets) == 2
+
+
 # Window semantics — the claim the docs used to make
 
 

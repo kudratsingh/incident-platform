@@ -12,15 +12,45 @@ requests, not jobs.
 """
 
 import uuid
+from collections.abc import Callable, Coroutine
+from typing import Any
 
+from app.config import get_settings
+from app.core.redis import get_redis
 from app.utils.backpressure import check_backpressure
 from app.utils.quota import check_tenant_limits
+from app.utils.rate_limit import check_client_rate_limit
+from fastapi import Depends, Request
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
 # The per-IP rate-limit bucket shared by every endpoint that creates jobs.
 # Per-endpoint buckets would leave the bypass half-open.
 JOB_CREATE_RATE_BUCKET = "jobs:create"
+
+
+def job_create_rate_limiter() -> Callable[..., Coroutine[Any, Any, None]]:
+    """The per-address rate limit every job-creating endpoint declares.
+
+    `JOB_CREATE_RATE_LIMIT` / `JOB_CREATE_RATE_WINDOW_SECONDS` (30, 60s) are read on
+    every request, because the dependency is built once at import and a ceiling read
+    there could never be changed by a deployment's environment (WO-R3-343).
+    """
+
+    async def dependency(
+        request: Request,
+        redis: Redis = Depends(get_redis),
+    ) -> None:
+        settings = get_settings()
+        await check_client_rate_limit(
+            request,
+            redis,
+            limit=settings.job_create_rate_limit,
+            window=settings.job_create_rate_window_seconds,
+            key_prefix=JOB_CREATE_RATE_BUCKET,
+        )
+
+    return dependency
 
 
 async def check_job_admission(

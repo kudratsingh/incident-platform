@@ -169,6 +169,11 @@ class Settings(BaseSettings):
     admin_digest_rate_limit: int = 5
     admin_paid_rate_limit_window_seconds: int = 60
 
+    # Job creation, keyed on the caller's address; `POST /jobs` and `POST /sagas`
+    # share one bucket. A setting since WO-R3-343 so the demo stack can raise it.
+    job_create_rate_limit: int = 30
+    job_create_rate_window_seconds: int = 60
+
     # LLM-driven DLQ triage. Disabled by default; enabling requires an
     # Anthropic API key (read from ANTHROPIC_API_KEY env var by the SDK).
     llm_triage_enabled: bool = False

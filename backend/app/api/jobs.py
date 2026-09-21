@@ -10,9 +10,8 @@ from app.repositories.outbox import OutboxRepository
 from app.schemas.common import PaginatedResponse
 from app.schemas.job import JobCreate, JobListParams, JobResponse
 from app.services.job import JobService
-from app.utils.admission import JOB_CREATE_RATE_BUCKET, check_job_admission
+from app.utils.admission import check_job_admission, job_create_rate_limiter
 from app.utils.cache import JobCache
-from app.utils.rate_limit import rate_limiter
 from fastapi import APIRouter, Depends, Request
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -37,9 +36,7 @@ async def create_job(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
     redis: Redis = Depends(get_redis),
-    _rl: None = Depends(
-        rate_limiter(limit=30, window=60, key_prefix=JOB_CREATE_RATE_BUCKET)
-    ),
+    _rl: None = Depends(job_create_rate_limiter()),
 ) -> JobResponse:
     # One job row, so job_count defaults to 1. POST /sagas runs the same guard
     # with job_count=len(steps) — see utils/admission.py.
