@@ -257,6 +257,27 @@ export function isFaultRow(row: AuditLog): boolean {
   return !(typeof outcome === 'string' && outcome !== 'success')
 }
 
+/**
+ * When the run fired its first Tier-1 action — its own `action` step, or the oldest
+ * `agent.tool_invoked` row by its principal where it has reported no step yet.
+ */
+export function firstActionAt(input: {
+  steps: AgentRunStepRecord[]
+  audit: AuditLog[]
+  runPrincipalId?: string | null
+}): string | null {
+  const fromStep = input.steps
+    .filter((s) => s.kind === 'action' && s.at !== null)
+    .sort((a, b) => a.seq - b.seq)[0]
+  if (fromStep?.at != null) return fromStep.at
+  const rows = input.audit.filter((row) => {
+    if (!isRunToolRow(row, input.runPrincipalId)) return false
+    const call = toolCall(row)
+    return call !== null && ACTION_TOOLS.includes(call.tool)
+  })
+  return oldest(rows)?.created_at ?? null
+}
+
 /** A chaos row that is not a fault: a refusal, a hook that raised, or one the lab labelled. */
 export function isChaosProbeRow(row: AuditLog): boolean {
   return isLabRow(row) && !isFaultRow(row)
@@ -314,19 +335,13 @@ export function faultRowsInTake(audit: AuditLog[], take: Take): AuditLog[] {
 }
 
 /**
- * An `agent.tool_invoked` row this run actually made.
- *
- * `principalId` is the run's own `service_account_id`. The third take's ledger was
- * flooded with `get_consumer_lag` every three seconds because the demo runner built
- * two of its clients with the AGENT's token, and the page could not tell those reads
- * from the agent's (F3). With a run selected there is a principal to compare
- * against, so it does: a row by anyone else is somebody else's read. Without a run
- * there is nothing to compare against and every row counts, which is the honest
- * reading rather than a guess.
+ * An `agent.tool_invoked` row the selected run made, matched on the run's own
+ * `service_account_id`. With no run selected NOTHING counts (WO-R3-341 item 5): the
+ * fifth take drew the demo runner's lag polls as the agent acting before the fault.
  */
 function isRunToolRow(row: AuditLog, principalId: string | null | undefined): boolean {
   if (!isAgentToolRow(row)) return false
-  if (principalId === null || principalId === undefined) return true
+  if (principalId === null || principalId === undefined) return false
   return row.principal_id === principalId
 }
 
@@ -488,6 +503,11 @@ export type TakeChoice =
   | 'current_run'
   /** The take now running, which has reported no run yet — a fresh take at zero. */
   | 'current_empty'
+  /**
+   * A finished take, held on screen because the take after it has neither a fault nor
+   * a run yet — the wind-down's reset has landed and the next run has not started.
+   */
+  | 'held'
 
 export interface TakeSelection {
   take: Take
@@ -499,28 +519,33 @@ export interface TakeSelection {
   why: TakeChoice
   /** True while the take on screen is the take now running. */
   current: boolean
+  /**
+   * When the reset that opened the newer, still-empty take happened — the time the
+   * banner prints. Null unless a take is being held (`why: 'held'`).
+   */
+  cleaningUpSince: string | null
+}
+
+/** True when a take has something to show: the lab's own fault row, or a run. */
+export function takeHasWork(take: Take, audit: AuditLog[], runs: AgentRun[]): boolean {
+  return faultInTake(audit, take) !== null || runsInTake(runs, take).length > 0
 }
 
 /**
- * Which take, and therefore which run, the page reads (WO-R3-336, owner's rule from
- * the fourth take).
+ * Which take, and therefore which run, the page reads: **the newest take that has a
+ * fault or a run** (WO-R3-341 item 1, replacing WO-R3-336's "the take now running").
  *
- * **The default is the take now running** — the span after the newest
- * `lab.world_reset` boundary — and the run it reads is the newest run that started
- * inside it, or none. WO-R3-334's rule was "the newest run with a fault in its own
- * take", which was right for a page reloaded after a wind-down and wrong for the
- * thing the demo actually does: start a fresh take. On the fourth take that rule
- * opened the page on the take before, so the first thing on screen was history.
+ * The fifth take's run vanished eleven seconds after it resolved. The runner's
+ * wind-down wrote a new boundary, that newer take was empty, and "the take now
+ * running" jumped to it — so the finished run, its stations, its ledger and its
+ * briefing left the screen while the owner was still looking at them. A take with
+ * neither a fault nor a run has nothing to show, so it is not switched to: the page
+ * holds the finished take (`why: 'held'`) and says the world is being cleaned up.
+ * The moment the newer take gets a `chaos.*` fault row or a run, it wins.
  *
- * A fresh take therefore starts at **zero**: the platform's own rows, an empty agent
- * row, and the ledger of this take alone. Because the choice is re-evaluated on every
- * poll rather than latched at load, the page **adopts** the run the moment it reports
- * — and moves on to the next take the moment a new boundary appears.
- *
- * `?run=` still wins, and selects that run's take the same way, so a deep link opens
- * the take it belongs to however many resets have happened since. A `?run=` naming a
- * run the page does not have falls through to the default rather than emptying the
- * screen. Everything else — the earlier takes — is history, reached by choosing it.
+ * `?run=` still pins, and a take with a fault but no run yet is still the fresh take
+ * at zero the fourth take's fix asked for. A `?run=` naming a run the page does not
+ * have falls through to the default rather than emptying the screen.
  */
 export function selectTake(input: {
   runs: AgentRun[]
@@ -542,7 +567,26 @@ export function selectTake(input: {
         takeRuns: runsInTake(runs, take),
         why: 'requested',
         current: takeKey(take) === takeKey(current),
+        cleaningUpSince: null,
       }
+    }
+  }
+
+  // Newest first, so the newest take with work wins. None at all — a stack whose
+  // takes are all empty — keeps the take now running, which is the honest default.
+  const held = [...takeSpans(input.audit)]
+    .reverse()
+    .find((span) => takeHasWork(span, input.audit, runs))
+  if (held !== undefined && takeKey(held) !== takeKey(current)) {
+    const heldRuns = runsInTake(runs, held)
+    return {
+      take: held,
+      run: heldRuns[0] ?? null,
+      runs,
+      takeRuns: heldRuns,
+      why: 'held',
+      current: false,
+      cleaningUpSince: current.startAt,
     }
   }
 
@@ -555,6 +599,7 @@ export function selectTake(input: {
     takeRuns,
     why: run === null ? 'current_empty' : 'current_run',
     current: true,
+    cleaningUpSince: null,
   }
 }
 
@@ -1060,6 +1105,45 @@ export interface PlatformRowInput extends PlatformPhaseInput {
    * reached when the reading says `recovered`, it just has no timestamp.
    */
   recoveredAt?: string | null
+  /**
+   * The selected run's own steps, which are the authority on when the agent started
+   * acting (WO-R3-341 item 2). The audit rows are the fallback, and only where the
+   * run has reported no step with a time yet.
+   */
+  runSteps?: AgentRunStepRecord[]
+}
+
+/** One reading of when the agent started acting, and the line the station carries. */
+interface ActingReading {
+  at: string | null
+  note: string | null
+}
+
+function readsPhrase(reads: number): string {
+  return `${String(reads)} read${reads === 1 ? '' : 's'}`
+}
+
+/**
+ * When the run started acting, from its own `read`/`action` steps — `steps[0].at` in
+ * `seq` order, with the first action named and the reads before it counted.
+ */
+function actingFromSteps(steps: AgentRunStepRecord[]): ActingReading {
+  const calls = steps
+    .filter((s) => s.kind === 'read' || s.kind === 'action')
+    .sort((a, b) => a.seq - b.seq)
+  const at = calls.find((s) => s.at !== null)?.at ?? null
+  if (at === null) return { at: null, note: null }
+  const action = calls.find((s) => s.kind === 'action')
+  const reads = calls.filter(
+    (s) => s.kind === 'read' && (action === undefined || s.seq < action.seq),
+  ).length
+  return {
+    at,
+    note:
+      action === undefined
+        ? `${readsPhrase(reads)}, no action yet`
+        : `${action.tool ?? 'a Tier-1 action'} fired after ${readsPhrase(reads)}`,
+  }
 }
 
 /** Oldest of a set of rows, where `newest` above takes the other end. */
@@ -1120,15 +1204,26 @@ export function platformRow(input: PlatformRowInput): PlatformStation[] {
     const call = toolCall(row)
     return call !== null && ACTION_TOOLS.includes(call.tool)
   })
-  const actingAt = oldest(callsSinceFault)?.created_at ?? null
   const firstAction = oldest(actions)
   const reads = callsSinceFault.length - actions.length
-  const note =
-    firstAction !== null
-      ? `${toolCall(firstAction)?.tool ?? 'a Tier-1 action'} fired after ${String(reads)} read${reads === 1 ? '' : 's'}`
-      : callsSinceFault.length > 0
-        ? `${String(reads)} read${reads === 1 ? '' : 's'}, no action yet`
-        : null
+  const fromAudit: ActingReading = {
+    at: oldest(callsSinceFault)?.created_at ?? null,
+    note:
+      firstAction !== null
+        ? `${toolCall(firstAction)?.tool ?? 'a Tier-1 action'} fired after ${readsPhrase(reads)}`
+        : callsSinceFault.length > 0
+          ? `${readsPhrase(reads)}, no action yet`
+          : null,
+  }
+  // The run's own steps first: they carry what the audit rows cannot (the result) and
+  // they are the run's, where an audit row is only a principal's (item 2). A step from
+  // before the fault is not this incident's, and nothing acts on a fault that is absent.
+  const fromSteps = actingFromSteps(input.runSteps ?? [])
+  const usable =
+    fromSteps.at !== null && faultAt !== null && fromSteps.at >= faultAt ? fromSteps : null
+  const acting = usable ?? fromAudit
+  const actingAt = acting.at
+  const note = acting.note
 
   const recoveredReached = reading.phase === 'recovered'
 
@@ -1284,6 +1379,38 @@ export function reportArrivals(
 }
 
 /**
+ * The same row with every station the previous poll had already reached kept reached
+ * (WO-R3-341 item 2): a later poll may only ADD stations, never take one away.
+ *
+ * The fifth take's PLATFORM row read paged → agent acting → paged → agent acting,
+ * because "agent acting" needs the run's principal, that principal arrives on a
+ * different poll from the audit rows, and the two answered at different times. A
+ * station that has been true once stays true until the take ends or the selected run
+ * changes — which is what the caller keys its memory on.
+ */
+export function latchStations<K extends string>(
+  previous: readonly Station<K>[] | null | undefined,
+  next: Station<K>[],
+): Station<K>[] {
+  if (previous === null || previous === undefined) return next
+  const before = new Map(previous.map((s) => [s.key, s]))
+  const cells = next.map((station) => {
+    if (station.state !== 'pending') return station
+    const old = before.get(station.key)
+    // Reached before, pending now: keep what the earlier poll knew, with this poll's
+    // label — a terminal station's label is the one thing that can still change.
+    if (old === undefined || old.state === 'pending') return station
+    return { ...old, label: station.label }
+  })
+  const lastReached = cells.reduce((acc, cell, i) => (cell.state === 'pending' ? acc : i), -1)
+  return cells.map((cell, i) =>
+    cell.state === 'pending'
+      ? cell
+      : { ...cell, state: i === lastReached ? 'current' : 'passed' },
+  )
+}
+
+/**
  * The same row with only its first `reveal` reached stations shown.
  *
  * The station that is last of the revealed ones becomes the current one, so a
@@ -1411,14 +1538,20 @@ export interface RecoveryReading {
  * samples come from the platform's 15-minute window (one per metrics tick, the
  * same reading the agent gets) rather than from the page's own polling, and a
  * recovery takes `required` consecutive samples inside the bar.
+ *
+ * `actionAt` moves the recovery to the first qualifying sample at or after the agent's
+ * remediation (WO-R3-341 item 3), so a dip in the metric before the action is not drawn
+ * as the recovery the action produced. The breach is still measured from the fault.
  */
 export function metricRecovery(
   samples: MetricSample[],
   threshold: number,
   faultAt: string | null,
   required = 2,
+  actionAt: string | null = null,
 ): RecoveryReading {
   const faultT = faultAt === null ? null : new Date(faultAt).getTime()
+  const actionT = actionAt === null ? null : new Date(actionAt).getTime()
   const relevant = [...samples]
     .filter((s) => faultT === null || s.t >= faultT)
     .sort((a, b) => a.t - b.t)
@@ -1437,7 +1570,8 @@ export function metricRecovery(
   let runStart: string | null = null
   let runLength = 0
   let recoveredAt: string | null = null
-  for (const sample of relevant.filter((s) => s.t >= breach.t)) {
+  const from = actionT === null || Number.isNaN(actionT) ? breach.t : Math.max(breach.t, actionT)
+  for (const sample of relevant.filter((s) => s.t >= from)) {
     if (sample.v <= threshold) {
       runLength += 1
       if (runStart === null) runStart = sample.at

@@ -103,6 +103,14 @@ const FAULT = toolRow('chaos.tool_invoked', 'kill_consumer', '2026-09-19T10:00:0
   ttl_seconds: 300,
 })
 
+/**
+ * The principal `auditRow` writes under, which is the selected run's own here.
+ *
+ * Since WO-R3-341 item 5 a tool row counts as the agent's only against a known run
+ * principal, so every fixture that asserts the agent acting has to name one.
+ */
+const AGENT_PRINCIPAL = '33333333-3333-3333-3333-333333333333'
+
 /** The boundary `make eval-reset` appends (WO-R3-327); its payload is the reset's counters. */
 function resetRow(at: string): AuditLog {
   return auditRow({
@@ -121,7 +129,7 @@ function run(state: AgentRunState, history: AgentRunState[] = []): AgentRun {
     id: 'run-1',
     tenant_id: 'tenant-1',
     alert_id: 'alert-1',
-    service_account_id: 'sa-1',
+    service_account_id: AGENT_PRINCIPAL,
     scenario: 'remediate_consumer_lag_success',
     state,
     phase_history: [...history, state].map((s, i) => ({
@@ -213,6 +221,7 @@ describe('platformPhase — what the platform itself can see', () => {
         toolRow('agent.tool_invoked', 'get_consumer_lag', '2026-09-19T10:01:00Z'),
         FAULT,
       ],
+      runPrincipalId: AGENT_PRINCIPAL,
       metricKnown: true,
       metricInsideThreshold: false,
       metricBreachedSinceFault: true,
@@ -242,6 +251,7 @@ describe('platformPhase — what the platform itself can see', () => {
         toolRow('agent.tool_invoked', 'get_consumer_lag', '2026-09-19T10:01:00Z'),
         FAULT,
       ],
+      runPrincipalId: AGENT_PRINCIPAL,
       metricKnown: true,
       metricInsideThreshold: false,
       metricBreachedSinceFault: true,
@@ -349,6 +359,7 @@ describe('the reset is a boundary — WO-R3-327', () => {
   it('leaves today’s behaviour alone when no reset row exists', () => {
     const reading = platformPhase({
       audit: previousTake,
+      runPrincipalId: AGENT_PRINCIPAL,
       metricKnown: true,
       metricInsideThreshold: false,
       metricBreachedSinceFault: true,
@@ -438,6 +449,7 @@ describe('derivePhase — the two sources side by side', () => {
       toolRow('agent.tool_invoked', 'restart_consumer_group', '2026-09-19T10:03:00Z'),
       FAULT,
     ],
+    runPrincipalId: AGENT_PRINCIPAL,
     metricKnown: true,
     metricInsideThreshold: false,
     metricBreachedSinceFault: true,
@@ -636,6 +648,9 @@ describe('platformRow — the stations the platform can assert for itself', () =
     metricKnown: true,
     metricInsideThreshold: false,
     metricBreachedSinceFault: true,
+    // The selected run's own principal: without one, no tool row is the agent's
+    // (WO-R3-341 item 5), which the last describe in this file pins on its own.
+    runPrincipalId: AGENT_PRINCIPAL,
   }
   /** By key, not by index: the row gained `paged` between two of them (WO-R3-336). */
   const at = (row: ReturnType<typeof platformRow>, key: string) =>
@@ -705,6 +720,7 @@ describe('platformRow — the stations the platform can assert for itself', () =
       audit: [FAULT, toolRow('agent.tool_invoked', 'restart_consumer_group', '2026-09-19T10:02:00Z')],
       faultAt: FAULT_AT,
       recoveredAt: '2026-09-19T10:03:00Z',
+      runPrincipalId: AGENT_PRINCIPAL,
       metricKnown: true,
       metricInsideThreshold: true,
       metricBreachedSinceFault: true,
@@ -914,6 +930,7 @@ describe('chartMarkers — what the chart draws on top of the line', () => {
         toolRow('agent.tool_invoked', 'get_consumer_lag', '2026-09-19T10:02:00Z'),
         toolRow('agent.tool_invoked', 'restart_consumer_group', '2026-09-19T10:05:00Z'),
       ],
+      runPrincipalId: AGENT_PRINCIPAL,
       windowStart,
       windowEnd,
     })
@@ -1103,25 +1120,49 @@ describe('takes — the span between two boundaries', () => {
 })
 
 // ─────────────────────────────────────────────────────────────────────────────
-// WO-R3-336 item 1 — a fresh take starts at zero.
+// WO-R3-341 item 1 — the newest take that has a fault or a run.
 //
-// WO-R3-334's default was "the newest run with a fault in its own take", which is the
-// right answer to "the page was reloaded after the wind-down" and the wrong answer to
-// the thing the demo actually does: start a take. On the owner's fourth take it opened
-// the page on the take before, so the first thing on screen was history.
-//
-// The default is now the take NOW RUNNING, whether or not it has a run yet.
+// WO-R3-336's default was "the take now running", which fixed the fourth take (the page
+// opened on history) and broke the fifth: the runner's wind-down reset landed eleven
+// seconds after the run resolved, the newer take was empty, and the finished run left
+// the screen while the owner was still watching it. An empty take has nothing to show,
+// so it is not switched to until it gets a fault row or a run — and a take with a fault
+// and no run yet is still the fresh take at zero the fourth take's fix asked for.
 // ─────────────────────────────────────────────────────────────────────────────
 
-describe('selectTake — the take now running, and the run it adopts', () => {
+describe('selectTake — the newest take with a fault or a run', () => {
   const rows = windDownRows()
 
-  it('shows the take now running, not the closed take that has the run', () => {
+  it('holds the finished take on screen while the newer take is empty', () => {
     const chosen = selectTake({ runs: [windDownRun()], audit: rows, wanted: null })
+    expect(chosen.take).toEqual({ startAt: B1, endAt: B2 })
+    expect(chosen.run?.id).toBe('run-take-3')
+    expect(chosen.why).toBe('held')
+    expect(chosen.current).toBe(false)
+    // The banner's own reading: the reset that opened the take being cleaned up.
+    expect(chosen.cleaningUpSince).toBe(B2)
+  })
+
+  it('switches to the newer take the moment the lab injects its fault', () => {
+    const faulted = [
+      ...rows,
+      toolRow('chaos.tool_invoked', 'kill_consumer', '2026-09-19T10:06:00Z'),
+    ]
+    const chosen = selectTake({ runs: [windDownRun()], audit: faulted, wanted: null })
     expect(chosen.take).toEqual({ startAt: B2, endAt: null })
     expect(chosen.run).toBeNull()
     expect(chosen.why).toBe('current_empty')
-    expect(chosen.current).toBe(true)
+    expect(chosen.cleaningUpSince).toBeNull()
+  })
+
+  it('does not switch to a newer take whose only chaos rows were refused probes', () => {
+    const probed = [
+      ...rows,
+      toolRow('chaos.tool_denied', 'inject_latency', '2026-09-19T10:06:00Z'),
+    ]
+    expect(selectTake({ runs: [windDownRun()], audit: probed, wanted: null }).why).toBe(
+      'held',
+    )
   })
 
   it('adopts a run that has reported inside the current take', () => {
@@ -1135,12 +1176,22 @@ describe('selectTake — the take now running, and the run it adopts', () => {
     expect(chosen.current).toBe(true)
   })
 
-  it('does not reach back for an older run when the current take has none', () => {
-    // The fourth take's own failure: the run of the take before was the newest run in
-    // view, and it had a fault in its take, so the old rule chose it.
+  it('offers the held take’s own run, and every run in view', () => {
     const chosen = selectTake({ runs: [windDownRun()], audit: rows, wanted: null })
-    expect(chosen.takeRuns).toEqual([])
+    expect(chosen.takeRuns.map((r) => r.id)).toEqual(['run-take-3'])
     expect(chosen.runs.map((r) => r.id)).toEqual(['run-take-3'])
+  })
+
+  it('starts a take with a fault at zero rather than holding the one before', () => {
+    // The fourth take's rule, still in force where the newer take has something to
+    // show: a fault and no run yet is a fresh take, not a reason to look at history.
+    const chosen = selectTake({
+      runs: [windDownRun()],
+      audit: [...rows, toolRow('chaos.tool_invoked', 'poison_message', '2026-09-19T10:07:00Z')],
+      wanted: null,
+    })
+    expect(chosen.why).toBe('current_empty')
+    expect(chosen.run).toBeNull()
   })
 
   it('honours ?run= and reads that run’s take, marked as not the current one', () => {
@@ -1155,10 +1206,10 @@ describe('selectTake — the take now running, and the run it adopts', () => {
     expect(chosen.current).toBe(false)
   })
 
-  it('falls back to the current take when ?run= names nothing it has', () => {
+  it('falls back to the default when ?run= names nothing it has', () => {
     const chosen = selectTake({ runs: [windDownRun()], audit: rows, wanted: 'gone' })
-    expect(chosen.why).toBe('current_empty')
-    expect(chosen.take).toEqual({ startAt: B2, endAt: null })
+    expect(chosen.why).toBe('held')
+    expect(chosen.take).toEqual({ startAt: B1, endAt: B2 })
   })
 
   it('reads the whole window as one open take on a stack with no boundary', () => {
@@ -1470,12 +1521,13 @@ describe('platformRow reads the take it is given, not the newest boundary', () =
     })
     expect(Object.fromEntries(mine.map((s) => [s.key, s.state])).agent_acting).toBe('pending')
 
-    // With no run selected there is no principal to compare against, and counting
-    // every row is the honest reading rather than a guess.
+    // And with NO run selected, nothing counts either (WO-R3-341 item 5, reversing
+    // WO-R3-334's "count them all"): the fifth take lit this station from the demo
+    // runner's own lag polls, seconds before the lab had injected anything.
     const anyone = platformRow({ audit: withForeign, take, ...metricQuiet })
-    expect(
-      Object.fromEntries(anyone.map((s) => [s.key, s.state])).agent_acting,
-    ).not.toBe('pending')
+    expect(Object.fromEntries(anyone.map((s) => [s.key, s.state])).agent_acting).toBe(
+      'pending',
+    )
   })
 })
 
