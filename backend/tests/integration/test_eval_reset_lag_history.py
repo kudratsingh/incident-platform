@@ -26,7 +26,7 @@ from pathlib import Path
 import pytest
 import pytest_asyncio
 from app.core.consumer_lag import (
-    LAG_SAMPLES_KEEP,
+    LAG_SAMPLES_MAX_ENTRIES,
     LAG_SAMPLES_TTL,
     LAG_SAMPLES_WINDOW_SECONDS,
     LIVE_REFRESHED_GROUP,
@@ -204,4 +204,4 @@ async def test_the_window_outlives_the_value_it_was_measured_beside(
     assert reading.lag_known is False
     assert reading.measured_at is None, "an undated window must not date an absent value"
     assert [s.lag for s in reading.recent_samples] == newest_first
-    assert len(reading.recent_samples) <= LAG_SAMPLES_KEEP
+    assert len(reading.recent_samples) <= LAG_SAMPLES_MAX_ENTRIES
