@@ -157,8 +157,14 @@ async def test_metrics_loop_skips_cache_write_when_lag_is_none() -> None:
         patch("app.workers.dispatcher.asyncio.sleep", _sleep_once),
         patch("app.workers.dispatcher.queue.delayed_length", AsyncMock(return_value=0)),
         patch("app.workers.dispatcher.metrics.emit_gauge", AsyncMock()) as gauge,
+        # The alert rules ride this tick since WO-R3-338; they have their own suite, and
+        # here they must not reach a database.
+        patch(
+            "app.workers.dispatcher.alert_rules.evaluate_alert_rules",
+            AsyncMock(return_value=None),
+        ),
     ):
-        await _metrics_loop(redis, consumer)
+        await _metrics_loop(redis, consumer, MagicMock())
 
     # ConsumerLag gauge NOT emitted when unknown; QueueDepth + InFlightJobs still are.
     emitted = {c.args[0] for c in gauge.await_args_list}

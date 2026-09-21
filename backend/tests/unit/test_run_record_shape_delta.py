@@ -24,13 +24,13 @@ pinned so nobody "tidies" them:
 
 from __future__ import annotations
 
+import json
 import pathlib
 from typing import Any
 
 import app.mcp.tools  # noqa: F401  — import for @tool registration side effects
 import pytest
 from app.core.consumer_lag import (
-    LAG_SAMPLES_KEEP,
     LAG_SAMPLES_TTL,
     LAG_SAMPLES_WINDOW_SECONDS,
 )
@@ -358,7 +358,6 @@ def test_the_lag_window_is_fifteen_minutes_and_the_description_says_so() -> None
     """The window is the delta a re-pin sees: a description that still said "five"
     would be a tool lying about how much history it holds."""
     assert LAG_SAMPLES_WINDOW_SECONDS == 900
-    assert LAG_SAMPLES_KEEP == 15
     # Long enough that a full window survives a gap in the metrics pass, short enough
     # that a window nothing refreshes still disappears.
     assert LAG_SAMPLES_TTL > LAG_SAMPLES_WINDOW_SECONDS
@@ -370,6 +369,24 @@ def test_the_lag_window_is_fifteen_minutes_and_the_description_says_so() -> None
         ]["description"]
     )
     assert "15 minutes" in surface
+
+
+def test_the_lag_description_names_no_clock_it_cannot_promise() -> None:
+    """WO-R3-338, and the contract delta this order carries. The sampling interval became a
+    setting (O-35: the demo stack runs it at 5 s), so every "~60s" and "90s TTL" in this
+    description was about to become false on the one stack anybody watches — and the rule
+    in CLAUDE.md is that a description which does not match the behaviour behind it is a
+    functional defect that fails silently with a confident-looking answer. The description
+    is also PINNED by the commander, so it must be the same bytes at every interval: it
+    names the reading's own `age_seconds` instead of a number.
+    """
+    tool = _tool("get_consumer_lag")
+    surface = tool.description + json.dumps(tool.output_json_schema())
+
+    for lie in ("~60s", "every 60s", "about every 60s", "90s TTL", "up to a minute"):
+        assert lie not in surface, f"the description still promises {lie!r}"
+    assert "deployment-configured" in tool.description
+    assert "age_seconds" in tool.description
 
 
 def test_the_new_columns_are_on_the_row() -> None:

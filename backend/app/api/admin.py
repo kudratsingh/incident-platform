@@ -9,11 +9,11 @@ from typing import Any
 
 from app.core.breaker_state import read_breaker_states
 from app.core.consumer_lag import (
-    LAG_SAMPLES_KEEP,
     LAG_SAMPLES_WINDOW_SECONDS,
     LIVE_REFRESHED_GROUP,
     SEEDED_CONSUMER_GROUPS,
     LagReading,
+    metrics_interval_seconds,
     read_lag,
 )
 from app.core.logging import request_id_var
@@ -916,7 +916,10 @@ async def admin_consumer_lag(
         total=len(groups),
         live_group=LIVE_REFRESHED_GROUP,
         sample_window_seconds=LAG_SAMPLES_WINDOW_SECONDS,
-        sample_interval_seconds=LAG_SAMPLES_WINDOW_SECONDS // LAG_SAMPLES_KEEP,
+        # The configured pass interval, not the window divided by a sample count: the
+        # count follows the clock now (WO-R3-338), so deriving the clock back out of it
+        # would report 60 s on a stack sampling every 5.
+        sample_interval_seconds=max(1, round(metrics_interval_seconds())),
     )
 
 

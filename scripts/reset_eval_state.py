@@ -538,6 +538,28 @@ def _seeded_alert_ids() -> list[uuid.UUID]:
     ]
 
 
+async def _resolve_rule_alerts(session_factory: Any) -> int:
+    """Close every open episode of the platform's own alert rules (WO-R3-338, ADR 0039).
+
+    The sweep below would already stamp `resolved_at` on these — its predicate spares five
+    ids and resolves everything else, which was checked against the WHERE clause rather
+    than assumed, and it needed no change. This step exists for what that sweep does NOT
+    do: a rule episode is a pair in the audit stream, and closing one with a bare UPDATE
+    leaves an `alert.raised` with no `alert.resolved` after it, so the console's timeline
+    holds a page that never ended. So the boundary closes an episode through the rule's own
+    resolution path, with its audit row, and the sweep stays the backstop it has been.
+
+    Run BEFORE `_resolve_organic_alerts`, which then finds nothing of ours left open.
+    Counted separately as `rule_alerts_resolved` — a step whose count nobody prints is a
+    step nobody can tell ran (ADR 0036)."""
+    from app.services import alert_rules  # type: ignore[import-not-found]
+
+    closed = await alert_rules.resolve_open_episodes(
+        session_factory, reason="world reset"
+    )
+    return len(closed)
+
+
 async def _resolve_organic_alerts(session_factory: Any) -> int:
     """Stamp `resolved_at` on every still-active alert that is not one of the five seeded
     fixture alerts. **WO-R2-131.**
@@ -724,6 +746,9 @@ async def reset(
         breakers_reset = await _reset_breaker_states(redis)
         # Order-independent of the seed: the fixture alerts use non-chaos sources.
         chaos_alerts_resolved = await _resolve_chaos_alerts(factory)
+        # Before the catch-all below, so an episode the platform raised itself is closed
+        # through its own path and its `alert.resolved` row exists (WO-R3-338).
+        rule_alerts_resolved = await _resolve_rule_alerts(factory)
         # Everything else active outside the five seeded alerts; spared by stable() id
         # (WO-R2-131).
         organic_alerts_resolved = await _resolve_organic_alerts(factory)
@@ -766,6 +791,7 @@ async def reset(
             "lag_samples_cleared": _LAG_SAMPLES_CLEARED,
             "organic_alerts_resolved": organic_alerts_resolved,
             "read_model_keys_rebuilt": read_model_keys,
+            "rule_alerts_resolved": rule_alerts_resolved,
             "seeded_dlq_deleted": seeded_dlq_deleted,
             "idempotency_purged": idempotency_purged,
             "timers_cleared": timers_cleared,

@@ -13,9 +13,6 @@ wording for it, and the wire shape is unchanged.
 from datetime import datetime
 
 from app.core.consumer_lag import (
-    LAG_SAMPLES_KEEP as _LAG_SAMPLES_KEEP,
-)
-from app.core.consumer_lag import (
     LIVE_REFRESHED_GROUP,
     SEEDED_CONSUMER_GROUPS,
     STATIC_LAG_GROUPS,
@@ -86,8 +83,9 @@ class GetConsumerLagOutput(BaseModel):
     )
     source: LagSource = Field(
         description="Where the number comes from, which determines "
-        "whether it can change. `live` — refreshed every ~60s (90s TTL); "
-        "it moves as conditions do. `static` — a recorded constant; "
+        "whether it can change. `live` — re-measured by a background "
+        "pass and cached under a TTL of a few passes; it moves as "
+        "conditions do. `static` — a recorded constant; "
         "re-reading returns the same number, so lag growth or drain "
         "cannot be observed on this group. `unrecognized` — not a group "
         "this platform tracks; check the spelling before concluding "
@@ -109,15 +107,18 @@ class GetConsumerLagOutput(BaseModel):
     age_seconds: int | None = Field(
         default=None,
         description="How long ago `measured_at` was, in whole seconds. "
-        "`null` exactly when `measured_at` is null. A new measurement is "
-        "taken about every 60s, so below ~60 this reading is the newest "
-        "one that exists and re-reading returns the same number.",
+        "`null` exactly when `measured_at` is null. This is the only "
+        "honest way to judge freshness: the sampling interval is "
+        "deployment-configured, so an age is a fact and an assumed "
+        "interval is not. Compare it against the gaps between "
+        "`recent_samples` to see how often this deployment measures.",
     )
     recent_samples: list[LagSample] = Field(
         default_factory=list,
         description="The measurements recorded for this group over the "
-        "last 15 minutes, newest first, the current one included — up to "
-        f"{_LAG_SAMPLES_KEEP} of them, one per ~60s measurement. "
+        "last 15 minutes, newest first, the current one included — one "
+        "per measurement pass, so how many there are depends on how "
+        "often this deployment samples. "
         "Comparing them is how to tell "
         "a climbing lag from a flat one without waiting. Empty for a "
         "group reporting a recorded constant (nothing measures it), and "
@@ -138,14 +139,18 @@ class GetConsumerLagOutput(BaseModel):
         "FRESHNESS: cached in Redis, never a live Kafka query, and the "
         "refresh behaviour differs per group — read `source` on the "
         "response before reasoning about change over time.\n"
-        "  - `worker-dispatcher` (source: live) is refreshed by a "
-        "background loop every ~60s with a 90s TTL. Measured behaviour: "
-        "after a fault begins the cached value catches up within ~60s; "
-        "after a recovery it keeps reading the old high value for ~30s "
-        "before dropping. Treat any single reading as up to a minute "
-        "stale, in either direction. This is the only group whose lag "
-        "moves, and so the only one where watching lag grow or drain is "
-        "a valid way to observe a change.\n"
+        "  - `worker-dispatcher` (source: live) is re-measured by a "
+        "background pass whose interval is deployment-configured, and "
+        "cached under a TTL of a few passes. THE INTERVAL IS NOT A "
+        "NUMBER YOU CAN ASSUME: read `age_seconds` for how old the "
+        "reading in front of you is, and the gaps between "
+        "`recent_samples` for how often this deployment measures. Any "
+        "single reading is up to one interval stale in either direction "
+        "— after a fault begins the cached value catches up within about "
+        "one interval, and after a recovery it can keep reading the old "
+        "high value for a fraction of one. This is the only group whose "
+        "lag moves, and so the only one where watching lag grow or drain "
+        "is a valid way to observe a change.\n"
         "  - The other seven (source: static) report a recorded "
         "constant that nothing refreshes. Re-reading one after an "
         "action returns the same number — that is the expected "
@@ -154,17 +159,18 @@ class GetConsumerLagOutput(BaseModel):
         "ONE CALL SHOWS THE TREND. Every response carries `measured_at` "
         "(when this number was measured), `age_seconds` (how old it is), "
         "and `recent_samples` — the measurements recorded over the last "
-        f"15 minutes, newest first, up to {_LAG_SAMPLES_KEEP} of them, "
-        "each with its own time, the current one included. Compare those "
+        "15 minutes, newest first, each with its own time, the current "
+        "one included. Compare those "
         "samples to decide whether lag is climbing, draining or flat. "
         "That comparison is the evidence; a second call is not, because "
-        "a new measurement is taken only about every 60s. Two calls a "
-        "few seconds apart therefore return the SAME number with the "
-        "SAME `measured_at`, and that repetition means 'not re-measured "
-        "yet', never 'not moving' — reading sooner cannot show change "
-        "that has not been measured. If you need a genuinely newer "
-        "number than the one in front of you, it exists once "
-        "`age_seconds` passes ~60; until then this response already "
+        "a new measurement exists only once a pass has taken one. Two "
+        "calls inside one interval therefore return the SAME number with "
+        "the SAME `measured_at`, and that repetition means 'not "
+        "re-measured yet', never 'not moving' — reading sooner cannot "
+        "show change that has not been measured. If you need a genuinely "
+        "newer number than the one in front of you, it exists once "
+        "`age_seconds` exceeds the gap between the newest two samples; "
+        "until then this response already "
         "contains every reading the platform has. On the seven groups "
         "reporting a recorded constant, `measured_at` and `age_seconds` "
         "are null and `recent_samples` is empty: a constant was never "
@@ -225,8 +231,9 @@ __all__ = [
     "LagSample",
     # Re-exported under their pre-WO-R3-312 private names: several tests and
     # `restart_consumer_group` import them from here, and moving the definitions to
-    # core is not a reason to move every import site.
-    "_LAG_SAMPLES_KEEP",
+    # core is not a reason to move every import site. `_LAG_SAMPLES_KEEP` left with
+    # WO-R3-338: the window is pruned by time, so a count of passes is no longer one of
+    # this module's numbers.
     "_parse_lag",
     "_redis_key",
     "_samples_key",

@@ -853,15 +853,19 @@ async def test_get_consumer_lag_description_scopes_its_freshness_claim(
     tools = {t["name"]: t for t in listing.json()["result"]["tools"]}
     description = tools["get_consumer_lag"]["description"]
 
-    # The freshness promise must be attributed to the one live group.
+    # The freshness promise must be attributed to the one live group. Since WO-R3-338 it
+    # names no interval at all — the pass interval is a setting, so a number here would be
+    # a lie on the one stack anybody watches — and the claim is pinned by the word that
+    # replaced it.
     refresh_sentence = [
-        line for line in description.splitlines() if "60s" in line
+        line for line in description.splitlines() if "re-measured" in line
     ]
     assert refresh_sentence, "freshness claim disappeared entirely"
     assert "worker-dispatcher" in " ".join(refresh_sentence), (
-        "the ~60s refresh claim is still stated for every advertised "
+        "the refresh claim is still stated for every advertised "
         "group; it holds only for worker-dispatcher"
     )
+    assert "deployment-configured" in " ".join(refresh_sentence)
     # ADR 0012 rule 1 bans "fixture"/"seed" from the non-chaos wire surface, so the honest wording
     # is operational: "a recorded constant".
     assert "static" in description.lower()

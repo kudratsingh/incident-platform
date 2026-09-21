@@ -946,7 +946,10 @@ async def test_the_lag_reading_says_how_wide_its_window_is(
 ) -> None:
     """15 minutes, from the platform rather than from a chart's own assumption — the
     first take stitched the window together client-side and lost it on every reload."""
-    from app.core.consumer_lag import LAG_SAMPLES_KEEP, LAG_SAMPLES_WINDOW_SECONDS
+    from app.core.consumer_lag import (
+        LAG_SAMPLES_MAX_ENTRIES,
+        LAG_SAMPLES_WINDOW_SECONDS,
+    )
 
     support = await _user(db_session, default_tenant.id, UserRole.SUPPORT)
     redis_stub.store[lag_key(LIVE_REFRESHED_GROUP)] = "42"
@@ -954,9 +957,9 @@ async def test_the_lag_reading_says_how_wide_its_window_is(
         [
             {
                 "lag": 42 - i,
-                "measured_at": (_NOW - timedelta(seconds=60 * i)).isoformat(),
+                "measured_at": (_NOW - timedelta(seconds=5 * i)).isoformat(),
             }
-            for i in range(LAG_SAMPLES_KEEP + 4)
+            for i in range(LAG_SAMPLES_MAX_ENTRIES + 4)
         ]
     )
 
@@ -965,12 +968,14 @@ async def test_the_lag_reading_says_how_wide_its_window_is(
     ).json()
 
     assert body["sample_window_seconds"] == LAG_SAMPLES_WINDOW_SECONDS == 900
+    # The configured pass interval, which is what the chart's axis has to step by — not
+    # the window divided by a sample count, because the count follows the clock now.
     assert body["sample_interval_seconds"] == 60
     live = next(
         g for g in body["groups"] if g["consumer_group"] == LIVE_REFRESHED_GROUP
     )
-    # The reader bounds what it hands back at the window's own cap, whatever is stored.
-    assert len(live["recent_samples"]) == LAG_SAMPLES_KEEP
+    # The reader bounds what it hands back at the absolute cap, whatever is stored.
+    assert len(live["recent_samples"]) == LAG_SAMPLES_MAX_ENTRIES
     assert [s["lag"] for s in live["recent_samples"]] == sorted(
         (s["lag"] for s in live["recent_samples"]), reverse=True
     ), "newest first"

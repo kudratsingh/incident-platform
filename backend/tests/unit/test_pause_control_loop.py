@@ -172,16 +172,38 @@ def test_the_mirrored_tick_intervals_match_the_dispatcher() -> None:
         ),
         ControlLoopName.STALE_RUNNING_SWEEP: dispatcher._STALE_RUNNING_SWEEP_INTERVAL,
         ControlLoopName.LEASE_RENEWAL: dispatcher._RUNNING_LEASE_RENEW_INTERVAL,
-        ControlLoopName.METRICS: dispatcher._METRICS_LOOP_INTERVAL,
         ControlLoopName.IDEMPOTENCY_REAPER: (
             dispatcher._IDEMPOTENCY_REAPER_INTERVAL_SECONDS
         ),
     }
     for member, interval in expected.items():
         assert TICK_INTERVAL_SECONDS[member] == float(interval), member.value
-    # The two that are settings-derived are declared as such, not guessed.
+    # The three that are settings-derived are declared as such, not guessed. `metrics`
+    # joined them in WO-R3-338: its interval became a setting (the demo stack runs it at
+    # 5 s), and a mirrored 60.0 here would have told an operator the wrong wait.
     assert TICK_INTERVAL_SECONDS[ControlLoopName.DIGEST] is None
     assert TICK_INTERVAL_SECONDS[ControlLoopName.SLO_EVALUATION] is None
+    assert TICK_INTERVAL_SECONDS[ControlLoopName.METRICS] is None
+
+
+def test_the_metrics_interval_is_reported_through_the_loops_own_clamp() -> None:
+    """The demo stack's 5 s, and the floor the loop sleeps on rather than a raw setting:
+    "resumes in N ticks" has to be the wait an operator will really see."""
+    with patch(
+        "app.workers.control_loop_pause.get_settings",
+        return_value=Settings(metrics_loop_interval_seconds=5, environment="test"),
+    ):
+        assert tick_interval_seconds(ControlLoopName.METRICS) == 5.0
+    with patch(
+        "app.workers.control_loop_pause.get_settings",
+        return_value=Settings(metrics_loop_interval_seconds=0, environment="test"),
+    ):
+        assert tick_interval_seconds(ControlLoopName.METRICS) == 1.0
+    with patch(
+        "app.workers.control_loop_pause.get_settings",
+        return_value=Settings(environment="test"),
+    ):
+        assert tick_interval_seconds(ControlLoopName.METRICS) == 60.0
 
 
 def test_a_disabled_slo_loop_reports_no_tick_interval() -> None:

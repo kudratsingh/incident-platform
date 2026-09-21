@@ -235,6 +235,33 @@ class Settings(BaseSettings):
     alert_webhook_secret: str | None = None
     alert_webhook_timeout_seconds: float = 5.0
 
+    # The metrics pass, and therefore the platform's lag clock (O-35, WO-R3-338). A
+    # setting rather than the hard-coded 60 s it replaces because the demo stack runs it
+    # at 5 s: a number that moves once a minute is unwatchable, and the eval stack shares
+    # the compose file. Two numbers are DERIVED from it in `core/consumer_lag.py` rather
+    # than restated — the lag value key's TTL (three passes) and how many samples fifteen
+    # minutes of history holds — so a faster clock cannot leave a TTL that expires between
+    # passes. Clamped to 1 s at the floor; the lag reading's `age_seconds` is what a
+    # caller should read, and `get_consumer_lag`'s description says the interval is
+    # deployment-configured rather than naming one.
+    metrics_loop_interval_seconds: float = 60.0
+
+    # Alert rules the platform evaluates on its own clock, in the metrics pass (ADR 0039,
+    # owner decision O-36). ON by default: a platform that never pages on its own metric
+    # is the gap this closes. A deployment that has a real pager in front of it turns them
+    # off with `ALERT_RULES_ENABLED=false` rather than by removing the rules.
+    alert_rules_enabled: bool = True
+    # `consumer_stalled` fires when the latest MEASURED lag sample for a group is at or
+    # above this. 20 is the number the demo's own premise uses (a killed consumer with
+    # light traffic passes it in seconds) and is far below `backpressure_lag_threshold`:
+    # paging is not throttling, and the alert should arrive long before submissions are
+    # refused.
+    consumer_lag_alert_threshold: int = 20
+    # `dlq_depth_warning` fires at this total. 5 = the seeded baseline of four dead-letter
+    # fixtures plus one, so a world nobody has hurt stays quiet and the first row that is
+    # not part of the baseline pages.
+    dlq_depth_alert_threshold: int = 5
+
     # Scheduled SLO evaluation (WO-R2-29): `_slo_evaluation_loop` raises an
     # Alert on a fast burn, the webhook's only non-chaos producer. The de-dup
     # window is a bucket width, not a cooldown (`slo._fast_burn_dedup_key`),
