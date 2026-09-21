@@ -12,11 +12,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from app.config import Settings
 from app.core.consumer_lag import (
+    LAG_SAMPLES_AGENT_CAP,
     LAG_SAMPLES_MAX_ENTRIES,
     LAG_SAMPLES_WINDOW_SECONDS,
     lag_samples_at_interval,
     lag_value_ttl_seconds,
     metrics_interval_seconds,
+    read_lag,
     record_lag_sample,
 )
 from app.mcp.registry import ToolContext
@@ -415,25 +417,70 @@ async def test_an_unreadable_window_reads_as_no_history() -> None:
 
 
 async def test_the_reader_caps_the_window_it_returns() -> None:
-    """Defence against a key written by something other than this loop:
-    the advertised shape is "the last few", so the tool bounds what it
-    hands back rather than trusting the stored length."""
+    """Defence against a key written by something other than this loop: the shared reader
+    bounds what it hands back at the absolute cap rather than trusting the stored length.
+
+    The cap that belongs to a *surface* is a separate decision, one level up —
+    `test_the_agents_window_is_capped_where_the_operators_is_not` owns that.
+    """
     redis = _RedisStub(
         {
             BACKPRESSURE_LAG_KEY: "99",
             LAG_SAMPLES_KEY: json.dumps(
-                [_sample(99 - i, seconds_ago=i * 60) for i in range(20)]
+                [
+                    _sample(99 - i, seconds_ago=i)
+                    for i in range(LAG_SAMPLES_MAX_ENTRIES + 20)
+                ]
             ),
         }
     )
 
-    redis.store[LAG_SAMPLES_KEY] = json.dumps(
-        [_sample(99 - i, seconds_ago=i) for i in range(LAG_SAMPLES_MAX_ENTRIES + 20)]
+    reading = await read_lag(redis, LIVE_REFRESHED_GROUP)
+
+    assert len(reading.recent_samples) == LAG_SAMPLES_MAX_ENTRIES
+
+
+async def test_the_agents_window_is_capped_where_the_operators_is_not() -> None:
+    """The two surfaces read the same ring and return different amounts of it, on purpose.
+
+    An operator's chart wants every point in the fifteen minutes and is drawn once. The
+    agent pays for each sample in its context on every read, and a reading whose SIZE
+    changed with a deployment's tick would make one stack's investigation quietly more
+    expensive than another's for no new information — so the agent's surface returns the
+    newest fifteen, the count it returned before the clock became a setting, and says so.
+    """
+    redis = _RedisStub()
+    # A 5 s tick for fifteen minutes: the ring the demo stack really holds.
+    for lag in range(180):
+        await record_lag_sample(redis, lag)
+    assert len(_window(redis)) == 180, "the writer keeps the whole time window"
+
+    # What the operator's console reads (`GET /admin/consumer-lag` builds from this).
+    operator = await read_lag(redis, LIVE_REFRESHED_GROUP)
+    assert len(operator.recent_samples) == 180
+
+    # What the agent reads.
+    agent = await _call(redis)
+    assert len(agent.recent_samples) == LAG_SAMPLES_AGENT_CAP == 15
+    assert [s.lag for s in agent.recent_samples] == list(range(179, 164, -1)), (
+        "the newest fifteen, newest first — not the oldest fifteen"
     )
+    assert [s.lag for s in agent.recent_samples] == [
+        s.lag for s in operator.recent_samples[:LAG_SAMPLES_AGENT_CAP]
+    ], "one ring, one order, two lengths"
 
-    out = await _call(redis)
+    # And the description says which, because a cap the caller cannot see is worse than
+    # an error (CLAUDE.md: never promise completeness you cap).
+    surface = _tool_description() + json.dumps(
+        (await _call(redis)).model_json_schema()
+    )
+    assert f"at most {LAG_SAMPLES_AGENT_CAP} of them" in surface
 
-    assert len(out.recent_samples) == LAG_SAMPLES_MAX_ENTRIES
+
+def _tool_description() -> str:
+    from app.mcp.registry import list_tools
+
+    return next(t.description for t in list_tools() if t.name == "get_consumer_lag")
 
 
 async def test_age_seconds_is_never_negative() -> None:

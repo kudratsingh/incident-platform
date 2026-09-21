@@ -13,6 +13,7 @@ wording for it, and the wire shape is unchanged.
 from datetime import datetime
 
 from app.core.consumer_lag import (
+    LAG_SAMPLES_AGENT_CAP,
     LIVE_REFRESHED_GROUP,
     SEEDED_CONSUMER_GROUPS,
     STATIC_LAG_GROUPS,
@@ -116,9 +117,10 @@ class GetConsumerLagOutput(BaseModel):
     recent_samples: list[LagSample] = Field(
         default_factory=list,
         description="The measurements recorded for this group over the "
-        "last 15 minutes, newest first, the current one included — one "
-        "per measurement pass, so how many there are depends on how "
-        "often this deployment samples. "
+        "last 15 minutes, newest first, the current one included — at "
+        f"most {LAG_SAMPLES_AGENT_CAP} of them, one per measurement pass. A "
+        "deployment that samples more often than that records more than "
+        "this call returns; the ones returned are always the newest. "
         "Comparing them is how to tell "
         "a climbing lag from a flat one without waiting. Empty for a "
         "group reporting a recorded constant (nothing measures it), and "
@@ -159,7 +161,8 @@ class GetConsumerLagOutput(BaseModel):
         "ONE CALL SHOWS THE TREND. Every response carries `measured_at` "
         "(when this number was measured), `age_seconds` (how old it is), "
         "and `recent_samples` — the measurements recorded over the last "
-        "15 minutes, newest first, each with its own time, the current "
+        f"15 minutes, newest first, at most {LAG_SAMPLES_AGENT_CAP} of "
+        "them, each with its own time, the current "
         "one included. Compare those "
         "samples to decide whether lag is climbing, draining or flat. "
         "That comparison is the evidence; a second call is not, because "
@@ -215,14 +218,19 @@ async def get_consumer_lag(
         cache_key=reading.cache_key,
         measured_at=reading.measured_at,
         age_seconds=reading.age_seconds,
+        # The newest few, not the whole window: the operator console reads every point
+        # in the window (`GET /admin/consumer-lag`), and this surface is paid for in the
+        # caller's context on every read, so its SIZE must not change with a
+        # deployment's sampling interval (WO-R3-338).
         recent_samples=[
             LagSample(lag=s.lag, measured_at=s.measured_at)
-            for s in reading.recent_samples
+            for s in reading.recent_samples[:LAG_SAMPLES_AGENT_CAP]
         ],
     )
 
 
 __all__ = [
+    "LAG_SAMPLES_AGENT_CAP",
     "STATIC_LAG_GROUPS",
     "LIVE_REFRESHED_GROUP",
     "SEEDED_CONSUMER_GROUPS",

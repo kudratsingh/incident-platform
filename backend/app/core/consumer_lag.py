@@ -59,6 +59,16 @@ LAG_SAMPLES_WINDOW_SECONDS = 900
 # other than the metrics loop — can leave an unbounded list to be read back. It is a
 # guard, not the window: at any interval down to 3.75 s the time prune bites first.
 LAG_SAMPLES_MAX_ENTRIES = 240
+
+# What the AGENT's surface returns, however many the ring holds: the newest fifteen, which
+# is the count and the order `get_consumer_lag` returned before the clock became a setting.
+# The two surfaces are deliberately asymmetric. An operator's chart wants every point in
+# the window and is drawn once; the agent pays for each sample in context on every read,
+# and a reading whose SIZE changed with a deployment's tick would make one stack's
+# investigation quietly more expensive than another's for no new information — fifteen
+# newest samples answer "climbing, draining or flat" at any interval. `age_seconds` and the
+# gaps between the samples still say how often this deployment measures.
+LAG_SAMPLES_AGENT_CAP = 15
 # Longer than the window on purpose, unlike the value key's. The value is what
 # `check_backpressure` reads and it must be fresh-or-absent; the window is history, and
 # history that vanished three passes after the metrics loop stopped would take the chart
@@ -322,6 +332,7 @@ async def read_lag(redis: Any, group: str) -> LagReading:
 
 __all__ = [
     "CONSUMER_LAG_KEY_PREFIX",
+    "LAG_SAMPLES_AGENT_CAP",
     "LAG_SAMPLES_MAX_ENTRIES",
     "LAG_SAMPLES_SUFFIX",
     "LAG_SAMPLES_TTL",
