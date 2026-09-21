@@ -197,7 +197,7 @@ async def _run_ticks(factory: Any, redis: _Redis, consumer: Any) -> list[bool]:
                     factory, leader_gate=lambda: _Gate(entries)
                 )
             ),
-            asyncio.create_task(dispatcher._metrics_loop(redis, consumer)),
+            asyncio.create_task(dispatcher._metrics_loop(redis, consumer, factory)),
         ]
         await asyncio.sleep(_WINDOW_SECONDS)
         for task in tasks:
