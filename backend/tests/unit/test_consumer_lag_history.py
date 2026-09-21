@@ -4,18 +4,25 @@ from __future__ import annotations
 
 import asyncio
 import json
+from contextlib import ExitStack
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from app.config import Settings
 from app.core.consumer_lag import (
+    LAG_SAMPLES_AGENT_CAP,
+    LAG_SAMPLES_MAX_ENTRIES,
     LAG_SAMPLES_WINDOW_SECONDS,
+    lag_samples_at_interval,
+    lag_value_ttl_seconds,
+    metrics_interval_seconds,
+    read_lag,
     record_lag_sample,
 )
 from app.mcp.registry import ToolContext
 from app.mcp.tools.consumer_lag import (
-    _LAG_SAMPLES_KEEP,
     LIVE_REFRESHED_GROUP,
     STATIC_LAG_GROUPS,
     GetConsumerLagInput,
@@ -24,8 +31,6 @@ from app.mcp.tools.consumer_lag import (
 )
 from app.utils.backpressure import BACKPRESSURE_LAG_KEY
 from app.workers.dispatcher import (
-    BACKPRESSURE_LAG_TTL,
-    LAG_SAMPLES_KEEP,
     LAG_SAMPLES_KEY,
     LAG_SAMPLES_TTL,
     _metrics_loop,
@@ -72,27 +77,51 @@ async def _call(redis: Any, group: str = LIVE_REFRESHED_GROUP):  # type: ignore[
     )
 
 
-async def _one_loop_pass(redis: Any, lag: int | None) -> None:
-    """Run exactly one iteration of `_metrics_loop` against `redis`."""
+async def _one_loop_pass(
+    redis: Any, lag: int | None, *, settings: Settings | None = None
+) -> list[float]:
+    """Run exactly one iteration of `_metrics_loop` against `redis`.
+
+    Returns the sleeps it asked for, because the pass interval is a setting now and the
+    sleep is the only place a wrong one is observable.
+    """
     consumer = MagicMock()
     consumer.in_flight = set()
     consumer.consumer_lag = AsyncMock(return_value=lag)
 
     calls = {"n": 0}
+    slept: list[float] = []
 
-    async def _sleep_once(_):  # type: ignore[no-untyped-def]
+    async def _sleep_once(seconds):  # type: ignore[no-untyped-def]
+        slept.append(seconds)
         calls["n"] += 1
         if calls["n"] >= 2:
             raise asyncio.CancelledError
 
-    with (
-        patch("app.workers.dispatcher.asyncio.sleep", _sleep_once),
-        patch(
-            "app.workers.dispatcher.queue.delayed_length", AsyncMock(return_value=0)
-        ),
-        patch("app.workers.dispatcher.metrics.emit_gauge", AsyncMock()),
-    ):
-        await _metrics_loop(redis, consumer)
+    with ExitStack() as stack:
+        stack.enter_context(patch("app.workers.dispatcher.asyncio.sleep", _sleep_once))
+        stack.enter_context(
+            patch(
+                "app.workers.dispatcher.queue.delayed_length",
+                AsyncMock(return_value=0),
+            )
+        )
+        stack.enter_context(
+            patch("app.workers.dispatcher.metrics.emit_gauge", AsyncMock())
+        )
+        # The alert rules ride the same tick (ADR 0039); `test_alert_rules.py` owns them.
+        stack.enter_context(
+            patch(
+                "app.workers.dispatcher.alert_rules.evaluate_alert_rules",
+                AsyncMock(return_value=None),
+            )
+        )
+        if settings is not None:
+            stack.enter_context(
+                patch("app.core.consumer_lag.get_settings", lambda: settings)
+            )
+        await _metrics_loop(redis, consumer, MagicMock())
+    return slept
 
 
 # The writer: the metrics loop records when it measured
@@ -103,10 +132,10 @@ async def test_the_loop_records_the_value_and_the_time_it_measured_it() -> None:
 
     await _one_loop_pass(redis, 29)
 
-    # The value key is unchanged in shape: still the bare integer, still
-    # the 90s TTL backpressure's fail-open behaviour depends on.
+    # The value key is unchanged in shape: still the bare integer, still a TTL short
+    # enough that backpressure reads a fresh number or none at all.
     assert redis.store[BACKPRESSURE_LAG_KEY] == "29"
-    assert redis.ttls[BACKPRESSURE_LAG_KEY] == BACKPRESSURE_LAG_TTL
+    assert redis.ttls[BACKPRESSURE_LAG_KEY] == lag_value_ttl_seconds()
 
     window = _window(redis)
     assert len(window) == 1
@@ -118,21 +147,49 @@ async def test_the_loop_records_the_value_and_the_time_it_measured_it() -> None:
     # backpressure reads it, and the window is history an operator needs to still be
     # there when the pass that would have refreshed it is the thing that stopped.
     assert redis.ttls[LAG_SAMPLES_KEY] == LAG_SAMPLES_TTL
-    assert LAG_SAMPLES_TTL > BACKPRESSURE_LAG_TTL
+    assert LAG_SAMPLES_TTL > lag_value_ttl_seconds()
 
 
-async def test_the_window_is_capped_and_newest_first() -> None:
-    """The cap is the whole window; the pass after it drops the oldest."""
-    redis = _RedisStub()
-    passes = LAG_SAMPLES_KEEP + 3
+async def test_the_window_drops_what_left_the_fifteen_minutes_and_keeps_the_rest() -> (
+    None
+):
+    """The window is time-based, not a count of passes (WO-R3-338): at a 5 s tick the same
+    fifteen minutes hold 180 samples, and the count is what the tick decides."""
+    redis = _RedisStub(
+        {
+            LAG_SAMPLES_KEY: json.dumps(
+                [
+                    _sample(7, seconds_ago=LAG_SAMPLES_WINDOW_SECONDS + 30),
+                    _sample(8, seconds_ago=LAG_SAMPLES_WINDOW_SECONDS + 90),
+                ]
+                + [_sample(1, seconds_ago=5)]
+            )
+        }
+    )
 
-    for lag in range(passes):
-        await _one_loop_pass(redis, lag)
+    await _one_loop_pass(redis, 2)
 
     window = _window(redis)
-    assert len(window) == LAG_SAMPLES_KEEP
+    assert [s["lag"] for s in window] == [2, 1], (
+        "a sample older than the window is history the window no longer covers"
+    )
+
+
+async def test_the_window_is_newest_first_and_bounded_however_fast_the_tick(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every sample is inside the window, so only the absolute cap can bound the ring —
+    it exists so a pathological interval cannot write an unbounded list."""
+    redis = _RedisStub()
+    passes = LAG_SAMPLES_MAX_ENTRIES + 3
+
+    for lag in range(passes):
+        await record_lag_sample(redis, lag)
+
+    window = _window(redis)
+    assert len(window) == LAG_SAMPLES_MAX_ENTRIES
     assert [s["lag"] for s in window] == list(
-        range(passes - 1, passes - 1 - LAG_SAMPLES_KEEP, -1)
+        range(passes - 1, passes - 1 - LAG_SAMPLES_MAX_ENTRIES, -1)
     ), "newest first, oldest dropped"
 
 
@@ -360,21 +417,70 @@ async def test_an_unreadable_window_reads_as_no_history() -> None:
 
 
 async def test_the_reader_caps_the_window_it_returns() -> None:
-    """Defence against a key written by something other than this loop:
-    the advertised shape is "the last few", so the tool bounds what it
-    hands back rather than trusting the stored length."""
+    """Defence against a key written by something other than this loop: the shared reader
+    bounds what it hands back at the absolute cap rather than trusting the stored length.
+
+    The cap that belongs to a *surface* is a separate decision, one level up —
+    `test_the_agents_window_is_capped_where_the_operators_is_not` owns that.
+    """
     redis = _RedisStub(
         {
             BACKPRESSURE_LAG_KEY: "99",
             LAG_SAMPLES_KEY: json.dumps(
-                [_sample(99 - i, seconds_ago=i * 60) for i in range(20)]
+                [
+                    _sample(99 - i, seconds_ago=i)
+                    for i in range(LAG_SAMPLES_MAX_ENTRIES + 20)
+                ]
             ),
         }
     )
 
-    out = await _call(redis)
+    reading = await read_lag(redis, LIVE_REFRESHED_GROUP)
 
-    assert len(out.recent_samples) == _LAG_SAMPLES_KEEP
+    assert len(reading.recent_samples) == LAG_SAMPLES_MAX_ENTRIES
+
+
+async def test_the_agents_window_is_capped_where_the_operators_is_not() -> None:
+    """The two surfaces read the same ring and return different amounts of it, on purpose.
+
+    An operator's chart wants every point in the fifteen minutes and is drawn once. The
+    agent pays for each sample in its context on every read, and a reading whose SIZE
+    changed with a deployment's tick would make one stack's investigation quietly more
+    expensive than another's for no new information — so the agent's surface returns the
+    newest fifteen, the count it returned before the clock became a setting, and says so.
+    """
+    redis = _RedisStub()
+    # A 5 s tick for fifteen minutes: the ring the demo stack really holds.
+    for lag in range(180):
+        await record_lag_sample(redis, lag)
+    assert len(_window(redis)) == 180, "the writer keeps the whole time window"
+
+    # What the operator's console reads (`GET /admin/consumer-lag` builds from this).
+    operator = await read_lag(redis, LIVE_REFRESHED_GROUP)
+    assert len(operator.recent_samples) == 180
+
+    # What the agent reads.
+    agent = await _call(redis)
+    assert len(agent.recent_samples) == LAG_SAMPLES_AGENT_CAP == 15
+    assert [s.lag for s in agent.recent_samples] == list(range(179, 164, -1)), (
+        "the newest fifteen, newest first — not the oldest fifteen"
+    )
+    assert [s.lag for s in agent.recent_samples] == [
+        s.lag for s in operator.recent_samples[:LAG_SAMPLES_AGENT_CAP]
+    ], "one ring, one order, two lengths"
+
+    # And the description says which, because a cap the caller cannot see is worse than
+    # an error (CLAUDE.md: never promise completeness you cap).
+    surface = _tool_description() + json.dumps(
+        (await _call(redis)).model_json_schema()
+    )
+    assert f"at most {LAG_SAMPLES_AGENT_CAP} of them" in surface
+
+
+def _tool_description() -> str:
+    from app.mcp.registry import list_tools
+
+    return next(t.description for t in list_tools() if t.name == "get_consumer_lag")
 
 
 async def test_age_seconds_is_never_negative() -> None:
@@ -396,15 +502,62 @@ async def test_age_seconds_is_never_negative() -> None:
 
 
 def test_the_window_spans_the_fifteen_minutes_it_advertises() -> None:
-    """The cap is not a taste: it is the window divided by the pass interval, and the
-    tool's description quotes the window. One sample per pass is the assumption that
-    makes the three numbers one number (WO-R3-328)."""
-    from app.workers.dispatcher import _METRICS_LOOP_INTERVAL
-
-    assert LAG_SAMPLES_KEEP * int(_METRICS_LOOP_INTERVAL) == (
-        LAG_SAMPLES_WINDOW_SECONDS
-    )
+    """The window is the promise; the sample count follows from the tick (WO-R3-338). At
+    the 60 s default that is the fifteen samples this window has always held; at the demo
+    stack's 5 s it is 180 of them, on the same axis."""
     assert LAG_SAMPLES_WINDOW_SECONDS == 15 * 60
+    assert lag_samples_at_interval(60.0) == 15
+    assert lag_samples_at_interval(5.0) == 180
+    assert lag_samples_at_interval(5.0) <= LAG_SAMPLES_MAX_ENTRIES, (
+        "the absolute cap must not truncate the demo stack's window"
+    )
+    # A pathological interval is bounded rather than trusted.
+    assert lag_samples_at_interval(0.01) == LAG_SAMPLES_MAX_ENTRIES
+
+
+def test_the_pass_interval_is_a_setting_the_loop_reads_every_pass() -> None:
+    """O-35: nobody watching a demo waits a minute for a number to move. The demo stack
+    sets 5 s; the default is unchanged."""
+    assert metrics_interval_seconds(Settings(environment="test")) == 60.0
+    assert (
+        metrics_interval_seconds(
+            Settings(environment="test", metrics_loop_interval_seconds=5)
+        )
+        == 5.0
+    )
+    # Clamped, so a 0 cannot turn the loop into a busy-wait, and clamped in ONE place so
+    # `control_loop_pause.tick_interval_seconds` reports what the loop will really sleep.
+    assert (
+        metrics_interval_seconds(
+            Settings(environment="test", metrics_loop_interval_seconds=0)
+        )
+        == 1.0
+    )
+
+
+async def test_the_loop_sleeps_the_configured_interval() -> None:
+    redis = _RedisStub()
+
+    slept = await _one_loop_pass(
+        redis,
+        7,
+        settings=Settings(environment="test", metrics_loop_interval_seconds=5),
+    )
+
+    assert slept[0] == 5.0
+
+
+async def test_the_value_key_ttl_follows_the_interval_rather_than_a_literal() -> None:
+    """The value must be fresh-or-absent because `check_backpressure` gates on it, so its
+    TTL is three passes — one lost pass is survivable, a stale number for a minute at a 5 s
+    tick is not."""
+    fast = Settings(environment="test", metrics_loop_interval_seconds=5)
+    assert lag_value_ttl_seconds(fast) == 15
+    assert lag_value_ttl_seconds(Settings(environment="test")) == 180
+
+    redis = _RedisStub()
+    await _one_loop_pass(redis, 7, settings=fast)
+    assert redis.ttls[BACKPRESSURE_LAG_KEY] == 15
 
 
 async def test_the_writer_keys_the_window_by_group() -> None:
@@ -426,4 +579,3 @@ def test_the_reader_and_the_writer_name_the_same_window_key() -> None:
     the scheduler's constants."""
     assert _samples_key(LIVE_REFRESHED_GROUP) == LAG_SAMPLES_KEY
     assert LAG_SAMPLES_KEY == f"{BACKPRESSURE_LAG_KEY}:samples"
-    assert _LAG_SAMPLES_KEEP == LAG_SAMPLES_KEEP

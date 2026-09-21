@@ -158,7 +158,7 @@ Producer-side validation in `publish_raw` catches schema violations *before* the
 
 ### Consumer lag
 
-`kafka:consumer_lag:worker-dispatcher` in Redis (TTL 90s) is the cached lag value from the dispatcher consumer's `consumer_lag()` method. The metrics loop emits it every 60s; the backpressure check in `POST /jobs` reads it without ever round-tripping to Kafka. Threshold: `Settings.backpressure_lag_threshold` (default 1000); above that, the API returns 503 with `BackpressureError`.
+`kafka:consumer_lag:worker-dispatcher` in Redis is the cached lag value from the dispatcher consumer's `consumer_lag()` method, under a TTL of three metrics passes. The metrics loop emits it once per pass, and the pass interval is `METRICS_LOOP_INTERVAL_SECONDS` — 60s by default, 5s in the demo stack (WO-R3-338, owner decision O-35), with the TTL derived from it rather than fixed; the backpressure check in `POST /jobs` reads it without ever round-tripping to Kafka. Threshold: `Settings.backpressure_lag_threshold` (default 1000); above that, the API returns 503 with `BackpressureError`.
 
 For lag on the other 7 consumer groups, use Redpanda Console or `rpk group describe <group>`.
 

@@ -19,13 +19,12 @@ from app.config import get_settings
 from app.core import metrics
 from app.core.circuit_breaker import record_registered_breakers
 from app.core.consumer_lag import (
-    LAG_SAMPLES_KEEP as _LAG_SAMPLES_KEEP,
-)
-from app.core.consumer_lag import (
     LAG_SAMPLES_TTL as _LAG_SAMPLES_TTL,
 )
 from app.core.consumer_lag import (
     LIVE_REFRESHED_GROUP,
+    lag_value_ttl_seconds,
+    metrics_interval_seconds,
     record_lag_sample,
 )
 from app.core.consumer_lag import (
@@ -42,7 +41,7 @@ from app.repositories.audit import AuditRepository
 from app.repositories.job import JobRepository
 from app.repositories.job_dependency import JobDependencyRepository
 from app.repositories.outbox import OutboxRepository
-from app.services import retry_policy
+from app.services import alert_rules, retry_policy
 from app.utils.dag_pause import find_blocking_pause
 from app.utils.post_commit import run_post_commit
 from app.workers import (
@@ -1652,21 +1651,19 @@ async def _outbox_relay_loop(
 
 
 BACKPRESSURE_LAG_KEY = "kafka:consumer_lag:worker-dispatcher"
-BACKPRESSURE_LAG_TTL = 90  # seconds — must exceed metrics loop interval (60s)
 
 # The same number with its measurement time, kept for the last several passes:
-# `BACKPRESSURE_LAG_KEY` is one undated integer overwritten every ~60s, so a climbing
+# `BACKPRESSURE_LAG_KEY` is one undated integer overwritten every pass, so a climbing
 # lag was unverifiable (WO-R3-254). A SECOND key, because `check_backpressure` fixes
 # the value key's shape. JSON list, newest first:
 # [{"lag": int, "measured_at": ISO-8601 UTC}].
 #
-# The key, the cap and the TTL are now imported from `app/core/consumer_lag.py`
-# (WO-R3-328) rather than mirrored here: the window is fifteen minutes of history at one
-# sample per pass, and the reader bounds what it returns by the same cap. They were two
-# literals in two files and drifting them would have shortened the chart without
-# shortening the axis. `test_consumer_lag_history.py` still pins the pair.
+# The key, the bound and both TTLs are imported from `app/core/consumer_lag.py`
+# (WO-R3-328, and the clock itself since WO-R3-338) rather than mirrored here: the window
+# is fifteen minutes of history however fast the pass runs, and the value key's TTL is
+# three passes. They were literals in two files and drifting them would have shortened the
+# chart without shortening the axis. `test_consumer_lag_history.py` still pins the pair.
 LAG_SAMPLES_KEY = _samples_key(LIVE_REFRESHED_GROUP)
-LAG_SAMPLES_KEEP = _LAG_SAMPLES_KEEP
 LAG_SAMPLES_TTL = _LAG_SAMPLES_TTL
 
 
@@ -1780,21 +1777,28 @@ async def _idempotency_reaper_loop(
             )
 
 
-#: Seconds between metrics passes. Named so `BACKPRESSURE_LAG_TTL`'s "must exceed
-#: the metrics loop interval" has something to point at.
-_METRICS_LOOP_INTERVAL = 60.0
-
-
-async def _metrics_loop(redis: Any, consumer: JobDispatcherConsumer) -> None:
-    """Emit queue/in-flight/consumer-lag gauges every ~60s.
+async def _metrics_loop(
+    redis: Any,
+    consumer: JobDispatcherConsumer,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Emit queue/in-flight/consumer-lag gauges on the configured metrics interval.
 
     Lag is also cached in Redis for the backpressure check (no per-request Kafka
     query), and each measurement is appended to `LAG_SAMPLES_KEY` so a reader can
-    tell a climbing lag from a flat one without waiting a minute itself.
+    tell a climbing lag from a flat one without waiting a whole pass itself.
+
+    The interval is a setting read every pass (`metrics_interval_seconds`), so the demo
+    stack's 5 s is an env var rather than a redeploy of this module (O-35), and the value
+    key's TTL is derived from it rather than fixed.
+
+    Since WO-R3-338 the platform's own alert rules run on this same tick, right after the
+    measurement they read (ADR 0039). Same clock on purpose: a rule evaluating between two
+    measurements can only re-read the number it already saw.
     """
     while True:
         try:
-            await asyncio.sleep(_METRICS_LOOP_INTERVAL)
+            await asyncio.sleep(metrics_interval_seconds())
             if await loop_is_paused(ControlLoopName.METRICS):
                 continue
             delayed = await queue.delayed_length(redis)
@@ -1807,7 +1811,9 @@ async def _metrics_loop(redis: Any, consumer: JobDispatcherConsumer) -> None:
             # entry TTLs out and backpressure fails open on absence.
             if lag is not None:
                 await metrics.emit_gauge("ConsumerLag", float(lag))
-                await redis.set(BACKPRESSURE_LAG_KEY, lag, ex=BACKPRESSURE_LAG_TTL)
+                await redis.set(
+                    BACKPRESSURE_LAG_KEY, lag, ex=lag_value_ttl_seconds()
+                )
                 # Value first, history second: backpressure's key is the one with
                 # a caller waiting on it, and the history is best effort.
                 try:
@@ -1817,6 +1823,12 @@ async def _metrics_loop(redis: Any, consumer: JobDispatcherConsumer) -> None:
                         "consumer lag sample not recorded",
                         extra={"error": str(exc)},
                     )
+            # Last, and in its own handler: the rules read what this pass just recorded,
+            # and a rule that fails must cost neither the gauges nor the next pass.
+            try:
+                await alert_rules.evaluate_alert_rules(session_factory, redis)
+            except Exception as exc:
+                logger.error("alert rule pass failed", extra={"error": str(exc)})
         except asyncio.CancelledError:
             break
         except Exception as exc:
@@ -1958,7 +1970,7 @@ async def worker_loop(
                 _requeue_stale_pending_loop(session_factory, redis)
             ),
             asyncio.create_task(_outbox_relay_loop(session_factory)),
-            asyncio.create_task(_metrics_loop(redis, dispatcher)),
+            asyncio.create_task(_metrics_loop(redis, dispatcher, session_factory)),
             asyncio.create_task(_digest_loop(session_factory)),
             asyncio.create_task(_idempotency_reaper_loop(session_factory)),
             asyncio.create_task(

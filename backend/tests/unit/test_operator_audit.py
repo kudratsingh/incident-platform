@@ -23,6 +23,7 @@ from app.models.audit import (
 )
 from app.models.service_account import ServiceAccount
 from app.models.user import User
+from app.services import alert_rules
 from app.services.operator_audit import (
     AGENT_RUN_REPORTED_ACTION,
     CHAOS_ACTION_PREFIX,
@@ -236,6 +237,28 @@ def test_the_lab_withholding_does_not_disturb_the_run_report_rule() -> None:
     assert CHAOS_ACTION_PREFIX in hidden
     assert LAB_ACTION_PREFIX in hidden
     assert "agent.run_reported" in hidden
+
+
+def test_the_alert_stream_is_shown_to_the_agent() -> None:
+    """WO-R3-338's one withholding decision, written down where the rule lives.
+
+    `alert.raised` / `alert.resolved` are NOT withheld from anybody. ADR 0012 hides the
+    lab (a fault going in, the reset's apparatus, a probe the lab took wearing the agent's
+    token) and, by the inverse rule, a responder's own report stream. An alert is the
+    opposite kind of row: it is the thing the agent was paged with, raised by a documented
+    platform rule over a reading the agent can take itself, and nothing in it names a
+    mechanism. Withholding it would hide the page from the responder answering it.
+    """
+    agent = _scoped_principal(Scope.TELEMETRY_READ, Scope.INCIDENTS_READ)
+    reporter = _scoped_principal(Scope.TELEMETRY_READ, Scope.AGENT_RUNS_WRITE)
+
+    for principal in (agent, reporter):
+        hidden = hidden_audit_action_prefixes(principal)
+        for action in (alert_rules.ALERT_RAISED_ACTION, alert_rules.ALERT_RESOLVED_ACTION):
+            assert not any(action.startswith(prefix) for prefix in hidden), action
+    assert alert_rules.ALERT_RAISED_ACTION.startswith(alert_rules.ALERT_ACTION_PREFIX)
+    assert not alert_rules.ALERT_ACTION_PREFIX.startswith(CHAOS_ACTION_PREFIX)
+    assert not alert_rules.ALERT_ACTION_PREFIX.startswith(LAB_ACTION_PREFIX)
 
 
 async def test_record_world_reset_writes_one_row_carrying_the_counters() -> None:

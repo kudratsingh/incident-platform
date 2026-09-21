@@ -50,7 +50,8 @@ LOOP_FUNCTIONS: dict[ControlLoopName, str] = {
 
 
 #: Nominal seconds between iterations, `None` where the loop reads its own interval each pass
-#: (`digest`, `slo_evaluation`). Mirrored, not imported, because `dispatcher` imports this module;
+#: (`digest`, `slo_evaluation`, and `metrics` since WO-R3-338). Mirrored, not imported, because
+#: `dispatcher` imports this module;
 #: `test_the_mirrored_tick_intervals_match_the_dispatcher` fails if one side moves.
 TICK_INTERVAL_SECONDS: dict[ControlLoopName, float | None] = {
     ControlLoopName.OUTBOX_RELAY: 1.0,
@@ -61,7 +62,7 @@ TICK_INTERVAL_SECONDS: dict[ControlLoopName, float | None] = {
     ControlLoopName.STALE_RUNNING_SWEEP: 60.0,
     ControlLoopName.LEASE_RENEWAL: 20.0,
     ControlLoopName.SLO_EVALUATION: None,
-    ControlLoopName.METRICS: 60.0,
+    ControlLoopName.METRICS: None,
     ControlLoopName.DIGEST: None,
     ControlLoopName.IDEMPOTENCY_REAPER: 3600.0,
 }
@@ -80,6 +81,12 @@ def tick_interval_seconds(loop_name: ControlLoopName) -> float | None:
     if loop_name is ControlLoopName.SLO_EVALUATION:
         interval = settings.slo_evaluation_interval_seconds
         return float(interval) if interval > 0 else None
+    if loop_name is ControlLoopName.METRICS:
+        # The demo stack runs this at 5 s (O-35). Through the same clamp the loop sleeps
+        # on, so "resumes in N ticks" is the wait an operator will actually see.
+        from app.core.consumer_lag import metrics_interval_seconds
+
+        return metrics_interval_seconds(settings)
     return None
 
 

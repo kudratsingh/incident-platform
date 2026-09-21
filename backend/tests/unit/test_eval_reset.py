@@ -904,6 +904,61 @@ async def test_organic_alerts_are_resolved_and_the_seeded_five_survive(
     assert total == 3, "the post-reset surface is the seeded baseline"
     assert {a.source for a in active} == {"kafka", "dlq", "api"}
 
+
+# _resolve_rule_alerts — WO-R3-338, the platform's own episodes
+
+
+async def test_a_platform_rule_episode_is_closed_with_its_audit_row(
+    db_session: AsyncSession, default_tenant  # type: ignore[no-untyped-def]
+) -> None:
+    """The step `_resolve_organic_alerts` cannot do. Its UPDATE would already stamp this
+    row — the predicate spares five ids and resolves everything else — but it writes no
+    `alert.resolved`, so the console's timeline would hold a page that never ended."""
+    reset = _reset_module()
+    from app.models.alert import Alert
+    from app.models.audit import AuditLog
+    from app.services import alert_rules
+
+    tenant_id = default_tenant.id
+    raised = Alert(
+        tenant_id=tenant_id,
+        severity="critical",
+        source=alert_rules.CONSUMER_LAG_ALERT_SOURCE,
+        title="Consumer lag on worker-dispatcher: 9000 messages behind",
+        fired_at=datetime.now(UTC) - timedelta(minutes=2),
+        resolved_at=None,
+        dedup_key=alert_rules.dedup_key(
+            alert_rules.CONSUMER_STALLED_FINGERPRINT, "worker-dispatcher", 0
+        ),
+    )
+    db_session.add(raised)
+    await db_session.flush()
+    alert_id = raised.id
+
+    closed = await reset._resolve_rule_alerts(_factory(db_session))
+
+    assert closed == 1
+    db_session.expire_all()
+    row = (
+        await db_session.execute(select(Alert).where(Alert.id == alert_id))
+    ).scalar_one()
+    assert row.resolved_at is not None, "resolved, never deleted"
+    audit = (
+        (
+            await db_session.execute(
+                select(AuditLog).where(
+                    AuditLog.action == alert_rules.ALERT_RESOLVED_ACTION
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(audit) == 1
+    assert audit[0].resource_id == str(alert_id)
+    assert audit[0].extra_data is not None
+    assert audit[0].extra_data["resolved_reason"] == "world reset"
+
     assert await reset._resolve_organic_alerts(_factory(db_session)) == 0, (
         "second run over post-reset state must be a no-op"
     )
@@ -2036,6 +2091,7 @@ def test_the_reset_summary_names_every_counter_it_owns() -> None:
         "agent_runs_closed",
         "breakers_reset",
         "hot_set_reseeded",
+        "rule_alerts_resolved",
         "world_reset_recorded",
     } <= keys
 
@@ -2067,6 +2123,7 @@ def test_the_reset_summary_names_every_counter_it_owns() -> None:
         "_record_world_reset",
         "_reset_breaker_states",
         "_reseed_hot_set",
+        "_resolve_rule_alerts",
     } <= awaited
 
 
