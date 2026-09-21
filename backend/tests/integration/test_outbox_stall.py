@@ -188,7 +188,9 @@ async def _run_ticks(factory: Any, redis: _Redis, consumer: Any) -> list[bool]:
         "app.workers.dispatcher.queue.delayed_length", new=AsyncMock(return_value=0)
     ), patch.object(
         dispatcher, "OUTBOX_RELAY_INTERVAL", _FAST_INTERVAL
-    ), patch.object(dispatcher, "_METRICS_LOOP_INTERVAL", _FAST_INTERVAL):
+    ), patch.object(
+        dispatcher, "metrics_interval_seconds", lambda *_: _FAST_INTERVAL
+    ):
         tasks = [
             asyncio.create_task(
                 dispatcher._outbox_relay_loop(
