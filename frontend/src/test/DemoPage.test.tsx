@@ -473,6 +473,9 @@ describe('DemoPage — two rows, always both, never merged', () => {
 
   it('moves the platform row to agent acting and names the action', async () => {
     stub({
+      // A run, because since WO-R3-341 item 5 an `agent.tool_invoked` row is only the
+      // agent's against the selected run's own principal.
+      runs: [agentRun()],
       audit: [
         RESET_ROW,
         FAULT_ROW,
@@ -1384,18 +1387,35 @@ describe('DemoPage — one take, pinned by ?run=', () => {
 })
 
 // ─────────────────────────────────────────────────────────────────────────────
-// WO-R3-336 item 1 — a fresh take starts at zero.
+// WO-R3-336 item 1 — a take with a fault starts at zero.
 //
 // The owner's fourth take was green and still not watchable, and this is the first
 // thing they saw: the page opened on the take BEFORE the one running, because
 // WO-R3-334's default was "the newest run with a fault in its own take" and that run
-// was in the previous take. A fresh demo has to start at zero and adopt its run when
-// the run reports.
+// was in the previous take. A take the lab has broken has to start at zero and adopt
+// its run when the run reports.
+//
+// WO-R3-341 item 1 narrows the trigger and nothing else: a newer take with NEITHER a
+// fault NOR a run is not switched to at all, because the fifth take's finished run
+// left the screen eleven seconds after it resolved. `DemoPageV5.test.tsx` holds that
+// half; everything here is the half that did not change.
 // ─────────────────────────────────────────────────────────────────────────────
 
-describe('DemoPage — a fresh take starts at zero', () => {
-  it('opens on the take now running, not on the take that has the run', async () => {
-    stub({ runs: [CLOSED_RUN], detail: CLOSED_RUN, audit: WIND_DOWN_ROWS })
+/** The newer take, once the lab has broken it: a fault of its own, no run yet. */
+const NEXT_TAKE_FAULT = toolRow(
+  'chaos.tool_invoked',
+  'poison_message',
+  '2026-09-19T10:05:30Z',
+  { fixture_name: 'demo' },
+)
+
+describe('DemoPage — a take with a fault starts at zero', () => {
+  it('opens on the faulted take now running, not on the take that has the run', async () => {
+    stub({
+      runs: [CLOSED_RUN],
+      detail: CLOSED_RUN,
+      audit: [...WIND_DOWN_ROWS, NEXT_TAKE_FAULT],
+    })
     renderDemo()
     await screen.findByTestId('phase-row-platform')
     await waitFor(() => {
@@ -1417,8 +1437,8 @@ describe('DemoPage — a fresh take starts at zero', () => {
     expect(screen.getByTestId('run-selector-empty')).toBeTruthy()
   })
 
-  it('reads the platform’s own row for the fresh take, with no fault and no clock', async () => {
-    stub({ runs: [CLOSED_RUN], detail: CLOSED_RUN, audit: WIND_DOWN_ROWS })
+  it('reads the platform’s own row for a fresh stack, with no fault and no clock', async () => {
+    stub({ audit: [RESET_ROW] })
     renderDemo()
     await screen.findByTestId('phase-row-platform')
     await waitFor(() => {
@@ -1429,7 +1449,11 @@ describe('DemoPage — a fresh take starts at zero', () => {
   })
 
   it('shows this take’s lab rows only — never the previous take’s', async () => {
-    stub({ runs: [CLOSED_RUN], detail: CLOSED_RUN, audit: WIND_DOWN_ROWS })
+    stub({
+      runs: [CLOSED_RUN],
+      detail: CLOSED_RUN,
+      audit: [...WIND_DOWN_ROWS, NEXT_TAKE_FAULT],
+    })
     renderDemo()
     await screen.findByTestId('action-ledger')
     await waitFor(() => {
@@ -1438,6 +1462,7 @@ describe('DemoPage — a fresh take starts at zero', () => {
     // `kill_consumer` belongs to the take before this one. The fourth take's ledger
     // showed exactly this row, from the take before, because the boundary was not in
     // view to cut it off.
+    expect(screen.getByTestId('action-ledger').textContent).toMatch(/poison_message/)
     expect(screen.getByTestId('action-ledger').textContent).not.toMatch(/kill_consumer/)
   })
 
@@ -1449,7 +1474,11 @@ describe('DemoPage — a fresh take starts at zero', () => {
       started_at: '2026-09-19T10:06:00Z',
       phase_history: [{ state: 'triage', at: '2026-09-19T10:06:00Z' }],
     })
-    stub({ runs: [CLOSED_RUN], detail: CLOSED_RUN, audit: WIND_DOWN_ROWS })
+    stub({
+      runs: [CLOSED_RUN],
+      detail: CLOSED_RUN,
+      audit: [...WIND_DOWN_ROWS, NEXT_TAKE_FAULT],
+    })
     listAgentRuns
       .mockResolvedValueOnce(page([CLOSED_RUN]))
       .mockResolvedValue(page([CLOSED_RUN, fresh]))
@@ -1472,7 +1501,11 @@ describe('DemoPage — a fresh take starts at zero', () => {
 
   it('offers the earlier takes as history, labelled, and reads one when chosen', async () => {
     const user = userEvent.setup()
-    stub({ runs: [CLOSED_RUN], detail: CLOSED_RUN, audit: WIND_DOWN_ROWS })
+    stub({
+      runs: [CLOSED_RUN],
+      detail: CLOSED_RUN,
+      audit: [...WIND_DOWN_ROWS, NEXT_TAKE_FAULT],
+    })
     renderDemo()
     const select = (await screen.findByTestId('take-selector')) as HTMLSelectElement
     const labels = within(select)

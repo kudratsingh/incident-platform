@@ -97,6 +97,13 @@
  *  5. **The stations are unchanged and still load-bearing** — real durations from
  *     `phase_history` (which WO-R3-337 fixes at the source), the late-report label, and
  *     one station at a time.
+ *
+ * ── WO-R3-341: the run stays up, and the stations only move forwards ────────────
+ *
+ * The fifth take, in three rules: an empty newer take is not switched to (the finished
+ * run stays, under a banner); a station once reached is latched and `agent acting` comes
+ * from the run's own steps; and with no run selected no `agent.tool_invoked` row is the
+ * agent's, so the demo runner's lag polls can no longer light a station before the fault.
  */
 
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
@@ -116,10 +123,13 @@ import {
   chartWindow,
   faultInTake,
   faultRowsInTake,
+  firstActionAt,
   isDemoMode,
+  latchStations,
   metricRecovery,
   platformRow,
   reportArrivals,
+  revealStations,
   rowsInTake,
   rowsInTakeWithEdges,
   selectTake,
@@ -268,6 +278,20 @@ function useStaggeredReveal(
   }, [key, target, state, stepMs])
 
   return state.key === key ? state.shown : target
+}
+
+/**
+ * One phase row with every station an earlier poll had already reached kept reached
+ * (WO-R3-341 item 2). `key` is what the memory belongs to — the take and the run — so
+ * a different take or a different run starts over rather than inheriting stations.
+ */
+function useLatchedRow<K extends string>(key: string, row: Station<K>[]): Station<K>[] {
+  // Mutating a ref during render is safe here: the update is idempotent, schedules
+  // nothing, and the render that writes it already reads the value it wrote.
+  const held = useRef<{ key: string; row: Station<K>[] }>({ key, row })
+  const latched = held.current.key === key ? latchStations(held.current.row, row) : row
+  held.current = { key, row: latched }
+  return latched
 }
 
 function formatMs(ms: number): string {
@@ -419,27 +443,65 @@ function TakeLabel({
   current,
   hasRun,
   newerTakeRunning,
+  held,
 }: {
   take: Take
   /** True while this is the take now running. */
   current: boolean
   hasRun: boolean
   newerTakeRunning: boolean
+  /** True while this finished take is being kept on screen (WO-R3-341 item 1). */
+  held: boolean
 }) {
   return (
     <span data-testid="take-label" className="text-xs font-mono text-gray-500">
       {take.startAt === null ? 'take start not in view' : `take from ${clockTime(take.startAt)}`}
       {take.endAt === null ? ' · live' : ` · take ended at ${clockTime(take.endAt)}`}
-      {!current && (
-        <span className="text-amber-300/80"> · history, chosen from the take selector</span>
+      {/* Held is not chosen: the page kept this take rather than the operator asking
+          for it, and the banner under the header says why. */}
+      {held ? (
+        <span className="text-blue-200/80"> · held while the world is cleaned up</span>
+      ) : (
+        !current && (
+          <span className="text-amber-300/80"> · history, chosen from the take selector</span>
+        )
       )}
       {current && !hasRun && (
         <span className="text-blue-200/80"> · waiting for this take’s run</span>
       )}
-      {!current && newerTakeRunning && (
+      {!current && !held && newerTakeRunning && (
         <span className="text-amber-300/80"> · the take now running has no run yet</span>
       )}
     </span>
+  )
+}
+
+/**
+ * The world has been reset and the next run has not started (WO-R3-341 item 1).
+ *
+ * The take above stays exactly as it ended; this says why it is still there and how
+ * long the cleaning-up has been going on, so nobody reads a finished run as a live one.
+ */
+function ResetBanner({ resetAt, now }: { resetAt: string | null; now: number }) {
+  const since = resetAt === null ? null : Math.max(0, now - new Date(resetAt).getTime())
+  return (
+    <div
+      data-testid="reset-banner"
+      className="mb-2 rounded-lg border border-blue-400/40 bg-blue-500/10 px-3 py-2 text-sm text-blue-100"
+    >
+      world reset at{' '}
+      <span className="font-mono">
+        {resetAt === null ? 'a time the page cannot see' : clockTime(resetAt)}
+      </span>{' '}
+      — cleaning up, waiting for the next run
+      {since !== null && (
+        <span className="text-blue-200/70 font-mono"> · {formatMs(since)} ago</span>
+      )}
+      <span className="text-blue-200/70">
+        {' '}
+        · the run below is the one that just finished
+      </span>
+    </div>
   )
 }
 
@@ -1923,6 +1985,7 @@ function ActionLedger({
   boundaryInView,
   stepsDropped,
   usingAudit,
+  runSelected,
   showJobEvents,
   onToggleJobEvents,
   showHiddenReads,
@@ -1946,6 +2009,8 @@ function ActionLedger({
   boundaryInView: boolean
   stepsDropped: number
   usingAudit: boolean
+  /** False while this take has no run: then no tool row can be attributed (item 5). */
+  runSelected: boolean
   showJobEvents: boolean
   onToggleJobEvents: (next: boolean) => void
   showHiddenReads: boolean
@@ -2038,8 +2103,10 @@ function ActionLedger({
       )}
       {counts.hiddenReads > 0 && (
         <p data-testid="ledger-hidden-reads" className="text-xs text-gray-500">
-          {counts.hiddenReads} evaluator/traffic reads hidden — the lab&rsquo;s probes and
-          other principals&rsquo; calls
+          {counts.hiddenReads} evaluator/traffic reads hidden —{' '}
+          {runSelected
+            ? 'the lab’s probes and other principals’ calls'
+            : 'the lab’s probes, and every tool call, because no run is selected and nothing says whose it was'}
         </p>
       )}
       {stepsDropped > 0 && (
@@ -2609,6 +2676,8 @@ export default function DemoPage() {
   const take = selection.take
   const listedRun = selection.run
   const runId = listedRun?.id ?? null
+  /** A finished take kept on screen while the newer, empty take is cleaned up (item 1). */
+  const held = selection.why === 'held'
   const takes = useMemo(
     () => takeOptions({ runs: runs.data?.items ?? [], audit: auditRows }),
     [runs.data, auditRows],
@@ -2800,56 +2869,71 @@ export default function DemoPage() {
   const metricInsideNow = metricValue !== null ? metricValue <= metric.threshold : false
 
   /**
-   * Recovery, from the platform's own samples rather than from one poll.
-   *
-   * The first take's rule asked "is the latest reading inside the bar, and was a
-   * breach seen" — and the cached lag value reads 42 → 0 → 42 as it ages, so the
-   * strip announced a recovery in the middle of the incident. Two consecutive
-   * samples inside the bar is the rule now, and while only one is the page says so
-   * instead of either lying or going quiet.
-   */
-  const recovery = useMemo(
-    () => metricRecovery(metricSamples, metric.threshold, faultAt),
-    [metricSamples, metric.threshold, faultAt],
-  )
-  const insideSustained = metricSamples.length > 0 ? recovery.sustained : metricInsideNow
-
-  /**
-   * The principal every row on this page is measured against.
-   *
-   * The run says who wrote it (`service_account_id`), so a call by anyone else — the
-   * demo runner reading lag under the agent's token, the evaluator's guard probes —
-   * is not this run's work (F3/F4). With no run selected there is nothing to compare
-   * against and every row counts, which the ledger's own line says.
+   * The principal every row on this page is measured against — the run's own
+   * `service_account_id`, so the demo runner's reads and the evaluator's guard probes
+   * are not counted as the agent's (F3/F4). With no run there is nothing to compare
+   * against, so nothing is counted at all (item 5) and the ledger says how much.
    */
   const runPrincipalId = run?.service_account_id ?? null
 
-  const platformStations: PlatformStation[] = useMemo(
+  /** The remediation the recovery has to follow, so a dip before it is not the R marker. */
+  const actionAt = useMemo(
+    () => firstActionAt({ steps, audit: rowsInTake(auditRows, take), runPrincipalId }),
+    [steps, auditRows, take, runPrincipalId],
+  )
+  /**
+   * Recovery, from the platform's own samples rather than from one poll: the first
+   * take's rule read the cached lag value, which ages 42 → 0 → 42, so the strip
+   * announced a recovery mid-incident. Two consecutive samples inside the bar, and
+   * not before the remediation (item 3).
+   */
+  const recovery = useMemo(
+    () => metricRecovery(metricSamples, metric.threshold, faultAt, 2, actionAt),
+    [metricSamples, metric.threshold, faultAt, actionAt],
+  )
+  const insideSustained = metricSamples.length > 0 ? recovery.sustained : metricInsideNow
+
+  const platformReading: PlatformStation[] = useMemo(
     () =>
       platformRow({
         audit: auditRows,
         take,
         runPrincipalId,
+        runSteps: steps,
         faultAt,
         recoveredAt: recovery.recoveredAt,
         metricKnown,
         metricInsideThreshold: insideSustained,
         metricBreachedSinceFault: recovery.breachedAt !== null,
       }),
-    [auditRows, take, runPrincipalId, faultAt, recovery, metricKnown, insideSustained],
+    [auditRows, take, runPrincipalId, steps, faultAt, recovery, metricKnown, insideSustained],
   )
 
   // When each reported state reached the platform, so a station whose report arrived
   // in a late burst says so instead of reading as instantaneous (F2).
   const arrivals = useMemo(() => reportArrivals(auditRows, runId), [auditRows, runId])
+  const agentReading = useMemo(() => agentRow(run, { arrivals }), [run, arrivals])
+
+  /**
+   * Both rows latched for as long as the take and the run stay the same (item 2).
+   *
+   * Two polls answer at different times — the run detail carries the principal, the
+   * audit query carries the rows — and the fifth take's PLATFORM row flipped paged →
+   * agent acting → paged → agent acting as they leapfrogged each other. A station that
+   * has been reached stays reached; the memory is dropped when the take or the run
+   * changes, because then it is a different thing being measured.
+   */
+  const platformStations = useLatchedRow(`${takeKey(take)}|${runId ?? 'none'}`, platformReading)
+  const latchedAgentRow = useLatchedRow(`${takeKey(take)}|${runId ?? 'none'}`, agentReading)
+
   const reachedStations = useMemo(
-    () => agentRow(run, { arrivals }).filter((s) => s.state !== 'pending').length,
-    [run, arrivals],
+    () => latchedAgentRow.filter((s) => s.state !== 'pending').length,
+    [latchedAgentRow],
   )
   const reveal = useStaggeredReveal(runId, reachedStations)
   const agentStations: AgentStation[] = useMemo(
-    () => agentRow(run, { arrivals, reveal }),
-    [run, arrivals, reveal],
+    () => revealStations(latchedAgentRow, reveal),
+    [latchedAgentRow, reveal],
   )
 
   const platformCurrent = platformStations.find((s) => s.state === 'current') ?? null
@@ -3001,6 +3085,7 @@ export default function DemoPage() {
               current={selection.current}
               hasRun={listedRun !== null}
               newerTakeRunning={newerTakeRunning}
+              held={held}
             />
             {labRow !== null && (
               <span className="text-xs font-mono text-amber-300/80">
@@ -3035,6 +3120,8 @@ export default function DemoPage() {
           </div>
         </div>
       </div>
+
+      {held && <ResetBanner resetAt={selection.cleaningUpSince} now={now} />}
 
       {/* ── the two rows, always both ─────────────────────────────────────── */}
       <div className="space-y-2">
@@ -3230,6 +3317,7 @@ export default function DemoPage() {
               stepStore.runId === runId ? stepStore.dropped : (run?.steps_dropped ?? 0)
             }
             usingAudit={steps.length === 0 && run !== null}
+            runSelected={run !== null}
             showJobEvents={showJobEvents}
             onToggleJobEvents={setShowJobEvents}
             showHiddenReads={showHiddenReads}

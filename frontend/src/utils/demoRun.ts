@@ -274,10 +274,14 @@ export function ledgerExclusions(input: {
   return { labProbe, otherPrincipal, total: labProbe + otherPrincipal }
 }
 
-/** An `agent.tool_invoked` row that some other principal made. */
+/**
+ * An `agent.tool_invoked` row this run did not make — including EVERY such row while
+ * no run is selected (WO-R3-341 item 5), because nothing then says whose call it was.
+ * The fifth take drew the demo runner's own lag polls as the agent's, before the fault.
+ */
 function isForeignToolRow(row: AuditLog, runPrincipalId: string | null | undefined): boolean {
   if (row.action !== AGENT_TOOL_ACTION) return false
-  if (runPrincipalId === null || runPrincipalId === undefined) return false
+  if (runPrincipalId === null || runPrincipalId === undefined) return true
   return row.principal_id !== runPrincipalId
 }
 

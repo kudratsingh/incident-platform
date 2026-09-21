@@ -1,0 +1,4367 @@
+[
+ {
+  "id": "2324e102-15af-408d-b009-f30b316e5603",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "c50a0f1b-07fe-4dc8-85df-0f8e24206b52",
+  "job_id": null,
+  "action": "lab.world_reset",
+  "resource_type": "world",
+  "resource_id": null,
+  "request_id": null,
+  "ip_address": null,
+  "extra_data": {
+   "dlq_reset": 0,
+   "dlq_swept": 0,
+   "breakers_reset": 0,
+   "timers_cleared": 0,
+   "hot_set_reseeded": 0,
+   "agent_runs_closed": 0,
+   "job_cache_cleared": 0,
+   "chaos_keys_cleared": 0,
+   "dag_pauses_cleared": 0,
+   "empty_dlq_baseline": false,
+   "idempotency_purged": 0,
+   "seeded_dlq_deleted": 0,
+   "lag_samples_cleared": 0,
+   "chaos_owners_deleted": 0,
+   "rule_alerts_resolved": 0,
+   "chaos_alerts_resolved": 0,
+   "timestamps_rebaselined": 18,
+   "organic_alerts_resolved": 0,
+   "read_model_keys_rebuilt": 9
+  },
+  "created_at": "2026-09-21T11:38:55.500798Z"
+ },
+ {
+  "id": "a7f2a7d5-c4f0-4122-a28c-3fddae85aa60",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "lab.probe",
+  "resource_type": "mcp_tool",
+  "resource_id": "mark_dlq_permanent",
+  "request_id": "f76ed305-2737-4502-93c0-f48bbfe6fd5f",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "unauthorized",
+   "arguments": {
+    "job_id": "00000000-0000-0000-0000-000000000000-INVALID",
+    "reason": "",
+    "idempotency_key": "x"
+   },
+   "tool_name": "mark_dlq_permanent",
+   "latency_ms": 4.11,
+   "scope_used": "actions:execute",
+   "error_message": "missing required scope",
+   "lab_probe_reason": "principal guard: proves this token cannot execute a Tier-1 action",
+   "lab_probe_principal": "incident-commander-smoke"
+  },
+  "created_at": "2026-09-21T11:38:56.290212Z"
+ },
+ {
+  "id": "90326784-8fca-4b0b-a01f-7cb99fe05f00",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "lab.probe",
+  "resource_type": "mcp_tool",
+  "resource_id": "list_dlq_messages",
+  "request_id": "00aeccc3-4238-4b4b-a00b-4a731d38a435",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {},
+   "tool_name": "list_dlq_messages",
+   "latency_ms": 9.253,
+   "scope_used": "incidents:read",
+   "lab_probe_reason": "world audit read",
+   "lab_probe_principal": "incident-commander-smoke"
+  },
+  "created_at": "2026-09-21T11:38:56.312870Z"
+ },
+ {
+  "id": "010770a8-fbd5-402b-a323-d7ae39593897",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "lab.probe",
+  "resource_type": "mcp_tool",
+  "resource_id": "list_active_alerts",
+  "request_id": "c8778f34-f5f4-44a6-9d8d-260f9db6da33",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {},
+   "tool_name": "list_active_alerts",
+   "latency_ms": 4.192,
+   "scope_used": "incidents:read",
+   "lab_probe_reason": "world audit read",
+   "lab_probe_principal": "incident-commander-smoke"
+  },
+  "created_at": "2026-09-21T11:38:56.330774Z"
+ },
+ {
+  "id": "387b683b-1a94-4979-9ab4-094999b176c2",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "lab.probe",
+  "resource_type": "mcp_tool",
+  "resource_id": "search_traces",
+  "request_id": "50010d44-4900-48cf-8e13-93f80402f933",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "status": "failed",
+    "since_hours": 1
+   },
+   "tool_name": "search_traces",
+   "latency_ms": 5.111,
+   "scope_used": "incidents:read",
+   "lab_probe_reason": "world audit read",
+   "lab_probe_principal": "incident-commander-smoke"
+  },
+  "created_at": "2026-09-21T11:38:56.411306Z"
+ },
+ {
+  "id": "7295d18a-59d8-40be-9b80-d11fa192c0b0",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "lab.probe",
+  "resource_type": "mcp_tool",
+  "resource_id": "list_dlq_messages",
+  "request_id": "c42af46a-7b30-4aa2-af48-7914d62161a4",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "limit": 50
+   },
+   "tool_name": "list_dlq_messages",
+   "latency_ms": 5.527,
+   "scope_used": "incidents:read",
+   "lab_probe_reason": "world audit read",
+   "lab_probe_principal": "incident-commander-smoke"
+  },
+  "created_at": "2026-09-21T11:38:56.422734Z"
+ },
+ {
+  "id": "64ed026c-65b8-474c-b7a6-69bafefa2702",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "lab.probe",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "4e5f593f-667c-4dc6-a41f-ac079f039b69",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 3.086,
+   "scope_used": "telemetry:read",
+   "lab_probe_reason": "world audit read",
+   "lab_probe_principal": "incident-commander-smoke"
+  },
+  "created_at": "2026-09-21T11:38:56.434748Z"
+ },
+ {
+  "id": "469e1f77-c11e-46a3-a0c0-0fd34307cb5c",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "lab.probe",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_cache_key_info",
+  "request_id": "7905132a-5aa6-4a12-9f25-f7fd182c9ea2",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "key": "cache:jobs:worker-dispatcher:hot_set"
+   },
+   "tool_name": "get_cache_key_info",
+   "latency_ms": 4.426,
+   "scope_used": "telemetry:read",
+   "lab_probe_reason": "world audit read",
+   "lab_probe_principal": "incident-commander-smoke"
+  },
+  "created_at": "2026-09-21T11:38:56.443919Z"
+ },
+ {
+  "id": "ad1a149d-5aa2-49ce-9766-8e2cc322919e",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "d2f0e6b4-cfb1-4243-bdc4-5b22ce06973d",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 1.507,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:38:56.527591Z"
+ },
+ {
+  "id": "a72986a4-5b3b-4a1e-8cf6-344a021108e7",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "8a277d48-e85c-43f9-91f7-a59d72dc42fc",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 1.389,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:38:56.901198Z"
+ },
+ {
+  "id": "9a57b58e-fb20-488d-95d7-e6255a8848b8",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "e22aa146-b635-4e24-a810-4c862497dfb6",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 1.972,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:38:59.965420Z"
+ },
+ {
+  "id": "0b26d59a-677c-4e1a-b996-c19bf09129d2",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "a48c3cf7-4e03-4c3c-a196-1a611a9966e1",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 1.891,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:03.027200Z"
+ },
+ {
+  "id": "bf180cae-2fcf-459a-809e-798fa63e072c",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "6f1193dc-e88f-43ec-88d6-b79d844a72aa",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 2.371,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:06.090074Z"
+ },
+ {
+  "id": "91bfe0c9-87a1-4085-8580-a0996547a7ad",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "c50a0f1b-07fe-4dc8-85df-0f8e24206b52",
+  "job_id": null,
+  "action": "chaos.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "kill_consumer",
+  "request_id": "4f4227b3-64db-479a-b0dd-9e85529f252f",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "ttl_seconds": 300,
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "kill_consumer",
+   "latency_ms": 1.173,
+   "scope_used": "chaos:invoke"
+  },
+  "created_at": "2026-09-21T11:39:06.995490Z"
+ },
+ {
+  "id": "ec52eb2a-cfcb-4a39-96e5-081e46e425a0",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "ee447601-acdb-4399-8898-30060a0c1eb6",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 1.859,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:07.020623Z"
+ },
+ {
+  "id": "3ef240fc-8296-44e6-9ca9-dfa16b43876a",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "0b733274-1364-4bcb-a39f-4a37cc898aee",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 1.326,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:07.390004Z"
+ },
+ {
+  "id": "1e65005d-36dc-4175-b862-dde5aad2ca3f",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "a4a65a01-ae04-47fe-8758-d3f242dd4aa9",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 2.234,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:08.187239Z"
+ },
+ {
+  "id": "87a8ba90-c57e-4a74-9d5b-d0b9ed6a2ffc",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "2af5a5a1-97e8-4d4c-af0f-e530e1178267",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 2.087,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:08.985257Z"
+ },
+ {
+  "id": "8c9baa53-8cd6-4db4-bd3c-32e674a910e9",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "af1015b5-a551-4fdf-a999-bf51c4aa7f6c",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 1.708,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:09.856688Z"
+ },
+ {
+  "id": "9ca5d753-b60d-4cd1-9278-cd2e7f98d3e2",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "671ba85d-9af9-4090-9cae-baf97378e3b4",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 2.043,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:10.662434Z"
+ },
+ {
+  "id": "df73c3f0-663e-429f-a08c-6a946fde94f6",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "518ba3c6-01a5-43a4-b46f-e60c79bd7da6",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 1.69,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:11.454370Z"
+ },
+ {
+  "id": "cc7c108a-fb36-40c6-8353-033b90c70644",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "7c5b395b-0ed1-469b-90e7-01833db33373",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 4.265,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:12.050669Z"
+ },
+ {
+  "id": "b828cb96-e0af-46f1-9300-d65ece565b91",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "f2fa0bac-315a-44d8-be52-4cf7ee338d3e",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 2.171,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:12.258888Z"
+ },
+ {
+  "id": "21276249-1ba5-4e9b-9400-974df3481a16",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "0d9042b4-e477-464b-a956-ab2a1d843505",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 2.282,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:13.118232Z"
+ },
+ {
+  "id": "b77d34d5-d17c-4790-af70-b90836f971f9",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "f339add6-18da-4df5-ad20-122ba07f83aa",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 3.205,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:13.936543Z"
+ },
+ {
+  "id": "c879f7ac-9864-4d0b-9716-ffa25b79eec5",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "0c5a9c6f-0105-4d38-a92a-aa9d6e69015f",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 2.338,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:14.754388Z"
+ },
+ {
+  "id": "63dc4d53-8cc9-4629-b9e0-15871c1defbd",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "84a117ca-d2e0-43e5-a2d7-f0d7eaa641cd",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 2.001,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:15.557564Z"
+ },
+ {
+  "id": "c4001e1e-4b10-4874-b909-377a739c8490",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "4e6abc28-e320-4e81-9ddf-f268ecc4f724",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 2.241,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:16.368198Z"
+ },
+ {
+  "id": "0dc01572-c39c-4a36-a4b7-2a13038b7eec",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "f123be1b-96a4-407c-8810-97f79455135f",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 2.201,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:17.090224Z"
+ },
+ {
+  "id": "7c7e9f83-6f04-4c49-89df-ec12b73edc82",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "76349554-bf48-4c90-bfea-e5b2bec79d52",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 1.611,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:17.153159Z"
+ },
+ {
+  "id": "e5e3a2b2-5f92-4359-8ceb-e96f12b252f6",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "064b0377-f5d3-45ad-97d6-b59570311770",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 1.979,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:17.955812Z"
+ },
+ {
+  "id": "627a88c0-f1e0-4c66-a024-0cb83ba2ee9b",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "37b8e89f-9447-4674-8954-361c62b6e297",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 2.007,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:18.761207Z"
+ },
+ {
+  "id": "c8e1f307-99b0-40b6-aa2a-37552d0e31ce",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "ad2b2294-706d-485d-9e89-636fa0699686",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 2.054,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:19.565555Z"
+ },
+ {
+  "id": "632fa20e-4399-4ded-9c08-c25c060e081c",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "e03c7e4c-12b8-4e43-a5a9-81627f82cc5e",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 2.212,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:20.363359Z"
+ },
+ {
+  "id": "cec6ddaa-19fb-46ce-8de9-0401fcfc5600",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "0a8a2bfb-e62d-4459-8841-c76748f0b799",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 1.556,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:21.148573Z"
+ },
+ {
+  "id": "164e825c-2f81-4c5b-ba20-e9dda9c8ead1",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "3037efbf-2f48-45c4-9e33-b0b6dffdb7f4",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 1.667,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:21.934173Z"
+ },
+ {
+  "id": "d952e2a0-184e-4440-925b-39f1f3369662",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "431d8e40-f938-463d-9f6f-2774979477fe",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 4.065,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:22.130005Z"
+ },
+ {
+  "id": "dd6dded2-a151-4fe4-a1e0-814d911a2e5f",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "85985a11-3fd6-4249-acb1-e6e6e88a787f",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 2.07,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:22.734177Z"
+ },
+ {
+  "id": "5a68e546-c7cb-497b-8dc0-9d25f59e5c78",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "e7d565df-ebc3-412b-a782-26eebc4da3f4",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 2.233,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:23.533212Z"
+ },
+ {
+  "id": "e46b5d97-9d89-41eb-84dd-0fa0cf104309",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "bfbb1813-47e5-4a95-8b07-36f86efecb94",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 1.676,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:24.349424Z"
+ },
+ {
+  "id": "6a5a5a75-446e-4e65-8515-63a3c412dc94",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "81c977f6-39a2-48eb-8dfe-72c311f12d9e",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 1.354,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:25.176126Z"
+ },
+ {
+  "id": "b5022c24-bbdd-4c53-a246-fdf14923b5fd",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "f84e3cad-ac73-4b41-9d41-2dfb381dde1c",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 1.932,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:25.979322Z"
+ },
+ {
+  "id": "3935dc7a-cda2-4518-8334-da14944ad4cc",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": null,
+  "job_id": null,
+  "action": "alert.raised",
+  "resource_type": "alert",
+  "resource_id": "323ffb14-9c12-487d-9415-c42b6bb094ad",
+  "request_id": null,
+  "ip_address": null,
+  "extra_data": {
+   "source": "kafka:consumer_lag",
+   "subject": "worker-dispatcher",
+   "summary": "worker-dispatcher is 24 messages behind (threshold 20); the group holds its assignment and keeps reporting, so the backlog is real. Measured at 2026-09-21T11:39:26.669707+00:00.",
+   "alert_id": "323ffb14-9c12-487d-9415-c42b6bb094ad",
+   "severity": "critical",
+   "dedup_key": "rule:consumer_stalled:worker-dispatcher:4",
+   "fingerprint": "consumer_stalled"
+  },
+  "created_at": "2026-09-21T11:39:26.675504Z"
+ },
+ {
+  "id": "7f19bf76-987b-4269-9671-56d541e661af",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "2aa29d30-6e38-4ead-9d57-7d2228441387",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 1.964,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:26.768468Z"
+ },
+ {
+  "id": "ca7a2124-7b45-40b3-9376-421c1a670c45",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "2f75a6ae-c689-4c94-8071-c0d22ad63879",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 2.113,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:27.173099Z"
+ },
+ {
+  "id": "a14b119d-6e22-4156-afd1-9b25a075155d",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "lab.probe",
+  "resource_type": "mcp_tool",
+  "resource_id": "list_active_alerts",
+  "request_id": "62250a63-7c97-45ed-8f55-d856168dfa4a",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "limit": 50
+   },
+   "tool_name": "list_active_alerts",
+   "latency_ms": 8.873,
+   "scope_used": "incidents:read",
+   "lab_probe_reason": "demo: has the platform raised this scenario's alert yet",
+   "lab_probe_principal": "incident-commander-smoke"
+  },
+  "created_at": "2026-09-21T11:39:27.555462Z"
+ },
+ {
+  "id": "6ffb7e92-fc26-45d3-b752-90b45c610be5",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "090d2187-f05e-4cca-8e46-37ba1913b9a0",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 1.303,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:27.571648Z"
+ },
+ {
+  "id": "dd13c8b5-c6bb-44de-b2a1-312a9b3c0f28",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "83af356a-36e9-4ab0-afd2-c7d59dd6ba36",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 4.404,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:27.927105Z"
+ },
+ {
+  "id": "e4c13ba3-9cc7-4fa1-8bad-2fb53e735cb4",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "ef6e6199-2a64-44a9-a333-e9578a3472a7",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 1.398,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:28.381756Z"
+ },
+ {
+  "id": "45be92f5-4ba8-4ea5-9849-7ee3b5653e73",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "586042d6-f550-4d76-9f4f-a9f291419d1a",
+  "job_id": null,
+  "action": "lab.probe",
+  "resource_type": "mcp_tool",
+  "resource_id": "mark_dlq_permanent",
+  "request_id": "bb690fc8-b4df-465c-9818-4832195fc581",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "error",
+   "arguments": {
+    "job_id": "00000000-0000-0000-0000-000000000000-INVALID",
+    "reason": "",
+    "idempotency_key": "x"
+   },
+   "tool_name": "mark_dlq_permanent",
+   "latency_ms": 2.522,
+   "scope_used": "actions:execute",
+   "error_message": "invalid arguments",
+   "lab_probe_reason": "principal guard: proves the agent token can execute a Tier-1 action",
+   "lab_probe_principal": "incident-commander-chaos"
+  },
+  "created_at": "2026-09-21T11:39:29.153359Z"
+ },
+ {
+  "id": "91e9cb66-d8e6-4c90-944d-2d5c05848005",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "368dd848-eaf6-4c49-9523-081f61fa6a8c",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 2.181,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:29.163063Z"
+ },
+ {
+  "id": "78dff019-2282-4f7a-8172-5d7af9c07e9a",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "586042d6-f550-4d76-9f4f-a9f291419d1a",
+  "job_id": null,
+  "action": "chaos.tool_denied",
+  "resource_type": "mcp_tool",
+  "resource_id": "inject_latency",
+  "request_id": "4c50ca3f-9c6b-42c3-a418-4c300c4cdc8a",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "unauthorized",
+   "arguments": {
+    "latency_ms": "not-a-latency",
+    "consumer_group": ""
+   },
+   "denied_by": "scope_check",
+   "tool_name": "inject_latency",
+   "latency_ms": 1.987,
+   "scope_used": "chaos:invoke",
+   "error_message": "missing required scope",
+   "lab_probe_reason": "principal guard: proves the agent token cannot seed chaos",
+   "lab_probe_principal": "incident-commander-chaos"
+  },
+  "created_at": "2026-09-21T11:39:29.168643Z"
+ },
+ {
+  "id": "68894a15-b05d-4b12-a2a0-7855682e9409",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "c50a0f1b-07fe-4dc8-85df-0f8e24206b52",
+  "job_id": null,
+  "action": "chaos.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "inject_latency",
+  "request_id": "37a1b61f-01a7-44e4-a4da-7a2f00c0c4b3",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "error",
+   "arguments": {
+    "latency_ms": "not-a-latency",
+    "consumer_group": ""
+   },
+   "tool_name": "inject_latency",
+   "latency_ms": 1.514,
+   "scope_used": "chaos:invoke",
+   "error_message": "invalid arguments",
+   "lab_probe_reason": "principal guard: proves the evaluator token can seed chaos",
+   "lab_probe_principal": "incident-commander-chaos"
+  },
+  "created_at": "2026-09-21T11:39:29.183916Z"
+ },
+ {
+  "id": "9e9cd2fc-b7e9-4eb0-8b96-730f6c5dc9d7",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "586042d6-f550-4d76-9f4f-a9f291419d1a",
+  "job_id": null,
+  "action": "lab.probe",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "b12ff216-4a73-4060-9c59-9db5a56bc684",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 3.941,
+   "scope_used": "telemetry:read",
+   "lab_probe_reason": "precondition: get_consumer_lag proves lag at_least 20.0",
+   "lab_probe_principal": "incident-commander-chaos"
+  },
+  "created_at": "2026-09-21T11:39:29.199027Z"
+ },
+ {
+  "id": "090da2e8-b062-4154-887f-3b6baae6125d",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "lab.probe",
+  "resource_type": "mcp_tool",
+  "resource_id": "list_active_alerts",
+  "request_id": "b72559bd-89fe-45fa-9326-73491200bb32",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "limit": 50
+   },
+   "tool_name": "list_active_alerts",
+   "latency_ms": 3.933,
+   "scope_used": "incidents:read",
+   "lab_probe_reason": "demo: has the platform raised this scenario's alert yet",
+   "lab_probe_principal": "incident-commander-smoke"
+  },
+  "created_at": "2026-09-21T11:39:29.216151Z"
+ },
+ {
+  "id": "578dd4b7-5d47-438f-8ee5-7484c6d19f3d",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "586042d6-f550-4d76-9f4f-a9f291419d1a",
+  "job_id": null,
+  "action": "agent.run_reported",
+  "resource_type": "mcp_tool",
+  "resource_id": "report_agent_run",
+  "request_id": "505b11b6-7d6e-4f51-b157-f139cddd3bbd",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "at": "2026-09-21T11:39:29.190979+00:00",
+    "state": "triage",
+    "budget": {
+     "usd_used": 0.0,
+     "tokens_used": 0,
+     "wall_seconds": 0.0,
+     "tool_calls_max": 13,
+     "tool_calls_used": 0
+    },
+    "run_id": "7b305000-6dd3-52b0-a39c-2c188573da00",
+    "last_step": null,
+    "run_label": "remediate_consumer_lag_success",
+    "hypotheses": null,
+    "current_hypothesis": null
+   },
+   "tool_name": "report_agent_run",
+   "latency_ms": 3.952,
+   "scope_used": "agent_runs:write"
+  },
+  "created_at": "2026-09-21T11:39:29.253328Z"
+ },
+ {
+  "id": "9cdc5de3-2394-4b5a-a271-429b00481544",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "586042d6-f550-4d76-9f4f-a9f291419d1a",
+  "job_id": null,
+  "action": "agent.run_reported",
+  "resource_type": "mcp_tool",
+  "resource_id": "report_agent_run",
+  "request_id": "ad095252-33b5-4c0a-baae-0a4d9e7f603d",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "at": "2026-09-21T11:39:29.262200+00:00",
+    "state": "investigating",
+    "budget": {
+     "usd_used": 0.0,
+     "tokens_used": 0,
+     "wall_seconds": 0.071,
+     "tool_calls_max": 13,
+     "tool_calls_used": 0
+    },
+    "run_id": "7b305000-6dd3-52b0-a39c-2c188573da00",
+    "last_step": null,
+    "run_label": "remediate_consumer_lag_success",
+    "hypotheses": null,
+    "current_hypothesis": null
+   },
+   "tool_name": "report_agent_run",
+   "latency_ms": 3.06,
+   "scope_used": "agent_runs:write"
+  },
+  "created_at": "2026-09-21T11:39:29.263876Z"
+ },
+ {
+  "id": "019a1f07-a94c-4f11-83d3-b11fa5ca5a61",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "35af15ec-51d2-4e99-b254-2baf66df44bb",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 2.907,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:29.955115Z"
+ },
+ {
+  "id": "d23317b4-b2c0-4bb5-aaa5-8a9e31e44cb3",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "9fc16870-edf4-481e-a729-14dad2eef979",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 2.798,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:30.749567Z"
+ },
+ {
+  "id": "255bc375-1f7f-4635-a960-ceeede1c9e99",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "12ea9ebe-84e0-4784-81f0-bbc2ac98216e",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 2.129,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:31.544205Z"
+ },
+ {
+  "id": "4dbf303f-b676-4da6-9792-099985f6a176",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "35310539-20bf-40e2-83ca-f119de4da727",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 2.745,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:32.336763Z"
+ },
+ {
+  "id": "0c4c6762-9a9f-4f94-bcf7-f2dd78b3df60",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "e94dfdbd-9a68-48ea-8628-b97ea9bc0ea8",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 1.736,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:33.113885Z"
+ },
+ {
+  "id": "f96ad710-56bb-4ba2-a665-35814e219d52",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "006fb3d4-24da-4013-b141-5d2786a71431",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 2.861,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:33.905076Z"
+ },
+ {
+  "id": "2d291de8-3659-4a4a-aaaf-58102732f90e",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "44a34720-87ca-4900-86d1-110757d52b47",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 2.876,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:34.699974Z"
+ },
+ {
+  "id": "14ba8be9-d73a-400a-96a4-130d7c35b34b",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "fae05fc8-0a12-4700-9782-a80c47829eb4",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 2.357,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:35.484527Z"
+ },
+ {
+  "id": "ffb9b22c-0240-4562-bf29-5b9de89022a1",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "586042d6-f550-4d76-9f4f-a9f291419d1a",
+  "job_id": null,
+  "action": "agent.run_reported",
+  "resource_type": "mcp_tool",
+  "resource_id": "report_agent_run",
+  "request_id": "693d67d0-179b-4da3-aa7d-34a14d27ea2c",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "at": "2026-09-21T11:39:35.693067+00:00",
+    "step": {
+     "at": "2026-09-21T11:39:35.693067+00:00",
+     "seq": 1,
+     "kind": "report",
+     "tool": "investigation_planner",
+     "outcome": "ok",
+     "arguments": {
+      "reason": null,
+      "ranking": [
+       {
+        "name": "worker-dispatcher-lag-24-above-threshold-20",
+        "category": "consumer_saturation",
+        "confidence": 0.8
+       },
+       {
+        "name": "recent-deploy-correlating-with-consumer-stall",
+        "category": "deploy_regression",
+        "confidence": 0.2
+       },
+       {
+        "name": "downstream-dependency-slowing-consumer-processing",
+        "category": "transient_dependency",
+        "confidence": 0.15
+       }
+      ],
+      "next_action": {
+       "kind": "probe",
+       "tool": "get_consumer_lag"
+      }
+     },
+     "latency_ms": null,
+     "result_excerpt": "top consumer_saturation 0.80 \u2192 probe get_consumer_lag"
+    },
+    "state": "investigating",
+    "budget": {
+     "usd_used": 0.0,
+     "tokens_used": 0,
+     "wall_seconds": 0.071,
+     "tool_calls_max": 13,
+     "tool_calls_used": 0
+    },
+    "run_id": "7b305000-6dd3-52b0-a39c-2c188573da00",
+    "last_step": null,
+    "run_label": "remediate_consumer_lag_success",
+    "hypotheses": [
+     {
+      "name": "worker-dispatcher-lag-24-above-threshold-20",
+      "category": "consumer_saturation",
+      "confidence": 0.8,
+      "reasoning_excerpt": "The alert directly reports worker-dispatcher consumer group is 24 messages behind (threshold 20), holding its assignment and reporting, which is the classic consumer saturation signal."
+     },
+     {
+      "name": "recent-deploy-correlating-with-consumer-stall",
+      "category": "deploy_regression",
+      "confidence": 0.2,
+      "reasoning_excerpt": "A recent deploy could have introduced a regression causing the consumer to slow down or stall."
+     },
+     {
+      "name": "downstream-dependency-slowing-consumer-processing",
+      "category": "transient_dependency",
+      "confidence": 0.15,
+      "reasoning_excerpt": "An external dependency being slow could cause the consumer to back up without stopping entirely."
+     }
+    ],
+    "current_hypothesis": {
+     "name": "worker-dispatcher-lag-24-above-threshold-20",
+     "category": "consumer_saturation",
+     "confidence": 0.8
+    }
+   },
+   "tool_name": "report_agent_run",
+   "latency_ms": 7.313,
+   "scope_used": "agent_runs:write"
+  },
+  "created_at": "2026-09-21T11:39:35.703275Z"
+ },
+ {
+  "id": "b2a3e0c8-ae61-440e-bac7-861e5c3d0940",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "586042d6-f550-4d76-9f4f-a9f291419d1a",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "81981707-d3bd-4af3-9a68-8c1d0b8d495f",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 2.293,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:35.724821Z"
+ },
+ {
+  "id": "b228179d-b6a6-4a9a-8ce3-b80b2e77d68e",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "586042d6-f550-4d76-9f4f-a9f291419d1a",
+  "job_id": null,
+  "action": "agent.run_reported",
+  "resource_type": "mcp_tool",
+  "resource_id": "report_agent_run",
+  "request_id": "0a7635f9-fb6d-4187-916e-be5058a7353a",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "at": "2026-09-21T11:39:35.733799+00:00",
+    "step": {
+     "at": "2026-09-21T11:39:35.733799+00:00",
+     "seq": 2,
+     "kind": "read",
+     "tool": "get_consumer_lag",
+     "outcome": "ok",
+     "arguments": {
+      "consumer_group": "worker-dispatcher"
+     },
+     "latency_ms": 12,
+     "result_excerpt": "{\"consumer_group\":\"worker-dispatcher\",\"lag\":28,\"lag_known\":true,\"source\":\"live\",\"cache_key\":\"kafka:consumer_lag:worker-dispatcher\",\"measured_at\":\"2026-09-21T11:39:31.758362Z\",\"age_seconds\":3,\"recent_samples\":[{\"lag\":28,\"measured_at\":\"2026-09-21T11:39:31.758362Z\"},{\"lag\":24,\"measured_at\":\"2026-09-21T11:39:26.669707Z\"},{\"lag\":18,\"measured_at\":\"2026-09-21T11:39:21.572481Z\"},{\"lag\":11,\"measured_at\":\"\u2026"
+    },
+    "state": "investigating",
+    "budget": {
+     "usd_used": 0.0,
+     "tokens_used": 0,
+     "wall_seconds": 0.071,
+     "tool_calls_max": 13,
+     "tool_calls_used": 0
+    },
+    "run_id": "7b305000-6dd3-52b0-a39c-2c188573da00",
+    "last_step": {
+     "at": "2026-09-21T11:39:35.733799+00:00",
+     "kind": "read",
+     "tool": "get_consumer_lag"
+    },
+    "run_label": "remediate_consumer_lag_success",
+    "hypotheses": null,
+    "current_hypothesis": null
+   },
+   "tool_name": "report_agent_run",
+   "latency_ms": 3.704,
+   "scope_used": "agent_runs:write"
+  },
+  "created_at": "2026-09-21T11:39:35.736160Z"
+ },
+ {
+  "id": "3e5d3c88-93f7-42eb-b718-7aa6cae5f9fd",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "28dcd95b-b324-499c-8815-ef08acec676e",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 2.939,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:36.275074Z"
+ },
+ {
+  "id": "b14c5830-5987-40f2-9518-f7ca96913fb1",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "b5b74798-e4f0-4fbf-929b-a1288a647b89",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 1.649,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:37.104676Z"
+ },
+ {
+  "id": "0e31e821-5c25-4dd6-b85c-901e4ee77120",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "5798ebdc-1a19-4a1e-acd7-ebc4d947c02c",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 70.009,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:37.896673Z"
+ },
+ {
+  "id": "4fafb4c9-450d-4131-9545-d5a79dcf3bad",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "8defc529-6236-4d86-b0a0-359eaa774c9e",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 3.162,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:38.750037Z"
+ },
+ {
+  "id": "5ddd881a-6db8-4248-a1f7-47342317da5e",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "ae8f3740-7191-4343-af42-27bdd5b11d49",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 2.909,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:39.544284Z"
+ },
+ {
+  "id": "ecd032b5-9fee-46f5-a38b-520b2e934177",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "e792143f-ce0a-4d57-a57d-5a88afcb4bde",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 2.551,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:40.335117Z"
+ },
+ {
+  "id": "3547fb43-0e84-44e5-b4d3-cb9891e8078d",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "ca18e694-e47b-4e11-8bc9-ea6237c35867",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 1.864,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:41.115996Z"
+ },
+ {
+  "id": "f81c93cc-df0c-479b-ad03-721c213d0947",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "74d50974-5cf6-4f3c-95f6-7deb210d5650",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 3.079,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:41.901461Z"
+ },
+ {
+  "id": "99c53664-a56f-4d36-a2c1-174c9fec73ea",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "b39b58e2-0dfd-4393-b3ee-f7982b4ebf6d",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 2.999,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:42.698503Z"
+ },
+ {
+  "id": "5a1dca5a-2056-44bb-816a-60a14e2102ae",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "ac85fe82-f33a-463c-b53a-42dc02047110",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 2.0,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:43.484491Z"
+ },
+ {
+  "id": "15902425-c4b8-4896-b542-a84e5bc2cda2",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "586042d6-f550-4d76-9f4f-a9f291419d1a",
+  "job_id": null,
+  "action": "agent.run_reported",
+  "resource_type": "mcp_tool",
+  "resource_id": "report_agent_run",
+  "request_id": "0f0afb8c-2c06-4fef-9807-95775a0be183",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "at": "2026-09-21T11:39:43.546547+00:00",
+    "step": {
+     "at": "2026-09-21T11:39:43.546547+00:00",
+     "seq": 3,
+     "kind": "report",
+     "tool": "investigation_planner",
+     "outcome": "ok",
+     "arguments": {
+      "reason": null,
+      "ranking": [
+       {
+        "name": "worker-dispatcher-lag-28-and-climbing",
+        "category": "consumer_saturation",
+        "confidence": 0.85
+       },
+       {
+        "name": "dlq-entries-blocking-worker-dispatcher",
+        "category": "poison_message",
+        "confidence": 0.2
+       },
+       {
+        "name": "recent-deploy-degrading-worker-dispatcher",
+        "category": "deploy_regression",
+        "confidence": 0.15
+       },
+       {
+        "name": "downstream-dependency-causing-slow-processing",
+        "category": "downstream_dependency",
+        "confidence": 0.1
+       }
+      ],
+      "next_action": {
+       "kind": "probe",
+       "tool": "get_consumer_lag"
+      }
+     },
+     "latency_ms": null,
+     "result_excerpt": "top consumer_saturation 0.85 \u2192 probe get_consumer_lag"
+    },
+    "state": "investigating",
+    "budget": {
+     "usd_used": 0.0,
+     "tokens_used": 0,
+     "wall_seconds": 0.071,
+     "tool_calls_max": 13,
+     "tool_calls_used": 0
+    },
+    "run_id": "7b305000-6dd3-52b0-a39c-2c188573da00",
+    "last_step": null,
+    "run_label": "remediate_consumer_lag_success",
+    "hypotheses": [
+     {
+      "name": "worker-dispatcher-lag-28-and-climbing",
+      "category": "consumer_saturation",
+      "confidence": 0.85,
+      "reasoning_excerpt": "Consumer lag for worker-dispatcher has grown from 0 to 28 in ~30 seconds and is still climbing, well above the threshold of 20, indicating the consumer is falling behind."
+     },
+     {
+      "name": "dlq-entries-blocking-worker-dispatcher",
+      "category": "poison_message",
+      "confidence": 0.2,
+      "reasoning_excerpt": "A poison message in the DLQ could cause repeated processing failures leading to lag buildup, though no DLQ evidence has been gathered yet."
+     },
+     {
+      "name": "recent-deploy-degrading-worker-dispatcher",
+      "category": "deploy_regression",
+      "confidence": 0.15,
+      "reasoning_excerpt": "A recent deployment could have introduced a regression causing the consumer to slow down, worth checking deploy history."
+     },
+     {
+      "name": "downstream-dependency-causing-slow-processing",
+      "category": "downstream_dependency",
+      "confidence": 0.1,
+      "reasoning_excerpt": "A slow or failing downstream dependency could cause each message to take longer, creating lag buildup."
+     }
+    ],
+    "current_hypothesis": {
+     "name": "worker-dispatcher-lag-28-and-climbing",
+     "category": "consumer_saturation",
+     "confidence": 0.85
+    }
+   },
+   "tool_name": "report_agent_run",
+   "latency_ms": 5.091,
+   "scope_used": "agent_runs:write"
+  },
+  "created_at": "2026-09-21T11:39:43.551535Z"
+ },
+ {
+  "id": "6b12f201-d1c8-4928-bb0e-4dbfdd7121af",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "586042d6-f550-4d76-9f4f-a9f291419d1a",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "fc6b9934-495d-41ed-843c-2f0792e51c56",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 2.045,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:43.566806Z"
+ },
+ {
+  "id": "df2a0d28-eeb1-4117-b9bf-6b8136e02b2a",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "586042d6-f550-4d76-9f4f-a9f291419d1a",
+  "job_id": null,
+  "action": "agent.run_reported",
+  "resource_type": "mcp_tool",
+  "resource_id": "report_agent_run",
+  "request_id": "b01667f2-e910-4b35-ba74-8a46ec367e12",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "at": "2026-09-21T11:39:43.575706+00:00",
+    "step": {
+     "at": "2026-09-21T11:39:43.575706+00:00",
+     "seq": 4,
+     "kind": "read",
+     "tool": "get_consumer_lag",
+     "outcome": "ok",
+     "arguments": {
+      "consumer_group": "worker-dispatcher"
+     },
+     "latency_ms": 10,
+     "result_excerpt": "{\"consumer_group\":\"worker-dispatcher\",\"lag\":28,\"lag_known\":true,\"source\":\"live\",\"cache_key\":\"kafka:consumer_lag:worker-dispatcher\",\"measured_at\":\"2026-09-21T11:39:41.984449Z\",\"age_seconds\":1,\"recent_samples\":[{\"lag\":28,\"measured_at\":\"2026-09-21T11:39:41.984449Z\"},{\"lag\":28,\"measured_at\":\"2026-09-21T11:39:36.857214Z\"},{\"lag\":28,\"measured_at\":\"2026-09-21T11:39:31.758362Z\"},{\"lag\":24,\"measured_at\":\"\u2026"
+    },
+    "state": "investigating",
+    "budget": {
+     "usd_used": 0.0,
+     "tokens_used": 0,
+     "wall_seconds": 0.071,
+     "tool_calls_max": 13,
+     "tool_calls_used": 0
+    },
+    "run_id": "7b305000-6dd3-52b0-a39c-2c188573da00",
+    "last_step": {
+     "at": "2026-09-21T11:39:43.575706+00:00",
+     "kind": "read",
+     "tool": "get_consumer_lag"
+    },
+    "run_label": "remediate_consumer_lag_success",
+    "hypotheses": null,
+    "current_hypothesis": null
+   },
+   "tool_name": "report_agent_run",
+   "latency_ms": 3.721,
+   "scope_used": "agent_runs:write"
+  },
+  "created_at": "2026-09-21T11:39:43.579120Z"
+ },
+ {
+  "id": "49d35578-d7ad-4d5a-9385-ad018bcdc79a",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "69cc3318-1057-4b74-b757-8d46e3a61b4a",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 2.828,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:44.280807Z"
+ },
+ {
+  "id": "2bdc7046-aae8-4517-abbf-9753cbbeabf1",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "5c728e43-8f24-42cf-bdbf-0f74ba27d46e",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 2.616,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:45.162425Z"
+ },
+ {
+  "id": "2bb1e5f6-c530-4597-b99b-3973e12b36a9",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "4bb8e1ba-d94e-4590-aca9-d08bab932ffa",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 3.013,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:45.954023Z"
+ },
+ {
+  "id": "398e3b84-c8c9-4896-a59e-7e48b1b1015f",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "4ea25dbe-842e-410f-a42d-62f486ede58b",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 3.01,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:46.746059Z"
+ },
+ {
+  "id": "27be5f3c-a5e2-4a21-86ad-4f18574bed6d",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "ef6a469e-f124-45b4-bd0e-98161edcf199",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 2.889,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:47.543043Z"
+ },
+ {
+  "id": "adaa624e-3530-4ca9-9ced-9a00c32d753c",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "2cdd1755-66a3-4781-a33b-67dfa9ce438e",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 3.182,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:48.342416Z"
+ },
+ {
+  "id": "270d85d2-a21f-43ee-8430-2194ecb40695",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "50324a43-6c6e-4236-8529-986ca3a82b5d",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 2.277,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:49.136559Z"
+ },
+ {
+  "id": "a1c0b9dc-9a99-45ae-a87e-fed7f113f69d",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "a41cb747-abd7-4510-ae88-35469f2aaee2",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 2.64,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:49.917134Z"
+ },
+ {
+  "id": "3378063a-3e18-40f3-bd69-22fcb8fd440a",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "f06a5221-d99d-4ca2-9de2-65385c22fc20",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 2.61,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:50.703901Z"
+ },
+ {
+  "id": "8e850700-ea4d-4fda-9ff5-d90334a8720c",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "586042d6-f550-4d76-9f4f-a9f291419d1a",
+  "job_id": null,
+  "action": "agent.run_reported",
+  "resource_type": "mcp_tool",
+  "resource_id": "report_agent_run",
+  "request_id": "133861aa-8a71-4246-bb8d-ba598224a7b2",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "at": "2026-09-21T11:39:50.820855+00:00",
+    "step": {
+     "at": "2026-09-21T11:39:50.820855+00:00",
+     "seq": 5,
+     "kind": "report",
+     "tool": "investigation_planner",
+     "outcome": "ok",
+     "arguments": {
+      "reason": "The worker-dispatcher consumer group lag is confirmed at 28 messages (threshold 20) in two independent live readings taken 10 seconds apart, both showing the fault present and growing. The lag climbed from 0 to 28 over ~35 seconds and has now plateaued at 28 for multiple consecu\u2026",
+      "ranking": [
+       {
+        "name": "worker-dispatcher-lag-28-climbing-sustained",
+        "category": "consumer_saturation",
+        "confidence": 0.95
+       }
+      ],
+      "next_action": {
+       "kind": "remediate",
+       "tool": null
+      }
+     },
+     "latency_ms": null,
+     "result_excerpt": "top consumer_saturation 0.95 \u2192 remediate: The worker-dispatcher consumer group lag is confirmed at 28 messages (threshold 20) in two independent live readings taken 10 seconds apart, both showing the fault present and growing. The lag climbed from 0 to 28 over ~35 seconds and has now plateaued at 28 for multiple consecu\u2026"
+    },
+    "state": "investigating",
+    "budget": {
+     "usd_used": 0.0,
+     "tokens_used": 0,
+     "wall_seconds": 0.071,
+     "tool_calls_max": 13,
+     "tool_calls_used": 0
+    },
+    "run_id": "7b305000-6dd3-52b0-a39c-2c188573da00",
+    "last_step": null,
+    "run_label": "remediate_consumer_lag_success",
+    "hypotheses": [
+     {
+      "name": "worker-dispatcher-lag-28-climbing-sustained",
+      "category": "consumer_saturation",
+      "confidence": 0.95,
+      "reasoning_excerpt": "Two fresh readings of the alerted consumer group both show lag at 28 (above the 20 threshold), with the trend clearly climbing from 0 to 28 over ~35 seconds and holding flat at 28 for the last two measurement intervals, confirming the consumer is not keeping up."
+     }
+    ],
+    "current_hypothesis": {
+     "name": "worker-dispatcher-lag-28-climbing-sustained",
+     "category": "consumer_saturation",
+     "confidence": 0.95
+    }
+   },
+   "tool_name": "report_agent_run",
+   "latency_ms": 6.974,
+   "scope_used": "agent_runs:write"
+  },
+  "created_at": "2026-09-21T11:39:50.830608Z"
+ },
+ {
+  "id": "b57336b6-143a-413e-a1b8-f625d267d6c1",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "586042d6-f550-4d76-9f4f-a9f291419d1a",
+  "job_id": null,
+  "action": "agent.run_reported",
+  "resource_type": "mcp_tool",
+  "resource_id": "report_agent_run",
+  "request_id": "f0741c8d-c8e1-4eaa-8021-c99fbac7cc46",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "at": "2026-09-21T11:39:50.847634+00:00",
+    "state": "planning",
+    "budget": {
+     "usd_used": 0.146457,
+     "tokens_used": 47826,
+     "wall_seconds": 21.657,
+     "tool_calls_max": 13,
+     "tool_calls_used": 2
+    },
+    "run_id": "7b305000-6dd3-52b0-a39c-2c188573da00",
+    "last_step": {
+     "at": "2026-09-21T11:39:29.271070+00:00",
+     "kind": "read",
+     "tool": "get_consumer_lag"
+    },
+    "run_label": "remediate_consumer_lag_success",
+    "hypotheses": [
+     {
+      "name": "worker-dispatcher-lag-28-climbing-sustained",
+      "category": "consumer_saturation",
+      "confidence": 0.95,
+      "reasoning_excerpt": "Two fresh readings of the alerted consumer group both show lag at 28 (above the 20 threshold), with the trend clearly climbing from 0 to 28 over ~35 seconds and holding flat at 28 for the last two measurement intervals, confirming the consumer is not keeping up."
+     }
+    ],
+    "current_hypothesis": {
+     "name": "worker-dispatcher-lag-28-climbing-sustained",
+     "category": "consumer_saturation",
+     "confidence": 0.95
+    }
+   },
+   "tool_name": "report_agent_run",
+   "latency_ms": 4.49,
+   "scope_used": "agent_runs:write"
+  },
+  "created_at": "2026-09-21T11:39:50.851423Z"
+ },
+ {
+  "id": "ad6eb454-01d4-48b8-9c74-6e349a936e47",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "44514ced-a4d9-470d-b34b-d7835ff2be4b",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 3.388,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:51.492803Z"
+ },
+ {
+  "id": "fc6318bf-6407-4e97-9d9f-c3762a0121fc",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "38066797-91e8-4e1c-bb99-ea925ec721be",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 2.21,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:52.278196Z"
+ },
+ {
+  "id": "80b9aaa9-61f6-4628-bfc7-18afbdf2ac55",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "2f8a9619-ad0e-4bfc-9856-847bc8a0dc78",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 2.041,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:53.147436Z"
+ },
+ {
+  "id": "25b73143-536f-4cc5-9cbc-f78ba482b141",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "c441e080-54ee-40c0-88f2-aa307a92bab0",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 3.112,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:53.930550Z"
+ },
+ {
+  "id": "d2255109-0510-40dd-8b80-4a98a9c9156b",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "95e10298-ffe9-4ee7-a3d2-6aee0b6a0e09",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 3.14,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:54.720938Z"
+ },
+ {
+  "id": "78df37df-8beb-4102-a443-19780f7de5c7",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "bb1335b6-2475-4701-bcfd-135358b99763",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 2.138,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:55.502747Z"
+ },
+ {
+  "id": "ebb8f907-90f3-405f-adc4-dad07fbffa1e",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "586042d6-f550-4d76-9f4f-a9f291419d1a",
+  "job_id": null,
+  "action": "agent.run_reported",
+  "resource_type": "mcp_tool",
+  "resource_id": "report_agent_run",
+  "request_id": "c4c39627-f2a4-4297-8d0c-fd659ce2a446",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "at": "2026-09-21T11:39:56.027963+00:00",
+    "plan": {
+     "action_tool": "restart_consumer_group",
+     "action_arguments": {
+      "consumer_group": "worker-dispatcher"
+     },
+     "rationale_excerpt": null,
+     "target_hypothesis": "worker-dispatcher-lag-28-climbing-sustained"
+    },
+    "state": "remediating",
+    "budget": {
+     "usd_used": 0.223,
+     "tokens_used": 69913,
+     "wall_seconds": 26.837,
+     "tool_calls_max": 13,
+     "tool_calls_used": 2
+    },
+    "run_id": "7b305000-6dd3-52b0-a39c-2c188573da00",
+    "last_step": {
+     "at": "2026-09-21T11:39:29.271070+00:00",
+     "kind": "read",
+     "tool": "get_consumer_lag"
+    },
+    "run_label": "remediate_consumer_lag_success",
+    "hypotheses": [
+     {
+      "name": "worker-dispatcher-lag-28-climbing-sustained",
+      "category": "consumer_saturation",
+      "confidence": 0.95,
+      "reasoning_excerpt": "Two fresh readings of the alerted consumer group both show lag at 28 (above the 20 threshold), with the trend clearly climbing from 0 to 28 over ~35 seconds and holding flat at 28 for the last two measurement intervals, confirming the consumer is not keeping up."
+     }
+    ],
+    "current_hypothesis": {
+     "name": "worker-dispatcher-lag-28-climbing-sustained",
+     "category": "consumer_saturation",
+     "confidence": 0.95
+    }
+   },
+   "tool_name": "report_agent_run",
+   "latency_ms": 6.981,
+   "scope_used": "agent_runs:write"
+  },
+  "created_at": "2026-09-21T11:39:56.034255Z"
+ },
+ {
+  "id": "769f5bfd-bed2-4f36-85fc-d66bb0a4317d",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "586042d6-f550-4d76-9f4f-a9f291419d1a",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "restart_consumer_group",
+  "request_id": "813a74ab-1a2a-46f3-aa82-391b95fb7962",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher",
+    "idempotency_key": "795c9beae97ad836d39a363084693f3c"
+   },
+   "tool_name": "restart_consumer_group",
+   "latency_ms": 4.631,
+   "scope_used": "actions:execute"
+  },
+  "created_at": "2026-09-21T11:39:56.054874Z"
+ },
+ {
+  "id": "e2a8cbe5-1317-4d87-a6c7-0549ef0f89c6",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "586042d6-f550-4d76-9f4f-a9f291419d1a",
+  "job_id": null,
+  "action": "agent.run_reported",
+  "resource_type": "mcp_tool",
+  "resource_id": "report_agent_run",
+  "request_id": "d44c7cc3-1ab0-45bf-8497-ab18d733c37d",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "at": "2026-09-21T11:39:56.070705+00:00",
+    "step": {
+     "at": "2026-09-21T11:39:56.070705+00:00",
+     "seq": 6,
+     "kind": "action",
+     "tool": "restart_consumer_group",
+     "outcome": "ok",
+     "arguments": {
+      "consumer_group": "worker-dispatcher",
+      "idempotency_key": "795c9beae97ad836d39a363084693f3c"
+     },
+     "latency_ms": 18,
+     "result_excerpt": "{\"consumer_group\":\"worker-dispatcher\",\"kill_key_cleared\":true,\"latency_key_cleared\":false,\"group_recognized\":true,\"accepted\":true}"
+    },
+    "state": "remediating",
+    "budget": {
+     "usd_used": 0.223,
+     "tokens_used": 69913,
+     "wall_seconds": 26.837,
+     "tool_calls_max": 13,
+     "tool_calls_used": 2
+    },
+    "run_id": "7b305000-6dd3-52b0-a39c-2c188573da00",
+    "last_step": {
+     "at": "2026-09-21T11:39:56.070705+00:00",
+     "kind": "action",
+     "tool": "restart_consumer_group"
+    },
+    "run_label": "remediate_consumer_lag_success",
+    "hypotheses": [
+     {
+      "name": "worker-dispatcher-lag-28-climbing-sustained",
+      "category": "consumer_saturation",
+      "confidence": 0.95,
+      "reasoning_excerpt": "Two fresh readings of the alerted consumer group both show lag at 28 (above the 20 threshold), with the trend clearly climbing from 0 to 28 over ~35 seconds and holding flat at 28 for the last two measurement intervals, confirming the consumer is not keeping up."
+     }
+    ],
+    "current_hypothesis": {
+     "name": "worker-dispatcher-lag-28-climbing-sustained",
+     "category": "consumer_saturation",
+     "confidence": 0.95
+    }
+   },
+   "tool_name": "report_agent_run",
+   "latency_ms": 5.001,
+   "scope_used": "agent_runs:write"
+  },
+  "created_at": "2026-09-21T11:39:56.074257Z"
+ },
+ {
+  "id": "dfad6dc0-1b09-43bf-861b-34e3e69bf5cf",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "586042d6-f550-4d76-9f4f-a9f291419d1a",
+  "job_id": null,
+  "action": "agent.run_reported",
+  "resource_type": "mcp_tool",
+  "resource_id": "report_agent_run",
+  "request_id": "de727cdb-5c09-479e-994b-7446ab1e3101",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "at": "2026-09-21T11:39:56.089244+00:00",
+    "state": "verifying",
+    "budget": {
+     "usd_used": 0.223,
+     "tokens_used": 69913,
+     "wall_seconds": 26.898,
+     "tool_calls_max": 13,
+     "tool_calls_used": 3
+    },
+    "run_id": "7b305000-6dd3-52b0-a39c-2c188573da00",
+    "last_step": {
+     "at": "2026-09-21T11:39:56.051570+00:00",
+     "kind": "action",
+     "tool": "restart_consumer_group"
+    },
+    "run_label": "remediate_consumer_lag_success",
+    "hypotheses": [
+     {
+      "name": "worker-dispatcher-lag-28-climbing-sustained",
+      "category": "consumer_saturation",
+      "confidence": 0.95,
+      "reasoning_excerpt": "Two fresh readings of the alerted consumer group both show lag at 28 (above the 20 threshold), with the trend clearly climbing from 0 to 28 over ~35 seconds and holding flat at 28 for the last two measurement intervals, confirming the consumer is not keeping up."
+     }
+    ],
+    "current_hypothesis": {
+     "name": "worker-dispatcher-lag-28-climbing-sustained",
+     "category": "consumer_saturation",
+     "confidence": 0.95
+    }
+   },
+   "tool_name": "report_agent_run",
+   "latency_ms": 3.847,
+   "scope_used": "agent_runs:write"
+  },
+  "created_at": "2026-09-21T11:39:56.092613Z"
+ },
+ {
+  "id": "2c76cde6-76ff-4c19-bd17-e63494743364",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "586042d6-f550-4d76-9f4f-a9f291419d1a",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "db547795-540c-423c-b1b2-9f4711611013",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 1.626,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:56.106399Z"
+ },
+ {
+  "id": "ea83f07a-115f-4edb-abd0-aa35ced5a081",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "586042d6-f550-4d76-9f4f-a9f291419d1a",
+  "job_id": null,
+  "action": "agent.run_reported",
+  "resource_type": "mcp_tool",
+  "resource_id": "report_agent_run",
+  "request_id": "67de77d2-705f-4857-97a1-643ecb17b250",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "at": "2026-09-21T11:39:56.114343+00:00",
+    "step": {
+     "at": "2026-09-21T11:39:56.114343+00:00",
+     "seq": 7,
+     "kind": "read",
+     "tool": "get_consumer_lag",
+     "outcome": "ok",
+     "arguments": {
+      "consumer_group": "worker-dispatcher"
+     },
+     "latency_ms": 10,
+     "result_excerpt": "{\"consumer_group\":\"worker-dispatcher\",\"lag\":28,\"lag_known\":true,\"source\":\"live\",\"cache_key\":\"kafka:consumer_lag:worker-dispatcher\",\"measured_at\":\"2026-09-21T11:39:52.198137Z\",\"age_seconds\":3,\"recent_samples\":[{\"lag\":28,\"measured_at\":\"2026-09-21T11:39:52.198137Z\"},{\"lag\":28,\"measured_at\":\"2026-09-21T11:39:47.105351Z\"},{\"lag\":28,\"measured_at\":\"2026-09-21T11:39:41.984449Z\"},{\"lag\":28,\"measured_at\":\"\u2026"
+    },
+    "state": "verifying",
+    "budget": {
+     "usd_used": 0.223,
+     "tokens_used": 69913,
+     "wall_seconds": 26.898,
+     "tool_calls_max": 13,
+     "tool_calls_used": 3
+    },
+    "run_id": "7b305000-6dd3-52b0-a39c-2c188573da00",
+    "last_step": {
+     "at": "2026-09-21T11:39:56.114343+00:00",
+     "kind": "read",
+     "tool": "get_consumer_lag"
+    },
+    "run_label": "remediate_consumer_lag_success",
+    "hypotheses": [
+     {
+      "name": "worker-dispatcher-lag-28-climbing-sustained",
+      "category": "consumer_saturation",
+      "confidence": 0.95,
+      "reasoning_excerpt": "Two fresh readings of the alerted consumer group both show lag at 28 (above the 20 threshold), with the trend clearly climbing from 0 to 28 over ~35 seconds and holding flat at 28 for the last two measurement intervals, confirming the consumer is not keeping up."
+     }
+    ],
+    "current_hypothesis": {
+     "name": "worker-dispatcher-lag-28-climbing-sustained",
+     "category": "consumer_saturation",
+     "confidence": 0.95
+    }
+   },
+   "tool_name": "report_agent_run",
+   "latency_ms": 4.395,
+   "scope_used": "agent_runs:write"
+  },
+  "created_at": "2026-09-21T11:39:56.116334Z"
+ },
+ {
+  "id": "e756b5f7-6e0a-4642-8899-6de530ef950d",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "a44075e0-d355-4ecd-812a-81f51f5d1eb4",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 2.464,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:56.281823Z"
+ },
+ {
+  "id": "d4c58ff6-765a-4876-b55a-5757f955ad76",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "6106e21e-8819-4f77-9ac1-8f42507b1578",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 2.446,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:57.109923Z"
+ },
+ {
+  "id": "75c31d47-4a3e-46f7-ac7a-458d3afc1351",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "586042d6-f550-4d76-9f4f-a9f291419d1a",
+  "job_id": null,
+  "action": "agent.run_reported",
+  "resource_type": "mcp_tool",
+  "resource_id": "report_agent_run",
+  "request_id": "a462d37d-8fed-4a82-9820-5749aef92728",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "at": "2026-09-21T11:39:57.880703+00:00",
+    "step": {
+     "at": "2026-09-21T11:39:57.880703+00:00",
+     "seq": 8,
+     "kind": "report",
+     "tool": "verify_judge",
+     "outcome": "ok",
+     "arguments": {
+      "reason": "The verify probe shows lag at 28 in the most recent five samples (all measured at 11:39:31\u201311:39:52), which remains above the threshold of 20; the historical decline in recent_samples reflects pre-remediation recovery, not post-remediation effect, since the lag has plateaued at \u2026",
+      "ranking": [
+       {
+        "name": "worker-dispatcher-lag-28-climbing-sustained",
+        "category": "consumer_saturation",
+        "confidence": 0.95
+       }
+      ],
+      "next_action": null
+     },
+     "latency_ms": null,
+     "result_excerpt": "top consumer_saturation 0.95 \u2192 verify 1/6 not_verified: The verify probe shows lag at 28 in the most recent five samples (all measured at 11:39:31\u201311:39:52), which remains above the threshold of 20; the historical decline in recent_samples reflects pre-remediation recovery, not post-remediation effect, since the lag has plateaued at \u2026"
+    },
+    "state": "verifying",
+    "budget": {
+     "usd_used": 0.223,
+     "tokens_used": 69913,
+     "wall_seconds": 26.898,
+     "tool_calls_max": 13,
+     "tool_calls_used": 3
+    },
+    "run_id": "7b305000-6dd3-52b0-a39c-2c188573da00",
+    "last_step": {
+     "at": "2026-09-21T11:39:56.051570+00:00",
+     "kind": "action",
+     "tool": "restart_consumer_group"
+    },
+    "run_label": "remediate_consumer_lag_success",
+    "hypotheses": [
+     {
+      "name": "worker-dispatcher-lag-28-climbing-sustained",
+      "category": "consumer_saturation",
+      "confidence": 0.95,
+      "reasoning_excerpt": "Two fresh readings of the alerted consumer group both show lag at 28 (above the 20 threshold), with the trend clearly climbing from 0 to 28 over ~35 seconds and holding flat at 28 for the last two measurement intervals, confirming the consumer is not keeping up."
+     }
+    ],
+    "current_hypothesis": {
+     "name": "worker-dispatcher-lag-28-climbing-sustained",
+     "category": "consumer_saturation",
+     "confidence": 0.95
+    }
+   },
+   "tool_name": "report_agent_run",
+   "latency_ms": 3.423,
+   "scope_used": "agent_runs:write"
+  },
+  "created_at": "2026-09-21T11:39:57.883065Z"
+ },
+ {
+  "id": "bc1ae18c-00cb-4ce9-b3a0-9765d7ac92bf",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "cb18ebfc-3676-4e30-9e89-368cb8f0747d",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 1.381,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:57.937074Z"
+ },
+ {
+  "id": "d583bae9-c8f9-44a1-8047-f2296c8b05d0",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "ce72e1f5-d611-426c-a19a-9de47c87976b",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 1.547,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:58.711029Z"
+ },
+ {
+  "id": "d223f0e7-6852-45f6-91af-f33a333a7ef5",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "5edfa1ba-765f-4820-9706-c4bf64fda362",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 1.526,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:39:59.481771Z"
+ },
+ {
+  "id": "a2bb8622-9ac0-46b1-ba7a-67ee87f2a39e",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "ccac6185-dbad-4aeb-b934-f3302fcef310",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 1.923,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:40:00.287818Z"
+ },
+ {
+  "id": "6a0ee774-21e3-4db9-9342-b19f9229bac6",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "1fd2cf2f-3324-47d0-a3a3-6de6354ab874",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 1.665,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:40:01.113495Z"
+ },
+ {
+  "id": "afd27212-a820-4008-a424-3b233175cf5f",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "dec9b32f-2cde-4b99-8012-ba00fe85c206",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 2.032,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:40:01.922413Z"
+ },
+ {
+  "id": "94f02506-db9c-47f8-9c2c-e60ae36a9022",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": null,
+  "job_id": null,
+  "action": "alert.resolved",
+  "resource_type": "alert",
+  "resource_id": "323ffb14-9c12-487d-9415-c42b6bb094ad",
+  "request_id": null,
+  "ip_address": null,
+  "extra_data": {
+   "source": "kafka:consumer_lag",
+   "subject": "worker-dispatcher",
+   "summary": "worker-dispatcher: lag measured at 0, below the threshold of 20",
+   "alert_id": "323ffb14-9c12-487d-9415-c42b6bb094ad",
+   "severity": "critical",
+   "dedup_key": "rule:consumer_stalled:worker-dispatcher:4",
+   "fingerprint": "consumer_stalled",
+   "resolved_reason": "lag measured at 0, below the threshold of 20"
+  },
+  "created_at": "2026-09-21T11:40:02.350775Z"
+ },
+ {
+  "id": "20e1d527-4b9a-4483-a398-21a1979fc809",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "f9dbf80c-1337-4edc-be87-b3ea3b245edc",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 1.569,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:40:02.733671Z"
+ },
+ {
+  "id": "0a88bfe0-49f1-4365-9293-2989e369d017",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "1acd1ee0-7dbd-4a71-932b-2fc429e7953a",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 1.702,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:40:03.606206Z"
+ },
+ {
+  "id": "e76285e5-60ad-45dc-8b9c-4c25717c0cb2",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "45361797-cf55-4581-aade-97dcc3021f02",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 1.822,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:40:04.423526Z"
+ },
+ {
+  "id": "81f6d06e-40bf-4187-b2f7-91f52c527778",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "c2f77a45-4786-410d-98f4-55f965b78350",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 1.353,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:40:05.211284Z"
+ },
+ {
+  "id": "9e4d8037-d498-41d6-9fea-4dd1e6b603d0",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "d47ffd04-400c-4044-a56e-bc580b60bb43",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 1.365,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:40:06.001716Z"
+ },
+ {
+  "id": "c88b6afd-be15-4d7c-9351-64fbe33941a2",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "d017b3d4-4064-4657-942a-3365d71318e6",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 1.914,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:40:06.796761Z"
+ },
+ {
+  "id": "2ba26934-e533-4a51-806a-9640d3201af2",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "d2c1dc94-b1fa-4401-ab4d-7f2e1305d14b",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 1.941,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:40:07.595211Z"
+ },
+ {
+  "id": "ea2a26b7-45fa-4c3c-b215-4a6c719dba8f",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "016fa66f-425b-455a-b879-8dca3c2bb3d2",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 1.584,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:40:08.396630Z"
+ },
+ {
+  "id": "09f025d8-df93-4e0c-9474-e75ab212e6bb",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "7ffb3d46-cff8-4c03-b069-7bb311ccb35c",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 1.525,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:40:09.215887Z"
+ },
+ {
+  "id": "2df1c51a-143e-4e00-9b0c-47f6fc5bbc3a",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "ca4004d5-f8db-4b89-90e8-b5eef4a75e9d",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 2.178,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:40:10.023988Z"
+ },
+ {
+  "id": "fc17890d-4933-4980-a1dc-8d338e01824f",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "7c1119f5-7de6-4768-97fb-d7192cd53a5d",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 2.248,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:40:10.814932Z"
+ },
+ {
+  "id": "bc91c4ae-417b-4eb7-9809-352ac9c6433e",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "008ab6be-2fec-4196-90bb-34542587e0f1",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 1.396,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:40:11.597654Z"
+ },
+ {
+  "id": "700a4ddf-39f6-4636-959b-4fc7430052db",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "5e508888-b8f2-414f-84bf-b57352edece2",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 2.106,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:40:12.406014Z"
+ },
+ {
+  "id": "4efe7448-2047-42ce-bfb7-aa00f8520b9f",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "49d9f104-aa89-438f-b9b8-3f224c4218c2",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 1.539,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:40:13.195667Z"
+ },
+ {
+  "id": "95aab49b-2cda-466c-9e17-afcc8706c7e9",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "562156ba-732c-4557-83cd-c66495c215d4",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 1.393,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:40:14.012424Z"
+ },
+ {
+  "id": "2f9ac28e-184a-46fc-bb3f-04158fc4d575",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "a041c27d-21c3-4ad5-b5fe-6f6a00efa5b7",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 1.301,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:40:14.796530Z"
+ },
+ {
+  "id": "f74761da-7781-447c-a68f-b238b625fb3a",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "01a215c6-9336-457c-be9e-51d65e0e7f2d",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 1.956,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:40:15.598467Z"
+ },
+ {
+  "id": "b1c5a23a-30a4-4042-aeb0-d9a56738aace",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "796b45b7-e112-46bb-bd6e-b23d9d957b92",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 1.744,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:40:16.407462Z"
+ },
+ {
+  "id": "cdf225af-636d-45bc-b867-8f23e3fc7e16",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "89bd3c78-2461-4ddb-8c49-300d1b9f8369",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 1.838,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:40:17.193804Z"
+ },
+ {
+  "id": "45f408ec-f15e-49c5-b5f9-968f49a6f32f",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "586042d6-f550-4d76-9f4f-a9f291419d1a",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "26da5b70-5310-44cc-914b-dd26bc0b223b",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 4.749,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:40:17.911944Z"
+ },
+ {
+  "id": "dcee7a92-c62a-4a43-979c-bef46a77ee1a",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "586042d6-f550-4d76-9f4f-a9f291419d1a",
+  "job_id": null,
+  "action": "agent.run_reported",
+  "resource_type": "mcp_tool",
+  "resource_id": "report_agent_run",
+  "request_id": "386d6ea0-46c7-4471-b7d1-d6bb9ac78be4",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "at": "2026-09-21T11:40:17.932698+00:00",
+    "step": {
+     "at": "2026-09-21T11:40:17.932698+00:00",
+     "seq": 9,
+     "kind": "read",
+     "tool": "get_consumer_lag",
+     "outcome": "ok",
+     "arguments": {
+      "consumer_group": "worker-dispatcher"
+     },
+     "latency_ms": 34,
+     "result_excerpt": "{\"consumer_group\":\"worker-dispatcher\",\"lag\":0,\"lag_known\":true,\"source\":\"live\",\"cache_key\":\"kafka:consumer_lag:worker-dispatcher\",\"measured_at\":\"2026-09-21T11:40:12.506751Z\",\"age_seconds\":5,\"recent_samples\":[{\"lag\":0,\"measured_at\":\"2026-09-21T11:40:12.506751Z\"},{\"lag\":0,\"measured_at\":\"2026-09-21T11:40:07.407665Z\"},{\"lag\":0,\"measured_at\":\"2026-09-21T11:40:02.340676Z\"},{\"lag\":28,\"measured_at\":\"2026\u2026"
+    },
+    "state": "verifying",
+    "budget": {
+     "usd_used": 0.223,
+     "tokens_used": 69913,
+     "wall_seconds": 26.898,
+     "tool_calls_max": 13,
+     "tool_calls_used": 3
+    },
+    "run_id": "7b305000-6dd3-52b0-a39c-2c188573da00",
+    "last_step": {
+     "at": "2026-09-21T11:40:17.932698+00:00",
+     "kind": "read",
+     "tool": "get_consumer_lag"
+    },
+    "run_label": "remediate_consumer_lag_success",
+    "hypotheses": [
+     {
+      "name": "worker-dispatcher-lag-28-climbing-sustained",
+      "category": "consumer_saturation",
+      "confidence": 0.95,
+      "reasoning_excerpt": "Two fresh readings of the alerted consumer group both show lag at 28 (above the 20 threshold), with the trend clearly climbing from 0 to 28 over ~35 seconds and holding flat at 28 for the last two measurement intervals, confirming the consumer is not keeping up."
+     }
+    ],
+    "current_hypothesis": {
+     "name": "worker-dispatcher-lag-28-climbing-sustained",
+     "category": "consumer_saturation",
+     "confidence": 0.95
+    }
+   },
+   "tool_name": "report_agent_run",
+   "latency_ms": 5.066,
+   "scope_used": "agent_runs:write"
+  },
+  "created_at": "2026-09-21T11:40:17.937049Z"
+ },
+ {
+  "id": "4b5892a9-f7cc-41e9-bb08-f9f55b091e00",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "8ef741c9-2d43-4ea7-a4b5-2d38d0a10ae3",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 1.557,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:40:17.978240Z"
+ },
+ {
+  "id": "f9b5c31b-21ad-4c58-a8cd-b972affb1e3a",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "6b8730b1-d052-4c3b-92dc-5abebc4a67ec",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 2.142,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:40:18.784998Z"
+ },
+ {
+  "id": "1596b548-a996-4179-9ce0-fa7f293ef3e5",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "586042d6-f550-4d76-9f4f-a9f291419d1a",
+  "job_id": null,
+  "action": "agent.run_reported",
+  "resource_type": "mcp_tool",
+  "resource_id": "report_agent_run",
+  "request_id": "875d1a6f-726e-4c3f-ac2e-3643f84d6769",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "at": "2026-09-21T11:40:19.326531+00:00",
+    "step": {
+     "at": "2026-09-21T11:40:19.326531+00:00",
+     "seq": 10,
+     "kind": "report",
+     "tool": "verify_judge",
+     "outcome": "ok",
+     "arguments": {
+      "reason": "Consumer lag dropped from sustained level of 28 to current 0, with recent_samples showing a clear declining trend (28\u219224\u219218\u219211\u21925\u21920), confirming the restart successfully drained the backlog below the threshold of 20.",
+      "ranking": [
+       {
+        "name": "worker-dispatcher-lag-28-climbing-sustained",
+        "category": "consumer_saturation",
+        "confidence": 0.95
+       }
+      ],
+      "next_action": null
+     },
+     "latency_ms": null,
+     "result_excerpt": "top consumer_saturation 0.95 \u2192 verify 2/6 verified: Consumer lag dropped from sustained level of 28 to current 0, with recent_samples showing a clear declining trend (28\u219224\u219218\u219211\u21925\u21920), confirming the restart successfully drained the backlog below the threshold of 20."
+    },
+    "state": "verifying",
+    "budget": {
+     "usd_used": 0.223,
+     "tokens_used": 69913,
+     "wall_seconds": 26.898,
+     "tool_calls_max": 13,
+     "tool_calls_used": 3
+    },
+    "run_id": "7b305000-6dd3-52b0-a39c-2c188573da00",
+    "last_step": {
+     "at": "2026-09-21T11:39:56.051570+00:00",
+     "kind": "action",
+     "tool": "restart_consumer_group"
+    },
+    "run_label": "remediate_consumer_lag_success",
+    "hypotheses": [
+     {
+      "name": "worker-dispatcher-lag-28-climbing-sustained",
+      "category": "consumer_saturation",
+      "confidence": 0.95,
+      "reasoning_excerpt": "Two fresh readings of the alerted consumer group both show lag at 28 (above the 20 threshold), with the trend clearly climbing from 0 to 28 over ~35 seconds and holding flat at 28 for the last two measurement intervals, confirming the consumer is not keeping up."
+     }
+    ],
+    "current_hypothesis": {
+     "name": "worker-dispatcher-lag-28-climbing-sustained",
+     "category": "consumer_saturation",
+     "confidence": 0.95
+    }
+   },
+   "tool_name": "report_agent_run",
+   "latency_ms": 3.096,
+   "scope_used": "agent_runs:write"
+  },
+  "created_at": "2026-09-21T11:40:19.328531Z"
+ },
+ {
+  "id": "fec2bb75-e049-49fe-a03c-662f4587093d",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "586042d6-f550-4d76-9f4f-a9f291419d1a",
+  "job_id": null,
+  "action": "agent.run_reported",
+  "resource_type": "mcp_tool",
+  "resource_id": "report_agent_run",
+  "request_id": "0efe6e0e-25c0-41e4-9d06-0b5676c849eb",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "at": "2026-09-21T11:39:56.103553+00:00",
+    "state": "verifying",
+    "budget": {
+     "usd_used": 0.227741,
+     "tokens_used": 73738,
+     "wall_seconds": 50.146,
+     "tool_calls_max": 13,
+     "tool_calls_used": 5
+    },
+    "run_id": "7b305000-6dd3-52b0-a39c-2c188573da00",
+    "last_step": {
+     "at": "2026-09-21T11:40:17.896969+00:00",
+     "kind": "read",
+     "tool": "get_consumer_lag"
+    },
+    "run_label": "remediate_consumer_lag_success",
+    "hypotheses": [
+     {
+      "name": "worker-dispatcher-lag-28-climbing-sustained",
+      "category": "consumer_saturation",
+      "confidence": 0.95,
+      "reasoning_excerpt": "Two fresh readings of the alerted consumer group both show lag at 28 (above the 20 threshold), with the trend clearly climbing from 0 to 28 over ~35 seconds and holding flat at 28 for the last two measurement intervals, confirming the consumer is not keeping up."
+     }
+    ],
+    "verification": {
+     "of": 6,
+     "attempt": 1,
+     "verdict": "not_verified",
+     "reasoning_excerpt": "The verify probe shows lag at 28 in the most recent five samples (all measured at 11:39:31\u201311:39:52), which remains above the threshold of 20; the historical decline in recent_samples reflects pre-remediation recovery, not post-remediation effect, since the lag has plateaued at \u2026"
+    },
+    "current_hypothesis": {
+     "name": "worker-dispatcher-lag-28-climbing-sustained",
+     "category": "consumer_saturation",
+     "confidence": 0.95
+    }
+   },
+   "tool_name": "report_agent_run",
+   "latency_ms": 3.503,
+   "scope_used": "agent_runs:write"
+  },
+  "created_at": "2026-09-21T11:40:19.337925Z"
+ },
+ {
+  "id": "b29d4ef5-4f14-4f44-883c-955d3d802075",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "586042d6-f550-4d76-9f4f-a9f291419d1a",
+  "job_id": null,
+  "action": "agent.run_reported",
+  "resource_type": "mcp_tool",
+  "resource_id": "report_agent_run",
+  "request_id": "ac540e0f-7fce-42dd-a085-5cf18d1eca03",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "at": "2026-09-21T11:40:19.336715+00:00",
+    "state": "resolved",
+    "budget": {
+     "usd_used": 0.227741,
+     "tokens_used": 73738,
+     "wall_seconds": 50.146,
+     "tool_calls_max": 13,
+     "tool_calls_used": 5
+    },
+    "run_id": "7b305000-6dd3-52b0-a39c-2c188573da00",
+    "last_step": {
+     "at": "2026-09-21T11:40:17.896969+00:00",
+     "kind": "read",
+     "tool": "get_consumer_lag"
+    },
+    "run_label": "remediate_consumer_lag_success",
+    "hypotheses": [
+     {
+      "name": "worker-dispatcher-lag-28-climbing-sustained",
+      "category": "consumer_saturation",
+      "confidence": 0.95,
+      "reasoning_excerpt": "Two fresh readings of the alerted consumer group both show lag at 28 (above the 20 threshold), with the trend clearly climbing from 0 to 28 over ~35 seconds and holding flat at 28 for the last two measurement intervals, confirming the consumer is not keeping up."
+     }
+    ],
+    "verification": {
+     "of": 6,
+     "attempt": 2,
+     "verdict": "verified",
+     "reasoning_excerpt": "Consumer lag dropped from sustained level of 28 to current 0, with recent_samples showing a clear declining trend (28\u219224\u219218\u219211\u21925\u21920), confirming the restart successfully drained the backlog below the threshold of 20."
+    },
+    "current_hypothesis": {
+     "name": "worker-dispatcher-lag-28-climbing-sustained",
+     "category": "consumer_saturation",
+     "confidence": 0.95
+    }
+   },
+   "tool_name": "report_agent_run",
+   "latency_ms": 3.338,
+   "scope_used": "agent_runs:write"
+  },
+  "created_at": "2026-09-21T11:40:19.346799Z"
+ },
+ {
+  "id": "4feee016-13c7-40a5-ae8c-6ec11017c671",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "ece756ee-86b6-4fc4-9611-7101323d066a",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 1.58,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:40:19.569715Z"
+ },
+ {
+  "id": "44d0acbb-1a1d-471d-9fa4-9c1dc7a3096c",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "428dafe2-c2f0-4da9-ba5a-2f3d2ae54cc1",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 1.368,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:40:20.359865Z"
+ },
+ {
+  "id": "074efd27-3e26-42b6-8c43-3ebac6d95e1c",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "9f00dcd8-d032-40ae-9c26-2f4caf572f0e",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 1.595,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:40:21.142533Z"
+ },
+ {
+  "id": "92ccf736-0f12-45cc-a960-e8c88d3410eb",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "d77dd519-abcb-4646-a3b5-71de368d2ad5",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 1.843,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:40:21.943990Z"
+ },
+ {
+  "id": "8aa91581-36aa-44be-9874-421b22f89212",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "857b81a3-7dc3-4523-8fd5-250df01488e5",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 1.5,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:40:22.737831Z"
+ },
+ {
+  "id": "ae7ef27b-345e-4548-b217-cc0e38a6c69b",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "212f54a2-3724-4624-876a-0083b16aac07",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 1.779,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:40:23.528306Z"
+ },
+ {
+  "id": "faf880a9-26ff-42db-90db-cf9cb00a6254",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "586042d6-f550-4d76-9f4f-a9f291419d1a",
+  "job_id": null,
+  "action": "agent.run_reported",
+  "resource_type": "mcp_tool",
+  "resource_id": "report_agent_briefing",
+  "request_id": "90b07f6c-c698-4944-96de-5ee82a07232e",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "prose": "Findings: A restart_consumer_group action was executed against worker-dispatcher (kill_key_cleared=true, latency_key_cleared=false), and subsequent polling confirmed lag dropped from 28 to 0 by 11:40:12Z; no remaining causes were listed for this run.\n\nRecommendation: Confirm that the lag reading has stayed at 0 since 11:40:12Z and that the latency key (which was not cleared by the restart) is not masking a recurring stall before closing the incident.",
+    "run_id": "7b305000-6dd3-52b0-a39c-2c188573da00",
+    "briefing": {
+     "findings": "A restart_consumer_group action was executed against worker-dispatcher (kill_key_cleared=true, latency_key_cleared=false), and subsequent polling confirmed lag dropped from 28 to 0 by 11:40:12Z; no remaining causes were listed for this run.",
+     "incidents": {
+      "primary": {
+       "name": "worker-dispatcher-lag-28-climbing-sustained",
+       "category": "consumer_saturation",
+       "addressed": true,
+       "confidence": 0.95
+      },
+      "secondary": [],
+      "unresolved_extra": []
+     },
+     "attribution": null,
+     "budget_used": {
+      "usd": "0.227741",
+      "tokens": 73738,
+      "tool_calls": 5,
+      "wall_seconds": 50.145736
+     },
+     "final_state": "resolved",
+     "incident_id": "a92b3fee-934c-4d0f-a936-a61a6a354723",
+     "alert_summary": "source=kafka:consumer_lag severity=critical fingerprint=consumer_stalled group=worker-dispatcher",
+     "recommendation": "Confirm that the lag reading has stayed at 0 since 11:40:12Z and that the latency key (which was not cleared by the restart) is not masking a recurring stall before closing the incident.",
+     "attempted_action": null,
+     "escalation_reason": "",
+     "investigation_trail": [
+      {
+       "tool": "get_consumer_lag",
+       "summary": "{\"consumer_group\":\"worker-dispatcher\",\"lag\":28,\"lag_known\":true,\"source\":\"live\",\"cache_key\":\"kafka:consumer_lag:worker-dispatcher\",\"measured_at\":\"2026-09-21T11:39:31.758362Z\",\"age_seconds\":3,\"recent_samples\":[{\"lag\":28,\"measured_at\":\"2026-09-21T11:39:31.758362Z\"},{\"lag\":24,\"measured_at\":\"2026-09-21T11:39:26.669707Z\"},{\"lag\":18,\"measured_at\":\"2026-09-21T11:39:21.572481Z\"},{\"lag\":11,\"measured_at\":\"2026-09-21T11:39:16.456528Z\"},{\"lag\":5,\"measured_at\":\"2026-09-21T11:39:11.383019Z\"},{\"lag\":0,\"measured_at\":\"2026-09-21T11:39:06.087854Z\"},{\"lag\":0,\"measured_at\":\"2026-09-21T11:39:00.902433Z\"},{\"lag\":0,\"measured_at\":\"2026-09-21T11:38:55.842765Z\"},{\"lag\":0,\"measured_at\":\"2026-09-21T11:38:50.708993Z\"},{\"lag\":0,\"measured_at\":\"2026-09-21T11:38:45.526894Z\"},{\"lag\":0,\"measured_at\":\"2026-09-21T11:38:40.348089Z\"},{\"lag\":0,\"measured_at\":\"2026-09-21T11:38:35.167156Z\"},{\"lag\":0,\"measured_at\":\"2026-09-21T11:38:30.019076Z\"},{\"lag\":0,\"measured_at\":\"2026-09-21T11:38:24.867755Z\"},{\"lag\":0,\"measured_at\":\"2026-09-21T11:38:19.678951Z\"}]}",
+       "arguments": {
+        "consumer_group": "worker-dispatcher"
+       }
+      },
+      {
+       "tool": "get_consumer_lag",
+       "summary": "{\"consumer_group\":\"worker-dispatcher\",\"lag\":28,\"lag_known\":true,\"source\":\"live\",\"cache_key\":\"kafka:consumer_lag:worker-dispatcher\",\"measured_at\":\"2026-09-21T11:39:41.984449Z\",\"age_seconds\":1,\"recent_samples\":[{\"lag\":28,\"measured_at\":\"2026-09-21T11:39:41.984449Z\"},{\"lag\":28,\"measured_at\":\"2026-09-21T11:39:36.857214Z\"},{\"lag\":28,\"measured_at\":\"2026-09-21T11:39:31.758362Z\"},{\"lag\":24,\"measured_at\":\"2026-09-21T11:39:26.669707Z\"},{\"lag\":18,\"measured_at\":\"2026-09-21T11:39:21.572481Z\"},{\"lag\":11,\"measured_at\":\"2026-09-21T11:39:16.456528Z\"},{\"lag\":5,\"measured_at\":\"2026-09-21T11:39:11.383019Z\"},{\"lag\":0,\"measured_at\":\"2026-09-21T11:39:06.087854Z\"},{\"lag\":0,\"measured_at\":\"2026-09-21T11:39:00.902433Z\"},{\"lag\":0,\"measured_at\":\"2026-09-21T11:38:55.842765Z\"},{\"lag\":0,\"measured_at\":\"2026-09-21T11:38:50.708993Z\"},{\"lag\":0,\"measured_at\":\"2026-09-21T11:38:45.526894Z\"},{\"lag\":0,\"measured_at\":\"2026-09-21T11:38:40.348089Z\"},{\"lag\":0,\"measured_at\":\"2026-09-21T11:38:35.167156Z\"},{\"lag\":0,\"measured_at\":\"2026-09-21T11:38:30.019076Z\"}]}",
+       "arguments": {
+        "consumer_group": "worker-dispatcher"
+       }
+      },
+      {
+       "tool": "restart_consumer_group",
+       "summary": "{\"consumer_group\":\"worker-dispatcher\",\"kill_key_cleared\":true,\"latency_key_cleared\":false,\"group_recognized\":true,\"accepted\":true}",
+       "arguments": {
+        "consumer_group": "worker-dispatcher",
+        "idempotency_key": "795c9beae97ad836d39a363084693f3c"
+       }
+      },
+      {
+       "tool": "get_consumer_lag",
+       "summary": "{\"consumer_group\":\"worker-dispatcher\",\"lag\":28,\"lag_known\":true,\"source\":\"live\",\"cache_key\":\"kafka:consumer_lag:worker-dispatcher\",\"measured_at\":\"2026-09-21T11:39:52.198137Z\",\"age_seconds\":3,\"recent_samples\":[{\"lag\":28,\"measured_at\":\"2026-09-21T11:39:52.198137Z\"},{\"lag\":28,\"measured_at\":\"2026-09-21T11:39:47.105351Z\"},{\"lag\":28,\"measured_at\":\"2026-09-21T11:39:41.984449Z\"},{\"lag\":28,\"measured_at\":\"2026-09-21T11:39:36.857214Z\"},{\"lag\":28,\"measured_at\":\"2026-09-21T11:39:31.758362Z\"},{\"lag\":24,\"measured_at\":\"2026-09-21T11:39:26.669707Z\"},{\"lag\":18,\"measured_at\":\"2026-09-21T11:39:21.572481Z\"},{\"lag\":11,\"measured_at\":\"2026-09-21T11:39:16.456528Z\"},{\"lag\":5,\"measured_at\":\"2026-09-21T11:39:11.383019Z\"},{\"lag\":0,\"measured_at\":\"2026-09-21T11:39:06.087854Z\"},{\"lag\":0,\"measured_at\":\"2026-09-21T11:39:00.902433Z\"},{\"lag\":0,\"measured_at\":\"2026-09-21T11:38:55.842765Z\"},{\"lag\":0,\"measured_at\":\"2026-09-21T11:38:50.708993Z\"},{\"lag\":0,\"measured_at\":\"2026-09-21T11:38:45.526894Z\"},{\"lag\":0,\"measured_at\":\"2026-09-21T11:38:40.348089Z\"}]}",
+       "arguments": {
+        "of": 6,
+        "attempt": 1,
+        "consumer_group": "worker-dispatcher"
+       }
+      },
+      {
+       "tool": "get_consumer_lag",
+       "summary": "{\"consumer_group\":\"worker-dispatcher\",\"lag\":0,\"lag_known\":true,\"source\":\"live\",\"cache_key\":\"kafka:consumer_lag:worker-dispatcher\",\"measured_at\":\"2026-09-21T11:40:12.506751Z\",\"age_seconds\":5,\"recent_samples\":[{\"lag\":0,\"measured_at\":\"2026-09-21T11:40:12.506751Z\"},{\"lag\":0,\"measured_at\":\"2026-09-21T11:40:07.407665Z\"},{\"lag\":0,\"measured_at\":\"2026-09-21T11:40:02.340676Z\"},{\"lag\":28,\"measured_at\":\"2026-09-21T11:39:57.280230Z\"},{\"lag\":28,\"measured_at\":\"2026-09-21T11:39:52.198137Z\"},{\"lag\":28,\"measured_at\":\"2026-09-21T11:39:47.105351Z\"},{\"lag\":28,\"measured_at\":\"2026-09-21T11:39:41.984449Z\"},{\"lag\":28,\"measured_at\":\"2026-09-21T11:39:36.857214Z\"},{\"lag\":28,\"measured_at\":\"2026-09-21T11:39:31.758362Z\"},{\"lag\":24,\"measured_at\":\"2026-09-21T11:39:26.669707Z\"},{\"lag\":18,\"measured_at\":\"2026-09-21T11:39:21.572481Z\"},{\"lag\":11,\"measured_at\":\"2026-09-21T11:39:16.456528Z\"},{\"lag\":5,\"measured_at\":\"2026-09-21T11:39:11.383019Z\"},{\"lag\":0,\"measured_at\":\"2026-09-21T11:39:06.087854Z\"},{\"lag\":0,\"measured_at\":\"2026-09-21T11:39:00.902433Z\"}]}",
+       "arguments": {
+        "of": 6,
+        "attempt": 2,
+        "consumer_group": "worker-dispatcher"
+       }
+      }
+     ]
+    }
+   },
+   "tool_name": "report_agent_briefing",
+   "latency_ms": 3.279,
+   "scope_used": "agent_runs:write"
+  },
+  "created_at": "2026-09-21T11:40:23.844915Z"
+ },
+ {
+  "id": "2a6779f5-85e3-4e56-b597-5214832d90db",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "d6e928d3-58aa-4be7-86e5-c79b7caa2d29",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 2.161,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:40:24.318499Z"
+ },
+ {
+  "id": "b95cee1e-a2e4-4cbc-807d-f6df7b5cb95b",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "a68a6a73-1dc1-4fc4-a8b5-507988410c55",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 2.394,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:40:25.190863Z"
+ },
+ {
+  "id": "c5c8658a-a3fc-41dc-9cdd-e7122b388c8d",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "8a6134fd-81d8-4e6c-9b63-7c44ed6bb3d1",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 3.839,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:40:25.986926Z"
+ },
+ {
+  "id": "d32f8868-9dca-4d74-b021-57c0188d598b",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "b6395be3-1ec5-4f9e-b71b-589cfdccd7ee",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 2.11,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:40:26.785343Z"
+ },
+ {
+  "id": "b02a7281-b1f1-45f5-a9e8-ca49a47dccfc",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "6f658642-54e8-4e16-a5c5-8769c7a5f412",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 2.562,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:40:27.564860Z"
+ },
+ {
+  "id": "e0fc3edf-6e60-4802-a0c4-0df98c449701",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "c5701ef4-76a8-46eb-a74c-dd198e943c7d",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 1.88,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:40:28.347501Z"
+ },
+ {
+  "id": "194b291e-413e-4cf5-b143-692305b5ad4e",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "c50a0f1b-07fe-4dc8-85df-0f8e24206b52",
+  "job_id": null,
+  "action": "lab.world_reset",
+  "resource_type": "world",
+  "resource_id": null,
+  "request_id": null,
+  "ip_address": null,
+  "extra_data": {
+   "dlq_reset": 0,
+   "dlq_swept": 0,
+   "breakers_reset": 1,
+   "timers_cleared": 0,
+   "hot_set_reseeded": 0,
+   "agent_runs_closed": 0,
+   "job_cache_cleared": 0,
+   "chaos_keys_cleared": 0,
+   "dag_pauses_cleared": 0,
+   "empty_dlq_baseline": false,
+   "idempotency_purged": 1,
+   "seeded_dlq_deleted": 0,
+   "lag_samples_cleared": 0,
+   "chaos_owners_deleted": 0,
+   "rule_alerts_resolved": 0,
+   "chaos_alerts_resolved": 0,
+   "timestamps_rebaselined": 18,
+   "organic_alerts_resolved": 0,
+   "read_model_keys_rebuilt": 9
+  },
+  "created_at": "2026-09-21T11:40:30.234236Z"
+ },
+ {
+  "id": "b93b1455-4bfa-432e-9127-26aa4f6a3eaa",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "agent.tool_invoked",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "ca91a734-589e-496d-bd9e-f2dd96e41efa",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 4.061,
+   "scope_used": "telemetry:read"
+  },
+  "created_at": "2026-09-21T11:40:30.810850Z"
+ },
+ {
+  "id": "7a9b26d3-5c29-44d3-a1c3-3f72a71d2ef6",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "lab.probe",
+  "resource_type": "mcp_tool",
+  "resource_id": "mark_dlq_permanent",
+  "request_id": "7bbe3f8c-0ee6-4b2d-abc6-396e5b2238a0",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "unauthorized",
+   "arguments": {
+    "job_id": "00000000-0000-0000-0000-000000000000-INVALID",
+    "reason": "",
+    "idempotency_key": "x"
+   },
+   "tool_name": "mark_dlq_permanent",
+   "latency_ms": 4.127,
+   "scope_used": "actions:execute",
+   "error_message": "missing required scope",
+   "lab_probe_reason": "principal guard: proves this token cannot execute a Tier-1 action",
+   "lab_probe_principal": "incident-commander-smoke"
+  },
+  "created_at": "2026-09-21T11:40:30.989889Z"
+ },
+ {
+  "id": "2c4c06c5-d625-43a1-a47d-47b495dfabd1",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "lab.probe",
+  "resource_type": "mcp_tool",
+  "resource_id": "list_dlq_messages",
+  "request_id": "708720df-904a-424b-b843-32b62d78ecb4",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {},
+   "tool_name": "list_dlq_messages",
+   "latency_ms": 9.264,
+   "scope_used": "incidents:read",
+   "lab_probe_reason": "world audit read",
+   "lab_probe_principal": "incident-commander-smoke"
+  },
+  "created_at": "2026-09-21T11:40:31.008283Z"
+ },
+ {
+  "id": "82b20bca-7036-4010-a5e4-481de749ca75",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "lab.probe",
+  "resource_type": "mcp_tool",
+  "resource_id": "list_active_alerts",
+  "request_id": "151930d4-b1ec-4ac9-bf93-89d25e6ce169",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {},
+   "tool_name": "list_active_alerts",
+   "latency_ms": 6.279,
+   "scope_used": "incidents:read",
+   "lab_probe_reason": "world audit read",
+   "lab_probe_principal": "incident-commander-smoke"
+  },
+  "created_at": "2026-09-21T11:40:31.026201Z"
+ },
+ {
+  "id": "ace774e0-d140-4ab8-955e-fe16e723aced",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "lab.probe",
+  "resource_type": "mcp_tool",
+  "resource_id": "search_traces",
+  "request_id": "073a6dad-8d7e-443a-9595-93c5f1f8909a",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "status": "failed",
+    "since_hours": 1
+   },
+   "tool_name": "search_traces",
+   "latency_ms": 4.792,
+   "scope_used": "incidents:read",
+   "lab_probe_reason": "world audit read",
+   "lab_probe_principal": "incident-commander-smoke"
+  },
+  "created_at": "2026-09-21T11:40:31.118182Z"
+ },
+ {
+  "id": "7c2c3d90-2491-413e-bb15-1b5e818479b9",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "lab.probe",
+  "resource_type": "mcp_tool",
+  "resource_id": "list_dlq_messages",
+  "request_id": "45a92d6c-8c24-484e-8536-c5c4912808e0",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "limit": 50
+   },
+   "tool_name": "list_dlq_messages",
+   "latency_ms": 6.469,
+   "scope_used": "incidents:read",
+   "lab_probe_reason": "world audit read",
+   "lab_probe_principal": "incident-commander-smoke"
+  },
+  "created_at": "2026-09-21T11:40:31.129896Z"
+ },
+ {
+  "id": "015c62a1-03a6-4f0d-ad67-7e6e865a2ff8",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "lab.probe",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_consumer_lag",
+  "request_id": "a32f119f-2a1a-4e02-a8a2-4f2850f92cb7",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "consumer_group": "worker-dispatcher"
+   },
+   "tool_name": "get_consumer_lag",
+   "latency_ms": 2.901,
+   "scope_used": "telemetry:read",
+   "lab_probe_reason": "world audit read",
+   "lab_probe_principal": "incident-commander-smoke"
+  },
+  "created_at": "2026-09-21T11:40:31.142743Z"
+ },
+ {
+  "id": "8958ce8a-697d-4eda-b765-f270fb295995",
+  "user_id": null,
+  "principal_type": "service_account",
+  "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+  "job_id": null,
+  "action": "lab.probe",
+  "resource_type": "mcp_tool",
+  "resource_id": "get_cache_key_info",
+  "request_id": "22997908-5edd-4807-b3ed-3c1e5c6b48b7",
+  "ip_address": null,
+  "extra_data": {
+   "outcome": "success",
+   "arguments": {
+    "key": "cache:jobs:worker-dispatcher:hot_set"
+   },
+   "tool_name": "get_cache_key_info",
+   "latency_ms": 4.605,
+   "scope_used": "telemetry:read",
+   "lab_probe_reason": "world audit read",
+   "lab_probe_principal": "incident-commander-smoke"
+  },
+  "created_at": "2026-09-21T11:40:31.151912Z"
+ }
+]

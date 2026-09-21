@@ -8,8 +8,9 @@ resolution without switching tabs. WO-R3-313 built the first version, WO-R3-327
 added the reset boundary, **WO-R3-330 rebuilt it around one run** after the owner's
 first live take, **WO-R3-334 made it read one TAKE** after the third, and
 **WO-R3-336 made it start each take at zero and read the run as it happens** after
-the fourth — see "What the takes showed" at the end, which is the whole reason the
-page has the shape it does.
+the fourth, and **WO-R3-341 made a finished run stay on screen and stopped the
+stations moving backwards** after the fifth — see "What the takes showed" at the
+end, which is the whole reason the page has the shape it does.
 
 The other half of the demo — the step machine that fires the fault, runs the agent
 and resets the world — lives in the commander repo (`scripts/demo_live.py`,
@@ -19,10 +20,10 @@ and resets the world — lives in the commander repo (`scripts/demo_live.py`,
 |---|---|
 | **Route** | `/demo`, `ProtectedRoute requiredRole="support"` — the same bar as `/admin`, because everything on it is operator-only |
 | **Mode** | `?mode=consumer_outage` (default) or `?mode=dlq_backlog`; the header buttons write the URL |
-| **Take** | the span between two `lab.world_reset` boundaries, and **the default is the take now running** (WO-R3-336). The take selector offers it first and the earlier takes as **history**, each labelled `start → end · scenario · outcome`; a closed take is labelled `take ended at HH:MM:SS` and, when it is on screen, `history, chosen from the take selector` |
-| **Run** | `?run=<id>` pins a run and therefore its take. Without it the page reads the **newest run of the take now running**, or none — and adopts a run on the poll after its first report. The run selector lists that take's own runs |
+| **Take** | the span between two `lab.world_reset` boundaries, and **the default is the newest take that has a fault or a run** (WO-R3-341; a newer take with neither is held off with a banner, WO-R3-336's "the take now running" otherwise). The take selector offers the live take first and the earlier takes as **history**, each labelled `start → end · scenario · outcome`; a closed take is labelled `take ended at HH:MM:SS` and, when it is on screen, `history, chosen from the take selector` or `held while the world is cleaned up` |
+| **Run** | `?run=<id>` pins a run and therefore its take. Without it the page reads the **newest run of the take it selected**, or none — and adopts a run on the poll after its first report. The run selector lists that take's own runs |
 | **Cadence** | every panel polls every **2 s** through `usePolling`, so no two panels disagree about *now*; alerts and breakers poll at 10 s |
-| **Code** | `frontend/src/pages/DemoPage.tsx`, with every derivation in `frontend/src/utils/demoPhase.ts` (the incident and its takes) and `frontend/src/utils/demoRun.ts` (the run record and the ledger) — all pure functions, all driven from fixtures in `src/test/demoPhase.test.ts`, `src/test/demoRun.test.ts` and `src/test/DemoPage.test.tsx` |
+| **Code** | `frontend/src/pages/DemoPage.tsx`, with every derivation in `frontend/src/utils/demoPhase.ts` (the incident and its takes) and `frontend/src/utils/demoRun.ts` (the run record and the ledger) — all pure functions, all driven from fixtures in `src/test/demoPhase.test.ts`, `src/test/demoRun.test.ts`, `src/test/DemoPage.test.tsx` and — for the fifth take's rules — the take's own 162 audit rows in `src/test/fixtures/take5-audit-rows.json`, driven by `src/test/demoTakeV5.test.ts` and `src/test/DemoPageV5.test.tsx` |
 | **Backend** | the shapes WO-R3-328 added to `agent_runs` and to the read endpoints (plat #230, → v0.6.16): the ranked `hypotheses`, `plan`, `verification`/`verifications`, `steps` with `steps_dropped`, `budget`; `GET /admin/agent-runs/{id}/steps?after_seq=`; the 15-minute lag window with `sample_window_seconds` / `sample_interval_seconds`; comma-list `action_prefix` and `exclude_prefix` on the human audit filter |
 
 Layout, at 1440×900 with no scroll for the top half:
@@ -147,6 +148,29 @@ run, and a parked poll keeps its last answer — so the page went on rendering t
 previous take's run in the agent row. The detail is used only when its id is the
 selected run's.
 
+### An empty take is not switched to (WO-R3-341, item 1)
+
+"The take now running" fixed the fourth take and broke the fifth. The runner's
+wind-down reset landed **eleven seconds** after the run resolved, that newer take was
+empty, and the page moved to it — so the finished run, its stations, its ledger, its
+chart and its briefing left the screen while the owner was still looking at them. The
+owner's words: *"the full run shouldn't disappear shortly after completion, it should
+stay up until another run is started, with a transition/clean-up period."*
+
+The default is now **the newest take that has a fault or a run**:
+
+| | |
+|---|---|
+| **A newer take with neither** | is not switched to. The finished take stays exactly as it ended, and a banner under the header reads `world reset at HH:MM:SS — cleaning up, waiting for the next run`, with the time since the reset ticking |
+| **The moment it gets either** | a `chaos.*` fault row (successful, unlabelled — the same test the fault station uses) or a run, the page switches to it and it is a fresh take at zero, exactly as above |
+| **The take label** | says `held while the world is cleaned up` rather than `history, chosen from the take selector`: the page kept this take, the operator did not ask for it |
+| **`?run=`** | still pins, and a `?run=` naming a run the page does not have falls back to this default |
+| **No take has either** | a stack whose takes are all empty keeps the take now running, which is the honest reading of a world nothing has happened in |
+
+`selectTake` reports which of the four it did in `why` (`requested` / `current_run` /
+`current_empty` / `held`) and, when holding, the reset the banner prints in
+`cleaningUpSince`.
+
 ### The fault is the take's FIRST successful injection (WO-R3-336, item 7)
 
 The fourth take's chaos rows, from the platform's own audit stream:
@@ -211,10 +235,21 @@ the platform really served, and neither is the agent's work.
 | `agent.tool_invoked` with the run's `service_account_id` | the run record names its own principal | the run's own call |
 | `agent.tool_invoked` with any other principal | principal comparison | hidden, counted, badged `NOT THIS RUN` on the toggle |
 | `lab.probe` (WO-R3-333) | the lab labels its own reads, because it cannot be told apart by principal | hidden, counted, badged `LAB PROBE` on the toggle |
-| no run selected | there is no principal to compare against | every row counts, which is the honest reading rather than a guess |
+| no run selected | there is no principal to compare against | **nothing counts** — every `agent.tool_invoked` row goes behind the toggle with the count on screen (WO-R3-341 item 5) |
 
 The platform row's `agent acting` station, the chart's action markers and the
 ledger's "N calls the platform recorded" all use that rule.
+
+The last line reverses WO-R3-334's "count them all", and the fifth take is why. From
+11:38:56 — **ten seconds before the lab injected anything** — the ledger filled with
+`agent.tool_invoked get_consumer_lag` every three seconds and the `agent acting`
+station lit. Every one of those 40 rows was the demo runner's own baseline lag poll
+under the smoke token, which is not labelled `lab.probe` today (WO-R3-342 item 5 will
+label it at the source). The owner asked the obvious question: *"why was the agent
+acting before the fault was injected by the lab"*. A call the page cannot attribute
+to the selected run is not the agent's, and with no run selected it can attribute
+none of them, so `agent acting` cannot light without a run. The rows are not dropped:
+the count is on screen and the toggle shows them.
 
 ### The fault is latched for the take
 
@@ -229,6 +264,27 @@ has been seen in this take the page holds its timestamp, releasing it only for a
 newer fault row or a new boundary. `platformPhase`/`platformRow` take that latched
 value as an input (`faultAt`), and a latched fault at or before the boundary is
 dropped, so a latch can never outlive its take.
+
+### A station, once reached, is latched (WO-R3-341, item 2)
+
+The fifth take's PLATFORM row read **paged → agent acting → paged → agent acting**,
+back and forth, for as long as the owner watched it. The cause is two polls answering
+at different times: `agent acting` was derived from audit rows matching the run's
+`service_account_id`, that id comes from the run-detail poll, and whichever poll
+answered last decided the station.
+
+Two rules close it, and the first one would close it alone:
+
+- **`agent acting` comes from the run's own record.** It is the selected run's first
+  `read`/`action` step (`steps[0].at` in `seq` order, from
+  `GET /admin/agent-runs/{id}`), and the note beside it names the first action and
+  counts the reads before it from the same list. The audit rows are the fallback, and
+  only where the run has reported no step with a time yet.
+- **Within a take, a station only ever moves forwards.** `latchStations` merges each
+  poll's row onto the one before it: a station that has been reached stays reached,
+  and a later poll can only add stations. The memory is keyed on the take **and** the
+  selected run, so crossing either boundary starts over rather than inheriting
+  stations from a different thing. Both rows are latched, platform and agent.
 
 ---
 
@@ -375,6 +431,14 @@ sample outside the bar at or after the fault, and the recovery is the first samp
 **two consecutive** samples inside it. While only one sample is back inside, the page
 says so — *"back inside its bar since 10:04:12 but only for one sample; recovery
 takes 2"* — instead of either lying or going quiet.
+
+And since WO-R3-341 item 3 the recovery must also follow the **remediation**: the
+first qualifying sample is looked for at or after the run's first Tier-1 action (its
+own `action` step, or the oldest action row by its principal where it reported none),
+so a dip in the metric between the breach and the action is not drawn as the recovery
+that action produced. The breach itself is still measured from the fault. The chart's
+`R` marker is that sample, which in the fifth take is 11:40:02 — the platform's own
+reading — rather than the agent's verify read at 11:40:17.
 
 Consequence worth knowing: open the page *after* the fault has already been fixed and
 the platform row says `fault injected`, not `recovered`. It never saw the breach.
@@ -652,6 +716,31 @@ platform about itself. The operator sees both.
 ---
 
 ## What the takes showed
+
+### The fifth take (2026-09-21, $0.23) — the run was right, the screen was not
+
+Run `7b305000`, archive `77fc1f45deba`. One `kill_consumer` at 11:39:07, the platform
+paged at 11:39:26.7, the agent triaged at 11:39:29, ranked three times live
+(0.80 → 0.85 → 0.95), restarted the group at 11:39:56, verified at 11:40:19 and
+resolved. Every phase stamp real. Three of the five findings are console rules above,
+and the take's own 162 audit rows are the fixture they are tested against
+(`frontend/src/test/fixtures/take5-audit-rows.json`):
+
+1. **The finished run disappeared** eleven seconds after it resolved, when the
+   wind-down's reset opened an empty take. → an empty take is not switched to; the
+   finished take is held with a banner until the next fault or run.
+2. **The PLATFORM row flipped `paged` → `agent acting` → `paged` → `agent acting`**,
+   because the run's principal and the audit rows arrive on different polls. → `agent
+   acting` comes from the run's own steps, and every station latches.
+3. **The agent appeared to act before the lab injected anything**: 40
+   `agent.tool_invoked get_consumer_lag` rows from 11:38:56, all of them the demo
+   runner's own baseline polls under the smoke token. → with no run selected, no tool
+   row is the agent's.
+4. **The verify verdicts reached the platform only with the terminal report** at
+   11:40:19, though the `verify_judge` steps were live. → commander-side (WO-R3-342).
+5. **The lag climb flattened at 28** for ~25 s: the fault-phase producer hit the
+   platform's 30-jobs/60-s rate limit. Real data, left alone here. → commander-side
+   (WO-R3-342).
 
 ### The fourth take (2026-09-20, $0.25) — green, and still not watchable live
 

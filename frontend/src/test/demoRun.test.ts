@@ -309,7 +309,11 @@ describe('buildLedger — the run’s own actions, with the lab interleaved', ()
       action: 'agent.run_reported',
       created_at: '2026-09-19T10:01:05Z',
     })
-    const ledger = buildLedger({ steps: [], audit: [invoked, reported, fault] })
+    const ledger = buildLedger({
+      steps: [],
+      audit: [invoked, reported, fault],
+      runPrincipalId: 'sa-1',
+    })
     expect(ledger.map((e) => e.kind)).toEqual(['agent_report', 'agent_audit', 'lab'])
   })
 
@@ -337,7 +341,7 @@ describe('buildLedger — the run’s own actions, with the lab interleaved', ()
       toolRow('agent.tool_invoked', 'get_consumer_lag', '2026-09-19T10:01:00Z'),
       toolRow('agent.tool_invoked', 'restart_consumer_group', '2026-09-19T10:02:00Z'),
     ]
-    expect(ledgerCounts({ steps, audit: [...invoked, fault] })).toEqual({
+    expect(ledgerCounts({ steps, audit: [...invoked, fault], runPrincipalId: 'sa-1' })).toEqual({
       steps: 3,
       calls: 2,
       auditCalls: 2,
@@ -351,7 +355,11 @@ describe('buildLedger — the run’s own actions, with the lab interleaved', ()
     // One witness ahead of the other is the interesting case: the platform saw
     // both calls and the reporter filed one, which is what a reporter that died
     // mid-run looks like.
-    const behind = ledgerCounts({ steps: steps.slice(0, 1), audit: [...invoked, fault] })
+    const behind = ledgerCounts({
+      steps: steps.slice(0, 1),
+      audit: [...invoked, fault],
+      runPrincipalId: 'sa-1',
+    })
     expect(behind.calls).toBe(1)
     expect(behind.auditCalls).toBe(2)
     expect(behind.agreed).toBe(false)
@@ -459,14 +467,21 @@ describe('the ledger hides what is not this run’s, and says how much', () => {
     })
   })
 
-  it('counts a lab probe even with no run to compare principals against', () => {
-    // The lab labels its own reads, so that one needs no principal to be sure of.
-    const audit = [runnerRead('2026-09-19T10:01:03Z'), labProbe('2026-09-19T10:01:06Z')]
+  it('hides every tool row while no run is selected, and counts them all', () => {
+    // WO-R3-341 item 5, reversing WO-R3-334's "with no run, count them all": the fifth
+    // take drew the demo runner's own lag polls as the agent's before the fault had
+    // been injected. With no run there is no principal, so nothing is attributable.
+    const audit = [
+      mine,
+      runnerRead('2026-09-19T10:01:03Z'),
+      labProbe('2026-09-19T10:01:06Z'),
+    ]
     expect(ledgerExclusions({ audit })).toEqual({
       labProbe: 1,
-      otherPrincipal: 0,
-      total: 1,
+      otherPrincipal: 2,
+      total: 3,
     })
+    expect(buildLedger({ steps: [], audit }).map((e) => e.kind)).toEqual([])
   })
 
   it('leaves both out of the rows by default', () => {
