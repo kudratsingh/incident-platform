@@ -19,8 +19,7 @@ from app.schemas.common import MAX_PAGE_SIZE
 from app.schemas.job import JobResponse, validate_processor_payload
 from app.services.job import JobService
 from app.services.saga import SagaService, SagaStep
-from app.utils.admission import JOB_CREATE_RATE_BUCKET, check_job_admission
-from app.utils.rate_limit import rate_limiter
+from app.utils.admission import check_job_admission, job_create_rate_limiter
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field, model_validator
 from redis.asyncio import Redis
@@ -132,9 +131,7 @@ async def create_saga(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
     redis: Redis = Depends(get_redis),
-    _rl: None = Depends(
-        rate_limiter(limit=30, window=60, key_prefix=JOB_CREATE_RATE_BUCKET)
-    ),
+    _rl: None = Depends(job_create_rate_limiter()),
 ) -> SagaResponse:
     """Create a saga and its chain of dependent jobs.
 

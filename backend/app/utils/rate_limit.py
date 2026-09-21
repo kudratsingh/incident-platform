@@ -8,7 +8,8 @@ boundary instant. The docs called it sliding and promised a bound the code never
 enforced (WO-R2-30); the naming was corrected rather than the algorithm, because
 ``2 * limit`` is a real bound. **Size ceilings against ``2 * limit``.**
 
-`rate_limiter()` is the FastAPI dependency keyed on client IP;
+`rate_limiter()` is the FastAPI dependency keyed on client IP (`check_client_rate_limit`
+is its body, for callers that read their ceiling per request);
 `check_identity_rate_limit` is the inline form keyed on an authenticated identity.
 """
 
@@ -64,6 +65,29 @@ async def _check(
         )
 
 
+async def check_client_rate_limit(
+    request: Request,
+    redis: Redis,
+    *,
+    limit: int,
+    window: int,
+    key_prefix: str = "",
+) -> None:
+    """Fixed-window check keyed on the caller's address (`_client_key` has the
+    trust model). `key_prefix` namespaces the bucket. Fail-open on a Redis error
+    (ADR 0005); a `RateLimitError` is re-raised.
+    """
+    client = _client_key(request)
+    key = f"{key_prefix}:{client}" if key_prefix else client
+    try:
+        await _check(redis, key, limit, window)
+    except RateLimitError:
+        raise
+    except Exception:
+        # Redis unavailable — fail open so legitimate traffic is not blocked
+        logger.warning("rate_limit_check_failed", extra={"key": key})
+
+
 def rate_limiter(
     limit: int = 60,
     window: int = 60,
@@ -77,15 +101,9 @@ def rate_limiter(
         request: Request,
         redis: Redis = Depends(get_redis),
     ) -> None:
-        client = _client_key(request)
-        key = f"{key_prefix}:{client}" if key_prefix else client
-        try:
-            await _check(redis, key, limit, window)
-        except RateLimitError:
-            raise
-        except Exception:
-            # Redis unavailable — fail open so legitimate traffic is not blocked
-            logger.warning("rate_limit_check_failed", extra={"key": key})
+        await check_client_rate_limit(
+            request, redis, limit=limit, window=window, key_prefix=key_prefix
+        )
 
     return dependency
 

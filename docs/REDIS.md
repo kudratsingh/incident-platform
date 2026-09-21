@@ -90,7 +90,7 @@ All four fail open if Redis is unreachable: `logger.warning` and let the request
 
 Configuration:
 
-- Per-client limits are hard-coded per endpoint (e.g. `rate_limiter(limit=30, window=60)` on `POST /jobs`).
+- Per-client limits are hard-coded per endpoint (e.g. `rate_limiter(limit=10, window=60)` on `POST /auth/login`) — **except job creation, which is a setting since WO-R3-343**: `POST /jobs` and `POST /sagas` both declare `job_create_rate_limiter()` (`app/utils/admission.py`), which reads `JOB_CREATE_RATE_LIMIT` (default 30) and `JOB_CREATE_RATE_WINDOW_SECONDS` (default 60) on every request. The defaults are the literals it replaced, so nothing changes unless a deployment raises them; the demo stack sets 240 because at 30/min a consumer backlog takes 40s to reach the alert threshold. The bucket and its key are unchanged — one `jobs:create` bucket, keyed on the caller's address.
 - Per-tenant limit is `tenants.rate_limit_per_minute`, configurable via `PATCH /admin/tenants/{id}`, defaults to 120 r/min. `0` disables.
 
 ### SSE progress bridge (`job:progress:{job_id}` Pub/Sub channel + `job:progress:last:{job_id}` snapshot)
