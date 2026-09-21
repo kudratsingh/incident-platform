@@ -25,12 +25,17 @@ import { describe, it, expect } from 'vitest'
 import {
   budgetMeter,
   buildLedger,
+  confidenceTrend,
   dlqDecisionFromSteps,
   hypothesesSource,
+  isThinkStep,
+  lastReportAt,
   ledgerCounts,
   ledgerExclusions,
   mergeSteps,
+  plannerReport,
   rankedHypotheses,
+  rankingHistory,
   runVerifications,
   summariseResult,
   summariseStep,
@@ -339,6 +344,9 @@ describe('buildLedger — the run’s own actions, with the lab interleaved', ()
       labRows: 1,
       hiddenReads: 0,
       agreed: true,
+      // Nothing to warn about, and WO-R3-336 makes the warning itself conditional —
+      // see "the counts warning has to earn itself" below.
+      warn: false,
     })
     // One witness ahead of the other is the interesting case: the platform saw
     // both calls and the reporter filed one, which is what a reporter that died
@@ -589,5 +597,416 @@ describe('summariseResult — one line that says what came back', () => {
     expect(summariseResult('get_consumer_lag', '{"lag": 30, "lag_known": tr')).toBe(
       'lag 30, known',
     )
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WO-R3-336 item 3 — the agent's thinking is a timeline.
+//
+// The fourth take's run investigated for 22 seconds, called its planner three times,
+// and the platform saw the first two rankings only when the run finally transitioned:
+// `hypotheses` rode on transition reports, and no transition happens inside an
+// investigation. So the hypotheses panel went from empty to finished in one poll.
+//
+// The commander now reports one `report`-kind step per planner call (WO-R3-337), and
+// the shapes below are what it sends. They are mocked here: the platform's step schema
+// already carries `kind: "report"`, so nothing on the platform side moves.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** One planner report exactly as WO-R3-337 will send it. */
+function thinkStep(
+  seq: number,
+  at: string,
+  ranking: { name: string; category: string; confidence: number }[],
+  overrides: Partial<AgentRunStepRecord> = {},
+): AgentRunStepRecord {
+  const top = ranking[0]
+  return {
+    seq,
+    kind: 'report',
+    tool: 'investigation_planner',
+    at,
+    arguments: {
+      ranking,
+      next_action: { kind: 'probe', tool: 'get_consumer_lag' },
+      reason: 'one more fresh reading of the alerted subject',
+    },
+    result_excerpt: `top ${top.name} ${top.confidence.toFixed(2)} → probe get_consumer_lag: one more fresh reading of the alerted subject`,
+    outcome: 'success',
+    latency_ms: null,
+    ...overrides,
+  }
+}
+
+const RANKING_ONE = [
+  { name: 'consumer_saturation', category: 'consumer_failure', confidence: 0.75 },
+  { name: 'poison_message', category: 'bad_payload', confidence: 0.3 },
+]
+const RANKING_TWO = [
+  { name: 'consumer_saturation', category: 'consumer_failure', confidence: 0.82 },
+  { name: 'poison_message', category: 'bad_payload', confidence: 0.2 },
+]
+const RANKING_THREE = [
+  { name: 'consumer_saturation', category: 'consumer_failure', confidence: 0.85 },
+]
+
+describe('isThinkStep and plannerReport — one planner call, read off its own step', () => {
+  it('is a report step carrying one of the three thinkers', () => {
+    expect(isThinkStep(thinkStep(3, '2026-09-19T10:01:10Z', RANKING_ONE))).toBe(true)
+    expect(
+      isThinkStep(
+        thinkStep(4, '2026-09-19T10:01:20Z', RANKING_ONE, { tool: 'verify_judge' }),
+      ),
+    ).toBe(true)
+    expect(
+      isThinkStep(thinkStep(5, '2026-09-19T10:01:30Z', RANKING_ONE, { tool: 'reflection' })),
+    ).toBe(true)
+  })
+
+  it('is not a status report, and not a tool call', () => {
+    // `report_agent_run` is the run telling the platform where it is — a different
+    // event to a viewer from the agent working something out.
+    expect(
+      isThinkStep(
+        thinkStep(6, '2026-09-19T10:01:40Z', RANKING_ONE, { tool: 'report_agent_run' }),
+      ),
+    ).toBe(false)
+    expect(isThinkStep(step(1, 'read', 'get_consumer_lag', '2026-09-19T10:01:00Z'))).toBe(false)
+    expect(
+      isThinkStep(step(2, 'action', 'restart_consumer_group', '2026-09-19T10:02:00Z')),
+    ).toBe(false)
+  })
+
+  it('reads the ranking, the next action and the reason', () => {
+    const report = plannerReport(thinkStep(3, '2026-09-19T10:01:10Z', RANKING_TWO))
+    expect(report?.ranking.map((c) => c.name)).toEqual([
+      'consumer_saturation',
+      'poison_message',
+    ])
+    expect(report?.ranking[0].confidence).toBe(0.82)
+    expect(report?.ranking[0].category).toBe('consumer_failure')
+    expect(report?.nextAction).toEqual({ kind: 'probe', tool: 'get_consumer_lag' })
+    expect(report?.reason).toMatch(/fresh reading/)
+    expect(report?.sentence).toMatch(/top consumer_saturation/)
+  })
+
+  it('is null for a step that is not a planner call', () => {
+    expect(plannerReport(step(1, 'read', 'get_consumer_lag', '2026-09-19T10:01:00Z'))).toBeNull()
+  })
+
+  it('survives a ranking entry that carries no number, rather than inventing a zero', () => {
+    const rough = thinkStep(3, '2026-09-19T10:01:10Z', RANKING_ONE, {
+      arguments: { ranking: [{ name: 'consumer_saturation' }, { category: 'no name' }, 7] },
+    })
+    const report = plannerReport(rough)
+    // The nameless entry and the number are not causes; the named one is, with its
+    // confidence honestly absent.
+    expect(report?.ranking).toEqual([
+      {
+        name: 'consumer_saturation',
+        category: null,
+        confidence: null,
+        reasoning_excerpt: null,
+      },
+    ])
+    expect(report?.nextAction).toBeNull()
+    expect(report?.reason).toBeNull()
+  })
+
+  it('cuts a long sentence rather than letting it run across the ledger', () => {
+    const wordy = thinkStep(3, '2026-09-19T10:01:10Z', RANKING_ONE, {
+      result_excerpt: `${'the same clause over and over '.repeat(12)}end`,
+    })
+    const sentence = summariseStep(wordy)
+    expect(sentence?.endsWith('…')).toBe(true)
+    expect((sentence ?? '').length).toBeLessThan(160)
+  })
+
+  it('summarises a THINK row from its own sentence, not from a tool summariser', () => {
+    // `summariseResult` would cut the sentence at 64 characters as an unrecognised
+    // excerpt; a planner's sentence is written to be read.
+    const report = thinkStep(3, '2026-09-19T10:01:10Z', RANKING_THREE)
+    expect(summariseStep(report)).toBe(report.result_excerpt)
+  })
+})
+
+describe('rankingHistory — what the agent thinks now, and what it thought before', () => {
+  const steps = [
+    step(1, 'read', 'get_consumer_lag', '2026-09-19T10:01:00Z'),
+    thinkStep(2, '2026-09-19T10:01:05Z', RANKING_ONE),
+    step(3, 'read', 'list_dlq_messages', '2026-09-19T10:01:15Z'),
+    thinkStep(4, '2026-09-19T10:01:20Z', RANKING_TWO),
+    thinkStep(5, '2026-09-19T10:01:40Z', RANKING_THREE),
+  ]
+
+  const ranked = baseRun({
+    hypotheses: [
+      {
+        name: 'consumer_saturation',
+        category: 'consumer_failure',
+        confidence: 0.85,
+        reasoning_excerpt: 'lag has climbed for three samples and the group has no members',
+      },
+    ],
+  })
+
+  it('puts the run’s own latest reading on top, with its reasoning and the newest clock', () => {
+    const history = rankingHistory(ranked, steps)
+    expect(history[0].source).toBe('latest')
+    expect(history[0].at).toBe('2026-09-19T10:01:40Z')
+    expect(history[0].seq).toBe(5)
+    expect(history[0].ranking[0].reasoning_excerpt).toMatch(/three samples/)
+    expect(history[0].nextAction).toEqual({ kind: 'probe', tool: 'get_consumer_lag' })
+  })
+
+  it('keeps the earlier rankings below it, newest first, each with its own time', () => {
+    const history = rankingHistory(ranked, steps)
+    expect(history).toHaveLength(3)
+    expect(history.slice(1).map((s) => s.at)).toEqual([
+      '2026-09-19T10:01:20Z',
+      '2026-09-19T10:01:05Z',
+    ])
+    expect(history[1].ranking[0].confidence).toBe(0.82)
+    expect(history[2].ranking[0].confidence).toBe(0.75)
+  })
+
+  it('falls back to the newest planner step when the record carries no hypotheses', () => {
+    const history = rankingHistory(baseRun(), steps)
+    expect(history[0].source).toBe('step')
+    expect(history[0].ranking[0].confidence).toBe(0.85)
+    expect(history).toHaveLength(3)
+  })
+
+  it('has one entry from the record alone when no planner step exists', () => {
+    const history = rankingHistory(ranked, [])
+    expect(history).toHaveLength(1)
+    expect(history[0].source).toBe('latest')
+    expect(history[0].at).toBeNull()
+  })
+
+  it('has nothing to show for a run that ranked nothing', () => {
+    expect(rankingHistory(baseRun(), [])).toEqual([])
+    expect(rankingHistory(null, [])).toEqual([])
+  })
+})
+
+describe('confidenceTrend — one point per planner call, oldest first', () => {
+  it('follows the top cause’s confidence through the investigation', () => {
+    const trend = confidenceTrend([
+      thinkStep(2, '2026-09-19T10:01:05Z', RANKING_ONE),
+      thinkStep(4, '2026-09-19T10:01:20Z', RANKING_TWO),
+      thinkStep(5, '2026-09-19T10:01:40Z', RANKING_THREE),
+    ])
+    expect(trend.map((p) => p.confidence)).toEqual([0.75, 0.82, 0.85])
+    expect(trend.map((p) => p.seq)).toEqual([2, 4, 5])
+    expect(trend[0].name).toBe('consumer_saturation')
+  })
+
+  it('ignores a call whose top cause carried no number, rather than plotting a zero', () => {
+    const trend = confidenceTrend([
+      thinkStep(2, '2026-09-19T10:01:05Z', RANKING_ONE),
+      thinkStep(3, '2026-09-19T10:01:10Z', RANKING_ONE, {
+        arguments: { ranking: [{ name: 'consumer_saturation' }] },
+      }),
+    ])
+    expect(trend).toHaveLength(1)
+  })
+
+  it('has nothing to draw from the tool calls alone', () => {
+    expect(confidenceTrend([step(1, 'read', 'get_consumer_lag', '2026-09-19T10:01:00Z')])).toEqual(
+      [],
+    )
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WO-R3-336 item 4 — the counts warning has to earn itself.
+//
+// The fourth take's ledger said "4 steps reported · 5 calls the platform recorded — the
+// two do not agree" about a run that had reported everything it did. The fifth call was
+// the eval runner's own precondition probe, unlabelled at the time (WO-R3-337 item 3
+// labels it). The warning was false, and on camera a false warning is worse than none.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('the counts warning has to earn itself', () => {
+  const NOW = new Date('2026-09-19T10:05:00Z').getTime()
+  const steps = [
+    step(1, 'read', 'get_consumer_lag', '2026-09-19T10:01:00Z'),
+    thinkStep(2, '2026-09-19T10:01:05Z', RANKING_ONE),
+  ]
+  /** Five rows for four steps: the fifth is the runner's own precondition probe. */
+  const rows = [
+    toolRow('agent.tool_invoked', 'get_consumer_lag', '2026-09-19T10:01:00Z'),
+    toolRow('agent.tool_invoked', 'get_consumer_lag', '2026-09-19T10:01:02Z'),
+  ]
+
+  it('counts only read and action steps, never the planner’s reports', () => {
+    const counts = ledgerCounts({ steps, audit: rows, runPrincipalId: RUN_SA, now: NOW })
+    expect(counts.calls).toBe(1)
+    expect(counts.steps).toBe(2)
+    expect(counts.auditCalls).toBe(2)
+  })
+
+  it('says nothing while the run is live, however far behind the reporter is', () => {
+    const counts = ledgerCounts({
+      steps,
+      audit: rows,
+      runPrincipalId: RUN_SA,
+      terminal: false,
+      lastReportAt: '2026-09-19T10:01:05Z',
+      now: NOW,
+    })
+    expect(counts.agreed).toBe(false)
+    expect(counts.warn).toBe(false)
+  })
+
+  it('says nothing about a terminal run that reported a second ago', () => {
+    const counts = ledgerCounts({
+      steps,
+      audit: rows,
+      runPrincipalId: RUN_SA,
+      terminal: true,
+      lastReportAt: new Date(NOW - 1000).toISOString(),
+      now: NOW,
+    })
+    expect(counts.warn).toBe(false)
+  })
+
+  it('warns about a terminal run that has been quiet for ten seconds', () => {
+    const counts = ledgerCounts({
+      steps,
+      audit: rows,
+      runPrincipalId: RUN_SA,
+      terminal: true,
+      lastReportAt: new Date(NOW - 30_000).toISOString(),
+      now: NOW,
+    })
+    expect(counts.warn).toBe(true)
+  })
+
+  it('never warns when the run reported MORE than the platform recorded', () => {
+    // A report the audit page has not caught up with is not a lost call, and the
+    // arithmetic runs that way round on every poll of a live run.
+    const counts = ledgerCounts({
+      steps: [
+        step(1, 'read', 'get_consumer_lag', '2026-09-19T10:01:00Z'),
+        step(2, 'read', 'list_dlq_messages', '2026-09-19T10:01:02Z'),
+        step(3, 'action', 'restart_consumer_group', '2026-09-19T10:01:04Z'),
+      ],
+      audit: rows,
+      runPrincipalId: RUN_SA,
+      terminal: true,
+      lastReportAt: new Date(NOW - 60_000).toISOString(),
+      now: NOW,
+    })
+    expect(counts.agreed).toBe(false)
+    expect(counts.warn).toBe(false)
+  })
+})
+
+describe('lastReportAt — when this run last said anything', () => {
+  function reportRow(at: string, runId: string): AuditLog {
+    return auditRow({
+      action: 'agent.run_reported',
+      created_at: at,
+      extra_data: {
+        tool_name: 'report_agent_run',
+        arguments: { run_id: runId, state: 'investigating' },
+      },
+    })
+  }
+
+  it('is the newest report row, on the platform’s own clock', () => {
+    const at = lastReportAt({
+      steps: [step(1, 'read', 'get_consumer_lag', '2026-09-19T10:01:00Z')],
+      audit: [reportRow('2026-09-19T10:01:41Z', 'run-1'), reportRow('2026-09-19T10:01:02Z', 'run-1')],
+      runId: 'run-1',
+    })
+    expect(at).toBe('2026-09-19T10:01:41Z')
+  })
+
+  it('ignores another run’s reports', () => {
+    const at = lastReportAt({
+      steps: [],
+      audit: [reportRow('2026-09-19T10:09:00Z', 'run-other')],
+      runId: 'run-1',
+    })
+    expect(at).toBeNull()
+  })
+
+  it('falls back to the newest step where no report row is in view', () => {
+    const at = lastReportAt({
+      steps: [
+        step(1, 'read', 'get_consumer_lag', '2026-09-19T10:01:00Z'),
+        step(2, 'action', 'restart_consumer_group', '2026-09-19T10:02:00Z'),
+      ],
+      audit: [],
+      runId: 'run-1',
+    })
+    expect(at).toBe('2026-09-19T10:02:00Z')
+  })
+
+  it('is null for a run that has reported nothing at all', () => {
+    expect(lastReportAt({ steps: [], audit: [], runId: 'run-1' })).toBeNull()
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WO-R3-336 item 7, ledger half — a refused hook is not a fault.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('the ledger draws an injection as the lab and everything else as a probe', () => {
+  const fault = toolRow('chaos.tool_invoked', 'kill_consumer', '2026-09-19T10:00:00Z')
+  const denied = auditRow({
+    action: 'chaos.tool_denied',
+    created_at: '2026-09-19T10:01:42Z',
+    extra_data: {
+      tool_name: 'inject_latency',
+      arguments: {},
+      lab_probe_reason: 'precondition: the agent token may not inject',
+    },
+  })
+  const raised = auditRow({
+    action: 'chaos.tool_invoked',
+    created_at: '2026-09-19T10:01:43Z',
+    extra_data: {
+      tool_name: 'inject_latency',
+      arguments: {},
+      outcome: 'error',
+      lab_probe_reason: 'precondition: the agent token may not inject',
+    },
+  })
+
+  it('keeps the injection and hides the refusals', () => {
+    const ledger = buildLedger({ steps: [], audit: [fault, denied, raised] })
+    expect(ledger.map((e) => e.kind)).toEqual(['lab'])
+  })
+
+  it('counts the refusals as the lab’s own probing', () => {
+    expect(ledgerExclusions({ audit: [fault, denied, raised] })).toEqual({
+      labProbe: 2,
+      otherPrincipal: 0,
+      total: 2,
+    })
+  })
+
+  it('shows them badged as probes on the toggle, never as faults', () => {
+    const ledger = buildLedger({
+      steps: [],
+      audit: [fault, denied, raised],
+      showHiddenReads: true,
+    })
+    expect(ledger.map((e) => e.kind)).toEqual(['lab_probe', 'lab_probe', 'lab'])
+  })
+
+  it('leaves the boundary row a boundary, not a probe', () => {
+    const boundary = auditRow({
+      action: WORLD_RESET_ACTION,
+      created_at: '2026-09-19T09:59:00Z',
+      extra_data: { chaos_keys_cleared: 4 },
+    })
+    const ledger = buildLedger({ steps: [], audit: [boundary, fault] })
+    expect(ledger.map((e) => e.kind)).toEqual(['lab', 'reset'])
+    expect(ledgerExclusions({ audit: [boundary, fault] }).total).toBe(0)
   })
 })

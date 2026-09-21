@@ -35,6 +35,13 @@
  *     `service_account_id`, `lab.probe` rows are the lab's own (WO-R3-333), and
  *     what is excluded is counted and shown behind a toggle rather than dropped.
  *     The rows themselves are one line each, with the answer summarised on them.
+ *  4. **The agent's thinking is a timeline, not a final answer** (WO-R3-336). The
+ *     fourth take's investigation made three planner calls in 22 seconds and the
+ *     platform saw the first two only at the end, because `hypotheses` rode on
+ *     transition reports and no transition happens inside an investigation. The
+ *     commander now reports one `report`-kind step per planner call (WO-R3-337), and
+ *     `plannerReport` / `rankingHistory` / `confidenceTrend` read them — so the panel
+ *     shows what the agent thinks now, what it thought before that, and when.
  */
 
 import type {
@@ -51,7 +58,9 @@ import {
   AGENT_RUN_REPORT_ACTION,
   AGENT_TOOL_ACTION,
   LAB_ACTION_PREFIX,
-  isLabProbeRow,
+  isAlertRow,
+  isFaultRow,
+  isProbeRow,
   isResetRow,
   toolCall,
 } from './demoPhase'
@@ -178,6 +187,8 @@ export type LedgerKind =
   | 'agent_audit'
   | 'agent_report'
   | 'lab'
+  /** The platform raising its own alert — `alert.raised` (WO-R3-338). */
+  | 'alert'
   /** A read the lab took under the agent's token, labelled by the lab (WO-R3-333). */
   | 'lab_probe'
   /** An `agent.tool_invoked` row by a principal that is not this run's (F3). */
@@ -232,7 +243,10 @@ export interface LedgerInput {
 }
 
 export interface LedgerExclusions {
-  /** `lab.probe` rows — the evaluator's own reads, labelled at the source. */
+  /**
+   * The lab's own probing: `lab.probe` rows, and chaos rows that are not injections —
+   * a refusal, a hook that raised, or one carrying `lab_probe_reason` (WO-R3-336 item 7).
+   */
   labProbe: number
   /** `agent.tool_invoked` rows by a principal that is not the run's. */
   otherPrincipal: number
@@ -253,7 +267,8 @@ export function ledgerExclusions(input: {
   let labProbe = 0
   let otherPrincipal = 0
   for (const row of input.audit) {
-    if (isLabProbeRow(row)) labProbe += 1
+    if (isResetRow(row)) continue
+    if (isProbeRow(row)) labProbe += 1
     else if (isForeignToolRow(row, input.runPrincipalId)) otherPrincipal += 1
   }
   return { labProbe, otherPrincipal, total: labProbe + otherPrincipal }
@@ -330,11 +345,18 @@ function auditLedgerKind(
   // Matched on the ACTION, not the principal: the evaluator is a service account
   // too, so a principal-only test files the lab's own rows under the agent and
   // makes the fault look like something the agent did.
-  if (row.action.startsWith(LAB_ACTION_PREFIX)) return 'lab'
-  // A lab row that is not the boundary is a read the lab took under the agent's own
-  // token (WO-R3-333) — hidden with the other principals' reads, never drawn as the
-  // agent's own.
-  if (isLabProbeRow(row)) return options.showHiddenReads ? 'lab_probe' : null
+  //
+  // And only an INJECTION is the lab's fault row (WO-R3-336 item 7): the fourth take's
+  // ledger showed two `inject_latency` rows that were guard probes the platform
+  // refused, drawn in amber beside the kill that was the real fault.
+  if (isFaultRow(row)) return 'lab'
+  // The platform paging itself is part of this take's story, and the station that draws
+  // it is only half the answer: the row says which alert, and when.
+  if (isAlertRow(row)) return 'alert'
+  // Everything else the lab did: a read it took under the agent's own token
+  // (WO-R3-333), a refused hook, a hook that raised, a labelled probe. Hidden with the
+  // other principals' reads, never drawn as the agent's own and never as a fault.
+  if (isProbeRow(row)) return options.showHiddenReads ? 'lab_probe' : null
   if (row.action.startsWith(JOB_EVENT_PREFIX)) return options.showJobEvents ? 'job_event' : null
   if (row.action === AGENT_RUN_REPORT_ACTION) return options.haveSteps ? null : 'agent_report'
   if (row.action === AGENT_TOOL_ACTION) {
@@ -348,6 +370,19 @@ function auditLedgerKind(
   if (row.principal_type === 'user') return 'human'
   return null
 }
+
+/**
+ * How long a terminal run's silence has to last before the two counts disagreeing is
+ * worth a warning (WO-R3-336, item 4).
+ *
+ * The fourth take's page said "4 steps reported · 5 calls the platform recorded — the
+ * two do not agree" over a run that had reported everything it did. The fifth call was
+ * the runner's own precondition probe, and the warning was simply false. A live run is
+ * ALWAYS mid-report — the reporter is one call behind by construction — so the only
+ * state where the counts not matching means something is a run that has finished and
+ * then gone quiet.
+ */
+export const REPORTER_SILENCE_MS = 10_000
 
 export interface LedgerCounts {
   /** Every step the responder reported, reports included. */
@@ -369,6 +404,53 @@ export interface LedgerCounts {
   hiddenReads: number
   /** False when the two witnesses do not agree on how many calls there were. */
   agreed: boolean
+  /**
+   * True only when the disagreement is worth saying out loud: the platform recorded
+   * MORE calls than the run reported, the run is over, and nothing has reported for
+   * `REPORTER_SILENCE_MS`.
+   *
+   * Three conditions rather than one because each removes a false alarm the fourth take
+   * produced or would have produced. `>` rather than `!==`: more steps than rows is a
+   * report the audit page has not caught up with, not a lost call. Terminal: a live run
+   * is always one report behind. Silent: a run that finished a second ago is still
+   * flushing.
+   */
+  warn: boolean
+}
+
+/**
+ * When this run last said anything, by the platform's own clock.
+ *
+ * The steps carry the responder's own times and the `agent.run_reported` rows carry the
+ * platform's; the arrival is the one that answers "has the reporter stopped", so the
+ * rows win and the steps are the fallback for a page that has no report row in view.
+ */
+export function lastReportAt(input: {
+  steps: AgentRunStepRecord[]
+  audit: AuditLog[]
+  runId?: string | null
+}): string | null {
+  let newestAt: string | null = null
+  const keep = (at: string | null | undefined) => {
+    if (at === null || at === undefined || at === '') return
+    if (newestAt === null || at > newestAt) newestAt = at
+  }
+  for (const row of input.audit) {
+    if (row.action !== AGENT_RUN_REPORT_ACTION) continue
+    const args = row.extra_data?.arguments
+    const runId = input.runId ?? null
+    if (runId !== null && (!args || typeof args !== 'object')) continue
+    if (
+      runId !== null &&
+      (args as Record<string, unknown>).run_id !== runId
+    ) {
+      continue
+    }
+    keep(row.created_at)
+  }
+  if (newestAt !== null) return newestAt
+  for (const step of input.steps) keep(step.at)
+  return newestAt
 }
 
 /**
@@ -384,13 +466,28 @@ export function ledgerCounts(input: {
   steps: AgentRunStepRecord[]
   audit: AuditLog[]
   runPrincipalId?: string | null
+  /** True once the run has finished — the only state in which silence means anything. */
+  terminal?: boolean
+  /** When this run last reported, from `lastReportAt`. */
+  lastReportAt?: string | null
+  /** The page's own clock, so the rule is testable without waiting. */
+  now?: number
+  /** Overridable for tests; the default is `REPORTER_SILENCE_MS`. */
+  silenceMs?: number
 }): LedgerCounts {
   const auditCalls = input.audit.filter(
     (r) => r.action === AGENT_TOOL_ACTION && !isForeignToolRow(r, input.runPrincipalId),
   ).length
-  // Report steps have no `agent.tool_invoked` row — they audit as
-  // `agent.run_reported` — so they are not part of the comparison.
-  const calls = input.steps.filter((s) => s.kind !== 'report').length
+  // Only the two kinds that make an MCP call. A `report` step audits as
+  // `agent.run_reported` and a kind this build does not know is not assumed to be a
+  // call, so neither is part of the comparison.
+  const calls = input.steps.filter((s) => s.kind === 'read' || s.kind === 'action').length
+  const silenceMs = input.silenceMs ?? REPORTER_SILENCE_MS
+  const reportedAt = input.lastReportAt ?? null
+  const silent =
+    reportedAt === null
+      ? true
+      : (input.now ?? Date.now()) - new Date(reportedAt).getTime() > silenceMs
   return {
     steps: input.steps.length,
     calls,
@@ -398,6 +495,7 @@ export function ledgerCounts(input: {
     labRows: input.audit.filter((r) => r.action.startsWith(LAB_ACTION_PREFIX)).length,
     hiddenReads: ledgerExclusions(input).total,
     agreed: calls === auditCalls,
+    warn: auditCalls > calls && input.terminal === true && silent,
   }
 }
 
@@ -559,7 +657,234 @@ export function summariseResult(
 
 /** The same, for a step: the excerpt it carries, summarised by its own tool. */
 export function summariseStep(step: AgentRunStepRecord): string | null {
+  if (isThinkStep(step)) return thinkSentence(step)
   return summariseResult(step.tool, step.result_excerpt)
+}
+
+// ── what the agent is thinking, as it thinks it ──────────────────────────────
+//
+// WO-R3-336 item 3, from the fourth take. The run made three planner calls during a
+// 22-second investigation and the platform saw none of their rankings until the last
+// one: the reporter sent `hypotheses` on transition reports, and no transition happens
+// inside an investigation. So the panel went from empty to finished in one poll, and
+// the one thing the demo is about — the agent working out what is wrong — was a burst.
+//
+// The commander's WO-R3-337 closes that seam by reporting one step per planner call:
+// `kind: "report"`, `tool: "investigation_planner" | "reflection" | "verify_judge"`,
+// `arguments: {ranking: [{name, category, confidence}], next_action: {kind, tool},
+// reason}` and a `result_excerpt` that is one readable sentence. Everything below reads
+// those steps, under the same rule as the rest of this file: **an absence is named,
+// never filled.** A ranking entry with no number gets no bar rather than a bar at zero.
+
+/** The tools a `report`-kind step carries when it is the agent thinking (WO-R3-337). */
+export const THINK_TOOLS: readonly string[] = [
+  'investigation_planner',
+  'reflection',
+  'verify_judge',
+]
+
+/** True for a step that is one planner decision rather than one MCP call. */
+export function isThinkStep(step: AgentRunStepRecord): boolean {
+  return step.kind === 'report' && step.tool !== null && THINK_TOOLS.includes(step.tool)
+}
+
+/** How much of a planner's sentence fits on a ledger line before it is cut. */
+const THINK_SENTENCE_CHARS = 150
+
+/** The one sentence a THINK row shows — the step's own excerpt, not a summariser's. */
+export function thinkSentence(step: AgentRunStepRecord): string | null {
+  const excerpt = step.result_excerpt
+  if (excerpt === null || excerpt === undefined || excerpt.trim() === '') return null
+  const text = collapse(excerpt)
+  return text.length > THINK_SENTENCE_CHARS
+    ? `${text.slice(0, THINK_SENTENCE_CHARS)}…`
+    : text
+}
+
+/** One cause as a ranking carried it. `confidence` is null where none was sent. */
+export interface RankedCause {
+  name: string
+  category: string | null
+  /** Null where the ranking carried no number — never rendered as zero. */
+  confidence: number | null
+  reasoning_excerpt: string | null
+}
+
+/** Where the planner said it was going next, and with what. */
+export interface PlannerNextAction {
+  /** `probe` | `remediate` | `stop` on the wire; an open string here. */
+  kind: string | null
+  tool: string | null
+}
+
+/** One planner call, read off its own `report` step. */
+export interface PlannerReport {
+  seq: number
+  at: string | null
+  /** Which of the three thinkers this was. */
+  tool: string
+  /** Best first, as the planner accepted it. */
+  ranking: RankedCause[]
+  nextAction: PlannerNextAction | null
+  reason: string | null
+  /** The readable sentence the step's `result_excerpt` carries. */
+  sentence: string | null
+}
+
+function causesFrom(value: unknown): RankedCause[] {
+  if (!Array.isArray(value)) return []
+  const causes: RankedCause[] = []
+  for (const entry of value) {
+    if (entry === null || typeof entry !== 'object') continue
+    const fields = entry as Record<string, unknown>
+    const name = fields.name
+    if (typeof name !== 'string' || name === '') continue
+    causes.push({
+      name,
+      category: typeof fields.category === 'string' ? fields.category : null,
+      confidence: typeof fields.confidence === 'number' ? fields.confidence : null,
+      reasoning_excerpt:
+        typeof fields.reasoning_excerpt === 'string' ? fields.reasoning_excerpt : null,
+    })
+  }
+  return causes
+}
+
+function nextActionFrom(value: unknown): PlannerNextAction | null {
+  if (value === null || typeof value !== 'object') return null
+  const fields = value as Record<string, unknown>
+  const kind = typeof fields.kind === 'string' ? fields.kind : null
+  const tool = typeof fields.tool === 'string' ? fields.tool : null
+  return kind === null && tool === null ? null : { kind, tool }
+}
+
+/**
+ * The planner's own report, or null for a step that is not one.
+ *
+ * Every member is optional and read defensively: this is the responder's account of its
+ * own decision, the platform validates only the step envelope, and a ranking the page
+ * cannot parse must cost the row its detail rather than the panel its render.
+ */
+export function plannerReport(step: AgentRunStepRecord): PlannerReport | null {
+  if (!isThinkStep(step) || step.tool === null) return null
+  const args = step.arguments ?? {}
+  return {
+    seq: step.seq,
+    at: step.at,
+    tool: step.tool,
+    ranking: causesFrom(args.ranking),
+    nextAction: nextActionFrom(args.next_action ?? null),
+    reason: typeof args.reason === 'string' && args.reason !== '' ? args.reason : null,
+    sentence: thinkSentence(step),
+  }
+}
+
+/** Every planner call the run reported, newest first. */
+export function plannerReports(steps: AgentRunStepRecord[]): PlannerReport[] {
+  return steps
+    .filter(isThinkStep)
+    .map(plannerReport)
+    .filter((r): r is PlannerReport => r !== null)
+    .sort((a, b) => b.seq - a.seq)
+}
+
+/** One ranking, with when it was made and what it led to. */
+export interface RankingSnapshot {
+  /** `latest` is the run record's own reading; `step` is one planner call. */
+  source: 'latest' | 'step'
+  at: string | null
+  seq: number | null
+  tool: string | null
+  ranking: RankedCause[]
+  nextAction: PlannerNextAction | null
+  reason: string | null
+}
+
+/**
+ * What the agent thinks now, and what it thought before that — newest first.
+ *
+ * The head of the list is the run record's own `hypotheses`, because that is the latest
+ * reading by definition and the only one carrying the reasoning excerpts (the ranking
+ * inside a planner step is name / category / confidence). It is stamped with the newest
+ * planner call's time and sequence when there is one, so "now" has a clock on it.
+ *
+ * The tail is the earlier planner calls, each with its own timestamp — which is the
+ * whole point: three rankings existed during the fourth take's investigation and the
+ * page could only ever show the last.
+ */
+export function rankingHistory(
+  run: AgentRun | null,
+  steps: AgentRunStepRecord[],
+): RankingSnapshot[] {
+  const reports = plannerReports(steps)
+  const newest = reports[0] ?? null
+  const latest: RankedCause[] = rankedHypotheses(run).map((h) => ({
+    name: h.name,
+    category: h.category,
+    confidence: h.confidence,
+    reasoning_excerpt: h.reasoning_excerpt ?? null,
+  }))
+
+  const head: RankingSnapshot | null =
+    latest.length > 0
+      ? {
+          source: 'latest',
+          at: newest?.at ?? null,
+          seq: newest?.seq ?? null,
+          tool: newest?.tool ?? null,
+          ranking: latest,
+          nextAction: newest?.nextAction ?? null,
+          reason: newest?.reason ?? null,
+        }
+      : newest === null
+        ? null
+        : {
+            source: 'step',
+            at: newest.at,
+            seq: newest.seq,
+            tool: newest.tool,
+            ranking: newest.ranking,
+            nextAction: newest.nextAction,
+            reason: newest.reason,
+          }
+
+  const older: RankingSnapshot[] = reports.slice(1).map((r) => ({
+    source: 'step' as const,
+    at: r.at,
+    seq: r.seq,
+    tool: r.tool,
+    ranking: r.ranking,
+    nextAction: r.nextAction,
+    reason: r.reason,
+  }))
+
+  return head === null ? older : [head, ...older]
+}
+
+/** One point of the confidence sparkline: the top cause of one planner call. */
+export interface ConfidencePoint {
+  seq: number
+  at: string | null
+  confidence: number
+  name: string
+}
+
+/**
+ * The top cause's confidence over the planner's calls, **oldest first**.
+ *
+ * One point per planner call, and only where that call's top cause carried a number: a
+ * line that plots an absence as zero says the agent lost confidence when in fact it
+ * said nothing. Two points are the minimum worth drawing, which the caller decides.
+ */
+export function confidenceTrend(steps: AgentRunStepRecord[]): ConfidencePoint[] {
+  return plannerReports(steps)
+    .slice()
+    .reverse()
+    .flatMap((report) => {
+      const top = report.ranking[0]
+      if (top === undefined || top.confidence === null) return []
+      return [{ seq: report.seq, at: report.at, confidence: top.confidence, name: top.name }]
+    })
 }
 
 // ── what the run decided about one dead-letter row ───────────────────────────

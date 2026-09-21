@@ -70,6 +70,33 @@
  *     eighth; the span is now two minutes before the fault to now, the markers are
  *     only the four moments that matter, and there is a cursor on the right.
  *  6. **An absence a terminal run will never fill is a sentence, not a blank.**
+ *
+ * ── WO-R3-336: the page starts each take at zero and reads the run as it happens ──
+ *
+ * The fourth take was green and still not watchable live. Five more rules, all from
+ * what the owner saw and what the platform's own record of that run said:
+ *
+ *  1. **A fresh take starts at zero.** The default take is the take NOW RUNNING, not
+ *     the newest run's take: on the fourth take the page opened on the take before it,
+ *     so the first thing on screen was history. The choice is re-evaluated on every
+ *     poll, so the page adopts a run the moment it reports and moves on the moment a
+ *     new boundary appears. Earlier takes are offered as history, explicitly labelled.
+ *  2. **The ledger is newest at the TOP** (the owner's rule, reversing WO-R3-334), and
+ *     its audit read pages back until it holds the take's opening boundary — the
+ *     fourth take's ledger showed a `kill_consumer` from the take before, because the
+ *     boundary was past the end of the one page of rows the page asked for.
+ *  3. **The agent's thinking is a live timeline.** Each planner call arrives as a
+ *     `report`-kind step (WO-R3-337) and renders as a purple THINK row whose click
+ *     opens the ranking and the chosen next action; the hypotheses panel is "what the
+ *     agent thinks now" — the newest ranking with its top cause's full reasoning, a
+ *     confidence sparkline over the planner's calls, and the older rankings below it.
+ *  4. **The counts warning has to earn itself.** "4 steps reported · 5 calls the
+ *     platform recorded — the two do not agree" was false: the fifth call was the
+ *     runner's own precondition probe. The warning now needs more rows than steps, a
+ *     terminal run, and ten seconds of silence.
+ *  5. **The stations are unchanged and still load-bearing** — real durations from
+ *     `phase_history` (which WO-R3-337 fixes at the source), the late-report label, and
+ *     one station at a time.
  */
 
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
@@ -88,6 +115,7 @@ import {
   chartMarkers,
   chartWindow,
   faultInTake,
+  faultRowsInTake,
   isDemoMode,
   metricRecovery,
   platformRow,
@@ -96,7 +124,7 @@ import {
   rowsInTakeWithEdges,
   selectTake,
   takeKey,
-  takeOfRun,
+  takeOptions,
   yAxisTicks,
 } from '../utils/demoPhase'
 import type {
@@ -107,20 +135,31 @@ import type {
   PlatformStation,
   Station,
   Take,
+  TakeOption,
 } from '../utils/demoPhase'
 import {
   budgetMeter,
   buildLedger,
+  confidenceTrend,
   dlqDecisionFromSteps,
   hypothesesSource,
+  isThinkStep,
   labToolName,
+  lastReportAt,
   ledgerCounts,
   mergeSteps,
-  rankedHypotheses,
+  plannerReport,
+  rankingHistory,
   runVerifications,
   summariseStep,
 } from '../utils/demoRun'
-import type { LedgerEntry, LedgerKind } from '../utils/demoRun'
+import type {
+  ConfidencePoint,
+  LedgerEntry,
+  LedgerKind,
+  RankedCause,
+  RankingSnapshot,
+} from '../utils/demoRun'
 import type {
   AgentBriefing,
   AgentBriefingSlot,
@@ -153,13 +192,24 @@ const REMEDIATE_THRESHOLD = 0.7
 /** Enough rows for a whole take once the job events are out of the way. */
 const AUDIT_ROWS = 100
 /**
+ * How far back the audit read may page to find the take's opening boundary.
+ *
+ * Five pages of 100 operator rows is about half an hour of a stack with the traffic
+ * loop running — well past the platform's own 15-minute metric window, which is the
+ * span the brief bounds this at. Past it there is nothing to find and the ledger says
+ * so, because paging back forever on a 2-second poll would cost the demo its cadence.
+ */
+const MAX_AUDIT_PAGES = 5
+/**
  * The three streams this page is about, in one request (WO-R3-328).
  *
  * `agent.` is both `agent.tool_invoked` and `agent.run_reported`; `chaos.` is the
- * lab's faults; `lab.` is the reset boundary. Nothing else on the stack writes
- * anything this page derives from, and everything else is what buried it.
+ * lab's faults; `lab.` is the reset boundary; `alert.` is the platform paging on its
+ * own metric (WO-R3-338, O-36), which is the station between the fault and the agent.
+ * Nothing else on the stack writes anything this page derives from, and everything else
+ * is what buried it.
  */
-const OPERATOR_STREAMS = 'agent.,lab.,chaos.'
+const OPERATOR_STREAMS = 'agent.,lab.,chaos.,alert.'
 /** The job lifecycle, fetched only when the operator asks for it. */
 const JOB_EVENT_STREAM = 'event.'
 const JOBS_STRIP_ROWS = 20
@@ -248,21 +298,20 @@ function shortId(id: string): string {
 // ─────────────────────────────────────────────────────── header: run + mode
 
 /**
- * Every run the page can see, each labelled with the take it belongs to.
+ * The runs of the take on screen, newest first.
  *
- * Across takes, not within one: the run the page is showing may be in a take that
- * has ended, which is exactly the case the third take needed, so a selector offering
- * only "this take's runs" would have offered nothing at all.
+ * Scoped to one take since WO-R3-336: the take selector beside it is what crosses a
+ * boundary, so a list mixing runs from three takes made "which run" and "which take"
+ * one question with two answers. A take with no run of its own says so — that is the
+ * reading a fresh take is supposed to give.
  */
 function RunSelector({
   runs,
   selected,
-  takeStartOf,
   onSelect,
 }: {
   runs: AgentRun[]
   selected: AgentRun | null
-  takeStartOf: (run: AgentRun) => string | null
   onSelect: (id: string) => void
 }) {
   if (runs.length === 0) {
@@ -280,42 +329,115 @@ function RunSelector({
         aria-label="Run"
         value={selected?.id ?? ''}
         onChange={(e) => onSelect(e.target.value)}
-        className="bg-gray-800 border border-gray-700 rounded px-2 py-1.5 text-sm text-gray-100 font-mono"
+        className="bg-gray-800 border border-gray-700 rounded px-2 py-1.5 text-sm text-gray-100 font-mono max-w-[17rem] truncate"
       >
-        {runs.map((r, i) => {
-          const takeStart = takeStartOf(r)
-          return (
-            <option key={r.id} value={r.id}>
-              {shortId(r.id)} · {r.scenario ?? 'no label'} · {r.state}
-              {takeStart === null ? '' : ` · take ${clockTime(takeStart)}`}
-              {i === 0 ? ' · newest' : ''}
-            </option>
-          )
-        })}
+        {runs.map((r, i) => (
+          <option key={r.id} value={r.id}>
+            {shortId(r.id)} · {r.scenario ?? 'no label'} · {r.state}
+            {i === 0 ? ' · newest' : ''}
+          </option>
+        ))}
+      </select>
+    </label>
+  )
+}
+
+/** One take, as the selector prints it: the live one, or a line of history. */
+function takeOptionLabel(option: TakeOption): string {
+  const span =
+    option.take.startAt === null
+      ? 'start not in view'
+      : clockTime(option.take.startAt)
+  const run = option.run
+  const outcome =
+    run === null
+      ? 'no run yet'
+      : `${run.scenario ?? 'no label'} · ${run.state}${
+          option.runs.length > 1 ? ` · ${String(option.runs.length)} runs` : ''
+        }`
+  if (option.current) return `this take · ${span} → live · ${outcome}`
+  const end = option.take.endAt === null ? 'now' : clockTime(option.take.endAt)
+  return `history · ${span} → ${end} · ${outcome}`
+}
+
+/**
+ * Which take the page reads — the one now running, or an earlier one as history.
+ *
+ * The owner's rule from the fourth take: a fresh demo starts at zero and earlier takes
+ * are history, so crossing a boundary is an explicit, labelled choice rather than
+ * something the default rule does on the operator's behalf. Choosing the live take
+ * clears `?run=`, which is what puts the page back on "whatever this take reports
+ * next".
+ */
+function TakeSelector({
+  options,
+  selectedKey,
+  onSelect,
+}: {
+  options: TakeOption[]
+  selectedKey: string
+  onSelect: (option: TakeOption) => void
+}) {
+  if (options.length <= 1) return null
+  return (
+    <label className="flex items-center gap-2 text-sm text-gray-400">
+      <span>Take</span>
+      <select
+        data-testid="take-selector"
+        aria-label="Take"
+        value={selectedKey}
+        onChange={(e) => {
+          const chosen = options.find((o) => o.key === e.target.value)
+          if (chosen) onSelect(chosen)
+        }}
+        // Capped, because a select is as wide as its longest option and a history
+        // line is long: uncapped it pushed the run selector onto a second row, which
+        // is 47px of the one screen the top half has to fit in.
+        className="bg-gray-800 border border-gray-700 rounded px-2 py-1.5 text-sm text-gray-100 font-mono max-w-[19rem] truncate"
+      >
+        {options.map((option) => (
+          <option key={option.key} value={option.key}>
+            {takeOptionLabel(option)}
+          </option>
+        ))}
       </select>
     </label>
   )
 }
 
 /**
- * Which take is on screen, and whether it is still running.
+ * Which take is on screen, whether it is still running, and whether it is history.
  *
  * "take ended at 08:20" is the one sentence the third take's screen needed: it is
- * what turns a page full of past readings from wrong into history.
+ * what turns a page full of past readings from wrong into history. WO-R3-336 adds the
+ * other half — a take on screen because the operator CHOSE it says so, and the live
+ * take with no run yet says what it is waiting for, so neither can be mistaken for
+ * the other.
  */
 function TakeLabel({
   take,
+  current,
+  hasRun,
   newerTakeRunning,
 }: {
   take: Take
+  /** True while this is the take now running. */
+  current: boolean
+  hasRun: boolean
   newerTakeRunning: boolean
 }) {
   return (
     <span data-testid="take-label" className="text-xs font-mono text-gray-500">
       {take.startAt === null ? 'take start not in view' : `take from ${clockTime(take.startAt)}`}
       {take.endAt === null ? ' · live' : ` · take ended at ${clockTime(take.endAt)}`}
-      {newerTakeRunning && (
-        <span className="text-amber-300/80"> · a newer take is running with no run yet</span>
+      {!current && (
+        <span className="text-amber-300/80"> · history, chosen from the take selector</span>
+      )}
+      {current && !hasRun && (
+        <span className="text-blue-200/80"> · waiting for this take’s run</span>
+      )}
+      {!current && newerTakeRunning && (
+        <span className="text-amber-300/80"> · the take now running has no run yet</span>
       )}
     </span>
   )
@@ -446,6 +568,7 @@ function PhaseRow<K extends string>({
   stations,
   tone,
   now,
+  note = null,
 }: {
   testId: string
   title: string
@@ -453,6 +576,8 @@ function PhaseRow<K extends string>({
   stations: Station<K>[]
   tone: 'platform' | 'agent'
   now: number
+  /** What this row is waiting for, when it has nothing of its own to say yet. */
+  note?: string | null
 }) {
   return (
     <div
@@ -468,6 +593,11 @@ function PhaseRow<K extends string>({
           {title}
         </h2>
         <p className="text-xs text-gray-500">{source}</p>
+        {note !== null && (
+          <p data-testid={`${testId}-note`} className="text-xs text-blue-200/80">
+            {note}
+          </p>
+        )}
       </div>
       <ol aria-label={`${title} phases`} className="flex flex-wrap items-stretch gap-1.5">
         {stations.map((station) => (
@@ -999,20 +1129,250 @@ function isTerminalRun(run: AgentRun | null): boolean {
   return run !== null && (run.finished_at !== null || TERMINAL_RUN_STATES.includes(run.state))
 }
 
+/**
+ * One ranked cause, as the run ranked it.
+ *
+ * `confidence` can be absent — a planner ranking carries name, category and confidence
+ * and any of them can be missing — and an absent number gets a sentence rather than a
+ * bar at zero, which would read as "the agent had no confidence in this" (ADR 0030 in
+ * the UI, again).
+ */
+function CauseRow({ cause, top }: { cause: RankedCause; top: boolean }) {
+  return (
+    <li
+      data-testid="hypothesis-row"
+      className="bg-gray-950/60 border border-gray-800 rounded px-3 py-2"
+    >
+      <div className="flex items-baseline justify-between gap-2">
+        <span className="text-base text-gray-100">{cause.name}</span>
+        <span className="text-xs font-mono text-gray-500">
+          {cause.category ?? 'no category reported'}
+        </span>
+      </div>
+      <div className="mt-1">
+        {cause.confidence === null ? (
+          <p className="text-xs text-gray-600">no confidence reported</p>
+        ) : (
+          <ConfidenceBar confidence={cause.confidence} />
+        )}
+      </div>
+      {cause.reasoning_excerpt ? (
+        <div className="mt-1">
+          {/* The top one whole; the rest truncated. */}
+          <Excerpt text={cause.reasoning_excerpt} full={top} />
+        </div>
+      ) : (
+        <p className="text-xs text-gray-600 mt-1">no reasoning reported</p>
+      )}
+    </li>
+  )
+}
+
+/** Where the planner said it was going next, and why — one line, its own words. */
+function NextActionLine({ snapshot }: { snapshot: RankingSnapshot }) {
+  const next = snapshot.nextAction
+  if (next === null && snapshot.reason === null) return null
+  return (
+    <p data-testid="ranking-next-action" className="text-xs text-gray-400 mt-1">
+      {next !== null && (
+        <>
+          next:{' '}
+          <span className="font-mono text-purple-200">
+            {next.kind ?? 'no kind reported'}
+            {next.tool === null ? '' : ` ${next.tool}`}
+          </span>
+        </>
+      )}
+      {snapshot.reason !== null && (
+        <span className="text-gray-400">
+          {next === null ? '' : ' — '}
+          {snapshot.reason}
+        </span>
+      )}
+    </p>
+  )
+}
+
+/**
+ * The top cause's confidence over the planner's own calls, with the bar it has to clear.
+ *
+ * One point per planner call (WO-R3-337's `report` steps), so the shape of the
+ * investigation is on screen rather than only its conclusion: the fourth take's run held
+ * one cause over 0.7 for three consecutive rankings and still did not act, and a single
+ * number could never show that. Every value is printed under the line as well, because
+ * nothing on this page may be reachable only by hovering.
+ */
+function ConfidenceSparkline({ points }: { points: ConfidencePoint[] }) {
+  if (points.length < 2) return null
+  const W = 240
+  const H = 44
+  const PAD = 5
+  const x = (i: number) => PAD + (i / (points.length - 1)) * (W - 2 * PAD)
+  const y = (v: number) => PAD + (1 - Math.max(0, Math.min(1, v))) * (H - 2 * PAD)
+  const line = points.map((p, i) => `${String(x(i))},${y(p.confidence).toFixed(1)}`).join(' ')
+  return (
+    <div data-testid="confidence-sparkline" className="mt-1.5">
+      <svg
+        viewBox={`0 0 ${String(W)} ${String(H)}`}
+        className="w-full h-11"
+        role="img"
+        aria-label={`top hypothesis confidence over ${String(points.length)} planner calls, threshold ${String(REMEDIATE_THRESHOLD)}`}
+      >
+        <line
+          x1={PAD}
+          x2={W - PAD}
+          y1={y(REMEDIATE_THRESHOLD)}
+          y2={y(REMEDIATE_THRESHOLD)}
+          className="stroke-gray-500"
+          strokeWidth={1}
+          strokeDasharray="4 3"
+        />
+        <text
+          x={W - PAD}
+          y={y(REMEDIATE_THRESHOLD) - 3}
+          textAnchor="end"
+          className="fill-gray-500"
+          style={{ fontSize: '9px' }}
+        >
+          {REMEDIATE_THRESHOLD}
+        </text>
+        <polyline
+          points={line}
+          fill="none"
+          stroke="#c4b5fd"
+          strokeWidth={2}
+          strokeLinejoin="round"
+          strokeLinecap="round"
+        />
+        {points.map((p, i) => (
+          <circle
+            key={p.seq}
+            cx={x(i)}
+            cy={y(p.confidence)}
+            r={2.5}
+            fill={p.confidence >= REMEDIATE_THRESHOLD ? '#d8b4fe' : '#a78bfa'}
+          />
+        ))}
+      </svg>
+      <p className="text-[11px] font-mono text-gray-500">
+        {points.map((p) => p.confidence.toFixed(2)).join(' → ')} over{' '}
+        {points.length} planner calls
+      </p>
+    </div>
+  )
+}
+
+/**
+ * What the agent thinks now, and what it thought before that.
+ *
+ * The newest ranking is on top with its top cause's reasoning whole; the older ones are
+ * collapsed below with their own timestamps, because three rankings existed during the
+ * fourth take's 22-second investigation and the page could only ever show the last.
+ */
+function HypothesesPanel({
+  history,
+  trend,
+  source,
+}: {
+  history: RankingSnapshot[]
+  trend: ConfidencePoint[]
+  source: ReturnType<typeof hypothesesSource>
+}) {
+  const [head, ...older] = history
+  return (
+    <div>
+      <h3 className="text-sm uppercase tracking-wider text-gray-500 mb-1">
+        What the agent thinks now
+      </h3>
+      {head === undefined ? (
+        <p data-testid="hypotheses-empty" className="text-sm text-gray-600">
+          None reported yet — the responder has not ranked a cause.
+        </p>
+      ) : (
+        <div data-testid="hypotheses-now">
+          <p className="text-xs font-mono text-gray-500">
+            {head.at === null ? 'the run’s latest reading' : `ranked ${clockTime(head.at)}`}
+            {head.tool !== null && ` · ${head.tool}`}
+            {head.seq !== null && ` · step #${String(head.seq)}`}
+          </p>
+          <ol className="space-y-2 mt-1">
+            {head.ranking.map((cause, i) => (
+              <CauseRow
+                key={`${cause.category ?? 'none'}-${cause.name}-${String(i)}`}
+                cause={cause}
+                top={i === 0}
+              />
+            ))}
+          </ol>
+          <NextActionLine snapshot={head} />
+          <ConfidenceSparkline points={trend} />
+          {older.length > 0 && (
+            <details data-testid="ranking-history" className="mt-1.5">
+              <summary className="text-xs text-blue-300 cursor-pointer">
+                {older.length} earlier ranking{older.length === 1 ? '' : 's'}
+              </summary>
+              <ul className="mt-1 space-y-1">
+                {older.map((snapshot) => (
+                  <li
+                    key={`${String(snapshot.seq ?? 0)}-${snapshot.at ?? 'no-time'}`}
+                    data-testid="ranking-history-entry"
+                    className="border-l-2 border-purple-900/60 pl-2"
+                  >
+                    <p className="text-[11px] font-mono text-gray-500">
+                      {snapshot.at === null ? 'no time reported' : clockTime(snapshot.at)}
+                      {snapshot.tool !== null && ` · ${snapshot.tool}`}
+                      {snapshot.seq !== null && ` · step #${String(snapshot.seq)}`}
+                    </p>
+                    <ul className="text-xs text-gray-400">
+                      {snapshot.ranking.map((cause, i) => (
+                        <li key={`${cause.name}-${String(i)}`} className="font-mono">
+                          {cause.confidence === null
+                            ? '—'
+                            : cause.confidence.toFixed(2)}{' '}
+                          {cause.name}
+                          {cause.category === null ? '' : ` · ${cause.category}`}
+                        </li>
+                      ))}
+                    </ul>
+                    <NextActionLine snapshot={snapshot} />
+                  </li>
+                ))}
+              </ul>
+            </details>
+          )}
+        </div>
+      )}
+      {source === 'current_only' && (
+        <p data-testid="hypotheses-source-note" className="text-xs text-amber-300/80 mt-1">
+          Only a top hypothesis was reported, with no ranking and no reasoning — a
+          commander older than WO-R3-329 sends one.
+        </p>
+      )}
+    </div>
+  )
+}
+
 function AgentPanel({
   run,
   steps,
+  takeStartAt,
+  currentTake,
   loading,
   error,
   onRetry,
 }: {
   run: AgentRun | null
   steps: AgentRunStepRecord[]
+  /** The opening boundary of the take on screen, for the waiting sentence. */
+  takeStartAt: string | null
+  /** True while the take on screen is the take now running. */
+  currentTake: boolean
   loading: boolean
   error: string | null
   onRetry: () => void
 }) {
-  const hypotheses = rankedHypotheses(run)
+  const history = rankingHistory(run, steps)
+  const trend = confidenceTrend(steps)
   const source = hypothesesSource(run)
   const verifications = runVerifications(run)
   const plan = run?.plan ?? null
@@ -1043,7 +1403,18 @@ function AgentPanel({
         className="bg-gray-900 border border-gray-800 rounded-lg px-6 py-10 text-center"
       >
         <p className="text-lg text-gray-400">
-          {loading ? 'Loading…' : 'Waiting for the responder to report a run.'}
+          {loading
+            ? 'Loading…'
+            : currentTake
+              ? 'Waiting for this take’s run.'
+              : 'This take reported no run.'}
+        </p>
+        {/* A fresh take is supposed to look like this, and saying which world it is
+            waiting in is the difference between "at zero" and "broken". */}
+        <p data-testid="agent-panel-waiting" className="text-sm text-gray-500 mt-1">
+          {takeStartAt === null
+            ? 'No reset boundary is in view, so this is everything the page can see.'
+            : `Nothing reported since the reset at ${clockTime(takeStartAt)}; the page adopts the run on the poll after its first report.`}
         </p>
         <p className="text-sm text-gray-600 mt-2">
           The commander reports itself over MCP (ADR 0035). Nothing on this panel is
@@ -1105,49 +1476,8 @@ function AgentPanel({
         </div>
       </div>
 
-      {/* ── hypotheses ─────────────────────────────────────────────────────── */}
-      <div>
-        <h3 className="text-sm uppercase tracking-wider text-gray-500 mb-1">
-          Hypotheses, ranked
-        </h3>
-        {hypotheses.length === 0 ? (
-          <p data-testid="hypotheses-empty" className="text-sm text-gray-600">
-            None reported yet — the responder has not ranked a cause.
-          </p>
-        ) : (
-          <ol className="space-y-2">
-            {hypotheses.map((h, i) => (
-              <li
-                key={`${h.category}-${h.name}-${String(i)}`}
-                data-testid="hypothesis-row"
-                className="bg-gray-950/60 border border-gray-800 rounded px-3 py-2"
-              >
-                <div className="flex items-baseline justify-between gap-2">
-                  <span className="text-base text-gray-100">{h.name}</span>
-                  <span className="text-xs font-mono text-gray-500">{h.category}</span>
-                </div>
-                <div className="mt-1">
-                  <ConfidenceBar confidence={h.confidence} />
-                </div>
-                {h.reasoning_excerpt ? (
-                  <div className="mt-1">
-                    {/* The top one whole; the rest truncated. */}
-                    <Excerpt text={h.reasoning_excerpt} full={i === 0} />
-                  </div>
-                ) : (
-                  <p className="text-xs text-gray-600 mt-1">no reasoning reported</p>
-                )}
-              </li>
-            ))}
-          </ol>
-        )}
-        {source === 'current_only' && (
-          <p data-testid="hypotheses-source-note" className="text-xs text-amber-300/80 mt-1">
-            Only a top hypothesis was reported, with no ranking and no reasoning — a
-            commander older than WO-R3-329 sends one.
-          </p>
-        )}
-      </div>
+      {/* ── what the agent thinks now (WO-R3-336) ──────────────────────────── */}
+      <HypothesesPanel history={history} trend={trend} source={source} />
 
       {/* ── the plan ───────────────────────────────────────────────────────── */}
       <div>
@@ -1268,6 +1598,7 @@ const KIND_BADGE: Record<string, { label: string; className: string }> = {
 
 const LEDGER_TONE: Record<LedgerKind, string> = {
   step: 'border-gray-800 bg-gray-950/50',
+  alert: 'border-red-800/60 bg-red-950/20',
   agent_audit: 'border-gray-800 bg-gray-950/50',
   agent_report: 'border-purple-900/60 bg-purple-950/20',
   lab: 'border-amber-700/60 bg-amber-950/25',
@@ -1285,12 +1616,15 @@ function LedgerLine({
   badgeClassName,
   subject,
   summary,
+  keepSubject = false,
 }: {
   at: string | null
   badge: string
   badgeClassName: string
   subject: string
   summary: string | null
+  /** True where the subject is short by construction and the summary is the sentence. */
+  keepSubject?: boolean
 }) {
   return (
     <span className="flex items-center gap-1.5 min-w-0">
@@ -1304,7 +1638,13 @@ function LedgerLine({
       >
         {badge}
       </span>
-      <span className="text-[13px] font-mono text-gray-100 truncate">{subject}</span>
+      <span
+        className={`text-[13px] font-mono text-gray-100 ${
+          keepSubject ? 'shrink-0 whitespace-nowrap' : 'truncate'
+        }`}
+      >
+        {subject}
+      </span>
       {summary !== null && (
         <span className="text-xs text-gray-400 truncate shrink-[2]">→ {summary}</span>
       )}
@@ -1312,30 +1652,96 @@ function LedgerLine({
   )
 }
 
+/**
+ * The badge a planner's own report wears (WO-R3-336, item 3).
+ *
+ * Its own badge rather than `REPORT`, because a planner call and a status report are
+ * different events to a viewer: one is the agent thinking, the other is the agent
+ * telling the platform where it is.
+ */
+const THINK_BADGE = {
+  label: 'THINK',
+  className: 'bg-purple-500/30 text-purple-100 border-purple-400/60',
+}
+
+/** The ranking a THINK row opens: what was on the table, and what it led to. */
+function ThinkDetail({ report }: { report: ReturnType<typeof plannerReport> }) {
+  if (report === null) return null
+  return (
+    <div data-testid="think-detail" className="mt-1 space-y-1">
+      {report.ranking.length === 0 ? (
+        <p className="text-[11px] text-gray-500">no ranking reported on this step</p>
+      ) : (
+        <ul className="space-y-1">
+          {report.ranking.map((cause, i) => (
+            <li key={`${cause.name}-${String(i)}`}>
+              <div className="flex items-baseline justify-between gap-2">
+                <span className="text-xs text-gray-200">{cause.name}</span>
+                <span className="text-[10px] font-mono text-gray-500">
+                  {cause.category ?? 'no category'}
+                </span>
+              </div>
+              {cause.confidence === null ? (
+                <p className="text-[10px] text-gray-600">no confidence reported</p>
+              ) : (
+                <ConfidenceBar confidence={cause.confidence} />
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+      <p className="text-[11px] font-mono text-gray-500">{report.tool}</p>
+      <p className="text-[11px] font-mono text-gray-400">
+        {report.nextAction === null
+          ? 'no next action reported'
+          : `next: ${report.nextAction.kind ?? 'no kind'}${
+              report.nextAction.tool === null ? '' : ` ${report.nextAction.tool}`
+            }`}
+      </p>
+      {report.reason !== null && (
+        <p className="text-[11px] text-gray-400 leading-snug">{report.reason}</p>
+      )}
+    </div>
+  )
+}
+
+/** The three thinkers, as a ledger line should name them — the full tool is in the detail. */
+const THINK_SUBJECT: Record<string, string> = {
+  investigation_planner: 'planner',
+  reflection: 'reflection',
+  verify_judge: 'verify judge',
+}
+
 function StepEntry({ step }: { step: AgentRunStepRecord }) {
+  const planner = plannerReport(step)
+  const think = planner !== null
   // `kind` is an open string on the wire; an unrecognised one is shown verbatim
   // rather than dressed up as a read.
-  const badge = KIND_BADGE[step.kind] ?? {
-    label: step.kind.toUpperCase(),
-    className: 'bg-gray-700/50 text-gray-300 border-gray-600',
-  }
+  const badge = think
+    ? THINK_BADGE
+    : (KIND_BADGE[step.kind] ?? {
+        label: step.kind.toUpperCase(),
+        className: 'bg-gray-700/50 text-gray-300 border-gray-600',
+      })
   const isAction = step.kind === 'action'
   const [open, setOpen] = useState(false)
   const expanded = open || isAction
-  const args = compactJson(step.arguments)
-  const excerpt = step.result_excerpt
+  const args = think ? null : compactJson(step.arguments)
+  const excerpt = think ? null : step.result_excerpt
   const failed = step.outcome != null && step.outcome !== 'success'
 
   return (
     <div
       data-testid="ledger-entry"
-      data-kind={step.kind}
+      data-kind={think ? 'think' : step.kind}
       className={`rounded border px-2 py-1 ${
         isAction
           ? 'border-blue-500/60 bg-blue-950/30'
-          : failed
-            ? 'border-red-900/60 bg-red-950/20'
-            : LEDGER_TONE.step
+          : think
+            ? 'border-purple-800/60 bg-purple-950/20'
+            : failed
+              ? 'border-red-900/60 bg-red-950/20'
+              : LEDGER_TONE.step
       }`}
     >
       {isAction ? (
@@ -1356,14 +1762,20 @@ function StepEntry({ step }: { step: AgentRunStepRecord }) {
             at={step.at}
             badge={badge.label}
             badgeClassName={badge.className}
-            subject={step.tool ?? 'no tool reported'}
+            subject={
+              think
+                ? (THINK_SUBJECT[planner.tool] ?? planner.tool)
+                : (step.tool ?? 'no tool reported')
+            }
             summary={summariseStep(step)}
+            keepSubject={think}
           />
         </button>
       )}
 
       {expanded && (
         <div className="mt-1 space-y-1">
+          {think && open && <ThinkDetail report={planner} />}
           {args !== null && (
             <pre className="text-[11px] font-mono text-gray-400 whitespace-pre-wrap break-all">
               {args}
@@ -1383,6 +1795,9 @@ function StepEntry({ step }: { step: AgentRunStepRecord }) {
               {step.outcome ?? 'outcome —'}
             </span>
             {step.latency_ms != null && ` · ${step.latency_ms.toFixed(0)} ms`}
+            {/* A planner call spends no budget and makes no MCP call: saying so on the
+                row is what stops a viewer counting it as one (WO-R3-337). */}
+            {think && ' · the agent thinking, not a call'}
           </p>
         </div>
       )}
@@ -1393,6 +1808,7 @@ function StepEntry({ step }: { step: AgentRunStepRecord }) {
 /** The badge an audit-derived row wears, which is the answer to "whose call was this?". */
 const ROW_BADGE: Record<string, { label: string; className: string }> = {
   lab: { label: 'LAB', className: 'bg-amber-500/25 text-amber-200 border-amber-500/50' },
+  alert: { label: 'PAGED', className: 'bg-red-500/25 text-red-200 border-red-500/50' },
   lab_probe: {
     label: 'LAB PROBE',
     className: 'bg-amber-500/10 text-amber-200/70 border-amber-700/40',
@@ -1422,12 +1838,17 @@ function RowEntry({ entry }: { entry: LedgerEntry }) {
     label: 'ROW',
     className: 'bg-gray-700/50 text-gray-300 border-gray-600',
   }
+  const alertText = (key: string): string | null =>
+    typeof extra[key] === 'string' && extra[key] !== '' ? (extra[key] as string) : null
   const reason =
     entry.kind === 'lab_probe'
       ? 'the lab labelled this read as its own'
       : entry.kind === 'other_principal'
         ? 'another principal, not this run’s'
-        : null
+        : // An alert has no tool and no arguments; what it has is what it said.
+          entry.kind === 'alert'
+          ? alertText('summary')
+          : null
 
   return (
     <div
@@ -1444,7 +1865,7 @@ function RowEntry({ entry }: { entry: LedgerEntry }) {
           at={row.created_at}
           badge={badge.label}
           badgeClassName={badge.className}
-          subject={tool ?? row.action}
+          subject={tool ?? (entry.kind === 'alert' ? (alertText('fingerprint') ?? row.action) : row.action)}
           summary={reason}
         />
       </button>
@@ -1498,6 +1919,8 @@ function ResetDivider({ at }: { at: string }) {
 function ActionLedger({
   entries,
   counts,
+  thinkCount,
+  boundaryInView,
   stepsDropped,
   usingAudit,
   showJobEvents,
@@ -1515,7 +1938,12 @@ function ActionLedger({
     auditCalls: number
     hiddenReads: number
     agreed: boolean
+    warn: boolean
   }
+  /** The run's own planner calls — steps that spend no budget and make no call. */
+  thinkCount: number
+  /** False while the take's opening boundary is still past the end of the rows read. */
+  boundaryInView: boolean
   stepsDropped: number
   usingAudit: boolean
   showJobEvents: boolean
@@ -1526,9 +1954,10 @@ function ActionLedger({
   error: string | null
   onRetry: () => void
 }) {
-  // Newest at the bottom means the newest row is the one that scrolls away, so the
-  // panel follows it — until the operator scrolls up, at which point following would
-  // be yanking the page out from under them.
+  // Newest at the TOP since WO-R3-336 — the owner's rule from the fourth take, which
+  // reverses WO-R3-334's transcript order. The newest row is the one the eye wants
+  // first, so the panel pins to the top and stops following the moment the operator
+  // scrolls down into the history.
   const scroller = useRef<HTMLDivElement | null>(null)
   const [pinned, setPinned] = useState(true)
   const count = entries.length
@@ -1536,20 +1965,19 @@ function ActionLedger({
   useEffect(() => {
     const box = scroller.current
     if (box === null || !pinned) return
-    box.scrollTop = box.scrollHeight
+    box.scrollTop = 0
   }, [count, pinned])
 
   function onScroll() {
     const box = scroller.current
     if (box === null) return
-    const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 24
-    setPinned(atBottom)
+    setPinned(box.scrollTop < 24)
   }
 
-  function toBottom() {
+  function toTop() {
     const box = scroller.current
     if (box === null) return
-    box.scrollTop = box.scrollHeight
+    box.scrollTop = 0
     setPinned(true)
   }
 
@@ -1587,15 +2015,27 @@ function ActionLedger({
         </div>
       </div>
 
+      {/* Read and action steps only, against this run's own `agent.tool_invoked` rows.
+          The planner's own reports are counted beside them rather than in them: they
+          make no MCP call, so counting them would recreate the disagreement the fourth
+          take's page invented. */}
       <p data-testid="ledger-counts" className="text-xs text-gray-500 mt-0.5">
-        {counts.steps} steps reported · {counts.auditCalls} calls the platform recorded
-        {!counts.agreed && (
+        {counts.calls} steps reported · {counts.auditCalls} calls the platform recorded
+        {thinkCount > 0 && ` · ${String(thinkCount)} planner calls, which make none`}
+        {counts.warn && (
           <span className="text-amber-300">
             {' '}
-            — the two do not agree, so the reporter is behind or has stopped
+            — the run is over and has been quiet for 10s, so the reporter stopped before
+            it finished
           </span>
         )}
       </p>
+      {!boundaryInView && (
+        <p data-testid="ledger-boundary-missing" className="text-xs text-amber-300/90">
+          This take&rsquo;s opening boundary is older than every audit row the page could
+          read, so the rows above may include the take before it.
+        </p>
+      )}
       {counts.hiddenReads > 0 && (
         <p data-testid="ledger-hidden-reads" className="text-xs text-gray-500">
           {counts.hiddenReads} evaluator/traffic reads hidden — the lab&rsquo;s probes and
@@ -1643,15 +2083,15 @@ function ActionLedger({
 
       <div className="flex items-center justify-between gap-2 mt-2">
         <p className="text-xs text-gray-600 font-mono truncate">
-          …/steps + /audit/logs — newest last
+          …/steps + /audit/logs — newest first
         </p>
         {!pinned && (
           <button
-            data-testid="ledger-to-bottom"
-            onClick={toBottom}
+            data-testid="ledger-to-top"
+            onClick={toTop}
             className="text-xs text-blue-300 hover:text-blue-200 shrink-0"
           >
-            newest ↓
+            newest ↑
           </button>
         )}
       </div>
@@ -2045,6 +2485,16 @@ export default function DemoPage() {
     [searchParams, setSearchParams],
   )
 
+  /** Unpinning matters as much as pinning: without `run` the page follows the take. */
+  const clearParam = useCallback(
+    (key: string) => {
+      const params = new URLSearchParams(searchParams)
+      params.delete(key)
+      setSearchParams(params, { replace: true })
+    },
+    [searchParams, setSearchParams],
+  )
+
   // ── the readings, all on one cadence ────────────────────────────────────
   // Every run, not just the active ones: see `adminApi.listAgentRuns`.
   const loadRuns = useCallback(() => adminApi.listAgentRuns(), [])
@@ -2085,15 +2535,37 @@ export default function DemoPage() {
    * pushed the one `chaos.*` row that states the fault off the page within a minute,
    * so the platform row fell back to `healthy` mid-incident.
    */
-  const loadAudit = useCallback(
-    () =>
-      adminApi.listAuditLogs({
-        page: 1,
-        page_size: AUDIT_ROWS,
-        action_prefix: OPERATOR_STREAMS,
-      }),
-    [],
-  )
+  /**
+   * How many pages of operator rows to read — one, until the take's opening boundary
+   * turns out to be further back than that (WO-R3-336, item 2).
+   *
+   * The fourth take's ledger showed `kill_consumer 08:18:05` from the take BEFORE the
+   * one on screen, and the take label said `take start not in view`: the boundary that
+   * opened the take was past the end of the single page of 100 rows the page asked for,
+   * so there was no boundary to cut the rows at and every older row leaked in. The page
+   * now asks for another page whenever the selected take has no opening boundary and
+   * the server says there are more rows, up to a bound — an unbounded walk back through
+   * an append-only table on a 2-second poll is not a fix.
+   */
+  const [auditPages, setAuditPages] = useState(1)
+  const loadAudit = useCallback(async () => {
+    const pages = []
+    for (let page = 1; page <= auditPages; page += 1) {
+      pages.push(
+        await adminApi.listAuditLogs({
+          page,
+          page_size: AUDIT_ROWS,
+          action_prefix: OPERATOR_STREAMS,
+        }),
+      )
+    }
+    const last = pages[pages.length - 1]
+    return {
+      items: pages.flatMap((p) => p.items),
+      // The oldest page's own flag: whether anything the page has not read still exists.
+      hasMore: last?.has_next ?? false,
+    }
+  }, [auditPages])
   const audit = usePolling(loadAudit, POLL_MS, {
     errorMessage: 'Could not read the audit log.',
   })
@@ -2126,11 +2598,10 @@ export default function DemoPage() {
 
   // ── the take, the run, the steps ─────────────────────────────────────────
   //
-  // One take, chosen by the run rather than by the clock (WO-R3-334). The rule is
-  // "the newest run with a fault row in its own take", so the page shows a coherent
-  // incident even when it is reloaded after the wind-down — which is exactly what
-  // happened on the third take and why the platform row and the agent row were
-  // describing two different worlds.
+  // The take NOW RUNNING by default (WO-R3-336), re-evaluated on every poll: a fresh
+  // demo starts the page at zero, the run is adopted on the poll after its first
+  // report, and a new boundary moves the page on. `?run=` pins a take explicitly, and
+  // everything earlier is history the operator chooses from the take selector.
   const selection = useMemo(
     () => selectTake({ runs: runs.data?.items ?? [], audit: auditRows, wanted: wantedRun }),
     [runs.data, auditRows, wantedRun],
@@ -2138,6 +2609,33 @@ export default function DemoPage() {
   const take = selection.take
   const listedRun = selection.run
   const runId = listedRun?.id ?? null
+  const takes = useMemo(
+    () => takeOptions({ runs: runs.data?.items ?? [], audit: auditRows }),
+    [runs.data, auditRows],
+  )
+
+  /**
+   * Read another page of audit rows while the take's opening boundary is not in view.
+   *
+   * Only while the server says there are more rows, and only up to `MAX_AUDIT_PAGES`:
+   * a take older than the platform's whole audit window has no boundary to find, and
+   * the ledger says so rather than the page walking back forever.
+   *
+   * The count only ever GROWS. Dropping back to one page the moment the boundary is in
+   * view drops the row that put it there, which un-finds it on the next poll and
+   * re-finds it on the one after — a page oscillating between two takes on a two-second
+   * cadence. An extra page of rows the take filter discards is the cheaper mistake.
+   */
+  const boundaryInView = take.startAt !== null
+  const moreAuditRows = audit.data?.hasMore === true
+  useEffect(() => {
+    if (boundaryInView || !moreAuditRows) return
+    setAuditPages((p) => (p < MAX_AUDIT_PAGES ? p + 1 : p))
+    // `audit.data` is in the deps because one page further back may still not hold the
+    // boundary: each answer is a chance to decide to read one more, and at the bound
+    // the state stops changing, so the walk ends by itself.
+  }, [boundaryInView, moreAuditRows, audit.data])
+
   /**
    * True when the take on screen has been closed and the take after it has reported
    * no run yet — the state the third take's reload was in, and the one sentence that
@@ -2162,7 +2660,16 @@ export default function DemoPage() {
   // The list row is the fallback for the run's own fields while the first detail
   // answer is in flight. It never contributes steps: the listing has none, and an
   // empty list there means "not sent", not "this run made no calls".
-  const run: AgentRun | null = runDetail.data ?? listedRun
+  //
+  // The detail is used ONLY when it is the detail of the selected run (WO-R3-336). A
+  // parked poll keeps its last answer, so without the id check a page that moves on to
+  // a fresh take — the whole point of item 1 — would keep rendering the previous take's
+  // run in the agent row and the panel, which is the thing the owner saw.
+  const detailRun =
+    runDetail.data !== null && runId !== null && runDetail.data.id === runId
+      ? runDetail.data
+      : null
+  const run: AgentRun | null = runId === null ? null : (detailRun ?? listedRun)
 
   // The steps, merged from the two reads that carry them, reset on a run change.
   const [stepStore, setStepStore] = useState<{
@@ -2231,6 +2738,9 @@ export default function DemoPage() {
   // Keyed on the whole take rather than on its opening boundary since WO-R3-334:
   // switching from a closed take to the live one shares no key, so a latch can
   // neither outlive its take nor leak backwards into an earlier one.
+  //
+  // The EARLIEST successful injection wins since WO-R3-336 item 7: a re-arm is not a new
+  // incident, and the fourth take's page measured everything from one.
   const rowFaultAt = useMemo(() => faultInTake(auditRows, take), [auditRows, take])
   const latch = useRef<{ take: string; faultAt: string | null }>({ take: '', faultAt: null })
   if (latch.current.take !== takeKey(take)) {
@@ -2238,7 +2748,7 @@ export default function DemoPage() {
   }
   if (
     rowFaultAt !== null &&
-    (latch.current.faultAt === null || rowFaultAt > latch.current.faultAt)
+    (latch.current.faultAt === null || rowFaultAt < latch.current.faultAt)
   ) {
     latch.current.faultAt = rowFaultAt
   }
@@ -2345,6 +2855,11 @@ export default function DemoPage() {
   const platformCurrent = platformStations.find((s) => s.state === 'current') ?? null
   const agentCurrent = agentStations.find((s) => s.state === 'current') ?? null
 
+  // The take's rows, which is the scope of the chart's markers, the ledger and both
+  // counts: a row from the take after this one belongs to that take, and the third
+  // take's page put seven of them under a run that had already finished.
+  const takeRows = useMemo(() => rowsInTake(auditRows, take), [auditRows, take])
+
   // ── the chart's window, its markers and the ledger ───────────────────────
   // The platform's window is taken from the reply rather than assumed: the reading
   // says how much history it can hold and how far apart the samples are (900 / 60
@@ -2370,7 +2885,10 @@ export default function DemoPage() {
         recoveredAt: recovery.recoveredAt,
         resetAts: [take.startAt, take.endAt],
         steps,
-        audit: auditRows,
+        // The take's rows, not the page's whole window: the axis can be zoomed out past
+        // the take (the `full window` button), and a marker outside it would say the
+        // agent or the lab did something in a world this chart is not about.
+        audit: takeRows,
         runPrincipalId,
         windowStart,
         windowEnd,
@@ -2381,17 +2899,13 @@ export default function DemoPage() {
       take.startAt,
       take.endAt,
       steps,
-      auditRows,
+      takeRows,
       runPrincipalId,
       windowStart,
       windowEnd,
     ],
   )
 
-  // The ledger reads the take's rows, not the page's whole window: a row from the
-  // take after this one belongs to that take's ledger, and the third take's page put
-  // seven of them under a run that had already finished.
-  const takeRows = useMemo(() => rowsInTake(auditRows, take), [auditRows, take])
   const ledgerRows = useMemo(
     () => [
       // With the edges: the boundary that opened the take is the divider the ledger
@@ -2410,15 +2924,35 @@ export default function DemoPage() {
         showJobEvents,
         runPrincipalId,
         showHiddenReads,
-        // Newest at the bottom: a live run's newest call is where the eye already is.
-        oldestFirst: true,
+        // Newest at the TOP (the owner's rule from the fourth take), which is this
+        // helper's default — the page no longer asks it to reverse.
       }),
     [steps, ledgerRows, showJobEvents, runPrincipalId, showHiddenReads],
   )
-  const counts = useMemo(
-    () => ledgerCounts({ steps, audit: takeRows, runPrincipalId }),
-    [steps, takeRows, runPrincipalId],
+  /**
+   * The two witnesses' counts, and the rule for when their disagreeing means anything.
+   *
+   * `now` comes from the page's own ticking clock rather than from `Date.now()` inside
+   * the helper, so the ten-second silence is re-evaluated on every tick instead of only
+   * when a poll happens to change something.
+   */
+  const reportedAt = useMemo(
+    () => lastReportAt({ steps, audit: takeRows, runId }),
+    [steps, takeRows, runId],
   )
+  const counts = useMemo(
+    () =>
+      ledgerCounts({
+        steps,
+        audit: takeRows,
+        runPrincipalId,
+        terminal: isTerminalRun(run),
+        lastReportAt: reportedAt,
+        now,
+      }),
+    [steps, takeRows, runPrincipalId, run, reportedAt, now],
+  )
+  const thinkCount = useMemo(() => steps.filter(isThinkStep).length, [steps])
 
   const briefing = run?.briefing ?? null
   const latestVerification =
@@ -2426,10 +2960,9 @@ export default function DemoPage() {
   const activeAlert = (alerts.data?.items ?? [])[0] ?? null
   const openBreakers = (breakers.data?.breakers ?? []).filter((b) => b.state !== 'closed')
   const breakersUnknownReason = breakers.data?.unknown_reason ?? null
-  const labRow = useMemo(
-    () => takeRows.find((r) => r.action.startsWith('chaos.')) ?? null,
-    [takeRows],
-  )
+  // The hook that broke this world — the take's FIRST injection, never a refused guard
+  // probe and never the re-arm that followed it (WO-R3-336 item 7).
+  const labRow = useMemo(() => faultRowsInTake(auditRows, take)[0] ?? null, [auditRows, take])
 
   const runsError = runs.error ?? runDetail.error
 
@@ -2441,18 +2974,34 @@ export default function DemoPage() {
           <h1 className="text-xl font-semibold text-white leading-tight">
             Agent run — {mode === 'consumer_outage' ? 'consumer outage' : 'DLQ backlog'}
           </h1>
-          <div className="flex items-center gap-4 mt-1.5">
+          <div className="flex items-center gap-4 mt-1.5 flex-wrap">
+            <TakeSelector
+              options={takes}
+              selectedKey={takeKey(take)}
+              onSelect={(option) => {
+                // Choosing the live take clears the pin, which is what puts the page
+                // back on "whatever this take reports next"; choosing history pins its
+                // newest run, so the page stays there while the world moves on.
+                if (option.current && option.run === null) clearParam('run')
+                else if (option.run !== null) setParam('run', option.run.id)
+                else clearParam('run')
+              }}
+            />
             <RunSelector
-              runs={selection.runs}
+              runs={selection.takeRuns}
               selected={listedRun}
-              takeStartOf={(r) => takeOfRun(auditRows, r).startAt}
               onSelect={(id) => setParam('run', id)}
             />
           </div>
           {/* Its own line: the take label is a sentence, and beside a run selector
               full of ids it pushed the clock and the mode buttons onto a third row. */}
           <div className="flex items-center gap-4 mt-1">
-            <TakeLabel take={take} newerTakeRunning={newerTakeRunning} />
+            <TakeLabel
+              take={take}
+              current={selection.current}
+              hasRun={listedRun !== null}
+              newerTakeRunning={newerTakeRunning}
+            />
             {labRow !== null && (
               <span className="text-xs font-mono text-amber-300/80">
                 lab: {labToolName(labRow)}
@@ -2504,6 +3053,13 @@ export default function DemoPage() {
           stations={agentStations}
           tone="agent"
           now={now}
+          note={
+            listedRun === null
+              ? selection.current
+                ? 'waiting for this take’s run'
+                : 'this take reported no run'
+              : null
+          }
         />
         <p data-testid="phase-reading" className="text-sm text-gray-400">
           The platform reads{' '}
@@ -2541,8 +3097,11 @@ export default function DemoPage() {
           the top half, and the top half has to be one screen at 1440×900 with no
           scroll — measured in a real browser, not guessed. A station carries a
           "reported" line now (WO-R3-334), so the rows are taller and this is
-          shorter. Each panel scrolls inside itself instead. */}
-      <div className="grid grid-cols-1 xl:grid-cols-12 gap-3 mt-2 xl:h-[22rem]">
+          shorter. Each panel scrolls inside itself instead. 21rem since WO-R3-336:
+          the header carries a take selector as well, and the measurement that
+          matters is where the ledger's bottom lands — 886 of a 900-pixel viewport
+          on the live state, measured in a real browser. */}
+      <div className="grid grid-cols-1 xl:grid-cols-12 gap-3 mt-2 xl:h-[21rem]">
         <div className="xl:col-span-4 flex flex-col gap-3 min-h-0 overflow-y-auto">
           {mode === 'consumer_outage' ? (
             <MetricChart
@@ -2646,6 +3205,8 @@ export default function DemoPage() {
           <AgentPanel
             run={run}
             steps={steps}
+            takeStartAt={take.startAt}
+            currentTake={selection.current}
             loading={runs.loading && runs.data === null}
             error={runsError}
             onRetry={() => {
@@ -2659,6 +3220,12 @@ export default function DemoPage() {
           <ActionLedger
             entries={ledger}
             counts={counts}
+            thinkCount={thinkCount}
+            boundaryInView={
+              // Either the boundary is in the rows, or there are no more rows to read —
+              // anything else means the page stopped short of it and must say so.
+              boundaryInView || !moreAuditRows
+            }
             stepsDropped={
               stepStore.runId === runId ? stepStore.dropped : (run?.steps_dropped ?? 0)
             }

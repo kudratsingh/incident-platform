@@ -151,6 +151,42 @@ function step(
   }
 }
 
+/**
+ * One planner call as WO-R3-337 will report it: a `report`-kind step whose tool is one
+ * of the three thinkers, carrying the ranking it accepted and where it went next.
+ *
+ * Mocked here, and valid on the platform as it stands — `StepEventKind` already includes
+ * `report`, so nothing on the platform side of the wire moves for this.
+ */
+function thinkStep(
+  seq: number,
+  at: string,
+  ranking: { name: string; category: string; confidence: number }[],
+  overrides: Partial<AgentRunStepRecord> = {},
+): AgentRunStepRecord {
+  const top = ranking[0]
+  return {
+    seq,
+    kind: 'report',
+    tool: 'investigation_planner',
+    at,
+    arguments: {
+      ranking,
+      next_action: { kind: 'probe', tool: 'get_consumer_lag' },
+      reason: 'one more fresh reading of the alerted subject',
+    },
+    result_excerpt: `top ${top.name} ${top.confidence.toFixed(2)} → probe get_consumer_lag: one more fresh reading of the alerted subject`,
+    outcome: 'success',
+    latency_ms: null,
+    ...overrides,
+  }
+}
+
+const THINK_STEP = thinkStep(2, '2026-09-19T10:01:10Z', [
+  { name: 'consumer_saturation', category: 'consumer_failure', confidence: 0.85 },
+  { name: 'poison_message', category: 'bad_payload', confidence: 0.2 },
+])
+
 function job(overrides: Partial<Job> = {}): Job {
   return {
     id: '44444444-4444-4444-4444-444444444444',
@@ -203,6 +239,15 @@ interface Fixture {
   detailError?: unknown
   steps?: AgentRunStepRecord[]
   audit?: AuditLog[]
+  /**
+   * The older pages of operator rows, keyed by page number (WO-R3-336 item 2).
+   *
+   * The fourth take's boundary was past the end of the one page the page asked for, so
+   * there was no boundary to cut the take at and the rows of the take before it leaked
+   * into the ledger. With this set, page 1 reports `has_next` and the page must come
+   * back for page 2.
+   */
+  auditPages?: Record<number, AuditLog[]>
   jobEvents?: AuditLog[]
   jobs?: Job[]
   dlqJobs?: Job[]
@@ -224,6 +269,15 @@ function page<T>(items: T[], pageSize = 50) {
 /** Minutes before now, so the 15-minute window keeps them. */
 function ago(minutes: number): string {
   return new Date(Date.now() - minutes * 60_000).toISOString()
+}
+
+/** The clock the page prints, so a test can assert WHICH instant is on screen. */
+function clockTimeOf(iso: string): string {
+  return new Date(iso).toLocaleTimeString(undefined, {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  })
 }
 
 function stub(f: Fixture = {}) {
@@ -278,13 +332,20 @@ function stub(f: Fixture = {}) {
   )
   // Two audit queries: the operator streams the page derives from, and the job
   // lifecycle, which is only asked for while the toggle is on.
-  listAuditLogs.mockImplementation((params = {}) =>
-    Promise.resolve(
-      params.action_prefix === 'event.'
-        ? page(f.jobEvents ?? [], 100)
-        : page(f.audit ?? [], 100),
-    ),
-  )
+  const olderPages = f.auditPages ?? {}
+  listAuditLogs.mockImplementation((params = {}) => {
+    if (params.action_prefix === 'event.') return Promise.resolve(page(f.jobEvents ?? [], 100))
+    const wanted = params.page ?? 1
+    const rows = wanted === 1 ? (f.audit ?? []) : (olderPages[wanted] ?? [])
+    const hasNext = olderPages[wanted + 1] !== undefined
+    return Promise.resolve({
+      items: rows,
+      total: 0,
+      page: wanted,
+      page_size: 100,
+      has_next: hasNext,
+    })
+  })
   vi.mocked(adminApi.circuitBreakers).mockResolvedValue({
     measured_at: '2026-09-19T10:02:00Z',
     breakers: [],
@@ -352,7 +413,7 @@ describe('DemoPage — the shape of the page', () => {
     await screen.findByTestId('action-ledger')
     await waitFor(() => {
       expect(listAuditLogs).toHaveBeenCalledWith(
-        expect.objectContaining({ action_prefix: 'agent.,lab.,chaos.' }),
+        expect.objectContaining({ action_prefix: 'agent.,lab.,chaos.,alert.' }),
       )
     })
     // The job lifecycle is 43 rows in 50 with traffic running; it is not fetched
@@ -395,7 +456,7 @@ describe('DemoPage — two rows, always both, never merged', () => {
       expect(stationState(key)).toBe('pending')
     }
     expect(screen.getByTestId('agent-panel').textContent).toMatch(
-      /waiting for the responder/i,
+      /waiting for this take’s run/i,
     )
   })
 
@@ -696,9 +757,9 @@ describe('DemoPage — the action ledger', () => {
     step(3, 'report', 'report_agent_run', '2026-09-19T10:02:01Z'),
   ]
 
-  it('is one row per step, oldest first with the newest at the bottom', async () => {
-    // WO-R3-334 turned the ledger round: a live run's newest call is where the eye
-    // already is, so the panel reads like a transcript and follows the bottom.
+  it('is one row per step, newest at the TOP', async () => {
+    // The owner's rule from the fourth take, reversing WO-R3-334's transcript order:
+    // the newest row is the one the eye wants first, so the panel pins to the top.
     stub({ runs: [agentRun()], steps, audit: [RESET_ROW, FAULT_ROW] })
     renderDemo()
     await screen.findByTestId('action-ledger')
@@ -706,7 +767,8 @@ describe('DemoPage — the action ledger', () => {
       expect(screen.getAllByTestId('ledger-entry').length).toBeGreaterThanOrEqual(4)
     })
     const kinds = screen.getAllByTestId('ledger-entry').map((e) => e.dataset.kind)
-    expect(kinds.slice(-4)).toEqual(['lab', 'read', 'action', 'report'])
+    expect(kinds.slice(0, 4)).toEqual(['report', 'action', 'read', 'lab'])
+    expect(screen.getByTestId('action-ledger').textContent).toMatch(/newest first/)
   })
 
   it('summarises what a read answered on its one line', async () => {
@@ -790,7 +852,10 @@ describe('DemoPage — the action ledger', () => {
     )
   })
 
-  it('counts both witnesses and says when they disagree', async () => {
+  it('counts both witnesses and stays quiet about a live run that is behind', async () => {
+    // WO-R3-336 item 4: the fourth take's page warned about a run that had reported
+    // everything it did. A live run is always one report behind, so the counts are
+    // shown and the warning is not.
     stub({
       runs: [agentRun()],
       steps: [steps[0]],
@@ -806,7 +871,50 @@ describe('DemoPage — the action ledger', () => {
       expect(counts.textContent).toMatch(/1 steps reported/)
     })
     expect(counts.textContent).toMatch(/2 calls the platform recorded/)
-    expect(counts.textContent).toMatch(/do not agree/)
+    expect(counts.textContent).not.toMatch(/reporter stopped/)
+  })
+
+  it('warns only about a terminal run that has gone quiet', async () => {
+    const finished = agentRun({
+      state: 'escalated',
+      finished_at: '2026-09-19T10:02:30Z',
+      active: false,
+    })
+    stub({
+      runs: [finished],
+      detail: finished,
+      steps: [steps[0]],
+      audit: [
+        FAULT_ROW,
+        // Its last report is in the distant past on the page's own clock, which is
+        // what "has stopped" means when the run is over.
+        toolRow('agent.run_reported', 'report_agent_run', '2026-09-19T10:01:00Z', {
+          run_id: 'run-1',
+          state: 'escalated',
+        }),
+        toolRow('agent.tool_invoked', 'get_consumer_lag', '2026-09-19T10:01:00Z'),
+        toolRow('agent.tool_invoked', 'restart_consumer_group', '2026-09-19T10:02:00Z'),
+      ],
+    })
+    renderDemo()
+    const counts = await screen.findByTestId('ledger-counts')
+    await waitFor(() => {
+      expect(counts.textContent).toMatch(/reporter stopped/)
+    })
+  })
+
+  it('counts the planner’s own reports beside the calls, never as calls', async () => {
+    stub({
+      runs: [agentRun()],
+      steps: [steps[0], THINK_STEP],
+      audit: [FAULT_ROW, toolRow('agent.tool_invoked', 'get_consumer_lag', '2026-09-19T10:01:00Z')],
+    })
+    renderDemo()
+    const counts = await screen.findByTestId('ledger-counts')
+    await waitFor(() => {
+      expect(counts.textContent).toMatch(/1 steps reported/)
+    })
+    expect(counts.textContent).toMatch(/1 planner calls, which make none/)
   })
 
   it('falls back to the audit rows when no step was reported, and says so', async () => {
@@ -1220,27 +1328,29 @@ const CLOSED_RUN = agentRun({
   active: false,
 })
 
-describe('DemoPage — one take, chosen by the run', () => {
-  it('shows the run’s own take after the wind-down, and says the take ended', async () => {
+describe('DemoPage — one take, pinned by ?run=', () => {
+  it('shows the pinned run’s own take, and says the take ended', async () => {
     stub({ runs: [CLOSED_RUN], detail: CLOSED_RUN, audit: WIND_DOWN_ROWS })
-    renderDemo()
+    renderDemo('?run=run-take-3')
     await screen.findByTestId('phase-row-platform')
     await waitFor(() => {
       expect(screen.getByTestId('take-label').textContent).toMatch(/take ended at/)
     })
-    // The reading the screenshot could not give: the platform saw the fault of the
-    // take the agent's `escalated` belongs to.
+    // The reading the third take's screenshot could not give: the platform saw the
+    // fault of the take the agent's `escalated` belongs to.
     expect(stationState('fault_injected')).not.toBe('pending')
     expect(screen.getByTestId('fault-clock').textContent).toMatch(/T\+/)
     expect(screen.getByTestId('fault-clock').textContent).toMatch(/stopped at the take/)
     expect((screen.getByTestId('run-selector') as HTMLSelectElement).value).toBe('run-take-3')
+    // And it says plainly that this is history the operator asked for.
+    expect(screen.getByTestId('take-label').textContent).toMatch(/history, chosen/)
   })
 
   it('leaves the next take’s rows out of this take’s ledger', async () => {
     // The seven bogus "agent" rows of finding F4: the evaluator's probes and the
     // world audit, written AFTER the boundary, which the page read as a new run.
     stub({ runs: [CLOSED_RUN], detail: CLOSED_RUN, audit: WIND_DOWN_ROWS })
-    renderDemo()
+    renderDemo('?run=run-take-3')
     await screen.findByTestId('action-ledger')
     await waitFor(() => {
       expect(screen.getAllByTestId('ledger-entry').length).toBeGreaterThan(0)
@@ -1252,7 +1362,7 @@ describe('DemoPage — one take, chosen by the run', () => {
 
   it('marks no agent action for a take where the agent never acted', async () => {
     stub({ runs: [CLOSED_RUN], detail: CLOSED_RUN, audit: WIND_DOWN_ROWS })
-    renderDemo()
+    renderDemo('?run=run-take-3')
     await screen.findByTestId('metric-chart-lag')
     await waitFor(() => {
       expect(screen.getAllByTestId('chart-marker-fault').length).toBe(1)
@@ -1261,7 +1371,7 @@ describe('DemoPage — one take, chosen by the run', () => {
     expect(screen.getAllByTestId('chart-marker-reset')).toHaveLength(2)
   })
 
-  it('honours ?run= and reads that run’s take', async () => {
+  it('honours ?run= for a run in the take now running', async () => {
     const liveRun = agentRun({ id: 'run-live', started_at: '2026-09-19T10:06:00Z' })
     stub({ runs: [CLOSED_RUN, liveRun], detail: liveRun, audit: WIND_DOWN_ROWS })
     renderDemo('?run=run-live')
@@ -1270,6 +1380,425 @@ describe('DemoPage — one take, chosen by the run', () => {
       expect(screen.getByTestId('take-label').textContent).toMatch(/live/)
     })
     expect(getAgentRun).toHaveBeenCalledWith('run-live')
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WO-R3-336 item 1 — a fresh take starts at zero.
+//
+// The owner's fourth take was green and still not watchable, and this is the first
+// thing they saw: the page opened on the take BEFORE the one running, because
+// WO-R3-334's default was "the newest run with a fault in its own take" and that run
+// was in the previous take. A fresh demo has to start at zero and adopt its run when
+// the run reports.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('DemoPage — a fresh take starts at zero', () => {
+  it('opens on the take now running, not on the take that has the run', async () => {
+    stub({ runs: [CLOSED_RUN], detail: CLOSED_RUN, audit: WIND_DOWN_ROWS })
+    renderDemo()
+    await screen.findByTestId('phase-row-platform')
+    await waitFor(() => {
+      expect(screen.getByTestId('take-label').textContent).toMatch(/take from/)
+    })
+    expect(screen.getByTestId('take-label').textContent).toMatch(/live/)
+    expect(screen.getByTestId('take-label').textContent).toMatch(/waiting for this take/)
+    // No run in this take: every agent station is empty and the panel says what it is
+    // waiting for rather than showing the previous take's escalation.
+    for (const key of ['triage', 'investigating', 'planning', 'remediating', 'verifying']) {
+      expect(stationState(key)).toBe('pending')
+    }
+    expect(screen.getByTestId('phase-row-agent-note').textContent).toMatch(
+      /waiting for this take/,
+    )
+    expect(screen.getByTestId('agent-panel-waiting').textContent).toMatch(
+      /Nothing reported since the reset at/,
+    )
+    expect(screen.getByTestId('run-selector-empty')).toBeTruthy()
+  })
+
+  it('reads the platform’s own row for the fresh take, with no fault and no clock', async () => {
+    stub({ runs: [CLOSED_RUN], detail: CLOSED_RUN, audit: WIND_DOWN_ROWS })
+    renderDemo()
+    await screen.findByTestId('phase-row-platform')
+    await waitFor(() => {
+      expect(stationState('healthy')).toBe('current')
+    })
+    expect(stationState('fault_injected')).toBe('pending')
+    expect(screen.getByTestId('fault-clock').textContent).toMatch(/no fault injected yet/)
+  })
+
+  it('shows this take’s lab rows only — never the previous take’s', async () => {
+    stub({ runs: [CLOSED_RUN], detail: CLOSED_RUN, audit: WIND_DOWN_ROWS })
+    renderDemo()
+    await screen.findByTestId('action-ledger')
+    await waitFor(() => {
+      expect(screen.getAllByTestId('ledger-reset-divider').length).toBe(1)
+    })
+    // `kill_consumer` belongs to the take before this one. The fourth take's ledger
+    // showed exactly this row, from the take before, because the boundary was not in
+    // view to cut it off.
+    expect(screen.getByTestId('action-ledger').textContent).not.toMatch(/kill_consumer/)
+  })
+
+  it('adopts the run on the poll after its first report', async () => {
+    vi.useFakeTimers()
+    const fresh = agentRun({
+      id: 'run-take-4',
+      state: 'triage',
+      started_at: '2026-09-19T10:06:00Z',
+      phase_history: [{ state: 'triage', at: '2026-09-19T10:06:00Z' }],
+    })
+    stub({ runs: [CLOSED_RUN], detail: CLOSED_RUN, audit: WIND_DOWN_ROWS })
+    listAgentRuns
+      .mockResolvedValueOnce(page([CLOSED_RUN]))
+      .mockResolvedValue(page([CLOSED_RUN, fresh]))
+    getAgentRun.mockResolvedValue(fresh)
+
+    renderDemo()
+    await vi.waitFor(() => {
+      expect(screen.getByTestId('run-selector-empty')).toBeTruthy()
+    })
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2100)
+    })
+    await vi.waitFor(() => {
+      expect((screen.getByTestId('run-selector') as HTMLSelectElement).value).toBe(
+        'run-take-4',
+      )
+    })
+    expect(getAgentRun).toHaveBeenCalledWith('run-take-4')
+  })
+
+  it('offers the earlier takes as history, labelled, and reads one when chosen', async () => {
+    const user = userEvent.setup()
+    stub({ runs: [CLOSED_RUN], detail: CLOSED_RUN, audit: WIND_DOWN_ROWS })
+    renderDemo()
+    const select = (await screen.findByTestId('take-selector')) as HTMLSelectElement
+    const labels = within(select)
+      .getAllByRole('option')
+      .map((o) => o.textContent ?? '')
+    expect(labels).toHaveLength(2)
+    expect(labels[0]).toMatch(/this take/)
+    expect(labels[0]).toMatch(/no run yet/)
+    // History: its span, its scenario and its outcome, so choosing it is deliberate.
+    expect(labels[1]).toMatch(/^history/)
+    expect(labels[1]).toMatch(/remediate_consumer_lag_success/)
+    expect(labels[1]).toMatch(/escalated/)
+
+    await user.selectOptions(select, within(select).getAllByRole('option')[1])
+    await waitFor(() => {
+      expect(getAgentRun).toHaveBeenCalledWith('run-take-3')
+    })
+    expect(screen.getByTestId('take-label').textContent).toMatch(/history, chosen/)
+  })
+
+  it('does not offer a take selector when the current take is all there is', async () => {
+    stub({ runs: [agentRun()], audit: [RESET_ROW, FAULT_ROW] })
+    renderDemo()
+    await screen.findByTestId('action-ledger')
+    expect(screen.queryByTestId('take-selector')).toBeNull()
+  })
+})
+
+describe('DemoPage — the ledger pages back to the take’s opening boundary', () => {
+  it('asks for another page while the boundary is not in view, and then stops', async () => {
+    // Page 1 holds the take's rows but not its boundary — which is exactly how the
+    // fourth take's ledger came to show a `kill_consumer` from the take before.
+    stub({
+      runs: [agentRun()],
+      audit: [FAULT_ROW, toolRow('agent.tool_invoked', 'get_consumer_lag', '2026-09-19T10:01:00Z')],
+      auditPages: { 2: [RESET_ROW] },
+    })
+    renderDemo()
+    await screen.findByTestId('action-ledger')
+    await waitFor(() => {
+      expect(listAuditLogs).toHaveBeenCalledWith(
+        expect.objectContaining({ page: 2, action_prefix: 'agent.,lab.,chaos.,alert.' }),
+      )
+    })
+    // With the boundary found, the take has a start, the page stops paging, and the
+    // warning is gone. It must also STAY gone: dropping back to one page would lose the
+    // row that found the boundary and the page would oscillate between two takes.
+    await waitFor(() => {
+      expect(screen.getByTestId('take-label').textContent).toMatch(/take from/)
+    })
+    expect(listAuditLogs).not.toHaveBeenCalledWith(expect.objectContaining({ page: 3 }))
+    expect(screen.queryByTestId('ledger-boundary-missing')).toBeNull()
+    await waitFor(() => {
+      expect(screen.getByTestId('take-label').textContent).toMatch(/take from/)
+    })
+    expect(screen.queryByTestId('ledger-boundary-missing')).toBeNull()
+  })
+
+  it('says so when the boundary is further back than it may read', async () => {
+    // Every page has more behind it and none of them holds a boundary: the page stops
+    // at its bound and says the rows may not be this take's alone, rather than drawing
+    // them as if they were.
+    const older = Object.fromEntries(
+      [2, 3, 4, 5, 6].map((p) => [
+        p,
+        [toolRow('agent.tool_invoked', 'get_consumer_lag', `2026-09-19T09:5${String(p)}:00Z`)],
+      ]),
+    )
+    stub({
+      runs: [agentRun()],
+      audit: [FAULT_ROW],
+      auditPages: older,
+    })
+    renderDemo()
+    await screen.findByTestId('action-ledger')
+    await waitFor(() => {
+      expect(listAuditLogs).toHaveBeenCalledWith(expect.objectContaining({ page: 5 }))
+    })
+    expect(listAuditLogs).not.toHaveBeenCalledWith(expect.objectContaining({ page: 6 }))
+    expect(screen.getByTestId('ledger-boundary-missing')).toBeTruthy()
+    expect(screen.getByTestId('take-label').textContent).toMatch(/take start not in view/)
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WO-R3-336 item 3 — the planner's thinking is a live timeline.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('DemoPage — the planner thinks on screen', () => {
+  const steps = [
+    step(1, 'read', 'get_consumer_lag', '2026-09-19T10:01:00Z', {
+      result_excerpt: '{"lag": 30, "lag_known": true}',
+    }),
+    thinkStep(2, '2026-09-19T10:01:05Z', [
+      { name: 'consumer_saturation', category: 'consumer_failure', confidence: 0.75 },
+      { name: 'poison_message', category: 'bad_payload', confidence: 0.3 },
+    ]),
+    thinkStep(3, '2026-09-19T10:01:20Z', [
+      { name: 'consumer_saturation', category: 'consumer_failure', confidence: 0.82 },
+    ]),
+    thinkStep(4, '2026-09-19T10:01:40Z', [
+      { name: 'consumer_saturation', category: 'consumer_failure', confidence: 0.85 },
+    ]),
+  ]
+  const thinking = agentRun({
+    hypotheses: [
+      {
+        name: 'consumer_saturation',
+        category: 'consumer_failure',
+        confidence: 0.85,
+        reasoning_excerpt:
+          'lag has climbed for three samples and the dispatcher group has no members',
+      },
+    ],
+  })
+
+  it('renders each planner call as a THINK row with its own sentence', async () => {
+    stub({ runs: [thinking], detail: thinking, steps, audit: [RESET_ROW, FAULT_ROW] })
+    renderDemo()
+    await screen.findByTestId('action-ledger')
+    await waitFor(() => {
+      expect(
+        screen.getAllByTestId('ledger-entry').filter((e) => e.dataset.kind === 'think'),
+      ).toHaveLength(3)
+    })
+    const think = screen
+      .getAllByTestId('ledger-entry')
+      .find((e) => e.dataset.kind === 'think')
+    expect(think?.textContent).toMatch(/THINK/)
+    expect(think?.textContent).toMatch(/top consumer_saturation 0.85/)
+  })
+
+  it('opens the ranking and the chosen next action on a click', async () => {
+    const user = userEvent.setup()
+    stub({ runs: [thinking], detail: thinking, steps, audit: [RESET_ROW, FAULT_ROW] })
+    renderDemo()
+    await screen.findByTestId('action-ledger')
+    await waitFor(() => {
+      expect(
+        screen.getAllByTestId('ledger-entry').some((e) => e.dataset.kind === 'think'),
+      ).toBe(true)
+    })
+    expect(screen.queryByTestId('think-detail')).toBeNull()
+    const think = screen
+      .getAllByTestId('ledger-entry')
+      .find((e) => e.dataset.kind === 'think')
+    await user.click(within(think as HTMLElement).getByRole('button'))
+    const detail = screen.getByTestId('think-detail')
+    expect(detail.textContent).toMatch(/consumer_saturation/)
+    expect(detail.textContent).toMatch(/next: probe get_consumer_lag/)
+    expect(detail.textContent).toMatch(/fresh reading of the alerted subject/)
+    // A planner call spends no budget and makes no MCP call; the row says so.
+    expect(think?.textContent).toMatch(/the agent thinking, not a call/)
+  })
+
+  it('shows what the agent thinks now, with the newest ranking’s reasoning whole', async () => {
+    stub({ runs: [thinking], detail: thinking, steps, audit: [RESET_ROW, FAULT_ROW] })
+    renderDemo()
+    await screen.findByTestId('agent-panel')
+    await waitFor(() => {
+      expect(screen.getByTestId('hypotheses-now')).toBeTruthy()
+    })
+    const now = screen.getByTestId('hypotheses-now')
+    expect(screen.getByTestId('agent-panel').textContent).toMatch(/What the agent thinks now/)
+    expect(now.textContent).toMatch(/lag has climbed for three samples/)
+    expect(now.textContent).not.toMatch(/more$/)
+    // Stamped with the newest planner call rather than reading as timeless.
+    expect(now.textContent).toMatch(/investigation_planner/)
+    expect(now.textContent).toMatch(/step #4/)
+  })
+
+  it('draws the confidence over the planner’s calls, with the 0.7 bar', async () => {
+    stub({ runs: [thinking], detail: thinking, steps, audit: [RESET_ROW, FAULT_ROW] })
+    renderDemo()
+    await screen.findByTestId('agent-panel')
+    await waitFor(() => {
+      expect(screen.getByTestId('confidence-sparkline')).toBeTruthy()
+    })
+    const spark = screen.getByTestId('confidence-sparkline')
+    expect(spark.textContent).toMatch(/0.75 → 0.82 → 0.85/)
+    expect(spark.textContent).toMatch(/3 planner calls/)
+    expect(
+      within(spark).getByRole('img').getAttribute('aria-label'),
+    ).toMatch(/threshold 0.7/)
+  })
+
+  it('keeps the earlier rankings below it, each with its own timestamp', async () => {
+    stub({ runs: [thinking], detail: thinking, steps, audit: [RESET_ROW, FAULT_ROW] })
+    renderDemo()
+    await screen.findByTestId('agent-panel')
+    await waitFor(() => {
+      expect(screen.getByTestId('ranking-history')).toBeTruthy()
+    })
+    const older = screen.getAllByTestId('ranking-history-entry')
+    expect(older).toHaveLength(2)
+    expect(older[0].textContent).toMatch(/0.82/)
+    expect(older[1].textContent).toMatch(/0.75/)
+    expect(screen.getByTestId('ranking-history').textContent).toMatch(/2 earlier rankings/)
+  })
+
+  it('has no sparkline and no history from a single ranking', async () => {
+    stub({
+      runs: [thinking],
+      detail: thinking,
+      steps: [steps[0], steps[3]],
+      audit: [RESET_ROW, FAULT_ROW],
+    })
+    renderDemo()
+    await screen.findByTestId('agent-panel')
+    await waitFor(() => {
+      expect(screen.getByTestId('hypotheses-now')).toBeTruthy()
+    })
+    expect(screen.queryByTestId('confidence-sparkline')).toBeNull()
+    expect(screen.queryByTestId('ranking-history')).toBeNull()
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WO-R3-336 item 7 — the fault is the take's first successful injection.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('DemoPage — the fault is the first injection, never a probe', () => {
+  const FAULT_AT = '2026-09-19T10:00:00Z'
+  const REARM_AT = '2026-09-19T10:01:43Z'
+  const rows = [
+    RESET_ROW,
+    toolRow('chaos.tool_invoked', 'kill_consumer', FAULT_AT, {
+      consumer_group: 'worker-dispatcher',
+    }),
+    // The two refused guard probes of the fourth take, 1 m 42 s later.
+    auditRow({
+      action: 'chaos.tool_denied',
+      created_at: '2026-09-19T10:01:42Z',
+      extra_data: {
+        tool_name: 'inject_latency',
+        arguments: {},
+        lab_probe_reason: 'precondition: the agent token may not inject',
+      },
+    }),
+    auditRow({
+      action: 'chaos.tool_invoked',
+      created_at: '2026-09-19T10:01:42.5Z',
+      extra_data: {
+        tool_name: 'inject_latency',
+        arguments: {},
+        outcome: 'error',
+        lab_probe_reason: 'precondition: the agent token may not inject',
+      },
+    }),
+    // And the eval runner's own second fire of the same hook.
+    toolRow('chaos.tool_invoked', 'kill_consumer', REARM_AT, {
+      consumer_group: 'worker-dispatcher',
+    }),
+  ]
+
+  it('stamps the fault station and the clock from the first injection', async () => {
+    stub({ runs: [agentRun()], audit: rows })
+    renderDemo()
+    await screen.findByTestId('phase-row-platform')
+    await waitFor(() => {
+      expect(stationState('fault_injected')).not.toBe('pending')
+    })
+    const clock = screen.getByTestId('fault-clock').textContent ?? ''
+    // 10:00:00 local, not the 10:01:43 re-arm — the fourth take measured everything
+    // from a re-arm 1 m 43 s after the fault.
+    expect(clock).toContain(clockTimeOf(FAULT_AT))
+    expect(clock).not.toContain(clockTimeOf(REARM_AT))
+  })
+
+  it('names the first hook in the header, not the refused probe', async () => {
+    stub({ runs: [agentRun()], audit: rows })
+    renderDemo()
+    await screen.findByTestId('phase-row-platform')
+    await waitFor(() => {
+      expect(screen.getByText(/lab: kill_consumer/)).toBeTruthy()
+    })
+    expect(screen.queryByText(/lab: inject_latency/)).toBeNull()
+  })
+
+  it('draws the fault and the re-arm, and neither refusal', async () => {
+    // Relative times, because the chart's window is relative to now.
+    const live = [
+      RESET_ROW,
+      toolRow('chaos.tool_invoked', 'kill_consumer', ago(9), {
+        consumer_group: 'worker-dispatcher',
+      }),
+      auditRow({
+        action: 'chaos.tool_denied',
+        created_at: ago(8),
+        extra_data: {
+          tool_name: 'inject_latency',
+          arguments: {},
+          lab_probe_reason: 'precondition: the agent token may not inject',
+        },
+      }),
+      toolRow('chaos.tool_invoked', 'kill_consumer', ago(7), {
+        consumer_group: 'worker-dispatcher',
+      }),
+    ]
+    stub({ runs: [agentRun()], audit: live, samples: [{ lag: 30, measured_at: ago(0.2) }] })
+    renderDemo()
+    await screen.findByTestId('metric-chart-lag')
+    await waitFor(() => {
+      expect(screen.getAllByTestId('chart-marker-fault').length).toBe(2)
+    })
+    const chart = screen.getByTestId('metric-chart-lag')
+    expect(chart.textContent).toMatch(/kill_consumer re-armed/)
+    expect(chart.textContent).not.toMatch(/inject_latency/)
+  })
+
+  it('hides the refused probes from the ledger and counts them as the lab’s', async () => {
+    stub({ runs: [agentRun()], steps: [], audit: rows })
+    renderDemo()
+    await screen.findByTestId('action-ledger')
+    await waitFor(() => {
+      expect(screen.getAllByTestId('ledger-entry').length).toBeGreaterThan(0)
+    })
+    const ledger = screen.getByTestId('action-ledger')
+    expect(ledger.textContent).not.toMatch(/inject_latency/)
+    expect(screen.getByTestId('ledger-hidden-reads').textContent).toMatch(
+      /2 evaluator\/traffic reads hidden/,
+    )
+    // Both injections are still the lab's own rows.
+    expect(
+      screen.getAllByTestId('ledger-entry').filter((e) => e.dataset.kind === 'lab'),
+    ).toHaveLength(2)
   })
 })
 
@@ -1556,5 +2085,101 @@ describe('DemoPage — the agent panel after the third take', () => {
       expect(screen.getByTestId('plan-empty').textContent).toMatch(/No action planned yet/)
     })
     expect(screen.getByTestId('verifications-empty').textContent).toMatch(/Nothing verified yet/)
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WO-R3-336 item 8 — the platform pages, and the row says so.
+//
+// The alert the agent triaged used to come from the scenario's YAML: `list_active_alerts`
+// read the same three seeded rows before, during and after the fourth take, so "the
+// platform pages and the agent responds" was a story the page could not show. The
+// platform raises it itself now (WO-R3-338, O-36) and audits `alert.raised`; the shape
+// below is that row, mocked.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('DemoPage — the platform pages', () => {
+  const PAGED_AT = '2026-09-19T10:00:12Z'
+  const ALERT_ROW = auditRow({
+    action: 'alert.raised',
+    created_at: PAGED_AT,
+    resource_type: 'alert',
+    extra_data: {
+      alert_id: 'alert-77',
+      fingerprint: 'consumer_stalled',
+      severity: 'critical',
+      summary: 'worker-dispatcher is 30 messages behind',
+    },
+  })
+
+  it('asks for the alert stream beside the other three', async () => {
+    renderDemo()
+    await screen.findByTestId('action-ledger')
+    await waitFor(() => {
+      expect(listAuditLogs).toHaveBeenCalledWith(
+        expect.objectContaining({ action_prefix: 'agent.,lab.,chaos.,alert.' }),
+      )
+    })
+  })
+
+  it('lights a paged station between the fault and the agent, with the alert on it', async () => {
+    stub({ runs: [agentRun()], audit: [RESET_ROW, FAULT_ROW, ALERT_ROW] })
+    renderDemo()
+    await screen.findByTestId('phase-row-platform')
+    await waitFor(() => {
+      expect(stationState('paged')).not.toBe('pending')
+    })
+    const paged = screen.getByTestId('station-paged')
+    expect(paged.textContent).toMatch(/consumer_stalled/)
+    expect(paged.textContent).toMatch(/30 messages behind/)
+    // In the row, in order, between the two stations it belongs between.
+    const keys = Array.from(
+      screen.getByTestId('phase-row-platform').querySelectorAll('[data-testid^="station-"]'),
+    ).map((el) => (el as HTMLElement).dataset.testid)
+    expect(keys).toEqual([
+      'station-healthy',
+      'station-fault_injected',
+      'station-paged',
+      'station-agent_acting',
+      'station-recovered',
+    ])
+  })
+
+  it('keeps the T+ clock on the fault, not on the page', async () => {
+    stub({ runs: [agentRun()], audit: [RESET_ROW, FAULT_ROW, ALERT_ROW] })
+    renderDemo()
+    await screen.findByTestId('fault-clock')
+    await waitFor(() => {
+      expect(screen.getByTestId('fault-clock').textContent).toMatch(/injected/)
+    })
+    const clock = screen.getByTestId('fault-clock').textContent ?? ''
+    expect(clock).toContain(clockTimeOf('2026-09-19T10:00:00Z'))
+    expect(clock).not.toContain(clockTimeOf(PAGED_AT))
+  })
+
+  it('says "not paged" for a take the platform never alerted on', async () => {
+    stub({ runs: [agentRun()], audit: [RESET_ROW, FAULT_ROW] })
+    renderDemo()
+    await screen.findByTestId('phase-row-platform')
+    await waitFor(() => {
+      expect(stationState('fault_injected')).not.toBe('pending')
+    })
+    expect(stationState('paged')).toBe('pending')
+    expect(screen.getByTestId('station-paged').textContent).toMatch(/not paged/)
+  })
+
+  it('draws the alert in the ledger as the platform’s own row', async () => {
+    stub({ runs: [agentRun()], steps: [], audit: [RESET_ROW, FAULT_ROW, ALERT_ROW] })
+    renderDemo()
+    await screen.findByTestId('action-ledger')
+    await waitFor(() => {
+      expect(
+        screen.getAllByTestId('ledger-entry').some((e) => e.dataset.kind === 'alert'),
+      ).toBe(true)
+    })
+    const alertEntry = screen
+      .getAllByTestId('ledger-entry')
+      .find((e) => e.dataset.kind === 'alert')
+    expect(alertEntry?.textContent).toMatch(/PAGED/)
   })
 })
