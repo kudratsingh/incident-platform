@@ -1,0 +1,2230 @@
+[
+  {
+    "id": "1273ce50-fefa-40f2-a915-79eaf7800661",
+    "user_id": null,
+    "principal_type": "service_account",
+    "principal_id": "c50a0f1b-07fe-4dc8-85df-0f8e24206b52",
+    "job_id": null,
+    "action": "lab.world_reset",
+    "resource_type": "world",
+    "resource_id": null,
+    "request_id": null,
+    "ip_address": null,
+    "extra_data": {
+      "dlq_reset": 0,
+      "dlq_swept": 0,
+      "breakers_reset": 0,
+      "timers_cleared": 0,
+      "hot_set_reseeded": 0,
+      "agent_runs_closed": 0,
+      "job_cache_cleared": 0,
+      "chaos_keys_cleared": 0,
+      "dag_pauses_cleared": 0,
+      "empty_dlq_baseline": false,
+      "idempotency_purged": 0,
+      "seeded_dlq_deleted": 0,
+      "lag_samples_cleared": 0,
+      "chaos_owners_deleted": 0,
+      "rule_alerts_resolved": 0,
+      "chaos_alerts_resolved": 0,
+      "timestamps_rebaselined": 18,
+      "organic_alerts_resolved": 0,
+      "read_model_keys_rebuilt": 9
+    },
+    "created_at": "2026-09-27T11:12:33.686951Z"
+  },
+  {
+    "id": "6b5bf594-4451-4be7-ba48-4bd5e6fc6a4d",
+    "user_id": null,
+    "principal_type": "service_account",
+    "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+    "job_id": null,
+    "action": "lab.probe",
+    "resource_type": "mcp_tool",
+    "resource_id": "mark_dlq_permanent",
+    "request_id": "2042c681-67f9-4f3e-9eb8-defef541fac9",
+    "ip_address": null,
+    "extra_data": {
+      "outcome": "unauthorized",
+      "arguments": {
+        "job_id": "00000000-0000-0000-0000-000000000000-INVALID",
+        "reason": "",
+        "idempotency_key": "x"
+      },
+      "tool_name": "mark_dlq_permanent",
+      "latency_ms": 4.183,
+      "scope_used": "actions:execute",
+      "error_message": "missing required scope",
+      "lab_probe_reason": "principal guard: proves this token cannot execute a Tier-1 action",
+      "lab_probe_principal": "incident-commander-smoke"
+    },
+    "created_at": "2026-09-27T11:12:34.488310Z"
+  },
+  {
+    "id": "d74e43b8-89b7-40d0-bf07-20aaf16f680a",
+    "user_id": null,
+    "principal_type": "service_account",
+    "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+    "job_id": null,
+    "action": "lab.probe",
+    "resource_type": "mcp_tool",
+    "resource_id": "list_dlq_messages",
+    "request_id": "fc83483d-24cb-48f4-a7c2-db7c05001b39",
+    "ip_address": null,
+    "extra_data": {
+      "outcome": "success",
+      "arguments": {},
+      "tool_name": "list_dlq_messages",
+      "latency_ms": 8.659,
+      "scope_used": "incidents:read",
+      "lab_probe_reason": "world audit read",
+      "lab_probe_principal": "incident-commander-smoke"
+    },
+    "created_at": "2026-09-27T11:12:34.511173Z"
+  },
+  {
+    "id": "d2029afd-1eed-444e-bb93-8dda10e67b36",
+    "user_id": null,
+    "principal_type": "service_account",
+    "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+    "job_id": null,
+    "action": "lab.probe",
+    "resource_type": "mcp_tool",
+    "resource_id": "list_active_alerts",
+    "request_id": "a4aae3d2-475a-48d6-8a6a-3aff28e91c8f",
+    "ip_address": null,
+    "extra_data": {
+      "outcome": "success",
+      "arguments": {},
+      "tool_name": "list_active_alerts",
+      "latency_ms": 4.61,
+      "scope_used": "incidents:read",
+      "lab_probe_reason": "world audit read",
+      "lab_probe_principal": "incident-commander-smoke"
+    },
+    "created_at": "2026-09-27T11:12:34.528589Z"
+  },
+  {
+    "id": "60944303-3517-4dc1-baaf-508465340a20",
+    "user_id": null,
+    "principal_type": "service_account",
+    "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+    "job_id": null,
+    "action": "lab.probe",
+    "resource_type": "mcp_tool",
+    "resource_id": "search_traces",
+    "request_id": "6dfbbfdb-9ec7-4fb4-8fa7-5f89926f1321",
+    "ip_address": null,
+    "extra_data": {
+      "outcome": "success",
+      "arguments": {
+        "status": "failed",
+        "since_hours": 1
+      },
+      "tool_name": "search_traces",
+      "latency_ms": 5.382,
+      "scope_used": "incidents:read",
+      "lab_probe_reason": "world audit read",
+      "lab_probe_principal": "incident-commander-smoke"
+    },
+    "created_at": "2026-09-27T11:12:34.614624Z"
+  },
+  {
+    "id": "0ebdd683-8e75-4c1b-930e-2e441072e935",
+    "user_id": null,
+    "principal_type": "service_account",
+    "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+    "job_id": null,
+    "action": "lab.probe",
+    "resource_type": "mcp_tool",
+    "resource_id": "list_dlq_messages",
+    "request_id": "cbb8fc28-7233-48ad-9ccd-426567763a40",
+    "ip_address": null,
+    "extra_data": {
+      "outcome": "success",
+      "arguments": {
+        "limit": 50
+      },
+      "tool_name": "list_dlq_messages",
+      "latency_ms": 5.405,
+      "scope_used": "incidents:read",
+      "lab_probe_reason": "world audit read",
+      "lab_probe_principal": "incident-commander-smoke"
+    },
+    "created_at": "2026-09-27T11:12:34.627125Z"
+  },
+  {
+    "id": "eaf47bda-0e10-4280-8008-d54a7f1afe61",
+    "user_id": null,
+    "principal_type": "service_account",
+    "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+    "job_id": null,
+    "action": "lab.probe",
+    "resource_type": "mcp_tool",
+    "resource_id": "get_consumer_lag",
+    "request_id": "96c6be97-0bbc-40d8-9f4e-7f661041dad1",
+    "ip_address": null,
+    "extra_data": {
+      "outcome": "success",
+      "arguments": {
+        "consumer_group": "worker-dispatcher"
+      },
+      "tool_name": "get_consumer_lag",
+      "latency_ms": 3.037,
+      "scope_used": "telemetry:read",
+      "lab_probe_reason": "world audit read",
+      "lab_probe_principal": "incident-commander-smoke"
+    },
+    "created_at": "2026-09-27T11:12:34.638674Z"
+  },
+  {
+    "id": "116b4539-ceae-4ecc-bb46-1e4ed4f9f528",
+    "user_id": null,
+    "principal_type": "service_account",
+    "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+    "job_id": null,
+    "action": "lab.probe",
+    "resource_type": "mcp_tool",
+    "resource_id": "get_cache_key_info",
+    "request_id": "79cd0606-fc72-4f18-a0ea-ac33f6d16926",
+    "ip_address": null,
+    "extra_data": {
+      "outcome": "success",
+      "arguments": {
+        "key": "cache:jobs:worker-dispatcher:hot_set"
+      },
+      "tool_name": "get_cache_key_info",
+      "latency_ms": 4.528,
+      "scope_used": "telemetry:read",
+      "lab_probe_reason": "world audit read",
+      "lab_probe_principal": "incident-commander-smoke"
+    },
+    "created_at": "2026-09-27T11:12:34.647708Z"
+  },
+  {
+    "id": "fda3bd92-d35c-4b98-a4ce-a43100ebd674",
+    "user_id": null,
+    "principal_type": "service_account",
+    "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+    "job_id": null,
+    "action": "lab.probe",
+    "resource_type": "mcp_tool",
+    "resource_id": "get_consumer_lag",
+    "request_id": "0ee70a02-172f-4e63-bb2e-661bf28627eb",
+    "ip_address": null,
+    "extra_data": {
+      "outcome": "success",
+      "arguments": {
+        "consumer_group": "worker-dispatcher"
+      },
+      "tool_name": "get_consumer_lag",
+      "latency_ms": 3.128,
+      "scope_used": "telemetry:read",
+      "lab_probe_reason": "demo: baseline lag poll",
+      "lab_probe_principal": "incident-commander-smoke"
+    },
+    "created_at": "2026-09-27T11:12:34.731213Z"
+  },
+  {
+    "id": "b6fa4d0d-e7e1-464c-a8e6-795fa3022104",
+    "user_id": null,
+    "principal_type": "service_account",
+    "principal_id": "c50a0f1b-07fe-4dc8-85df-0f8e24206b52",
+    "job_id": null,
+    "action": "chaos.tool_invoked",
+    "resource_type": "mcp_tool",
+    "resource_id": "kill_consumer",
+    "request_id": "409f7a30-47c3-47e0-80cb-d86ab55c99eb",
+    "ip_address": null,
+    "extra_data": {
+      "outcome": "success",
+      "arguments": {
+        "ttl_seconds": 300,
+        "consumer_group": "worker-dispatcher"
+      },
+      "tool_name": "kill_consumer",
+      "latency_ms": 1.619,
+      "scope_used": "chaos:invoke"
+    },
+    "created_at": "2026-09-27T11:12:45.204984Z"
+  },
+  {
+    "id": "2a3b67f1-bfa9-45af-be0c-dde1dd3100bd",
+    "user_id": null,
+    "principal_type": "service_account",
+    "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+    "job_id": null,
+    "action": "lab.probe",
+    "resource_type": "mcp_tool",
+    "resource_id": "get_consumer_lag",
+    "request_id": "f5f0fe3c-33ff-4b7b-8296-c281f532eaaa",
+    "ip_address": null,
+    "extra_data": {
+      "outcome": "success",
+      "arguments": {
+        "consumer_group": "worker-dispatcher"
+      },
+      "tool_name": "get_consumer_lag",
+      "latency_ms": 5.375,
+      "scope_used": "telemetry:read",
+      "lab_probe_reason": "demo: baseline lag poll",
+      "lab_probe_principal": "incident-commander-smoke"
+    },
+    "created_at": "2026-09-27T11:12:45.239782Z"
+  },
+  {
+    "id": "7b5c0495-f4b9-49d9-9925-1f0b26a4f075",
+    "user_id": null,
+    "principal_type": "service_account",
+    "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+    "job_id": null,
+    "action": "lab.probe",
+    "resource_type": "mcp_tool",
+    "resource_id": "get_consumer_lag",
+    "request_id": "851798c7-b816-4133-99b1-e319e7872f2e",
+    "ip_address": null,
+    "extra_data": {
+      "outcome": "success",
+      "arguments": {
+        "consumer_group": "worker-dispatcher"
+      },
+      "tool_name": "get_consumer_lag",
+      "latency_ms": 7.285,
+      "scope_used": "telemetry:read",
+      "lab_probe_reason": "demo: baseline lag poll",
+      "lab_probe_principal": "incident-commander-smoke"
+    },
+    "created_at": "2026-09-27T11:12:50.290018Z"
+  },
+  {
+    "id": "4942c398-5ac0-43ec-a374-0662e1228836",
+    "user_id": null,
+    "principal_type": "service_account",
+    "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+    "job_id": null,
+    "action": "lab.probe",
+    "resource_type": "mcp_tool",
+    "resource_id": "get_consumer_lag",
+    "request_id": "b3136a86-ba13-4138-a48e-fabbc215bb83",
+    "ip_address": null,
+    "extra_data": {
+      "outcome": "success",
+      "arguments": {
+        "consumer_group": "worker-dispatcher"
+      },
+      "tool_name": "get_consumer_lag",
+      "latency_ms": 4.15,
+      "scope_used": "telemetry:read",
+      "lab_probe_reason": "traffic: lag read",
+      "lab_probe_principal": "incident-commander-smoke"
+    },
+    "created_at": "2026-09-27T11:12:52.846953Z"
+  },
+  {
+    "id": "d2eb11ef-0aa2-4c72-9e6a-b456565da879",
+    "user_id": null,
+    "principal_type": "service_account",
+    "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+    "job_id": null,
+    "action": "lab.probe",
+    "resource_type": "mcp_tool",
+    "resource_id": "get_consumer_lag",
+    "request_id": "87ae071f-3b2c-4166-9fca-14319160e273",
+    "ip_address": null,
+    "extra_data": {
+      "outcome": "success",
+      "arguments": {
+        "consumer_group": "worker-dispatcher"
+      },
+      "tool_name": "get_consumer_lag",
+      "latency_ms": 3.637,
+      "scope_used": "telemetry:read",
+      "lab_probe_reason": "demo: baseline lag poll",
+      "lab_probe_principal": "incident-commander-smoke"
+    },
+    "created_at": "2026-09-27T11:12:55.337282Z"
+  },
+  {
+    "id": "f51740f0-0f9c-4964-99de-1d6d079b3dc3",
+    "user_id": null,
+    "principal_type": "service_account",
+    "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+    "job_id": null,
+    "action": "lab.probe",
+    "resource_type": "mcp_tool",
+    "resource_id": "get_consumer_lag",
+    "request_id": "a615835c-cc0f-471f-bad2-8f54fbb7801b",
+    "ip_address": null,
+    "extra_data": {
+      "outcome": "success",
+      "arguments": {
+        "consumer_group": "worker-dispatcher"
+      },
+      "tool_name": "get_consumer_lag",
+      "latency_ms": 10.279,
+      "scope_used": "telemetry:read",
+      "lab_probe_reason": "demo: baseline lag poll",
+      "lab_probe_principal": "incident-commander-smoke"
+    },
+    "created_at": "2026-09-27T11:13:00.386248Z"
+  },
+  {
+    "id": "30051656-bdbf-4fb3-9e8d-e022f3476ecf",
+    "user_id": null,
+    "principal_type": "service_account",
+    "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+    "job_id": null,
+    "action": "lab.probe",
+    "resource_type": "mcp_tool",
+    "resource_id": "get_consumer_lag",
+    "request_id": "3c3ecb03-41a7-4fe5-868f-3f2f18477aa6",
+    "ip_address": null,
+    "extra_data": {
+      "outcome": "success",
+      "arguments": {
+        "consumer_group": "worker-dispatcher"
+      },
+      "tool_name": "get_consumer_lag",
+      "latency_ms": 4.402,
+      "scope_used": "telemetry:read",
+      "lab_probe_reason": "traffic: lag read",
+      "lab_probe_principal": "incident-commander-smoke"
+    },
+    "created_at": "2026-09-27T11:13:00.880463Z"
+  },
+  {
+    "id": "340ac87e-2c73-41d9-a135-cb7e769c4a53",
+    "user_id": null,
+    "principal_type": "service_account",
+    "principal_id": null,
+    "job_id": null,
+    "action": "alert.raised",
+    "resource_type": "alert",
+    "resource_id": "ddeee9e9-f34b-448c-8f5e-fa6b206cc7ce",
+    "request_id": null,
+    "ip_address": null,
+    "extra_data": {
+      "source": "kafka:consumer_lag",
+      "subject": "worker-dispatcher",
+      "summary": "worker-dispatcher is 23 messages behind (threshold 20); the group holds its assignment and keeps reporting, so the backlog is real. Measured at 2026-09-27T11:13:04.209157+00:00.",
+      "alert_id": "ddeee9e9-f34b-448c-8f5e-fa6b206cc7ce",
+      "severity": "critical",
+      "dedup_key": "rule:consumer_stalled:worker-dispatcher:19",
+      "fingerprint": "consumer_stalled"
+    },
+    "created_at": "2026-09-27T11:13:04.217095Z"
+  },
+  {
+    "id": "8c5a2ebc-ffae-4803-9752-de6c6c34f181",
+    "user_id": null,
+    "principal_type": "service_account",
+    "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+    "job_id": null,
+    "action": "lab.probe",
+    "resource_type": "mcp_tool",
+    "resource_id": "get_consumer_lag",
+    "request_id": "6e84a445-86d0-4d8b-b820-4d4a6401337a",
+    "ip_address": null,
+    "extra_data": {
+      "outcome": "success",
+      "arguments": {
+        "consumer_group": "worker-dispatcher"
+      },
+      "tool_name": "get_consumer_lag",
+      "latency_ms": 7.935,
+      "scope_used": "telemetry:read",
+      "lab_probe_reason": "demo: baseline lag poll",
+      "lab_probe_principal": "incident-commander-smoke"
+    },
+    "created_at": "2026-09-27T11:13:05.446248Z"
+  },
+  {
+    "id": "cfb6c828-32c0-4e96-bf28-7b1499772ecd",
+    "user_id": null,
+    "principal_type": "service_account",
+    "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+    "job_id": null,
+    "action": "lab.probe",
+    "resource_type": "mcp_tool",
+    "resource_id": "list_active_alerts",
+    "request_id": "d8df3daf-24af-484b-afac-6108a36756ae",
+    "ip_address": null,
+    "extra_data": {
+      "outcome": "success",
+      "arguments": {
+        "limit": 50
+      },
+      "tool_name": "list_active_alerts",
+      "latency_ms": 5.375,
+      "scope_used": "incidents:read",
+      "lab_probe_reason": "demo: has the platform raised this scenario's alert yet",
+      "lab_probe_principal": "incident-commander-smoke"
+    },
+    "created_at": "2026-09-27T11:13:05.881190Z"
+  },
+  {
+    "id": "5eaa8a1b-16aa-4ee7-9667-b64c42164854",
+    "user_id": null,
+    "principal_type": "service_account",
+    "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+    "job_id": null,
+    "action": "lab.probe",
+    "resource_type": "mcp_tool",
+    "resource_id": "get_consumer_lag",
+    "request_id": "2c2d7952-f273-42e7-a3bf-8d0569eefd14",
+    "ip_address": null,
+    "extra_data": {
+      "outcome": "success",
+      "arguments": {
+        "consumer_group": "worker-dispatcher"
+      },
+      "tool_name": "get_consumer_lag",
+      "latency_ms": 8.482,
+      "scope_used": "telemetry:read",
+      "lab_probe_reason": "precondition: get_consumer_lag proves lag at_least 20.0",
+      "lab_probe_principal": "incident-commander-smoke"
+    },
+    "created_at": "2026-09-27T11:13:06.277468Z"
+  },
+  {
+    "id": "8d838217-7419-4f5b-a2a4-bee4578044f2",
+    "user_id": null,
+    "principal_type": "service_account",
+    "principal_id": "586042d6-f550-4d76-9f4f-a9f291419d1a",
+    "job_id": null,
+    "action": "lab.probe",
+    "resource_type": "mcp_tool",
+    "resource_id": "mark_dlq_permanent",
+    "request_id": "7c5e9d0b-a2e9-441a-97b1-d92ae2e447c2",
+    "ip_address": null,
+    "extra_data": {
+      "outcome": "error",
+      "arguments": {
+        "job_id": "00000000-0000-0000-0000-000000000000-INVALID",
+        "reason": "",
+        "idempotency_key": "x"
+      },
+      "tool_name": "mark_dlq_permanent",
+      "latency_ms": 5.288,
+      "scope_used": "actions:execute",
+      "error_message": "invalid arguments",
+      "lab_probe_reason": "principal guard: proves the agent token can execute a Tier-1 action",
+      "lab_probe_principal": "incident-commander-chaos"
+    },
+    "created_at": "2026-09-27T11:13:07.680682Z"
+  },
+  {
+    "id": "a8cf9125-a920-4aff-aca1-38b1cf569f4f",
+    "user_id": null,
+    "principal_type": "service_account",
+    "principal_id": "586042d6-f550-4d76-9f4f-a9f291419d1a",
+    "job_id": null,
+    "action": "chaos.tool_denied",
+    "resource_type": "mcp_tool",
+    "resource_id": "inject_latency",
+    "request_id": "a2de81b3-0419-4259-b32d-171ff4de3eaf",
+    "ip_address": null,
+    "extra_data": {
+      "outcome": "unauthorized",
+      "arguments": {
+        "latency_ms": "not-a-latency",
+        "consumer_group": ""
+      },
+      "denied_by": "scope_check",
+      "tool_name": "inject_latency",
+      "latency_ms": 2.78,
+      "scope_used": "chaos:invoke",
+      "error_message": "missing required scope",
+      "lab_probe_reason": "principal guard: proves the agent token cannot seed chaos",
+      "lab_probe_principal": "incident-commander-chaos"
+    },
+    "created_at": "2026-09-27T11:13:07.705358Z"
+  },
+  {
+    "id": "553b0f14-e530-430f-a2c9-6656281cb8e5",
+    "user_id": null,
+    "principal_type": "service_account",
+    "principal_id": "c50a0f1b-07fe-4dc8-85df-0f8e24206b52",
+    "job_id": null,
+    "action": "chaos.tool_invoked",
+    "resource_type": "mcp_tool",
+    "resource_id": "inject_latency",
+    "request_id": "be12317c-2b62-4de9-93b3-fdde684952b6",
+    "ip_address": null,
+    "extra_data": {
+      "outcome": "error",
+      "arguments": {
+        "latency_ms": "not-a-latency",
+        "consumer_group": ""
+      },
+      "tool_name": "inject_latency",
+      "latency_ms": 2.418,
+      "scope_used": "chaos:invoke",
+      "error_message": "invalid arguments",
+      "lab_probe_reason": "principal guard: proves the evaluator token can seed chaos",
+      "lab_probe_principal": "incident-commander-chaos"
+    },
+    "created_at": "2026-09-27T11:13:07.729722Z"
+  },
+  {
+    "id": "e3da2eb5-733e-4c68-bf60-a3c27ce335c9",
+    "user_id": null,
+    "principal_type": "service_account",
+    "principal_id": "586042d6-f550-4d76-9f4f-a9f291419d1a",
+    "job_id": null,
+    "action": "lab.probe",
+    "resource_type": "mcp_tool",
+    "resource_id": "get_consumer_lag",
+    "request_id": "bed9c42a-7964-451c-928e-10e402e1cc5f",
+    "ip_address": null,
+    "extra_data": {
+      "outcome": "success",
+      "arguments": {
+        "consumer_group": "worker-dispatcher"
+      },
+      "tool_name": "get_consumer_lag",
+      "latency_ms": 3.947,
+      "scope_used": "telemetry:read",
+      "lab_probe_reason": "precondition: get_consumer_lag proves lag at_least 20.0",
+      "lab_probe_principal": "incident-commander-chaos"
+    },
+    "created_at": "2026-09-27T11:13:07.752150Z"
+  },
+  {
+    "id": "066a9fb0-b21a-4373-8ce6-19c6198be838",
+    "user_id": null,
+    "principal_type": "service_account",
+    "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+    "job_id": null,
+    "action": "lab.probe",
+    "resource_type": "mcp_tool",
+    "resource_id": "list_active_alerts",
+    "request_id": "46dedecd-ff3b-4bd6-b62e-0e5512889fcc",
+    "ip_address": null,
+    "extra_data": {
+      "outcome": "success",
+      "arguments": {
+        "limit": 50
+      },
+      "tool_name": "list_active_alerts",
+      "latency_ms": 3.854,
+      "scope_used": "incidents:read",
+      "lab_probe_reason": "demo: has the platform raised this scenario's alert yet",
+      "lab_probe_principal": "incident-commander-smoke"
+    },
+    "created_at": "2026-09-27T11:13:07.770595Z"
+  },
+  {
+    "id": "f0d31cb3-ce0c-4680-8c34-1b284f6754a2",
+    "user_id": null,
+    "principal_type": "service_account",
+    "principal_id": "586042d6-f550-4d76-9f4f-a9f291419d1a",
+    "job_id": null,
+    "action": "agent.run_reported",
+    "resource_type": "mcp_tool",
+    "resource_id": "report_agent_run",
+    "request_id": "2c9a1197-bb17-4236-bcb3-c40bb25dafc3",
+    "ip_address": null,
+    "extra_data": {
+      "outcome": "success",
+      "arguments": {
+        "at": "2026-09-27T11:13:07.740722+00:00",
+        "state": "triage",
+        "budget": {
+          "usd_used": 0.0,
+          "tokens_used": 0,
+          "wall_seconds": 0.0,
+          "tool_calls_max": 13,
+          "tool_calls_used": 0
+        },
+        "run_id": "b5fcaa9c-553e-595f-89bf-06cbee14b9dd",
+        "last_step": null,
+        "run_label": "remediate_consumer_lag_success",
+        "hypotheses": null,
+        "current_hypothesis": null
+      },
+      "tool_name": "report_agent_run",
+      "latency_ms": 4.907,
+      "scope_used": "agent_runs:write"
+    },
+    "created_at": "2026-09-27T11:13:07.819169Z"
+  },
+  {
+    "id": "1398e479-b0c6-4c72-add2-f8215b9475ee",
+    "user_id": null,
+    "principal_type": "service_account",
+    "principal_id": "586042d6-f550-4d76-9f4f-a9f291419d1a",
+    "job_id": null,
+    "action": "agent.run_reported",
+    "resource_type": "mcp_tool",
+    "resource_id": "report_agent_run",
+    "request_id": "951b6ac9-b624-4d75-88d9-5c00f0138198",
+    "ip_address": null,
+    "extra_data": {
+      "outcome": "success",
+      "arguments": {
+        "at": "2026-09-27T11:13:07.830038+00:00",
+        "state": "investigating",
+        "budget": {
+          "usd_used": 0.0,
+          "tokens_used": 0,
+          "wall_seconds": 0.089,
+          "tool_calls_max": 13,
+          "tool_calls_used": 0
+        },
+        "run_id": "b5fcaa9c-553e-595f-89bf-06cbee14b9dd",
+        "last_step": null,
+        "run_label": "remediate_consumer_lag_success",
+        "hypotheses": null,
+        "current_hypothesis": null
+      },
+      "tool_name": "report_agent_run",
+      "latency_ms": 3.622,
+      "scope_used": "agent_runs:write"
+    },
+    "created_at": "2026-09-27T11:13:07.832421Z"
+  },
+  {
+    "id": "d3225c98-2f0c-431b-aa3f-3b234823aae7",
+    "user_id": null,
+    "principal_type": "service_account",
+    "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+    "job_id": null,
+    "action": "lab.probe",
+    "resource_type": "mcp_tool",
+    "resource_id": "get_consumer_lag",
+    "request_id": "df166e07-937f-4fb4-a806-e8627273b0a1",
+    "ip_address": null,
+    "extra_data": {
+      "outcome": "success",
+      "arguments": {
+        "consumer_group": "worker-dispatcher"
+      },
+      "tool_name": "get_consumer_lag",
+      "latency_ms": 3.719,
+      "scope_used": "telemetry:read",
+      "lab_probe_reason": "traffic: lag read",
+      "lab_probe_principal": "incident-commander-smoke"
+    },
+    "created_at": "2026-09-27T11:13:08.800639Z"
+  },
+  {
+    "id": "d91a7422-eb6a-46dc-b39b-d276ca5b9f0a",
+    "user_id": null,
+    "principal_type": "service_account",
+    "principal_id": "586042d6-f550-4d76-9f4f-a9f291419d1a",
+    "job_id": null,
+    "action": "agent.run_reported",
+    "resource_type": "mcp_tool",
+    "resource_id": "report_agent_run",
+    "request_id": "a73fc038-5125-41a8-9a65-401d232c3af6",
+    "ip_address": null,
+    "extra_data": {
+      "outcome": "success",
+      "arguments": {
+        "at": "2026-09-27T11:13:14.333971+00:00",
+        "step": {
+          "at": "2026-09-27T11:13:14.333971+00:00",
+          "seq": 1,
+          "kind": "report",
+          "tool": "investigation_planner",
+          "outcome": "ok",
+          "arguments": {
+            "reason": null,
+            "ranking": [
+              {
+                "name": "worker-dispatcher-lag-23-above-threshold-20",
+                "category": "consumer_saturation",
+                "confidence": 0.8
+              },
+              {
+                "name": "dlq-entry-blocking-worker-dispatcher",
+                "category": "poison_message",
+                "confidence": 0.3
+              },
+              {
+                "name": "recent-deploy-correlated-with-lag",
+                "category": "deploy_regression",
+                "confidence": 0.2
+              }
+            ],
+            "next_action": {
+              "kind": "probe",
+              "tool": "get_consumer_lag"
+            }
+          },
+          "latency_ms": null,
+          "result_excerpt": "top consumer_saturation 0.80 \u2192 probe get_consumer_lag"
+        },
+        "state": "investigating",
+        "budget": {
+          "usd_used": 0.0,
+          "tokens_used": 0,
+          "wall_seconds": 0.089,
+          "tool_calls_max": 13,
+          "tool_calls_used": 0
+        },
+        "run_id": "b5fcaa9c-553e-595f-89bf-06cbee14b9dd",
+        "last_step": null,
+        "run_label": "remediate_consumer_lag_success",
+        "hypotheses": [
+          {
+            "name": "worker-dispatcher-lag-23-above-threshold-20",
+            "category": "consumer_saturation",
+            "confidence": 0.8,
+            "reasoning_excerpt": "The alert directly reports worker-dispatcher consumer group is 23 messages behind threshold of 20, holding its assignment and reporting real backlog \u2014 classic consumer saturation signal."
+          },
+          {
+            "name": "dlq-entry-blocking-worker-dispatcher",
+            "category": "poison_message",
+            "confidence": 0.3,
+            "reasoning_excerpt": "A DLQ entry could be causing repeated failures and contributing to lag if the consumer keeps retrying a bad message."
+          },
+          {
+            "name": "recent-deploy-correlated-with-lag",
+            "category": "deploy_regression",
+            "confidence": 0.2,
+            "reasoning_excerpt": "A recent deploy could have introduced a regression causing consumer slowdown."
+          }
+        ],
+        "current_hypothesis": {
+          "name": "worker-dispatcher-lag-23-above-threshold-20",
+          "category": "consumer_saturation",
+          "confidence": 0.8
+        }
+      },
+      "tool_name": "report_agent_run",
+      "latency_ms": 9.09,
+      "scope_used": "agent_runs:write"
+    },
+    "created_at": "2026-09-27T11:13:14.346080Z"
+  },
+  {
+    "id": "a2376743-9f49-4328-a971-82a885bb0fd6",
+    "user_id": null,
+    "principal_type": "service_account",
+    "principal_id": "586042d6-f550-4d76-9f4f-a9f291419d1a",
+    "job_id": null,
+    "action": "agent.tool_invoked",
+    "resource_type": "mcp_tool",
+    "resource_id": "get_consumer_lag",
+    "request_id": "5a50378b-85f6-4a7d-99c6-767bcaf57578",
+    "ip_address": null,
+    "extra_data": {
+      "outcome": "success",
+      "arguments": {
+        "consumer_group": "worker-dispatcher"
+      },
+      "tool_name": "get_consumer_lag",
+      "latency_ms": 2.412,
+      "scope_used": "telemetry:read"
+    },
+    "created_at": "2026-09-27T11:13:14.372078Z"
+  },
+  {
+    "id": "27393f3c-952d-458a-9e5b-490ec56924d6",
+    "user_id": null,
+    "principal_type": "service_account",
+    "principal_id": "586042d6-f550-4d76-9f4f-a9f291419d1a",
+    "job_id": null,
+    "action": "agent.run_reported",
+    "resource_type": "mcp_tool",
+    "resource_id": "report_agent_run",
+    "request_id": "fe5f7cd5-a0fb-4e20-b8f7-852a67f29323",
+    "ip_address": null,
+    "extra_data": {
+      "outcome": "success",
+      "arguments": {
+        "at": "2026-09-27T11:13:14.382027+00:00",
+        "step": {
+          "at": "2026-09-27T11:13:14.382027+00:00",
+          "seq": 2,
+          "kind": "read",
+          "tool": "get_consumer_lag",
+          "outcome": "ok",
+          "arguments": {
+            "consumer_group": "worker-dispatcher"
+          },
+          "latency_ms": 13,
+          "result_excerpt": "{\"consumer_group\":\"worker-dispatcher\",\"lag\":36,\"lag_known\":true,\"source\":\"live\",\"cache_key\":\"kafka:consumer_lag:worker-dispatcher\",\"measured_at\":\"2026-09-27T11:13:14.372434Z\",\"age_seconds\":0,\"recent_samples\":[{\"lag\":36,\"measured_at\":\"2026-09-27T11:13:14.372434Z\"},{\"lag\":29,\"measured_at\":\"2026-09-27T11:13:09.305904Z\"},{\"lag\":23,\"measured_at\":\"2026-09-27T11:13:04.209157Z\"},{\"lag\":16,\"measured_at\":\"\u2026"
+        },
+        "state": "investigating",
+        "budget": {
+          "usd_used": 0.0,
+          "tokens_used": 0,
+          "wall_seconds": 0.089,
+          "tool_calls_max": 13,
+          "tool_calls_used": 0
+        },
+        "run_id": "b5fcaa9c-553e-595f-89bf-06cbee14b9dd",
+        "last_step": {
+          "at": "2026-09-27T11:13:14.382027+00:00",
+          "kind": "read",
+          "tool": "get_consumer_lag"
+        },
+        "run_label": "remediate_consumer_lag_success",
+        "hypotheses": null,
+        "current_hypothesis": null
+      },
+      "tool_name": "report_agent_run",
+      "latency_ms": 3.86,
+      "scope_used": "agent_runs:write"
+    },
+    "created_at": "2026-09-27T11:13:14.384745Z"
+  },
+  {
+    "id": "2d1a00b2-cf9a-4f45-8bc3-d05d7ce0eb1f",
+    "user_id": null,
+    "principal_type": "service_account",
+    "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+    "job_id": null,
+    "action": "lab.probe",
+    "resource_type": "mcp_tool",
+    "resource_id": "get_consumer_lag",
+    "request_id": "e2f44a03-0dc7-4f09-9714-31035ddc3b26",
+    "ip_address": null,
+    "extra_data": {
+      "outcome": "success",
+      "arguments": {
+        "consumer_group": "worker-dispatcher"
+      },
+      "tool_name": "get_consumer_lag",
+      "latency_ms": 3.928,
+      "scope_used": "telemetry:read",
+      "lab_probe_reason": "traffic: lag read",
+      "lab_probe_principal": "incident-commander-smoke"
+    },
+    "created_at": "2026-09-27T11:13:16.864160Z"
+  },
+  {
+    "id": "efdf8b0f-b855-4257-98dc-9d677040d2e1",
+    "user_id": null,
+    "principal_type": "service_account",
+    "principal_id": "586042d6-f550-4d76-9f4f-a9f291419d1a",
+    "job_id": null,
+    "action": "agent.run_reported",
+    "resource_type": "mcp_tool",
+    "resource_id": "report_agent_run",
+    "request_id": "360f519c-3888-4483-8bb8-34df97bf42df",
+    "ip_address": null,
+    "extra_data": {
+      "outcome": "success",
+      "arguments": {
+        "at": "2026-09-27T11:13:21.994172+00:00",
+        "step": {
+          "at": "2026-09-27T11:13:21.994172+00:00",
+          "seq": 3,
+          "kind": "report",
+          "tool": "investigation_planner",
+          "outcome": "ok",
+          "arguments": {
+            "reason": null,
+            "ranking": [
+              {
+                "name": "worker-dispatcher-lag-36-climbing",
+                "category": "consumer_saturation",
+                "confidence": 0.85
+              },
+              {
+                "name": "dlq-blocking-worker-dispatcher",
+                "category": "poison_message",
+                "confidence": 0.2
+              },
+              {
+                "name": "recent-deploy-correlates-with-lag-spike",
+                "category": "deploy_regression",
+                "confidence": 0.15
+              }
+            ],
+            "next_action": {
+              "kind": "probe",
+              "tool": "get_deploy_history"
+            }
+          },
+          "latency_ms": null,
+          "result_excerpt": "top consumer_saturation 0.85 \u2192 probe get_deploy_history"
+        },
+        "state": "investigating",
+        "budget": {
+          "usd_used": 0.0,
+          "tokens_used": 0,
+          "wall_seconds": 0.089,
+          "tool_calls_max": 13,
+          "tool_calls_used": 0
+        },
+        "run_id": "b5fcaa9c-553e-595f-89bf-06cbee14b9dd",
+        "last_step": null,
+        "run_label": "remediate_consumer_lag_success",
+        "hypotheses": [
+          {
+            "name": "worker-dispatcher-lag-36-climbing",
+            "category": "consumer_saturation",
+            "confidence": 0.85,
+            "reasoning_excerpt": "Consumer lag for worker-dispatcher has been steadily climbing from 0 to 36 in the last ~30 seconds, confirming the consumer is falling behind on its Kafka assignment."
+          },
+          {
+            "name": "dlq-blocking-worker-dispatcher",
+            "category": "poison_message",
+            "confidence": 0.2,
+            "reasoning_excerpt": "A poison message in the DLQ could be causing repeated failures and stalling progress, though no DLQ evidence has been collected yet."
+          },
+          {
+            "name": "recent-deploy-correlates-with-lag-spike",
+            "category": "deploy_regression",
+            "confidence": 0.15,
+            "reasoning_excerpt": "A recent deploy could have introduced a regression causing the consumer to slow down, but no deploy history has been checked yet."
+          }
+        ],
+        "current_hypothesis": {
+          "name": "worker-dispatcher-lag-36-climbing",
+          "category": "consumer_saturation",
+          "confidence": 0.85
+        }
+      },
+      "tool_name": "report_agent_run",
+      "latency_ms": 8.55,
+      "scope_used": "agent_runs:write"
+    },
+    "created_at": "2026-09-27T11:13:22.005406Z"
+  },
+  {
+    "id": "9047a5b3-4061-43cb-a236-7ecc8497fc05",
+    "user_id": null,
+    "principal_type": "service_account",
+    "principal_id": "586042d6-f550-4d76-9f4f-a9f291419d1a",
+    "job_id": null,
+    "action": "agent.tool_invoked",
+    "resource_type": "mcp_tool",
+    "resource_id": "get_deploy_history",
+    "request_id": "ff27feea-4fa3-4294-9cb3-aa5c14c615cc",
+    "ip_address": null,
+    "extra_data": {
+      "outcome": "success",
+      "arguments": {
+        "limit": 20,
+        "environment": null
+      },
+      "tool_name": "get_deploy_history",
+      "latency_ms": 11.168,
+      "scope_used": "telemetry:read"
+    },
+    "created_at": "2026-09-27T11:13:22.031221Z"
+  },
+  {
+    "id": "91bb7e4c-7912-4f8d-8e76-c2ea72ca88e4",
+    "user_id": null,
+    "principal_type": "service_account",
+    "principal_id": "586042d6-f550-4d76-9f4f-a9f291419d1a",
+    "job_id": null,
+    "action": "agent.run_reported",
+    "resource_type": "mcp_tool",
+    "resource_id": "report_agent_run",
+    "request_id": "06a18872-9049-404d-8733-a911507e777b",
+    "ip_address": null,
+    "extra_data": {
+      "outcome": "success",
+      "arguments": {
+        "at": "2026-09-27T11:13:22.051324+00:00",
+        "step": {
+          "at": "2026-09-27T11:13:22.051324+00:00",
+          "seq": 4,
+          "kind": "read",
+          "tool": "get_deploy_history",
+          "outcome": "ok",
+          "arguments": {
+            "limit": 20,
+            "environment": null
+          },
+          "latency_ms": 23,
+          "result_excerpt": "{\"total\":6,\"entries\":[{\"version\":\"v0.4.3\",\"revision\":\"d1e5a83\",\"image_tag\":\"v0.4.3\",\"deployed_at\":\"2026-09-27T09:12:33.306221Z\",\"environment\":\"prod\",\"notes\":null},{\"version\":\"v0.4.3\",\"revision\":\"d1e5a83\",\"image_tag\":\"v0.4.3\",\"deployed_at\":\"2026-09-27T08:12:33.306221Z\",\"environment\":\"staging\",\"notes\":\"staging soak before prod\"},{\"version\":\"v0.4.2\",\"revision\":\"c9f4d02\",\"image_tag\":\"v0.4.2\",\"deploye\u2026"
+        },
+        "state": "investigating",
+        "budget": {
+          "usd_used": 0.0,
+          "tokens_used": 0,
+          "wall_seconds": 0.089,
+          "tool_calls_max": 13,
+          "tool_calls_used": 0
+        },
+        "run_id": "b5fcaa9c-553e-595f-89bf-06cbee14b9dd",
+        "last_step": {
+          "at": "2026-09-27T11:13:22.051324+00:00",
+          "kind": "read",
+          "tool": "get_deploy_history"
+        },
+        "run_label": "remediate_consumer_lag_success",
+        "hypotheses": null,
+        "current_hypothesis": null
+      },
+      "tool_name": "report_agent_run",
+      "latency_ms": 4.488,
+      "scope_used": "agent_runs:write"
+    },
+    "created_at": "2026-09-27T11:13:22.056325Z"
+  },
+  {
+    "id": "b3889825-19fd-4fd9-bfc7-86ce63302c5a",
+    "user_id": null,
+    "principal_type": "service_account",
+    "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+    "job_id": null,
+    "action": "lab.probe",
+    "resource_type": "mcp_tool",
+    "resource_id": "get_consumer_lag",
+    "request_id": "e6077b47-92a9-43b9-a3e0-8d22ed96e120",
+    "ip_address": null,
+    "extra_data": {
+      "outcome": "success",
+      "arguments": {
+        "consumer_group": "worker-dispatcher"
+      },
+      "tool_name": "get_consumer_lag",
+      "latency_ms": 6.975,
+      "scope_used": "telemetry:read",
+      "lab_probe_reason": "traffic: lag read",
+      "lab_probe_principal": "incident-commander-smoke"
+    },
+    "created_at": "2026-09-27T11:13:24.943244Z"
+  },
+  {
+    "id": "abae2356-e93b-4e68-bbdc-c3a169013fac",
+    "user_id": null,
+    "principal_type": "service_account",
+    "principal_id": "586042d6-f550-4d76-9f4f-a9f291419d1a",
+    "job_id": null,
+    "action": "agent.run_reported",
+    "resource_type": "mcp_tool",
+    "resource_id": "report_agent_run",
+    "request_id": "fab2df97-b9c5-4b64-861f-88e2e68c528e",
+    "ip_address": null,
+    "extra_data": {
+      "outcome": "success",
+      "arguments": {
+        "at": "2026-09-27T11:13:31.970494+00:00",
+        "step": {
+          "at": "2026-09-27T11:13:31.970494+00:00",
+          "seq": 5,
+          "kind": "report",
+          "tool": "investigation_planner",
+          "outcome": "ok",
+          "arguments": {
+            "reason": "The worker-dispatcher consumer group lag is confirmed at 36 and climbing (36\u219229\u219223\u219216\u219210\u21925\u21920 in reverse, showing a sustained rise from 0 to 36 over ~90 seconds). The fault is present in the freshest reading (age_seconds=0), well above the 20-message threshold. Consumer saturatio\u2026",
+            "ranking": [
+              {
+                "name": "worker-dispatcher-lag-36-climbing",
+                "category": "consumer_saturation",
+                "confidence": 0.92
+              },
+              {
+                "name": "v0.4.3-prod-deploy-2h-before-incident",
+                "category": "deploy_regression",
+                "confidence": 0.18
+              },
+              {
+                "name": "upstream-producer-burst-causing-lag",
+                "category": "transient_dependency",
+                "confidence": 0.1
+              }
+            ],
+            "next_action": {
+              "kind": "remediate",
+              "tool": null
+            }
+          },
+          "latency_ms": null,
+          "result_excerpt": "top consumer_saturation 0.92 \u2192 remediate: The worker-dispatcher consumer group lag is confirmed at 36 and climbing (36\u219229\u219223\u219216\u219210\u21925\u21920 in reverse, showing a sustained rise from 0 to 36 over ~90 seconds). The fault is present in the freshest reading (age_seconds=0), well above the 20-message threshold. Consumer saturatio\u2026"
+        },
+        "state": "investigating",
+        "budget": {
+          "usd_used": 0.0,
+          "tokens_used": 0,
+          "wall_seconds": 0.089,
+          "tool_calls_max": 13,
+          "tool_calls_used": 0
+        },
+        "run_id": "b5fcaa9c-553e-595f-89bf-06cbee14b9dd",
+        "last_step": null,
+        "run_label": "remediate_consumer_lag_success",
+        "hypotheses": [
+          {
+            "name": "worker-dispatcher-lag-36-climbing",
+            "category": "consumer_saturation",
+            "confidence": 0.92,
+            "reasoning_excerpt": "Live reading shows lag at 36 and climbing steadily from 0 over the last ~90 seconds, well above the 20-message threshold, with no sign of recovery."
+          },
+          {
+            "name": "v0.4.3-prod-deploy-2h-before-incident",
+            "category": "deploy_regression",
+            "confidence": 0.18,
+            "reasoning_excerpt": "v0.4.3 was deployed to prod ~2 hours before the incident began, but lag was zero until ~90 seconds ago, making a deploy regression less likely as the primary cause."
+          },
+          {
+            "name": "upstream-producer-burst-causing-lag",
+            "category": "transient_dependency",
+            "confidence": 0.1,
+            "reasoning_excerpt": "A sudden burst from an upstream producer could explain rapidly climbing lag, but no evidence of a dependency issue has been observed."
+          }
+        ],
+        "current_hypothesis": {
+          "name": "worker-dispatcher-lag-36-climbing",
+          "category": "consumer_saturation",
+          "confidence": 0.92
+        }
+      },
+      "tool_name": "report_agent_run",
+      "latency_ms": 8.235,
+      "scope_used": "agent_runs:write"
+    },
+    "created_at": "2026-09-27T11:13:31.984695Z"
+  },
+  {
+    "id": "3f00e155-9e33-46d7-a1b5-77ddc1a4fc96",
+    "user_id": null,
+    "principal_type": "service_account",
+    "principal_id": "586042d6-f550-4d76-9f4f-a9f291419d1a",
+    "job_id": null,
+    "action": "agent.run_reported",
+    "resource_type": "mcp_tool",
+    "resource_id": "report_agent_run",
+    "request_id": "b6084899-9f6b-48d8-9541-fc5ba9b95992",
+    "ip_address": null,
+    "extra_data": {
+      "outcome": "success",
+      "arguments": {
+        "at": "2026-09-27T11:13:32.008627+00:00",
+        "state": "planning",
+        "budget": {
+          "usd_used": 0.14691,
+          "tokens_used": 47789,
+          "wall_seconds": 24.268,
+          "tool_calls_max": 13,
+          "tool_calls_used": 2
+        },
+        "run_id": "b5fcaa9c-553e-595f-89bf-06cbee14b9dd",
+        "last_step": {
+          "at": "2026-09-27T11:13:07.841225+00:00",
+          "kind": "read",
+          "tool": "get_deploy_history"
+        },
+        "run_label": "remediate_consumer_lag_success",
+        "hypotheses": [
+          {
+            "name": "worker-dispatcher-lag-36-climbing",
+            "category": "consumer_saturation",
+            "confidence": 0.92,
+            "reasoning_excerpt": "Live reading shows lag at 36 and climbing steadily from 0 over the last ~90 seconds, well above the 20-message threshold, with no sign of recovery."
+          },
+          {
+            "name": "v0.4.3-prod-deploy-2h-before-incident",
+            "category": "deploy_regression",
+            "confidence": 0.18,
+            "reasoning_excerpt": "v0.4.3 was deployed to prod ~2 hours before the incident began, but lag was zero until ~90 seconds ago, making a deploy regression less likely as the primary cause."
+          },
+          {
+            "name": "upstream-producer-burst-causing-lag",
+            "category": "transient_dependency",
+            "confidence": 0.1,
+            "reasoning_excerpt": "A sudden burst from an upstream producer could explain rapidly climbing lag, but no evidence of a dependency issue has been observed."
+          }
+        ],
+        "current_hypothesis": {
+          "name": "worker-dispatcher-lag-36-climbing",
+          "category": "consumer_saturation",
+          "confidence": 0.92
+        }
+      },
+      "tool_name": "report_agent_run",
+      "latency_ms": 6.74,
+      "scope_used": "agent_runs:write"
+    },
+    "created_at": "2026-09-27T11:13:32.013171Z"
+  },
+  {
+    "id": "851cb7f9-8a6c-4895-9285-a1bcd8347aee",
+    "user_id": null,
+    "principal_type": "service_account",
+    "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+    "job_id": null,
+    "action": "lab.probe",
+    "resource_type": "mcp_tool",
+    "resource_id": "get_consumer_lag",
+    "request_id": "9a7b3e30-695b-43e6-a9e2-5eef521daba0",
+    "ip_address": null,
+    "extra_data": {
+      "outcome": "success",
+      "arguments": {
+        "consumer_group": "worker-dispatcher"
+      },
+      "tool_name": "get_consumer_lag",
+      "latency_ms": 4.152,
+      "scope_used": "telemetry:read",
+      "lab_probe_reason": "traffic: lag read",
+      "lab_probe_principal": "incident-commander-smoke"
+    },
+    "created_at": "2026-09-27T11:13:32.837917Z"
+  },
+  {
+    "id": "46df18b5-cf39-44d0-b008-3586629ffcd6",
+    "user_id": null,
+    "principal_type": "service_account",
+    "principal_id": "586042d6-f550-4d76-9f4f-a9f291419d1a",
+    "job_id": null,
+    "action": "agent.run_reported",
+    "resource_type": "mcp_tool",
+    "resource_id": "report_agent_run",
+    "request_id": "6795dd6f-60cf-4f30-b3ee-14fa6d25e2fc",
+    "ip_address": null,
+    "extra_data": {
+      "outcome": "success",
+      "arguments": {
+        "at": "2026-09-27T11:13:38.890503+00:00",
+        "plan": {
+          "action_tool": "restart_consumer_group",
+          "action_arguments": {
+            "consumer_group": "worker-dispatcher",
+            "idempotency_key": "bd852e91-b9ac-4c66-b595-44a75bc4ed49-restart"
+          },
+          "rationale_excerpt": null,
+          "target_hypothesis": "worker-dispatcher-lag-36-climbing"
+        },
+        "state": "remediating",
+        "budget": {
+          "usd_used": 0.224935,
+          "tokens_used": 70114,
+          "wall_seconds": 31.15,
+          "tool_calls_max": 13,
+          "tool_calls_used": 2
+        },
+        "run_id": "b5fcaa9c-553e-595f-89bf-06cbee14b9dd",
+        "last_step": {
+          "at": "2026-09-27T11:13:07.841225+00:00",
+          "kind": "read",
+          "tool": "get_deploy_history"
+        },
+        "run_label": "remediate_consumer_lag_success",
+        "hypotheses": [
+          {
+            "name": "worker-dispatcher-lag-36-climbing",
+            "category": "consumer_saturation",
+            "confidence": 0.92,
+            "reasoning_excerpt": "Live reading shows lag at 36 and climbing steadily from 0 over the last ~90 seconds, well above the 20-message threshold, with no sign of recovery."
+          },
+          {
+            "name": "v0.4.3-prod-deploy-2h-before-incident",
+            "category": "deploy_regression",
+            "confidence": 0.18,
+            "reasoning_excerpt": "v0.4.3 was deployed to prod ~2 hours before the incident began, but lag was zero until ~90 seconds ago, making a deploy regression less likely as the primary cause."
+          },
+          {
+            "name": "upstream-producer-burst-causing-lag",
+            "category": "transient_dependency",
+            "confidence": 0.1,
+            "reasoning_excerpt": "A sudden burst from an upstream producer could explain rapidly climbing lag, but no evidence of a dependency issue has been observed."
+          }
+        ],
+        "current_hypothesis": {
+          "name": "worker-dispatcher-lag-36-climbing",
+          "category": "consumer_saturation",
+          "confidence": 0.92
+        }
+      },
+      "tool_name": "report_agent_run",
+      "latency_ms": 6.846,
+      "scope_used": "agent_runs:write"
+    },
+    "created_at": "2026-09-27T11:13:38.897350Z"
+  },
+  {
+    "id": "4ed67827-62e1-4065-9675-6790a661ec3c",
+    "user_id": null,
+    "principal_type": "service_account",
+    "principal_id": "586042d6-f550-4d76-9f4f-a9f291419d1a",
+    "job_id": null,
+    "action": "agent.tool_invoked",
+    "resource_type": "mcp_tool",
+    "resource_id": "restart_consumer_group",
+    "request_id": "eb186f5a-34a9-4407-810b-ca37bd187f17",
+    "ip_address": null,
+    "extra_data": {
+      "outcome": "success",
+      "arguments": {
+        "consumer_group": "worker-dispatcher",
+        "idempotency_key": "3015c2b7755619cfe8cd14cad895a97c"
+      },
+      "tool_name": "restart_consumer_group",
+      "latency_ms": 4.63,
+      "scope_used": "actions:execute"
+    },
+    "created_at": "2026-09-27T11:13:38.917929Z"
+  },
+  {
+    "id": "e8d5df35-9e97-4369-9e2c-96f30490c4f9",
+    "user_id": null,
+    "principal_type": "service_account",
+    "principal_id": "586042d6-f550-4d76-9f4f-a9f291419d1a",
+    "job_id": null,
+    "action": "agent.run_reported",
+    "resource_type": "mcp_tool",
+    "resource_id": "report_agent_run",
+    "request_id": "72b36f3e-d4e2-4593-94dd-625451e93713",
+    "ip_address": null,
+    "extra_data": {
+      "outcome": "success",
+      "arguments": {
+        "at": "2026-09-27T11:13:38.932224+00:00",
+        "step": {
+          "at": "2026-09-27T11:13:38.932224+00:00",
+          "seq": 6,
+          "kind": "action",
+          "tool": "restart_consumer_group",
+          "outcome": "ok",
+          "arguments": {
+            "consumer_group": "worker-dispatcher",
+            "idempotency_key": "3015c2b7755619cfe8cd14cad895a97c"
+          },
+          "latency_ms": 16,
+          "result_excerpt": "{\"consumer_group\":\"worker-dispatcher\",\"kill_key_cleared\":true,\"latency_key_cleared\":false,\"group_recognized\":true,\"accepted\":true}"
+        },
+        "state": "remediating",
+        "budget": {
+          "usd_used": 0.224935,
+          "tokens_used": 70114,
+          "wall_seconds": 31.15,
+          "tool_calls_max": 13,
+          "tool_calls_used": 2
+        },
+        "run_id": "b5fcaa9c-553e-595f-89bf-06cbee14b9dd",
+        "last_step": {
+          "at": "2026-09-27T11:13:38.932224+00:00",
+          "kind": "action",
+          "tool": "restart_consumer_group"
+        },
+        "run_label": "remediate_consumer_lag_success",
+        "hypotheses": [
+          {
+            "name": "worker-dispatcher-lag-36-climbing",
+            "category": "consumer_saturation",
+            "confidence": 0.92,
+            "reasoning_excerpt": "Live reading shows lag at 36 and climbing steadily from 0 over the last ~90 seconds, well above the 20-message threshold, with no sign of recovery."
+          },
+          {
+            "name": "v0.4.3-prod-deploy-2h-before-incident",
+            "category": "deploy_regression",
+            "confidence": 0.18,
+            "reasoning_excerpt": "v0.4.3 was deployed to prod ~2 hours before the incident began, but lag was zero until ~90 seconds ago, making a deploy regression less likely as the primary cause."
+          },
+          {
+            "name": "upstream-producer-burst-causing-lag",
+            "category": "transient_dependency",
+            "confidence": 0.1,
+            "reasoning_excerpt": "A sudden burst from an upstream producer could explain rapidly climbing lag, but no evidence of a dependency issue has been observed."
+          }
+        ],
+        "current_hypothesis": {
+          "name": "worker-dispatcher-lag-36-climbing",
+          "category": "consumer_saturation",
+          "confidence": 0.92
+        }
+      },
+      "tool_name": "report_agent_run",
+      "latency_ms": 4.146,
+      "scope_used": "agent_runs:write"
+    },
+    "created_at": "2026-09-27T11:13:38.934469Z"
+  },
+  {
+    "id": "20a49bf9-7437-4e70-a610-dd539e380a20",
+    "user_id": null,
+    "principal_type": "service_account",
+    "principal_id": "586042d6-f550-4d76-9f4f-a9f291419d1a",
+    "job_id": null,
+    "action": "agent.run_reported",
+    "resource_type": "mcp_tool",
+    "resource_id": "report_agent_run",
+    "request_id": "e0c905b5-01f1-4e0c-af1d-08205e89921d",
+    "ip_address": null,
+    "extra_data": {
+      "outcome": "success",
+      "arguments": {
+        "at": "2026-09-27T11:13:38.945159+00:00",
+        "state": "verifying",
+        "budget": {
+          "usd_used": 0.224935,
+          "tokens_used": 70114,
+          "wall_seconds": 31.204,
+          "tool_calls_max": 13,
+          "tool_calls_used": 3
+        },
+        "run_id": "b5fcaa9c-553e-595f-89bf-06cbee14b9dd",
+        "last_step": {
+          "at": "2026-09-27T11:13:38.914862+00:00",
+          "kind": "action",
+          "tool": "restart_consumer_group"
+        },
+        "run_label": "remediate_consumer_lag_success",
+        "hypotheses": [
+          {
+            "name": "worker-dispatcher-lag-36-climbing",
+            "category": "consumer_saturation",
+            "confidence": 0.92,
+            "reasoning_excerpt": "Live reading shows lag at 36 and climbing steadily from 0 over the last ~90 seconds, well above the 20-message threshold, with no sign of recovery."
+          },
+          {
+            "name": "v0.4.3-prod-deploy-2h-before-incident",
+            "category": "deploy_regression",
+            "confidence": 0.18,
+            "reasoning_excerpt": "v0.4.3 was deployed to prod ~2 hours before the incident began, but lag was zero until ~90 seconds ago, making a deploy regression less likely as the primary cause."
+          },
+          {
+            "name": "upstream-producer-burst-causing-lag",
+            "category": "transient_dependency",
+            "confidence": 0.1,
+            "reasoning_excerpt": "A sudden burst from an upstream producer could explain rapidly climbing lag, but no evidence of a dependency issue has been observed."
+          }
+        ],
+        "current_hypothesis": {
+          "name": "worker-dispatcher-lag-36-climbing",
+          "category": "consumer_saturation",
+          "confidence": 0.92
+        }
+      },
+      "tool_name": "report_agent_run",
+      "latency_ms": 3.608,
+      "scope_used": "agent_runs:write"
+    },
+    "created_at": "2026-09-27T11:13:38.947025Z"
+  },
+  {
+    "id": "e7dda52b-000f-497b-9883-8c3a611e4937",
+    "user_id": null,
+    "principal_type": "service_account",
+    "principal_id": "586042d6-f550-4d76-9f4f-a9f291419d1a",
+    "job_id": null,
+    "action": "agent.tool_invoked",
+    "resource_type": "mcp_tool",
+    "resource_id": "get_consumer_lag",
+    "request_id": "635375db-efb1-4323-b9d2-030d4774e502",
+    "ip_address": null,
+    "extra_data": {
+      "outcome": "success",
+      "arguments": {
+        "consumer_group": "worker-dispatcher"
+      },
+      "tool_name": "get_consumer_lag",
+      "latency_ms": 1.976,
+      "scope_used": "telemetry:read"
+    },
+    "created_at": "2026-09-27T11:13:38.958826Z"
+  },
+  {
+    "id": "774643e9-bf6c-49a7-b277-6ffb7ee7c6d8",
+    "user_id": null,
+    "principal_type": "service_account",
+    "principal_id": "586042d6-f550-4d76-9f4f-a9f291419d1a",
+    "job_id": null,
+    "action": "agent.run_reported",
+    "resource_type": "mcp_tool",
+    "resource_id": "report_agent_run",
+    "request_id": "eab7c2c7-6abf-4f45-90d6-92792d94c0a4",
+    "ip_address": null,
+    "extra_data": {
+      "outcome": "success",
+      "arguments": {
+        "at": "2026-09-27T11:13:38.967767+00:00",
+        "step": {
+          "at": "2026-09-27T11:13:38.967767+00:00",
+          "seq": 7,
+          "kind": "read",
+          "tool": "get_consumer_lag",
+          "outcome": "ok",
+          "arguments": {
+            "consumer_group": "worker-dispatcher"
+          },
+          "latency_ms": 10,
+          "result_excerpt": "{\"consumer_group\":\"worker-dispatcher\",\"lag\":61,\"lag_known\":true,\"source\":\"live\",\"cache_key\":\"kafka:consumer_lag:worker-dispatcher\",\"measured_at\":\"2026-09-27T11:13:34.665353Z\",\"age_seconds\":4,\"recent_samples\":[{\"lag\":61,\"measured_at\":\"2026-09-27T11:13:34.665353Z\"},{\"lag\":55,\"measured_at\":\"2026-09-27T11:13:29.604635Z\"},{\"lag\":49,\"measured_at\":\"2026-09-27T11:13:24.546678Z\"},{\"lag\":42,\"measured_at\":\"\u2026"
+        },
+        "state": "verifying",
+        "budget": {
+          "usd_used": 0.224935,
+          "tokens_used": 70114,
+          "wall_seconds": 31.204,
+          "tool_calls_max": 13,
+          "tool_calls_used": 3
+        },
+        "run_id": "b5fcaa9c-553e-595f-89bf-06cbee14b9dd",
+        "last_step": {
+          "at": "2026-09-27T11:13:38.967767+00:00",
+          "kind": "read",
+          "tool": "get_consumer_lag"
+        },
+        "run_label": "remediate_consumer_lag_success",
+        "hypotheses": [
+          {
+            "name": "worker-dispatcher-lag-36-climbing",
+            "category": "consumer_saturation",
+            "confidence": 0.92,
+            "reasoning_excerpt": "Live reading shows lag at 36 and climbing steadily from 0 over the last ~90 seconds, well above the 20-message threshold, with no sign of recovery."
+          },
+          {
+            "name": "v0.4.3-prod-deploy-2h-before-incident",
+            "category": "deploy_regression",
+            "confidence": 0.18,
+            "reasoning_excerpt": "v0.4.3 was deployed to prod ~2 hours before the incident began, but lag was zero until ~90 seconds ago, making a deploy regression less likely as the primary cause."
+          },
+          {
+            "name": "upstream-producer-burst-causing-lag",
+            "category": "transient_dependency",
+            "confidence": 0.1,
+            "reasoning_excerpt": "A sudden burst from an upstream producer could explain rapidly climbing lag, but no evidence of a dependency issue has been observed."
+          }
+        ],
+        "current_hypothesis": {
+          "name": "worker-dispatcher-lag-36-climbing",
+          "category": "consumer_saturation",
+          "confidence": 0.92
+        }
+      },
+      "tool_name": "report_agent_run",
+      "latency_ms": 3.616,
+      "scope_used": "agent_runs:write"
+    },
+    "created_at": "2026-09-27T11:13:38.969327Z"
+  },
+  {
+    "id": "a89090ba-364a-4496-a160-bdae0a0f2663",
+    "user_id": null,
+    "principal_type": "service_account",
+    "principal_id": "586042d6-f550-4d76-9f4f-a9f291419d1a",
+    "job_id": null,
+    "action": "agent.run_reported",
+    "resource_type": "mcp_tool",
+    "resource_id": "report_agent_run",
+    "request_id": "52cce0a3-d105-4163-94d0-a97c6a38c4fd",
+    "ip_address": null,
+    "extra_data": {
+      "outcome": "success",
+      "arguments": {
+        "at": "2026-09-27T11:13:40.920499+00:00",
+        "step": {
+          "at": "2026-09-27T11:13:40.920499+00:00",
+          "seq": 8,
+          "kind": "report",
+          "tool": "verify_judge",
+          "outcome": "ok",
+          "arguments": {
+            "reason": "All 15 samples were measured before the action executed (latest sample at 11:13:34.665353Z, action at 11:13:38.623533Z), with samples_after_action=0; the lag trend rose continuously from 0 to 61, but no post-action samples exist to confirm the expected downward trend that would \u2026",
+            "ranking": [
+              {
+                "name": "worker-dispatcher-lag-36-climbing",
+                "category": "consumer_saturation",
+                "confidence": 0.92
+              },
+              {
+                "name": "v0.4.3-prod-deploy-2h-before-incident",
+                "category": "deploy_regression",
+                "confidence": 0.18
+              },
+              {
+                "name": "upstream-producer-burst-causing-lag",
+                "category": "transient_dependency",
+                "confidence": 0.1
+              }
+            ],
+            "next_action": null
+          },
+          "latency_ms": null,
+          "result_excerpt": "top consumer_saturation 0.92 \u2192 verify 1/6 not_verified: All 15 samples were measured before the action executed (latest sample at 11:13:34.665353Z, action at 11:13:38.623533Z), with samples_after_action=0; the lag trend rose continuously from 0 to 61, but no post-action samples exist to confirm the expected downward trend that would \u2026"
+        },
+        "state": "verifying",
+        "budget": {
+          "usd_used": 0.224935,
+          "tokens_used": 70114,
+          "wall_seconds": 31.204,
+          "tool_calls_max": 13,
+          "tool_calls_used": 3
+        },
+        "run_id": "b5fcaa9c-553e-595f-89bf-06cbee14b9dd",
+        "last_step": {
+          "at": "2026-09-27T11:13:38.914862+00:00",
+          "kind": "action",
+          "tool": "restart_consumer_group"
+        },
+        "run_label": "remediate_consumer_lag_success",
+        "hypotheses": [
+          {
+            "name": "worker-dispatcher-lag-36-climbing",
+            "category": "consumer_saturation",
+            "confidence": 0.92,
+            "reasoning_excerpt": "Live reading shows lag at 36 and climbing steadily from 0 over the last ~90 seconds, well above the 20-message threshold, with no sign of recovery."
+          },
+          {
+            "name": "v0.4.3-prod-deploy-2h-before-incident",
+            "category": "deploy_regression",
+            "confidence": 0.18,
+            "reasoning_excerpt": "v0.4.3 was deployed to prod ~2 hours before the incident began, but lag was zero until ~90 seconds ago, making a deploy regression less likely as the primary cause."
+          },
+          {
+            "name": "upstream-producer-burst-causing-lag",
+            "category": "transient_dependency",
+            "confidence": 0.1,
+            "reasoning_excerpt": "A sudden burst from an upstream producer could explain rapidly climbing lag, but no evidence of a dependency issue has been observed."
+          }
+        ],
+        "verification": {
+          "of": 6,
+          "attempt": 1,
+          "verdict": "not_verified",
+          "reasoning_excerpt": "All 15 samples were measured before the action executed (latest sample at 11:13:34.665353Z, action at 11:13:38.623533Z), with samples_after_action=0; the lag trend rose continuously from 0 to 61, but no post-action samples exist to confirm the expected downward trend that would \u2026"
+        },
+        "current_hypothesis": {
+          "name": "worker-dispatcher-lag-36-climbing",
+          "category": "consumer_saturation",
+          "confidence": 0.92
+        }
+      },
+      "tool_name": "report_agent_run",
+      "latency_ms": 4.132,
+      "scope_used": "agent_runs:write"
+    },
+    "created_at": "2026-09-27T11:13:40.922932Z"
+  },
+  {
+    "id": "1289b5c8-12cd-4027-af9c-2565b761108b",
+    "user_id": null,
+    "principal_type": "service_account",
+    "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+    "job_id": null,
+    "action": "lab.probe",
+    "resource_type": "mcp_tool",
+    "resource_id": "get_consumer_lag",
+    "request_id": "19e55325-eea7-4675-9251-4cc28f3e1387",
+    "ip_address": null,
+    "extra_data": {
+      "outcome": "success",
+      "arguments": {
+        "consumer_group": "worker-dispatcher"
+      },
+      "tool_name": "get_consumer_lag",
+      "latency_ms": 8.465,
+      "scope_used": "telemetry:read",
+      "lab_probe_reason": "traffic: lag read",
+      "lab_probe_principal": "incident-commander-smoke"
+    },
+    "created_at": "2026-09-27T11:13:41.007019Z"
+  },
+  {
+    "id": "3f903ff1-76cd-46f6-a280-be900770d2e8",
+    "user_id": null,
+    "principal_type": "service_account",
+    "principal_id": null,
+    "job_id": null,
+    "action": "alert.resolved",
+    "resource_type": "alert",
+    "resource_id": "ddeee9e9-f34b-448c-8f5e-fa6b206cc7ce",
+    "request_id": null,
+    "ip_address": null,
+    "extra_data": {
+      "source": "kafka:consumer_lag",
+      "subject": "worker-dispatcher",
+      "summary": "worker-dispatcher: lag measured at 0, below the threshold of 20",
+      "alert_id": "ddeee9e9-f34b-448c-8f5e-fa6b206cc7ce",
+      "severity": "critical",
+      "dedup_key": "rule:consumer_stalled:worker-dispatcher:19",
+      "fingerprint": "consumer_stalled",
+      "resolved_reason": "lag measured at 0, below the threshold of 20"
+    },
+    "created_at": "2026-09-27T11:13:45.278494Z"
+  },
+  {
+    "id": "32cb461e-e10d-4924-84a7-4ea66df40df8",
+    "user_id": null,
+    "principal_type": "service_account",
+    "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+    "job_id": null,
+    "action": "lab.probe",
+    "resource_type": "mcp_tool",
+    "resource_id": "get_consumer_lag",
+    "request_id": "02aa1402-de67-4bdf-a2b6-60c1b2ec05e3",
+    "ip_address": null,
+    "extra_data": {
+      "outcome": "success",
+      "arguments": {
+        "consumer_group": "worker-dispatcher"
+      },
+      "tool_name": "get_consumer_lag",
+      "latency_ms": 3.695,
+      "scope_used": "telemetry:read",
+      "lab_probe_reason": "traffic: lag read",
+      "lab_probe_principal": "incident-commander-smoke"
+    },
+    "created_at": "2026-09-27T11:13:48.868888Z"
+  },
+  {
+    "id": "d5da4f3c-17e2-45af-8c01-f6199fe80a31",
+    "user_id": null,
+    "principal_type": "service_account",
+    "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+    "job_id": null,
+    "action": "lab.probe",
+    "resource_type": "mcp_tool",
+    "resource_id": "get_consumer_lag",
+    "request_id": "d2868ed4-7b3c-4b56-97bb-629a46455755",
+    "ip_address": null,
+    "extra_data": {
+      "outcome": "success",
+      "arguments": {
+        "consumer_group": "worker-dispatcher"
+      },
+      "tool_name": "get_consumer_lag",
+      "latency_ms": 4.363,
+      "scope_used": "telemetry:read",
+      "lab_probe_reason": "traffic: lag read",
+      "lab_probe_principal": "incident-commander-smoke"
+    },
+    "created_at": "2026-09-27T11:13:56.954297Z"
+  },
+  {
+    "id": "d657c3ab-d258-45fa-b301-334ad9f559e3",
+    "user_id": null,
+    "principal_type": "service_account",
+    "principal_id": "586042d6-f550-4d76-9f4f-a9f291419d1a",
+    "job_id": null,
+    "action": "agent.tool_invoked",
+    "resource_type": "mcp_tool",
+    "resource_id": "get_consumer_lag",
+    "request_id": "c07f00ed-4658-434a-8fc7-74c1f6f5b62b",
+    "ip_address": null,
+    "extra_data": {
+      "outcome": "success",
+      "arguments": {
+        "consumer_group": "worker-dispatcher"
+      },
+      "tool_name": "get_consumer_lag",
+      "latency_ms": 2.291,
+      "scope_used": "telemetry:read"
+    },
+    "created_at": "2026-09-27T11:14:00.942877Z"
+  },
+  {
+    "id": "7734d819-9980-4531-930a-2e631f870e72",
+    "user_id": null,
+    "principal_type": "service_account",
+    "principal_id": "586042d6-f550-4d76-9f4f-a9f291419d1a",
+    "job_id": null,
+    "action": "agent.run_reported",
+    "resource_type": "mcp_tool",
+    "resource_id": "report_agent_run",
+    "request_id": "affe9410-7458-4b77-b153-b894a6389651",
+    "ip_address": null,
+    "extra_data": {
+      "outcome": "success",
+      "arguments": {
+        "at": "2026-09-27T11:14:00.954397+00:00",
+        "step": {
+          "at": "2026-09-27T11:14:00.954397+00:00",
+          "seq": 9,
+          "kind": "read",
+          "tool": "get_consumer_lag",
+          "outcome": "ok",
+          "arguments": {
+            "consumer_group": "worker-dispatcher"
+          },
+          "latency_ms": 15,
+          "result_excerpt": "{\"consumer_group\":\"worker-dispatcher\",\"lag\":0,\"lag_known\":true,\"source\":\"live\",\"cache_key\":\"kafka:consumer_lag:worker-dispatcher\",\"measured_at\":\"2026-09-27T11:13:55.997511Z\",\"age_seconds\":4,\"recent_samples\":[{\"lag\":0,\"measured_at\":\"2026-09-27T11:13:55.997511Z\"},{\"lag\":0,\"measured_at\":\"2026-09-27T11:13:50.380775Z\"},{\"lag\":0,\"measured_at\":\"2026-09-27T11:13:45.275653Z\"},{\"lag\":23,\"measured_at\":\"2026\u2026"
+        },
+        "state": "verifying",
+        "budget": {
+          "usd_used": 0.224935,
+          "tokens_used": 70114,
+          "wall_seconds": 31.204,
+          "tool_calls_max": 13,
+          "tool_calls_used": 3
+        },
+        "run_id": "b5fcaa9c-553e-595f-89bf-06cbee14b9dd",
+        "last_step": {
+          "at": "2026-09-27T11:14:00.954397+00:00",
+          "kind": "read",
+          "tool": "get_consumer_lag"
+        },
+        "run_label": "remediate_consumer_lag_success",
+        "hypotheses": [
+          {
+            "name": "worker-dispatcher-lag-36-climbing",
+            "category": "consumer_saturation",
+            "confidence": 0.92,
+            "reasoning_excerpt": "Live reading shows lag at 36 and climbing steadily from 0 over the last ~90 seconds, well above the 20-message threshold, with no sign of recovery."
+          },
+          {
+            "name": "v0.4.3-prod-deploy-2h-before-incident",
+            "category": "deploy_regression",
+            "confidence": 0.18,
+            "reasoning_excerpt": "v0.4.3 was deployed to prod ~2 hours before the incident began, but lag was zero until ~90 seconds ago, making a deploy regression less likely as the primary cause."
+          },
+          {
+            "name": "upstream-producer-burst-causing-lag",
+            "category": "transient_dependency",
+            "confidence": 0.1,
+            "reasoning_excerpt": "A sudden burst from an upstream producer could explain rapidly climbing lag, but no evidence of a dependency issue has been observed."
+          }
+        ],
+        "current_hypothesis": {
+          "name": "worker-dispatcher-lag-36-climbing",
+          "category": "consumer_saturation",
+          "confidence": 0.92
+        }
+      },
+      "tool_name": "report_agent_run",
+      "latency_ms": 4.234,
+      "scope_used": "agent_runs:write"
+    },
+    "created_at": "2026-09-27T11:14:00.956705Z"
+  },
+  {
+    "id": "18cf704d-fc1a-404b-b33d-57686d45fcab",
+    "user_id": null,
+    "principal_type": "service_account",
+    "principal_id": "586042d6-f550-4d76-9f4f-a9f291419d1a",
+    "job_id": null,
+    "action": "agent.run_reported",
+    "resource_type": "mcp_tool",
+    "resource_id": "report_agent_run",
+    "request_id": "477c400c-4c43-48c3-851a-ed2e281d5f49",
+    "ip_address": null,
+    "extra_data": {
+      "outcome": "success",
+      "arguments": {
+        "at": "2026-09-27T11:14:02.995099+00:00",
+        "step": {
+          "at": "2026-09-27T11:14:02.995099+00:00",
+          "seq": 10,
+          "kind": "report",
+          "tool": "verify_judge",
+          "outcome": "ok",
+          "arguments": {
+            "reason": "Lag climbed from 0 to peak of 61 before the restart at 2026-09-27T11:13:37.974427Z, then dropped sharply to 23 at sample 12 (2026-09-27T11:13:40.112058Z, 2.14 seconds post-action) and fell to 0 by sample 13 (2026-09-27T11:13:45.275653Z), demonstrating successful draining with 4 \u2026",
+            "ranking": [
+              {
+                "name": "worker-dispatcher-lag-36-climbing",
+                "category": "consumer_saturation",
+                "confidence": 0.92
+              },
+              {
+                "name": "v0.4.3-prod-deploy-2h-before-incident",
+                "category": "deploy_regression",
+                "confidence": 0.18
+              },
+              {
+                "name": "upstream-producer-burst-causing-lag",
+                "category": "transient_dependency",
+                "confidence": 0.1
+              }
+            ],
+            "next_action": null
+          },
+          "latency_ms": null,
+          "result_excerpt": "top consumer_saturation 0.92 \u2192 verify 2/6 verified: Lag climbed from 0 to peak of 61 before the restart at 2026-09-27T11:13:37.974427Z, then dropped sharply to 23 at sample 12 (2026-09-27T11:13:40.112058Z, 2.14 seconds post-action) and fell to 0 by sample 13 (2026-09-27T11:13:45.275653Z), demonstrating successful draining with 4 \u2026"
+        },
+        "state": "verifying",
+        "budget": {
+          "usd_used": 0.224935,
+          "tokens_used": 70114,
+          "wall_seconds": 31.204,
+          "tool_calls_max": 13,
+          "tool_calls_used": 3
+        },
+        "run_id": "b5fcaa9c-553e-595f-89bf-06cbee14b9dd",
+        "last_step": {
+          "at": "2026-09-27T11:13:38.914862+00:00",
+          "kind": "action",
+          "tool": "restart_consumer_group"
+        },
+        "run_label": "remediate_consumer_lag_success",
+        "hypotheses": [
+          {
+            "name": "worker-dispatcher-lag-36-climbing",
+            "category": "consumer_saturation",
+            "confidence": 0.92,
+            "reasoning_excerpt": "Live reading shows lag at 36 and climbing steadily from 0 over the last ~90 seconds, well above the 20-message threshold, with no sign of recovery."
+          },
+          {
+            "name": "v0.4.3-prod-deploy-2h-before-incident",
+            "category": "deploy_regression",
+            "confidence": 0.18,
+            "reasoning_excerpt": "v0.4.3 was deployed to prod ~2 hours before the incident began, but lag was zero until ~90 seconds ago, making a deploy regression less likely as the primary cause."
+          },
+          {
+            "name": "upstream-producer-burst-causing-lag",
+            "category": "transient_dependency",
+            "confidence": 0.1,
+            "reasoning_excerpt": "A sudden burst from an upstream producer could explain rapidly climbing lag, but no evidence of a dependency issue has been observed."
+          }
+        ],
+        "verification": {
+          "of": 6,
+          "attempt": 2,
+          "verdict": "verified",
+          "reasoning_excerpt": "Lag climbed from 0 to peak of 61 before the restart at 2026-09-27T11:13:37.974427Z, then dropped sharply to 23 at sample 12 (2026-09-27T11:13:40.112058Z, 2.14 seconds post-action) and fell to 0 by sample 13 (2026-09-27T11:13:45.275653Z), demonstrating successful draining with 4 \u2026"
+        },
+        "current_hypothesis": {
+          "name": "worker-dispatcher-lag-36-climbing",
+          "category": "consumer_saturation",
+          "confidence": 0.92
+        }
+      },
+      "tool_name": "report_agent_run",
+      "latency_ms": 4.001,
+      "scope_used": "agent_runs:write"
+    },
+    "created_at": "2026-09-27T11:14:02.997347Z"
+  },
+  {
+    "id": "a37161bd-3eb2-4b2a-8391-01a1e1d4df65",
+    "user_id": null,
+    "principal_type": "service_account",
+    "principal_id": "586042d6-f550-4d76-9f4f-a9f291419d1a",
+    "job_id": null,
+    "action": "agent.run_reported",
+    "resource_type": "mcp_tool",
+    "resource_id": "report_agent_run",
+    "request_id": "60ca8b45-cfcc-47ff-bdd0-2c9b133a8005",
+    "ip_address": null,
+    "extra_data": {
+      "outcome": "success",
+      "arguments": {
+        "at": "2026-09-27T11:14:03.007197+00:00",
+        "state": "resolved",
+        "budget": {
+          "usd_used": 0.2309,
+          "tokens_used": 74835,
+          "wall_seconds": 55.266,
+          "tool_calls_max": 13,
+          "tool_calls_used": 5
+        },
+        "run_id": "b5fcaa9c-553e-595f-89bf-06cbee14b9dd",
+        "last_step": {
+          "at": "2026-09-27T11:14:00.937946+00:00",
+          "kind": "read",
+          "tool": "get_consumer_lag"
+        },
+        "run_label": "remediate_consumer_lag_success",
+        "hypotheses": [
+          {
+            "name": "worker-dispatcher-lag-36-climbing",
+            "category": "consumer_saturation",
+            "confidence": 0.92,
+            "reasoning_excerpt": "Live reading shows lag at 36 and climbing steadily from 0 over the last ~90 seconds, well above the 20-message threshold, with no sign of recovery."
+          },
+          {
+            "name": "v0.4.3-prod-deploy-2h-before-incident",
+            "category": "deploy_regression",
+            "confidence": 0.18,
+            "reasoning_excerpt": "v0.4.3 was deployed to prod ~2 hours before the incident began, but lag was zero until ~90 seconds ago, making a deploy regression less likely as the primary cause."
+          },
+          {
+            "name": "upstream-producer-burst-causing-lag",
+            "category": "transient_dependency",
+            "confidence": 0.1,
+            "reasoning_excerpt": "A sudden burst from an upstream producer could explain rapidly climbing lag, but no evidence of a dependency issue has been observed."
+          }
+        ],
+        "current_hypothesis": {
+          "name": "worker-dispatcher-lag-36-climbing",
+          "category": "consumer_saturation",
+          "confidence": 0.92
+        }
+      },
+      "tool_name": "report_agent_run",
+      "latency_ms": 3.044,
+      "scope_used": "agent_runs:write"
+    },
+    "created_at": "2026-09-27T11:14:03.008327Z"
+  },
+  {
+    "id": "7da94b89-0b7e-45d8-b1bc-bca8c03cde8f",
+    "user_id": null,
+    "principal_type": "service_account",
+    "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+    "job_id": null,
+    "action": "lab.probe",
+    "resource_type": "mcp_tool",
+    "resource_id": "get_consumer_lag",
+    "request_id": "c476b38e-df01-44b3-9a3a-6af90b6b5930",
+    "ip_address": null,
+    "extra_data": {
+      "outcome": "success",
+      "arguments": {
+        "consumer_group": "worker-dispatcher"
+      },
+      "tool_name": "get_consumer_lag",
+      "latency_ms": 3.75,
+      "scope_used": "telemetry:read",
+      "lab_probe_reason": "traffic: lag read",
+      "lab_probe_principal": "incident-commander-smoke"
+    },
+    "created_at": "2026-09-27T11:14:04.852819Z"
+  },
+  {
+    "id": "7c94fcc8-09f5-46af-abd8-4b9cea12428f",
+    "user_id": null,
+    "principal_type": "service_account",
+    "principal_id": "586042d6-f550-4d76-9f4f-a9f291419d1a",
+    "job_id": null,
+    "action": "agent.run_reported",
+    "resource_type": "mcp_tool",
+    "resource_id": "report_agent_briefing",
+    "request_id": "345f1a36-03d0-422a-b9b8-24904e04e48f",
+    "ip_address": null,
+    "extra_data": {
+      "outcome": "success",
+      "arguments": {
+        "prose": "Findings: A restart_consumer_group action was issued for worker-dispatcher (kill_key_cleared=true, latency_key_cleared=false); lag climbed from 36 to 61 immediately after the restart before dropping to 0 in the subsequent verify read at 11:13:55Z, though the latency key was not cleared and sustained recovery has not been confirmed beyond that single moment. No remaining causes block was present in this run, so no additional open causes were flagged.\n\nRecommendation: Confirm that worker-dispatcher lag is holding at 0 with a current read, and check whether the uncleared latency key is causing any residual processing delay before closing the incident.",
+        "run_id": "b5fcaa9c-553e-595f-89bf-06cbee14b9dd",
+        "briefing": {
+          "findings": "A restart_consumer_group action was issued for worker-dispatcher (kill_key_cleared=true, latency_key_cleared=false); lag climbed from 36 to 61 immediately after the restart before dropping to 0 in the subsequent verify read at 11:13:55Z, though the latency key was not cleared and sustained recovery has not been confirmed beyond that single moment. No remaining causes block was present in this run, so no additional open causes were flagged.",
+          "incidents": {
+            "primary": {
+              "name": "worker-dispatcher-lag-36-climbing",
+              "category": "consumer_saturation",
+              "addressed": true,
+              "confidence": 0.92
+            },
+            "secondary": [],
+            "unresolved_extra": []
+          },
+          "attribution": null,
+          "budget_used": {
+            "usd": "0.230900",
+            "tokens": 74835,
+            "tool_calls": 5,
+            "wall_seconds": 55.266475
+          },
+          "final_state": "resolved",
+          "incident_id": "bd852e91-b9ac-4c66-b595-44a75bc4ed49",
+          "alert_summary": "source=kafka:consumer_lag severity=critical fingerprint=consumer_stalled group=worker-dispatcher",
+          "recommendation": "Confirm that worker-dispatcher lag is holding at 0 with a current read, and check whether the uncleared latency key is causing any residual processing delay before closing the incident.",
+          "attempted_action": null,
+          "escalation_reason": "",
+          "investigation_trail": [
+            {
+              "tool": "get_consumer_lag",
+              "summary": "{\"consumer_group\":\"worker-dispatcher\",\"lag\":36,\"lag_known\":true,\"source\":\"live\",\"cache_key\":\"kafka:consumer_lag:worker-dispatcher\",\"measured_at\":\"2026-09-27T11:13:14.372434Z\",\"age_seconds\":0,\"recent_samples\":[{\"lag\":36,\"measured_at\":\"2026-09-27T11:13:14.372434Z\"},{\"lag\":29,\"measured_at\":\"2026-09-27T11:13:09.305904Z\"},{\"lag\":23,\"measured_at\":\"2026-09-27T11:13:04.209157Z\"},{\"lag\":16,\"measured_at\":\"2026-09-27T11:12:59.094018Z\"},{\"lag\":10,\"measured_at\":\"2026-09-27T11:12:54.014552Z\"},{\"lag\":5,\"measured_at\":\"2026-09-27T11:12:48.975556Z\"},{\"lag\":0,\"measured_at\":\"2026-09-27T11:12:43.640874Z\"},{\"lag\":0,\"measured_at\":\"2026-09-27T11:12:38.394493Z\"},{\"lag\":0,\"measured_at\":\"2026-09-27T11:12:33.208521Z\"},{\"lag\":0,\"measured_at\":\"2026-09-27T11:12:28.088155Z\"},{\"lag\":0,\"measured_at\":\"2026-09-27T11:12:22.906749Z\"},{\"lag\":0,\"measured_at\":\"2026-09-27T11:12:17.708415Z\"},{\"lag\":0,\"measured_at\":\"2026-09-27T11:12:12.544454Z\"},{\"lag\":0,\"measured_at\":\"2026-09-27T11:12:07.339929Z\"},{\"lag\":0,\"measured_at\":\"2026-09-27T11:12:02.137260Z\"}]}",
+              "arguments": {
+                "consumer_group": "worker-dispatcher"
+              }
+            },
+            {
+              "tool": "get_deploy_history",
+              "summary": "{\"total\":6,\"entries\":[{\"version\":\"v0.4.3\",\"revision\":\"d1e5a83\",\"image_tag\":\"v0.4.3\",\"deployed_at\":\"2026-09-27T09:12:33.306221Z\",\"environment\":\"prod\",\"notes\":null},{\"version\":\"v0.4.3\",\"revision\":\"d1e5a83\",\"image_tag\":\"v0.4.3\",\"deployed_at\":\"2026-09-27T08:12:33.306221Z\",\"environment\":\"staging\",\"notes\":\"staging soak before prod\"},{\"version\":\"v0.4.2\",\"revision\":\"c9f4d02\",\"image_tag\":\"v0.4.2\",\"deployed_at\":\"2026-09-27T05:12:33.306221Z\",\"environment\":\"prod\",\"notes\":\"correlated with billing failures\"},{\"version\":\"v0.4.1\",\"revision\":\"b7c3e51\",\"image_tag\":\"v0.4.1\",\"deployed_at\":\"2026-09-26T17:12:33.306221Z\",\"environment\":\"prod\",\"notes\":null},{\"version\":\"v0.4.0\",\"revision\":\"a1940af\",\"image_tag\":\"v0.4.0\",\"deployed_at\":\"2026-09-26T13:12:33.306221Z\",\"environment\":\"prod\",\"notes\":null},{\"version\":\"v0.3.9\",\"revision\":\"e0f6b14\",\"image_tag\":\"v0.3.9\",\"deployed_at\":\"2026-09-25T11:12:33.306221Z\",\"environment\":\"prod\",\"notes\":null}],\"source\":\"deploy_markers\"}",
+              "arguments": {
+                "limit": 20,
+                "environment": null
+              }
+            },
+            {
+              "tool": "restart_consumer_group",
+              "summary": "{\"consumer_group\":\"worker-dispatcher\",\"kill_key_cleared\":true,\"latency_key_cleared\":false,\"group_recognized\":true,\"accepted\":true}",
+              "arguments": {
+                "consumer_group": "worker-dispatcher",
+                "idempotency_key": "3015c2b7755619cfe8cd14cad895a97c"
+              }
+            },
+            {
+              "tool": "get_consumer_lag",
+              "summary": "{\"consumer_group\":\"worker-dispatcher\",\"lag\":61,\"lag_known\":true,\"source\":\"live\",\"cache_key\":\"kafka:consumer_lag:worker-dispatcher\",\"measured_at\":\"2026-09-27T11:13:34.665353Z\",\"age_seconds\":4,\"recent_samples\":[{\"lag\":61,\"measured_at\":\"2026-09-27T11:13:34.665353Z\"},{\"lag\":55,\"measured_at\":\"2026-09-27T11:13:29.604635Z\"},{\"lag\":49,\"measured_at\":\"2026-09-27T11:13:24.546678Z\"},{\"lag\":42,\"measured_at\":\"2026-09-27T11:13:19.446986Z\"},{\"lag\":36,\"measured_at\":\"2026-09-27T11:13:14.372434Z\"},{\"lag\":29,\"measured_at\":\"2026-09-27T11:13:09.305904Z\"},{\"lag\":23,\"measured_at\":\"2026-09-27T11:13:04.209157Z\"},{\"lag\":16,\"measured_at\":\"2026-09-27T11:12:59.094018Z\"},{\"lag\":10,\"measured_at\":\"2026-09-27T11:12:54.014552Z\"},{\"lag\":5,\"measured_at\":\"2026-09-27T11:12:48.975556Z\"},{\"lag\":0,\"measured_at\":\"2026-09-27T11:12:43.640874Z\"},{\"lag\":0,\"measured_at\":\"2026-09-27T11:12:38.394493Z\"},{\"lag\":0,\"measured_at\":\"2026-09-27T11:12:33.208521Z\"},{\"lag\":0,\"measured_at\":\"2026-09-27T11:12:28.088155Z\"},{\"lag\":0,\"measured_at\":\"2026-09-27T11:12:22.906749Z\"}]}",
+              "arguments": {
+                "of": 6,
+                "attempt": 1,
+                "consumer_group": "worker-dispatcher"
+              }
+            },
+            {
+              "tool": "get_consumer_lag",
+              "summary": "{\"consumer_group\":\"worker-dispatcher\",\"lag\":0,\"lag_known\":true,\"source\":\"live\",\"cache_key\":\"kafka:consumer_lag:worker-dispatcher\",\"measured_at\":\"2026-09-27T11:13:55.997511Z\",\"age_seconds\":4,\"recent_samples\":[{\"lag\":0,\"measured_at\":\"2026-09-27T11:13:55.997511Z\"},{\"lag\":0,\"measured_at\":\"2026-09-27T11:13:50.380775Z\"},{\"lag\":0,\"measured_at\":\"2026-09-27T11:13:45.275653Z\"},{\"lag\":23,\"measured_at\":\"2026-09-27T11:13:40.112058Z\"},{\"lag\":61,\"measured_at\":\"2026-09-27T11:13:34.665353Z\"},{\"lag\":55,\"measured_at\":\"2026-09-27T11:13:29.604635Z\"},{\"lag\":49,\"measured_at\":\"2026-09-27T11:13:24.546678Z\"},{\"lag\":42,\"measured_at\":\"2026-09-27T11:13:19.446986Z\"},{\"lag\":36,\"measured_at\":\"2026-09-27T11:13:14.372434Z\"},{\"lag\":29,\"measured_at\":\"2026-09-27T11:13:09.305904Z\"},{\"lag\":23,\"measured_at\":\"2026-09-27T11:13:04.209157Z\"},{\"lag\":16,\"measured_at\":\"2026-09-27T11:12:59.094018Z\"},{\"lag\":10,\"measured_at\":\"2026-09-27T11:12:54.014552Z\"},{\"lag\":5,\"measured_at\":\"2026-09-27T11:12:48.975556Z\"},{\"lag\":0,\"measured_at\":\"2026-09-27T11:12:43.640874Z\"}]}",
+              "arguments": {
+                "of": 6,
+                "attempt": 2,
+                "consumer_group": "worker-dispatcher"
+              }
+            }
+          ]
+        }
+      },
+      "tool_name": "report_agent_briefing",
+      "latency_ms": 7.173,
+      "scope_used": "agent_runs:write"
+    },
+    "created_at": "2026-09-27T11:14:08.481771Z"
+  },
+  {
+    "id": "895d62fe-eb75-49f6-a548-80764314aaca",
+    "user_id": null,
+    "principal_type": "service_account",
+    "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+    "job_id": null,
+    "action": "lab.probe",
+    "resource_type": "mcp_tool",
+    "resource_id": "get_consumer_lag",
+    "request_id": "d7b923fd-6e0d-490b-b61c-d5da8bb4410b",
+    "ip_address": null,
+    "extra_data": {
+      "outcome": "success",
+      "arguments": {
+        "consumer_group": "worker-dispatcher"
+      },
+      "tool_name": "get_consumer_lag",
+      "latency_ms": 4.528,
+      "scope_used": "telemetry:read",
+      "lab_probe_reason": "traffic: lag read",
+      "lab_probe_principal": "incident-commander-smoke"
+    },
+    "created_at": "2026-09-27T11:14:12.849103Z"
+  },
+  {
+    "id": "aee3cfb4-eda3-45f8-a9be-0cac2837f584",
+    "user_id": null,
+    "principal_type": "service_account",
+    "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+    "job_id": null,
+    "action": "lab.probe",
+    "resource_type": "mcp_tool",
+    "resource_id": "get_consumer_lag",
+    "request_id": "4c88bc5d-353f-4ba7-b850-abed239a3156",
+    "ip_address": null,
+    "extra_data": {
+      "outcome": "success",
+      "arguments": {
+        "consumer_group": "worker-dispatcher"
+      },
+      "tool_name": "get_consumer_lag",
+      "latency_ms": 3.882,
+      "scope_used": "telemetry:read",
+      "lab_probe_reason": "traffic: lag read",
+      "lab_probe_principal": "incident-commander-smoke"
+    },
+    "created_at": "2026-09-27T11:14:21.176716Z"
+  },
+  {
+    "id": "4b5c31c7-eb80-4a58-a673-f784a4e2ac98",
+    "user_id": null,
+    "principal_type": "service_account",
+    "principal_id": "d6bd0ef1-9a9d-490e-aae6-1bdb8868e349",
+    "job_id": null,
+    "action": "lab.probe",
+    "resource_type": "mcp_tool",
+    "resource_id": "get_consumer_lag",
+    "request_id": "76023443-90f5-4ab7-beb3-3da768e1643c",
+    "ip_address": null,
+    "extra_data": {
+      "outcome": "success",
+      "arguments": {
+        "consumer_group": "worker-dispatcher"
+      },
+      "tool_name": "get_consumer_lag",
+      "latency_ms": 3.071,
+      "scope_used": "telemetry:read",
+      "lab_probe_reason": "traffic: lag read",
+      "lab_probe_principal": "incident-commander-smoke"
+    },
+    "created_at": "2026-09-27T11:14:29.308190Z"
+  }
+]
