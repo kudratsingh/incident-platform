@@ -55,6 +55,7 @@
 
 import type {
   AgentRun,
+  AgentRunPhase,
   AgentRunState,
   AgentRunStepRecord,
   AuditLog,
@@ -1111,12 +1112,41 @@ export interface PlatformRowInput extends PlatformPhaseInput {
    * run has reported no step with a time yet.
    */
   runSteps?: AgentRunStepRecord[]
+  /**
+   * The selected run's `phase_history`; its first entry starts `agent acting` (WO-R3-358).
+   * Absent or empty keeps the older rule: the station starts at the run's first own call.
+   */
+  runPhaseHistory?: AgentRunPhase[] | null
 }
 
 /** One reading of when the agent started acting, and the line the station carries. */
 interface ActingReading {
   at: string | null
   note: string | null
+  /** Whether that first call was a read rather than an action. */
+  firstIsRead?: boolean
+  /** "<action> fired after N reads", once an action has fired. */
+  fired?: string | null
+}
+
+function clockHms(iso: string): string {
+  const d = new Date(iso)
+  return [d.getHours(), d.getMinutes(), d.getSeconds()]
+    .map((n) => String(n).padStart(2, '0'))
+    .join(':')
+}
+
+function msBetween(from: string, to: string): number {
+  return new Date(to).getTime() - new Date(from).getTime()
+}
+
+/** When the run reported its first state, or null when it has none yet. */
+function runStartedAt(history: AgentRunPhase[] | null | undefined): string | null {
+  let first: string | null = null
+  for (const entry of history ?? []) {
+    if (first === null || msBetween(entry.at, first) > 0) first = entry.at
+  }
+  return first
 }
 
 function readsPhrase(reads: number): string {
@@ -1137,13 +1167,28 @@ function actingFromSteps(steps: AgentRunStepRecord[]): ActingReading {
   const reads = calls.filter(
     (s) => s.kind === 'read' && (action === undefined || s.seq < action.seq),
   ).length
+  const fired =
+    action === undefined
+      ? null
+      : `${action.tool ?? 'a Tier-1 action'} fired after ${readsPhrase(reads)}`
   return {
     at,
-    note:
-      action === undefined
-        ? `${readsPhrase(reads)}, no action yet`
-        : `${action.tool ?? 'a Tier-1 action'} fired after ${readsPhrase(reads)}`,
+    firstIsRead: calls.find((s) => s.at !== null)?.kind === 'read',
+    fired,
+    note: fired ?? `${readsPhrase(reads)}, no action yet`,
   }
+}
+
+/** The station's line once the run has started: "run started HH:MM:SS · first read +N s · …". */
+function startedNote(startedAt: string, calls: ActingReading): string {
+  if (calls.at === null) return 'run started · no read yet'
+  const gap = `+${(Math.max(0, msBetween(startedAt, calls.at)) / 1000).toFixed(1)} s`
+  const parts = [
+    `run started ${clockHms(startedAt)}`,
+    `${calls.firstIsRead === false ? 'first call' : 'first read'} ${gap}`,
+  ]
+  if (calls.fired) parts.push(calls.fired)
+  return parts.join(' · ')
 }
 
 /** Oldest of a set of rows, where `newest` above takes the other end. */
@@ -1156,18 +1201,27 @@ function oldest(rows: AuditLog[]): AuditLog | null {
 }
 
 function stationRow<K extends string>(
-  cells: { key: K; label: string; at: string | null; reached: boolean; note?: string | null }[],
+  cells: {
+    key: K
+    label: string
+    at: string | null
+    reached: boolean
+    note?: string | null
+    /** Where the duration is measured from, when not `at`. */
+    durationFrom?: string | null
+  }[],
 ): Station<K>[] {
   const lastReached = cells.reduce((acc, cell, i) => (cell.reached ? i : acc), -1)
   return cells.map((cell, i) => {
     const nextAt = cells.slice(i + 1).find((c) => c.reached && c.at !== null)?.at ?? null
+    const from = cell.durationFrom ?? cell.at
     return {
       key: cell.key,
       label: cell.label,
       at: cell.reached ? cell.at : null,
       durationMs:
-        cell.reached && cell.at !== null && nextAt !== null
-          ? new Date(nextAt).getTime() - new Date(cell.at).getTime()
+        cell.reached && from !== null && nextAt !== null
+          ? new Date(nextAt).getTime() - new Date(from).getTime()
           : null,
       state: i === lastReached ? 'current' : cell.reached ? 'passed' : 'pending',
       note: cell.note ?? null,
@@ -1206,11 +1260,18 @@ export function platformRow(input: PlatformRowInput): PlatformStation[] {
   })
   const firstAction = oldest(actions)
   const reads = callsSinceFault.length - actions.length
+  const firstCall = oldest(callsSinceFault)
+  const firedAudit =
+    firstAction !== null
+      ? `${toolCall(firstAction)?.tool ?? 'a Tier-1 action'} fired after ${readsPhrase(reads)}`
+      : null
   const fromAudit: ActingReading = {
-    at: oldest(callsSinceFault)?.created_at ?? null,
+    at: firstCall?.created_at ?? null,
+    firstIsRead: firstCall !== null && !actions.includes(firstCall),
+    fired: firedAudit,
     note:
-      firstAction !== null
-        ? `${toolCall(firstAction)?.tool ?? 'a Tier-1 action'} fired after ${readsPhrase(reads)}`
+      firedAudit !== null
+        ? firedAudit
         : callsSinceFault.length > 0
           ? `${readsPhrase(reads)}, no action yet`
           : null,
@@ -1221,9 +1282,14 @@ export function platformRow(input: PlatformRowInput): PlatformStation[] {
   const fromSteps = actingFromSteps(input.runSteps ?? [])
   const usable =
     fromSteps.at !== null && faultAt !== null && fromSteps.at >= faultAt ? fromSteps : null
-  const acting = usable ?? fromAudit
-  const actingAt = acting.at
-  const note = acting.note
+  const calls = usable ?? fromAudit
+  // The run's first reported state starts the station (WO-R3-358): the platform recorded that
+  // report itself. A start before the fault belongs to another incident, so it is ignored.
+  const started = runStartedAt(input.runPhaseHistory)
+  const startedAt =
+    started !== null && faultAt !== null && msBetween(faultAt, started) >= 0 ? started : null
+  const actingAt = startedAt ?? calls.at
+  const note = startedAt === null ? calls.note : startedNote(startedAt, calls)
 
   const recoveredReached = reading.phase === 'recovered'
 
@@ -1263,6 +1329,8 @@ export function platformRow(input: PlatformRowInput): PlatformStation[] {
       at: actingAt,
       reached: actingAt !== null,
       note,
+      // The duration still runs from the first call, as before the start moved to triage.
+      durationFrom: calls.at,
     },
     {
       key: 'recovered',
@@ -1510,6 +1578,18 @@ export interface MetricSample {
   t: number
   v: number
   at: string
+}
+
+/**
+ * The vertices of a step line: each sample's value holds until the next sample is measured
+ * (WO-R3-358 item 4). Nothing is known between samples, so a straight line would draw a
+ * change before it was seen — take 9's lag fell from 61 on a line that began before the action.
+ */
+export function stepPoints(samples: MetricSample[]): { t: number; v: number }[] {
+  const sorted = [...samples].sort((a, b) => a.t - b.t)
+  return sorted.flatMap((s, i) =>
+    i === 0 ? [{ t: s.t, v: s.v }] : [{ t: s.t, v: sorted[i - 1].v }, { t: s.t, v: s.v }],
+  )
 }
 
 export interface RecoveryReading {

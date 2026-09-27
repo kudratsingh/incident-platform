@@ -133,6 +133,7 @@ import {
   rowsInTake,
   rowsInTakeWithEdges,
   selectTake,
+  stepPoints,
   takeKey,
   takeOptions,
   yAxisTicks,
@@ -780,7 +781,11 @@ function MetricChart({
   const y = (v: number) => PAD.t + plotH - (Math.min(v, yMax) / yMax) * plotH
 
   const inWindow = samples.filter((s) => s.t >= windowStart && s.t <= windowEnd)
-  const points = inWindow.map((s) => `${String(x(s.t))},${y(s.v).toFixed(1)}`).join(' ')
+  // A step line: a sample holds until the next one, so a marker between two samples
+  // sits before the change it caused rather than on a slope drawn ahead of it.
+  const points = stepPoints(inWindow)
+    .map((p) => `${String(x(p.t))},${y(p.v).toFixed(1)}`)
+    .join(' ')
   const last = inWindow[inWindow.length - 1] ?? null
   const breaching = known && value !== null && value > threshold
   const spanMinutes = Math.max(1, Math.round(span / 60_000))
@@ -3015,13 +3020,24 @@ export default function DemoPage() {
         take,
         runPrincipalId,
         runSteps: steps,
+        runPhaseHistory: run?.phase_history ?? null,
         faultAt,
         recoveredAt: recovery.recoveredAt,
         metricKnown,
         metricInsideThreshold: insideSustained,
         metricBreachedSinceFault: recovery.breachedAt !== null,
       }),
-    [auditRows, take, runPrincipalId, steps, faultAt, recovery, metricKnown, insideSustained],
+    [
+      auditRows,
+      take,
+      runPrincipalId,
+      steps,
+      run,
+      faultAt,
+      recovery,
+      metricKnown,
+      insideSustained,
+    ],
   )
 
   // When each reported state reached the platform, so a station whose report arrived

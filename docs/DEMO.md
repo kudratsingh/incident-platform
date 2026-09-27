@@ -302,7 +302,7 @@ Source: `GET /api/v1/audit/logs` (the operator streams) plus the mode's metric.
 | healthy | always — it is where every take starts | the boundary (`lab.world_reset`), which is when this world began |
 | fault injected | a **fault row** exists in this take, **or the latch holds one** | the take's first injection (above), never a probe and never a re-arm |
 | paged | an `alert.raised` row exists in this take | its first one; the note is the alert's fingerprint and summary, or `not paged` |
-| agent acting | an `agent.tool_invoked` row **by this run's own principal** at or after the fault | the first such row; the note says how many reads, and names the Tier-1 action once one fires |
+| agent acting | the selected run's first reported state (`phase_history[0]`, normally `triage`) at or after the fault — the platform audited that report itself (`agent.run_reported`); with no run record, the run's first own `read`/`action` call (WO-R3-358) | that state's time; the note reads `run started HH:MM:SS · first read +N s · <action> fired after N reads` as those happen (`run started · no read yet` before any), while the duration and the chart's `A` marker still measure from the first call and the action |
 | recovered | the metric was breached after the fault and is back inside its bar, sustained | the sample that started the inside-the-bar run |
 
 The last station reached is the current one; earlier reached stations are `passed`
@@ -398,6 +398,7 @@ flat line). The `full window` button zooms back out to that whole history, and
 
 Drawn on the plot:
 
+- the **series as a step line** (lag and DLQ depth): each sample holds until the next one is measured, because nothing is known between them — a straight line put take 9's fall from 61 on a slope that began before the `A` marker (WO-R3-358 item 4);
 - a **band** above the threshold, with the threshold line labelled **on the left**,
   where the eye starts and no marker can cover it;
 - **y ticks at round numbers with zero always drawn**, because zero is the line a

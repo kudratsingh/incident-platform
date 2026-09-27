@@ -1,0 +1,399 @@
+{
+  "id": "b5fcaa9c-553e-595f-89bf-06cbee14b9dd",
+  "tenant_id": "d3fa17de-7a17-de7a-17de-7a17de7a17de",
+  "alert_id": null,
+  "service_account_id": "586042d6-f550-4d76-9f4f-a9f291419d1a",
+  "scenario": "remediate_consumer_lag_success",
+  "state": "resolved",
+  "phase_history": [
+    {
+      "at": "2026-09-27T11:13:07.740722+00:00",
+      "state": "triage"
+    },
+    {
+      "at": "2026-09-27T11:13:07.830038+00:00",
+      "state": "investigating"
+    },
+    {
+      "at": "2026-09-27T11:13:32.008627+00:00",
+      "state": "planning"
+    },
+    {
+      "at": "2026-09-27T11:13:38.890503+00:00",
+      "state": "remediating"
+    },
+    {
+      "at": "2026-09-27T11:13:38.945159+00:00",
+      "state": "verifying"
+    },
+    {
+      "at": "2026-09-27T11:14:03.007197+00:00",
+      "state": "resolved"
+    }
+  ],
+  "current_hypothesis": {
+    "name": "worker-dispatcher-lag-36-climbing",
+    "category": "consumer_saturation",
+    "confidence": 0.92
+  },
+  "last_step": {
+    "at": "2026-09-27T11:14:00.937946Z",
+    "kind": "read",
+    "tool": "get_consumer_lag"
+  },
+  "hypotheses": [
+    {
+      "name": "worker-dispatcher-lag-36-climbing",
+      "category": "consumer_saturation",
+      "confidence": 0.92,
+      "reasoning_excerpt": "Live reading shows lag at 36 and climbing steadily from 0 over the last ~90 seconds, well above the 20-message threshold, with no sign of recovery."
+    },
+    {
+      "name": "v0.4.3-prod-deploy-2h-before-incident",
+      "category": "deploy_regression",
+      "confidence": 0.18,
+      "reasoning_excerpt": "v0.4.3 was deployed to prod ~2 hours before the incident began, but lag was zero until ~90 seconds ago, making a deploy regression less likely as the primary cause."
+    },
+    {
+      "name": "upstream-producer-burst-causing-lag",
+      "category": "transient_dependency",
+      "confidence": 0.1,
+      "reasoning_excerpt": "A sudden burst from an upstream producer could explain rapidly climbing lag, but no evidence of a dependency issue has been observed."
+    }
+  ],
+  "plan": {
+    "action_tool": "restart_consumer_group",
+    "action_arguments": {
+      "consumer_group": "worker-dispatcher",
+      "idempotency_key": "bd852e91-b9ac-4c66-b595-44a75bc4ed49-restart"
+    },
+    "rationale_excerpt": null,
+    "target_hypothesis": "worker-dispatcher-lag-36-climbing"
+  },
+  "verification": {
+    "of": 6,
+    "attempt": 2,
+    "verdict": "verified",
+    "reasoning_excerpt": "Lag climbed from 0 to peak of 61 before the restart at 2026-09-27T11:13:37.974427Z, then dropped sharply to 23 at sample 12 (2026-09-27T11:13:40.112058Z, 2.14 seconds post-action) and fell to 0 by sample 13 (2026-09-27T11:13:45.275653Z), demonstrating successful draining with 4 \u2026"
+  },
+  "verifications": [
+    {
+      "of": 6,
+      "attempt": 1,
+      "verdict": "not_verified",
+      "reasoning_excerpt": "All 15 samples were measured before the action executed (latest sample at 11:13:34.665353Z, action at 11:13:38.623533Z), with samples_after_action=0; the lag trend rose continuously from 0 to 61, but no post-action samples exist to confirm the expected downward trend that would \u2026"
+    },
+    {
+      "of": 6,
+      "attempt": 2,
+      "verdict": "verified",
+      "reasoning_excerpt": "Lag climbed from 0 to peak of 61 before the restart at 2026-09-27T11:13:37.974427Z, then dropped sharply to 23 at sample 12 (2026-09-27T11:13:40.112058Z, 2.14 seconds post-action) and fell to 0 by sample 13 (2026-09-27T11:13:45.275653Z), demonstrating successful draining with 4 \u2026"
+    }
+  ],
+  "steps_dropped": 0,
+  "budget": {
+    "usd_used": 0.2309,
+    "tokens_used": 74835,
+    "wall_seconds": 55.266,
+    "tool_calls_max": 13,
+    "tool_calls_used": 5
+  },
+  "briefing": {
+    "prose": "Findings: A restart_consumer_group action was issued for worker-dispatcher (kill_key_cleared=true, latency_key_cleared=false); lag climbed from 36 to 61 immediately after the restart before dropping to 0 in the subsequent verify read at 11:13:55Z, though the latency key was not cleared and sustained recovery has not been confirmed beyond that single moment. No remaining causes block was present in this run, so no additional open causes were flagged.\n\nRecommendation: Confirm that worker-dispatcher lag is holding at 0 with a current read, and check whether the uncleared latency key is causing any residual processing delay before closing the incident.",
+    "findings": "A restart_consumer_group action was issued for worker-dispatcher (kill_key_cleared=true, latency_key_cleared=false); lag climbed from 36 to 61 immediately after the restart before dropping to 0 in the subsequent verify read at 11:13:55Z, though the latency key was not cleared and sustained recovery has not been confirmed beyond that single moment. No remaining causes block was present in this run, so no additional open causes were flagged.",
+    "incidents": {
+      "primary": {
+        "name": "worker-dispatcher-lag-36-climbing",
+        "category": "consumer_saturation",
+        "addressed": true,
+        "confidence": 0.92
+      },
+      "secondary": [],
+      "unresolved_extra": []
+    },
+    "attribution": null,
+    "budget_used": {
+      "usd": "0.230900",
+      "tokens": 74835,
+      "tool_calls": 5,
+      "wall_seconds": 55.266475
+    },
+    "final_state": "resolved",
+    "incident_id": "bd852e91-b9ac-4c66-b595-44a75bc4ed49",
+    "recorded_at": "2026-09-27T11:14:08.486916+00:00",
+    "alert_summary": "source=kafka:consumer_lag severity=critical fingerprint=consumer_stalled group=worker-dispatcher",
+    "recommendation": "Confirm that worker-dispatcher lag is holding at 0 with a current read, and check whether the uncleared latency key is causing any residual processing delay before closing the incident.",
+    "attempted_action": null,
+    "escalation_reason": "",
+    "investigation_trail": [
+      {
+        "tool": "get_consumer_lag",
+        "summary": "{\"consumer_group\":\"worker-dispatcher\",\"lag\":36,\"lag_known\":true,\"source\":\"live\",\"cache_key\":\"kafka:consumer_lag:worker-dispatcher\",\"measured_at\":\"2026-09-27T11:13:14.372434Z\",\"age_seconds\":0,\"recent_samples\":[{\"lag\":36,\"measured_at\":\"2026-09-27T11:13:14.372434Z\"},{\"lag\":29,\"measured_at\":\"2026-09-27T11:13:09.305904Z\"},{\"lag\":23,\"measured_at\":\"2026-09-27T11:13:04.209157Z\"},{\"lag\":16,\"measured_at\":\"2026-09-27T11:12:59.094018Z\"},{\"lag\":10,\"measured_at\":\"2026-09-27T11:12:54.014552Z\"},{\"lag\":5,\"measured_at\":\"2026-09-27T11:12:48.975556Z\"},{\"lag\":0,\"measured_at\":\"2026-09-27T11:12:43.640874Z\"},{\"lag\":0,\"measured_at\":\"2026-09-27T11:12:38.394493Z\"},{\"lag\":0,\"measured_at\":\"2026-09-27T11:12:33.208521Z\"},{\"lag\":0,\"measured_at\":\"2026-09-27T11:12:28.088155Z\"},{\"lag\":0,\"measured_at\":\"2026-09-27T11:12:22.906749Z\"},{\"lag\":0,\"measured_at\":\"2026-09-27T11:12:17.708415Z\"},{\"lag\":0,\"measured_at\":\"2026-09-27T11:12:12.544454Z\"},{\"lag\":0,\"measured_at\":\"2026-09-27T11:12:07.339929Z\"},{\"lag\":0,\"measured_at\":\"2026-09-27T11:12:02.137260Z\"}]}",
+        "arguments": {
+          "consumer_group": "worker-dispatcher"
+        }
+      },
+      {
+        "tool": "get_deploy_history",
+        "summary": "{\"total\":6,\"entries\":[{\"version\":\"v0.4.3\",\"revision\":\"d1e5a83\",\"image_tag\":\"v0.4.3\",\"deployed_at\":\"2026-09-27T09:12:33.306221Z\",\"environment\":\"prod\",\"notes\":null},{\"version\":\"v0.4.3\",\"revision\":\"d1e5a83\",\"image_tag\":\"v0.4.3\",\"deployed_at\":\"2026-09-27T08:12:33.306221Z\",\"environment\":\"staging\",\"notes\":\"staging soak before prod\"},{\"version\":\"v0.4.2\",\"revision\":\"c9f4d02\",\"image_tag\":\"v0.4.2\",\"deployed_at\":\"2026-09-27T05:12:33.306221Z\",\"environment\":\"prod\",\"notes\":\"correlated with billing failures\"},{\"version\":\"v0.4.1\",\"revision\":\"b7c3e51\",\"image_tag\":\"v0.4.1\",\"deployed_at\":\"2026-09-26T17:12:33.306221Z\",\"environment\":\"prod\",\"notes\":null},{\"version\":\"v0.4.0\",\"revision\":\"a1940af\",\"image_tag\":\"v0.4.0\",\"deployed_at\":\"2026-09-26T13:12:33.306221Z\",\"environment\":\"prod\",\"notes\":null},{\"version\":\"v0.3.9\",\"revision\":\"e0f6b14\",\"image_tag\":\"v0.3.9\",\"deployed_at\":\"2026-09-25T11:12:33.306221Z\",\"environment\":\"prod\",\"notes\":null}],\"source\":\"deploy_markers\"}",
+        "arguments": {
+          "limit": 20,
+          "environment": null
+        }
+      },
+      {
+        "tool": "restart_consumer_group",
+        "summary": "{\"consumer_group\":\"worker-dispatcher\",\"kill_key_cleared\":true,\"latency_key_cleared\":false,\"group_recognized\":true,\"accepted\":true}",
+        "arguments": {
+          "consumer_group": "worker-dispatcher",
+          "idempotency_key": "3015c2b7755619cfe8cd14cad895a97c"
+        }
+      },
+      {
+        "tool": "get_consumer_lag",
+        "summary": "{\"consumer_group\":\"worker-dispatcher\",\"lag\":61,\"lag_known\":true,\"source\":\"live\",\"cache_key\":\"kafka:consumer_lag:worker-dispatcher\",\"measured_at\":\"2026-09-27T11:13:34.665353Z\",\"age_seconds\":4,\"recent_samples\":[{\"lag\":61,\"measured_at\":\"2026-09-27T11:13:34.665353Z\"},{\"lag\":55,\"measured_at\":\"2026-09-27T11:13:29.604635Z\"},{\"lag\":49,\"measured_at\":\"2026-09-27T11:13:24.546678Z\"},{\"lag\":42,\"measured_at\":\"2026-09-27T11:13:19.446986Z\"},{\"lag\":36,\"measured_at\":\"2026-09-27T11:13:14.372434Z\"},{\"lag\":29,\"measured_at\":\"2026-09-27T11:13:09.305904Z\"},{\"lag\":23,\"measured_at\":\"2026-09-27T11:13:04.209157Z\"},{\"lag\":16,\"measured_at\":\"2026-09-27T11:12:59.094018Z\"},{\"lag\":10,\"measured_at\":\"2026-09-27T11:12:54.014552Z\"},{\"lag\":5,\"measured_at\":\"2026-09-27T11:12:48.975556Z\"},{\"lag\":0,\"measured_at\":\"2026-09-27T11:12:43.640874Z\"},{\"lag\":0,\"measured_at\":\"2026-09-27T11:12:38.394493Z\"},{\"lag\":0,\"measured_at\":\"2026-09-27T11:12:33.208521Z\"},{\"lag\":0,\"measured_at\":\"2026-09-27T11:12:28.088155Z\"},{\"lag\":0,\"measured_at\":\"2026-09-27T11:12:22.906749Z\"}]}",
+        "arguments": {
+          "of": 6,
+          "attempt": 1,
+          "consumer_group": "worker-dispatcher"
+        }
+      },
+      {
+        "tool": "get_consumer_lag",
+        "summary": "{\"consumer_group\":\"worker-dispatcher\",\"lag\":0,\"lag_known\":true,\"source\":\"live\",\"cache_key\":\"kafka:consumer_lag:worker-dispatcher\",\"measured_at\":\"2026-09-27T11:13:55.997511Z\",\"age_seconds\":4,\"recent_samples\":[{\"lag\":0,\"measured_at\":\"2026-09-27T11:13:55.997511Z\"},{\"lag\":0,\"measured_at\":\"2026-09-27T11:13:50.380775Z\"},{\"lag\":0,\"measured_at\":\"2026-09-27T11:13:45.275653Z\"},{\"lag\":23,\"measured_at\":\"2026-09-27T11:13:40.112058Z\"},{\"lag\":61,\"measured_at\":\"2026-09-27T11:13:34.665353Z\"},{\"lag\":55,\"measured_at\":\"2026-09-27T11:13:29.604635Z\"},{\"lag\":49,\"measured_at\":\"2026-09-27T11:13:24.546678Z\"},{\"lag\":42,\"measured_at\":\"2026-09-27T11:13:19.446986Z\"},{\"lag\":36,\"measured_at\":\"2026-09-27T11:13:14.372434Z\"},{\"lag\":29,\"measured_at\":\"2026-09-27T11:13:09.305904Z\"},{\"lag\":23,\"measured_at\":\"2026-09-27T11:13:04.209157Z\"},{\"lag\":16,\"measured_at\":\"2026-09-27T11:12:59.094018Z\"},{\"lag\":10,\"measured_at\":\"2026-09-27T11:12:54.014552Z\"},{\"lag\":5,\"measured_at\":\"2026-09-27T11:12:48.975556Z\"},{\"lag\":0,\"measured_at\":\"2026-09-27T11:12:43.640874Z\"}]}",
+        "arguments": {
+          "of": 6,
+          "attempt": 2,
+          "consumer_group": "worker-dispatcher"
+        }
+      }
+    ]
+  },
+  "started_at": "2026-09-27T11:13:07.819169Z",
+  "updated_at": "2026-09-27T11:14:08.481771Z",
+  "finished_at": "2026-09-27T11:14:03.007197Z",
+  "steps": [
+    {
+      "at": "2026-09-27T11:13:14.333971Z",
+      "seq": 1,
+      "kind": "report",
+      "tool": "investigation_planner",
+      "outcome": "ok",
+      "arguments": {
+        "reason": null,
+        "ranking": [
+          {
+            "name": "worker-dispatcher-lag-23-above-threshold-20",
+            "category": "consumer_saturation",
+            "confidence": 0.8
+          },
+          {
+            "name": "dlq-entry-blocking-worker-dispatcher",
+            "category": "poison_message",
+            "confidence": 0.3
+          },
+          {
+            "name": "recent-deploy-correlated-with-lag",
+            "category": "deploy_regression",
+            "confidence": 0.2
+          }
+        ],
+        "next_action": {
+          "kind": "probe",
+          "tool": "get_consumer_lag"
+        }
+      },
+      "latency_ms": null,
+      "result_excerpt": "top consumer_saturation 0.80 \u2192 probe get_consumer_lag"
+    },
+    {
+      "at": "2026-09-27T11:13:14.382027Z",
+      "seq": 2,
+      "kind": "read",
+      "tool": "get_consumer_lag",
+      "outcome": "ok",
+      "arguments": {
+        "consumer_group": "worker-dispatcher"
+      },
+      "latency_ms": 13.0,
+      "result_excerpt": "{\"consumer_group\":\"worker-dispatcher\",\"lag\":36,\"lag_known\":true,\"source\":\"live\",\"cache_key\":\"kafka:consumer_lag:worker-dispatcher\",\"measured_at\":\"2026-09-27T11:13:14.372434Z\",\"age_seconds\":0,\"recent_samples\":[{\"lag\":36,\"measured_at\":\"2026-09-27T11:13:14.372434Z\"},{\"lag\":29,\"measured_at\":\"2026-09-27T11:13:09.305904Z\"},{\"lag\":23,\"measured_at\":\"2026-09-27T11:13:04.209157Z\"},{\"lag\":16,\"measured_at\":\"\u2026"
+    },
+    {
+      "at": "2026-09-27T11:13:21.994172Z",
+      "seq": 3,
+      "kind": "report",
+      "tool": "investigation_planner",
+      "outcome": "ok",
+      "arguments": {
+        "reason": null,
+        "ranking": [
+          {
+            "name": "worker-dispatcher-lag-36-climbing",
+            "category": "consumer_saturation",
+            "confidence": 0.85
+          },
+          {
+            "name": "dlq-blocking-worker-dispatcher",
+            "category": "poison_message",
+            "confidence": 0.2
+          },
+          {
+            "name": "recent-deploy-correlates-with-lag-spike",
+            "category": "deploy_regression",
+            "confidence": 0.15
+          }
+        ],
+        "next_action": {
+          "kind": "probe",
+          "tool": "get_deploy_history"
+        }
+      },
+      "latency_ms": null,
+      "result_excerpt": "top consumer_saturation 0.85 \u2192 probe get_deploy_history"
+    },
+    {
+      "at": "2026-09-27T11:13:22.051324Z",
+      "seq": 4,
+      "kind": "read",
+      "tool": "get_deploy_history",
+      "outcome": "ok",
+      "arguments": {
+        "limit": 20,
+        "environment": null
+      },
+      "latency_ms": 23.0,
+      "result_excerpt": "{\"total\":6,\"entries\":[{\"version\":\"v0.4.3\",\"revision\":\"d1e5a83\",\"image_tag\":\"v0.4.3\",\"deployed_at\":\"2026-09-27T09:12:33.306221Z\",\"environment\":\"prod\",\"notes\":null},{\"version\":\"v0.4.3\",\"revision\":\"d1e5a83\",\"image_tag\":\"v0.4.3\",\"deployed_at\":\"2026-09-27T08:12:33.306221Z\",\"environment\":\"staging\",\"notes\":\"staging soak before prod\"},{\"version\":\"v0.4.2\",\"revision\":\"c9f4d02\",\"image_tag\":\"v0.4.2\",\"deploye\u2026"
+    },
+    {
+      "at": "2026-09-27T11:13:31.970494Z",
+      "seq": 5,
+      "kind": "report",
+      "tool": "investigation_planner",
+      "outcome": "ok",
+      "arguments": {
+        "reason": "The worker-dispatcher consumer group lag is confirmed at 36 and climbing (36\u219229\u219223\u219216\u219210\u21925\u21920 in reverse, showing a sustained rise from 0 to 36 over ~90 seconds). The fault is present in the freshest reading (age_seconds=0), well above the 20-message threshold. Consumer saturatio\u2026",
+        "ranking": [
+          {
+            "name": "worker-dispatcher-lag-36-climbing",
+            "category": "consumer_saturation",
+            "confidence": 0.92
+          },
+          {
+            "name": "v0.4.3-prod-deploy-2h-before-incident",
+            "category": "deploy_regression",
+            "confidence": 0.18
+          },
+          {
+            "name": "upstream-producer-burst-causing-lag",
+            "category": "transient_dependency",
+            "confidence": 0.1
+          }
+        ],
+        "next_action": {
+          "kind": "remediate",
+          "tool": null
+        }
+      },
+      "latency_ms": null,
+      "result_excerpt": "top consumer_saturation 0.92 \u2192 remediate: The worker-dispatcher consumer group lag is confirmed at 36 and climbing (36\u219229\u219223\u219216\u219210\u21925\u21920 in reverse, showing a sustained rise from 0 to 36 over ~90 seconds). The fault is present in the freshest reading (age_seconds=0), well above the 20-message threshold. Consumer saturatio\u2026"
+    },
+    {
+      "at": "2026-09-27T11:13:38.932224Z",
+      "seq": 6,
+      "kind": "action",
+      "tool": "restart_consumer_group",
+      "outcome": "ok",
+      "arguments": {
+        "consumer_group": "worker-dispatcher",
+        "idempotency_key": "3015c2b7755619cfe8cd14cad895a97c"
+      },
+      "latency_ms": 16.0,
+      "result_excerpt": "{\"consumer_group\":\"worker-dispatcher\",\"kill_key_cleared\":true,\"latency_key_cleared\":false,\"group_recognized\":true,\"accepted\":true}"
+    },
+    {
+      "at": "2026-09-27T11:13:38.967767Z",
+      "seq": 7,
+      "kind": "read",
+      "tool": "get_consumer_lag",
+      "outcome": "ok",
+      "arguments": {
+        "consumer_group": "worker-dispatcher"
+      },
+      "latency_ms": 10.0,
+      "result_excerpt": "{\"consumer_group\":\"worker-dispatcher\",\"lag\":61,\"lag_known\":true,\"source\":\"live\",\"cache_key\":\"kafka:consumer_lag:worker-dispatcher\",\"measured_at\":\"2026-09-27T11:13:34.665353Z\",\"age_seconds\":4,\"recent_samples\":[{\"lag\":61,\"measured_at\":\"2026-09-27T11:13:34.665353Z\"},{\"lag\":55,\"measured_at\":\"2026-09-27T11:13:29.604635Z\"},{\"lag\":49,\"measured_at\":\"2026-09-27T11:13:24.546678Z\"},{\"lag\":42,\"measured_at\":\"\u2026"
+    },
+    {
+      "at": "2026-09-27T11:13:40.920499Z",
+      "seq": 8,
+      "kind": "report",
+      "tool": "verify_judge",
+      "outcome": "ok",
+      "arguments": {
+        "reason": "All 15 samples were measured before the action executed (latest sample at 11:13:34.665353Z, action at 11:13:38.623533Z), with samples_after_action=0; the lag trend rose continuously from 0 to 61, but no post-action samples exist to confirm the expected downward trend that would \u2026",
+        "ranking": [
+          {
+            "name": "worker-dispatcher-lag-36-climbing",
+            "category": "consumer_saturation",
+            "confidence": 0.92
+          },
+          {
+            "name": "v0.4.3-prod-deploy-2h-before-incident",
+            "category": "deploy_regression",
+            "confidence": 0.18
+          },
+          {
+            "name": "upstream-producer-burst-causing-lag",
+            "category": "transient_dependency",
+            "confidence": 0.1
+          }
+        ],
+        "next_action": null
+      },
+      "latency_ms": null,
+      "result_excerpt": "top consumer_saturation 0.92 \u2192 verify 1/6 not_verified: All 15 samples were measured before the action executed (latest sample at 11:13:34.665353Z, action at 11:13:38.623533Z), with samples_after_action=0; the lag trend rose continuously from 0 to 61, but no post-action samples exist to confirm the expected downward trend that would \u2026"
+    },
+    {
+      "at": "2026-09-27T11:14:00.954397Z",
+      "seq": 9,
+      "kind": "read",
+      "tool": "get_consumer_lag",
+      "outcome": "ok",
+      "arguments": {
+        "consumer_group": "worker-dispatcher"
+      },
+      "latency_ms": 15.0,
+      "result_excerpt": "{\"consumer_group\":\"worker-dispatcher\",\"lag\":0,\"lag_known\":true,\"source\":\"live\",\"cache_key\":\"kafka:consumer_lag:worker-dispatcher\",\"measured_at\":\"2026-09-27T11:13:55.997511Z\",\"age_seconds\":4,\"recent_samples\":[{\"lag\":0,\"measured_at\":\"2026-09-27T11:13:55.997511Z\"},{\"lag\":0,\"measured_at\":\"2026-09-27T11:13:50.380775Z\"},{\"lag\":0,\"measured_at\":\"2026-09-27T11:13:45.275653Z\"},{\"lag\":23,\"measured_at\":\"2026\u2026"
+    },
+    {
+      "at": "2026-09-27T11:14:02.995099Z",
+      "seq": 10,
+      "kind": "report",
+      "tool": "verify_judge",
+      "outcome": "ok",
+      "arguments": {
+        "reason": "Lag climbed from 0 to peak of 61 before the restart at 2026-09-27T11:13:37.974427Z, then dropped sharply to 23 at sample 12 (2026-09-27T11:13:40.112058Z, 2.14 seconds post-action) and fell to 0 by sample 13 (2026-09-27T11:13:45.275653Z), demonstrating successful draining with 4 \u2026",
+        "ranking": [
+          {
+            "name": "worker-dispatcher-lag-36-climbing",
+            "category": "consumer_saturation",
+            "confidence": 0.92
+          },
+          {
+            "name": "v0.4.3-prod-deploy-2h-before-incident",
+            "category": "deploy_regression",
+            "confidence": 0.18
+          },
+          {
+            "name": "upstream-producer-burst-causing-lag",
+            "category": "transient_dependency",
+            "confidence": 0.1
+          }
+        ],
+        "next_action": null
+      },
+      "latency_ms": null,
+      "result_excerpt": "top consumer_saturation 0.92 \u2192 verify 2/6 verified: Lag climbed from 0 to peak of 61 before the restart at 2026-09-27T11:13:37.974427Z, then dropped sharply to 23 at sample 12 (2026-09-27T11:13:40.112058Z, 2.14 seconds post-action) and fell to 0 by sample 13 (2026-09-27T11:13:45.275653Z), demonstrating successful draining with 4 \u2026"
+    }
+  ],
+  "active": false
+}

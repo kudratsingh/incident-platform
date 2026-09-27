@@ -434,17 +434,19 @@ describe('DemoPage — the shape of the page', () => {
 })
 
 describe('DemoPage — two rows, always both, never merged', () => {
-  it('shows the platform on fault injected while the agent says investigating', async () => {
+  it('shows the platform’s fault while the agent says investigating', async () => {
     // The first take's single strip lit only the agent's station here, so the one
-    // fact only the platform can assert was never on screen.
+    // fact only the platform can assert was never on screen. Since WO-R3-358 a started
+    // run moves the platform row on to agent acting; the fault stays reached behind it.
     stub({ audit: [RESET_ROW, FAULT_ROW], runs: [agentRun({ state: 'investigating' })] })
     renderDemo()
     await screen.findByTestId('phase-row-platform')
     await waitFor(() => {
-      expect(stationState('fault_injected')).toBe('current')
+      expect(stationState('agent_acting')).toBe('current')
     })
+    expect(stationState('fault_injected')).toBe('passed')
     expect(stationState('investigating')).toBe('current')
-    expect(screen.getByTestId('phase-reading').textContent).toMatch(/fault injected/i)
+    expect(screen.getByTestId('phase-reading').textContent).toMatch(/agent acting/i)
     expect(screen.getByTestId('phase-reading').textContent).toMatch(/investigating/i)
   })
 
@@ -559,6 +561,43 @@ describe('DemoPage — the chart', () => {
     expect(screen.getByTestId('metric-chart-lag').textContent).not.toMatch(
       /get_consumer_lag/,
     )
+  })
+
+  it('draws the lag as a step, so the action marker sits before the drop (WO-R3-358 item 4)', async () => {
+    // Take 9: lag 61, the action, then 23 and 0. Straight lines between samples put
+    // the descent before the action; a sample holds until the next one is measured.
+    stub({
+      audit: [RESET_ROW, auditRow({ action: 'chaos.tool_invoked', created_at: ago(3), extra_data: { tool_name: 'kill_consumer', arguments: {} } })],
+      runs: [agentRun()],
+      steps: [
+        step(1, 'read', 'get_consumer_lag', ago(2)),
+        step(2, 'action', 'restart_consumer_group', ago(0.8)),
+      ],
+      samples: [
+        { lag: 0, measured_at: ago(0.1) },
+        { lag: 23, measured_at: ago(0.6) },
+        { lag: 61, measured_at: ago(1.2) },
+      ],
+    })
+    renderDemo()
+    const chart = await screen.findByTestId('metric-chart-lag')
+    await waitFor(() => {
+      expect(within(chart).getAllByTestId('chart-marker-action').length).toBe(1)
+    })
+    const pts = (chart.querySelector('polyline')?.getAttribute('points') ?? '')
+      .trim()
+      .split(/\s+/)
+      .map((p) => p.split(',').map(Number))
+    const markerX = Number(
+      within(chart).getByTestId('chart-marker-action').querySelector('line')?.getAttribute('x1'),
+    )
+    // The line's height at the marker's x, read off the drawn segments.
+    const seg = pts.findIndex((p, i) => i > 0 && pts[i - 1][0] <= markerX && markerX <= p[0])
+    expect(seg).toBeGreaterThan(0)
+    const [[x0, y0], [x1, y1]] = [pts[seg - 1], pts[seg]]
+    const yAtMarker = x1 === x0 ? y0 : y0 + ((markerX - x0) / (x1 - x0)) * (y1 - y0)
+    const y61 = pts[0][1]
+    expect(yAtMarker).toBeCloseTo(y61, 3)
   })
 
   it('renders an unknown lag with its reason, never as zero', async () => {
