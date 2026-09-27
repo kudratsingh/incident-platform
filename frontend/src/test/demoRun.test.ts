@@ -590,13 +590,10 @@ describe('summariseResult — one line that says what came back', () => {
     )
   })
 
-  it('falls back to the excerpt itself rather than inventing a reading', () => {
-    // A tool nobody has written a summariser for is still better read than hidden,
-    // and the whole excerpt is one click away.
+  it('falls back to the whole excerpt rather than inventing a reading', () => {
+    // A tool nobody has written a summariser for is read whole, never cut (WO-R3-359).
     const long = `${'x'.repeat(200)}`
-    const summary = summariseResult('get_outbox_status', long)
-    expect(summary?.endsWith('…')).toBe(true)
-    expect((summary ?? '').length).toBeLessThan(70)
+    expect(summariseResult('get_outbox_status', long)).toBe(long)
     expect(summariseResult('some_new_tool', '  unpublished 3   waiting  ')).toBe(
       'unpublished 3 waiting',
     )
@@ -728,13 +725,11 @@ describe('isThinkStep and plannerReport — one planner call, read off its own s
     expect(report?.reason).toBeNull()
   })
 
-  it('cuts a long sentence rather than letting it run across the ledger', () => {
+  it('keeps a long sentence whole; the ledger wraps it instead (WO-R3-359)', () => {
     const wordy = thinkStep(3, '2026-09-19T10:01:10Z', RANKING_ONE, {
       result_excerpt: `${'the same clause over and over '.repeat(12)}end`,
     })
-    const sentence = summariseStep(wordy)
-    expect(sentence?.endsWith('…')).toBe(true)
-    expect((sentence ?? '').length).toBeLessThan(160)
+    expect(summariseStep(wordy)).toBe(`${'the same clause over and over '.repeat(12)}end`)
   })
 
   it('summarises a THINK row from its own sentence, not from a tool summariser', () => {
