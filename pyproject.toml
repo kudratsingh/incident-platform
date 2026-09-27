@@ -9,7 +9,7 @@ requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.111.0",
     "uvicorn[standard]>=0.29.0",
-    "sqlalchemy[asyncio]>=2.0.0",
+    "sqlalchemy[asyncio]>=2.0.0,<2.1",
     "asyncpg>=0.29.0",
     "alembic>=1.13.0",
     "pydantic[email]>=2.7.0",
@@ -56,7 +56,7 @@ dev = [
     "mypy>=1.10.0",
     "ruff>=0.4.0",
     "import-linter>=2.0",
-    "sqlalchemy[mypy]>=2.0.0",
+    "sqlalchemy[mypy]>=2.0.0,<2.1",
 
     "types-python-jose>=3.3.4",
     "types-jsonschema>=4.21.0",
