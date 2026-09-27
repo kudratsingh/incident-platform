@@ -137,6 +137,10 @@ async def _check_chaos_latency(group_id: str) -> int:
 class BaseKafkaConsumer(ABC):
     """Base class for every Kafka consumer here: `start()`, `run()` as a task, `stop()`."""
 
+    # True while the supervisor's `_restart_consumer` is stopping or starting this consumer, so
+    # the metrics pass skips the lag query instead of waiting on a client mid-teardown (ADR 0040).
+    restarting: bool = False
+
     def __init__(self, topics: list[str], group_id: str) -> None:
         self.topics = topics
         self.group_id = group_id

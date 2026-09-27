@@ -23,6 +23,7 @@ from app.core.consumer_lag import (
 )
 from app.core.consumer_lag import (
     LIVE_REFRESHED_GROUP,
+    lag_query_timeout_seconds,
     lag_value_ttl_seconds,
     metrics_interval_seconds,
     record_lag_sample,
@@ -713,32 +714,43 @@ class JobDispatcherConsumer(BaseKafkaConsumer):
     async def consumer_lag(self) -> int | None:
         """Sum of (log_end_offset - committed_offset) across all assigned partitions.
 
-        Returns `None`, never 0, for genuinely-unknown states (not started, no
-        assignment, Kafka query failed): a fabricated 0 reads as healthy. `None`
-        propagates — `_metrics_loop` skips the Redis cache write and the gauge, and
-        `check_backpressure` fails open on the absent entry.
+        Returns `None`, never 0, when unknown (not started, restarting, no assignment, query failed
+        or slower than `lag_query_timeout_seconds`): a fabricated 0 reads as healthy. ADR 0040.
         """
         consumer = self._consumer
-        if consumer is None:
+        if consumer is None or self.restarting:
             return None
+        timeout = lag_query_timeout_seconds()
         try:
             assignment = consumer.assignment()
             if not assignment:
                 return None
-            end_offsets = await consumer.end_offsets(list(assignment))
-            lag = 0
-            for tp in assignment:
-                committed = await consumer.committed(tp)
-                end = end_offsets.get(tp, 0)
-                if committed is None:
-                    # Never committed — everything in the log is pending.
-                    lag += int(end)
-                else:
-                    lag += max(0, int(end) - int(committed))
-            return lag
+            # Bounded: a client stopped mid-query hung this pass for its 40-s request timeout.
+            return await asyncio.wait_for(
+                _sum_partition_lag(consumer, assignment), timeout=timeout
+            )
+        except TimeoutError:
+            logger.warning(
+                "consumer_lag query timed out", extra={"timeout_seconds": timeout}
+            )
+            return None
         except Exception as exc:
             logger.warning("consumer_lag query failed", extra={"error": str(exc)})
             return None
+
+
+async def _sum_partition_lag(consumer: Any, assignment: Any) -> int:
+    """Sum of log-end minus committed offset; a partition never committed counts in full."""
+    end_offsets = await consumer.end_offsets(list(assignment))
+    lag = 0
+    for tp in assignment:
+        committed = await consumer.committed(tp)
+        end = end_offsets.get(tp, 0)
+        if committed is None:
+            lag += int(end)
+        else:
+            lag += max(0, int(end) - int(committed))
+    return lag
 
 
 def _job_submitted_payload(job: Job) -> dict[str, Any]:
@@ -1840,26 +1852,34 @@ _SUPERVISOR_MAX_BACKOFF_SECONDS = 30.0
 
 
 async def _restart_consumer(consumer: BaseKafkaConsumer) -> None:
-    """stop()+start() with capped exponential backoff until it sticks."""
+    """stop()+start() with capped exponential backoff until it sticks.
+
+    `consumer.restarting` is set for the whole call, backoff included, so the metrics pass
+    reports lag as unknown rather than querying a client with no usable connection (ADR 0040).
+    """
     backoff = 1.0
-    while True:
-        try:
-            await consumer.stop()
-            await consumer.start()
-            logger.warning(
-                "supervisor restarted consumer",
-                extra={"group_id": consumer.group_id},
-            )
-            return
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            logger.error(
-                "consumer restart failed; retrying",
-                extra={"group_id": consumer.group_id, "error": str(exc)},
-            )
-            await asyncio.sleep(min(backoff, _SUPERVISOR_MAX_BACKOFF_SECONDS))
-            backoff *= 2
+    consumer.restarting = True
+    try:
+        while True:
+            try:
+                await consumer.stop()
+                await consumer.start()
+                logger.warning(
+                    "supervisor restarted consumer",
+                    extra={"group_id": consumer.group_id},
+                )
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error(
+                    "consumer restart failed; retrying",
+                    extra={"group_id": consumer.group_id, "error": str(exc)},
+                )
+                await asyncio.sleep(min(backoff, _SUPERVISOR_MAX_BACKOFF_SECONDS))
+                backoff *= 2
+    finally:
+        consumer.restarting = False
 
 
 async def _supervise_consumer(consumer: BaseKafkaConsumer) -> None:

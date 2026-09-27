@@ -90,6 +90,10 @@ LAG_VALUE_TTL_INTERVALS = 3
 # produce a TTL that expires between passes.
 MIN_LAG_VALUE_TTL_SECONDS = 15
 
+# The longest one metrics pass waits on its offset queries: half a pass, at most 2 s (ADR 0040).
+# Unbounded, a query on a consumer the supervisor was restarting waited out the 40-s client timeout.
+LAG_QUERY_TIMEOUT_CAP_SECONDS = 2.0
+
 # The one group genuinely refreshed: every ~60s, 90s TTL, so its number moves.
 LIVE_REFRESHED_GROUP = "worker-dispatcher"
 
@@ -137,6 +141,14 @@ def lag_value_ttl_seconds(settings: "Settings | None" = None) -> int:
         MIN_LAG_VALUE_TTL_SECONDS,
         math.ceil(LAG_VALUE_TTL_INTERVALS * metrics_interval_seconds(settings)),
     )
+
+
+def lag_query_timeout_seconds(settings: "Settings | None" = None) -> float:
+    """How long one pass may wait on Kafka for the offsets: half the interval, capped at 2 s.
+
+    Half, so a query that times out still leaves the next pass on schedule (ADR 0040).
+    """
+    return min(LAG_QUERY_TIMEOUT_CAP_SECONDS, metrics_interval_seconds(settings) / 2)
 
 
 def lag_samples_at_interval(interval_seconds: float) -> int:
@@ -332,6 +344,7 @@ async def read_lag(redis: Any, group: str) -> LagReading:
 
 __all__ = [
     "CONSUMER_LAG_KEY_PREFIX",
+    "LAG_QUERY_TIMEOUT_CAP_SECONDS",
     "LAG_SAMPLES_AGENT_CAP",
     "LAG_SAMPLES_MAX_ENTRIES",
     "LAG_SAMPLES_SUFFIX",
@@ -347,6 +360,7 @@ __all__ = [
     "LagSampleReading",
     "LagSource",
     "lag_key",
+    "lag_query_timeout_seconds",
     "lag_samples_at_interval",
     "lag_value_ttl_seconds",
     "metrics_interval_seconds",
