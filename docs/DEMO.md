@@ -510,6 +510,7 @@ tool, and what the call **answered**. Click a row for its arguments, the whole r
 sequence number, its outcome and its latency. An **ACTION row is highlighted and
 never collapsed** — the action is the point of the run, so it shows its arguments and
 its result without being asked.
+**Nothing is cut short** (WO-R3-359, owner after the ninth take: *"I need to be able to see all the data"*): tool names, summaries, a THINK row's headline (`top <full name> (<category> <confidence>) → <next action>`, then the planner's whole reason), every hypothesis's reasoning, the paged station and the briefing prose all wrap instead of ending in "…"; the three panels are 30/35/35 wide and scroll inside themselves.
 
 ### The run's state changes are rows (WO-R3-354)
 

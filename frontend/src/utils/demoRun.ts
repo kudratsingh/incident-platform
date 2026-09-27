@@ -627,8 +627,6 @@ export function countsSentence(
 // characters of a JSON blob is not.
 
 /** How much of an unrecognised excerpt fits on one line. */
-const GENERIC_SUMMARY_CHARS = 64
-
 function collapse(text: string): string {
   return text.replace(/\s+/g, ' ').trim()
 }
@@ -743,12 +741,8 @@ function replaySummary(json: Record<string, unknown> | null, text: string): stri
 }
 
 /**
- * The one-line summary of what a call answered, or null where there is nothing to
- * summarise.
- *
- * The generic fallback is the excerpt itself, collapsed to one line and cut — a
- * reading nobody has written a summariser for is still better read than hidden, and
- * the full excerpt is one click away.
+ * The summary of what a call answered, or null where there is nothing to summarise.
+ * With no summariser for the tool it is the whole excerpt on one line, never cut (WO-R3-359).
  */
 export function summariseResult(
   tool: string | null | undefined,
@@ -763,10 +757,7 @@ export function summariseResult(
       : REPLAY_TOOLS.includes(tool)
         ? replaySummary(json, text)
         : (SUMMARISERS[tool]?.(json, text) ?? null)
-  if (named !== null) return named
-  return text.length > GENERIC_SUMMARY_CHARS
-    ? `${text.slice(0, GENERIC_SUMMARY_CHARS)}…`
-    : text
+  return named ?? text
 }
 
 /** The same, for a step: the excerpt it carries, summarised by its own tool. */
@@ -802,17 +793,55 @@ export function isThinkStep(step: AgentRunStepRecord): boolean {
   return step.kind === 'report' && step.tool !== null && THINK_TOOLS.includes(step.tool)
 }
 
-/** How much of a planner's sentence fits on a ledger line before it is cut. */
-const THINK_SENTENCE_CHARS = 150
-
-/** The one sentence a THINK row shows — the step's own excerpt, not a summariser's. */
+/** The one sentence a THINK step carries — its own excerpt on one line, never cut. */
 export function thinkSentence(step: AgentRunStepRecord): string | null {
   const excerpt = step.result_excerpt
   if (excerpt === null || excerpt === undefined || excerpt.trim() === '') return null
-  const text = collapse(excerpt)
-  return text.length > THINK_SENTENCE_CHARS
-    ? `${text.slice(0, THINK_SENTENCE_CHARS)}…`
-    : text
+  return collapse(excerpt)
+}
+
+/** A THINK row's two lines: who is on top and where the planner goes next, then its reason. */
+export interface ThinkHeadline {
+  /** `top <name> (<category> <confidence>) → <next action>`, every part whole. */
+  headline: string
+  /** The planner's own words after the next action, or null where the sentence has none. */
+  reason: string | null
+}
+
+// The commander's sentence: `top <category> <confidence> → <next action>[: <reason>]`.
+const THINK_SENTENCE = /^top \S+ [\d.]+ → ([^:]+?)(?:: ([\s\S]*))?$/
+
+/**
+ * The headline of a THINK row (WO-R3-359): the commander's sentence names only the top cause's
+ * category, so the full name, category and confidence come from the step's own ranking.
+ */
+export function thinkHeadline(step: AgentRunStepRecord): ThinkHeadline | null {
+  const report = plannerReport(step)
+  if (report === null) return null
+  const sentence = report.sentence
+  const top = report.ranking[0] ?? null
+  const parsed = sentence === null ? null : THINK_SENTENCE.exec(sentence)
+  const next = report.nextAction
+  const nextText =
+    parsed !== null
+      ? parsed[1]
+      : next === null
+        ? null
+        : [next.kind, next.tool].filter((v) => v !== null).join(' ')
+  if (top === null && parsed === null) {
+    return sentence === null ? null : { headline: sentence, reason: null }
+  }
+  const cause =
+    top === null
+      ? 'no ranking reported'
+      : `top ${top.name} (${top.category ?? 'no category'} ${
+          top.confidence === null ? 'no confidence' : top.confidence.toFixed(2)
+        })`
+  return {
+    headline: nextText === null ? cause : `${cause} → ${nextText}`,
+    // A sentence in another shape is still the planner's words: kept whole under the headline.
+    reason: parsed !== null ? (parsed[2] ?? null) : sentence,
+  }
 }
 
 /**

@@ -1687,7 +1687,10 @@ describe('DemoPage — the planner thinks on screen', () => {
       .getAllByTestId('ledger-entry')
       .find((e) => e.dataset.kind === 'think')
     expect(think?.textContent).toMatch(/THINK/)
-    expect(think?.textContent).toMatch(/top consumer_saturation 0.85/)
+    // The headline names the top cause whole, then its category and confidence (WO-R3-359).
+    expect(think?.textContent).toMatch(
+      /top consumer_saturation \(consumer_failure 0\.85\) → probe get_consumer_lag/,
+    )
   })
 
   it('opens the ranking and the chosen next action on a click', async () => {
@@ -1708,7 +1711,11 @@ describe('DemoPage — the planner thinks on screen', () => {
     const detail = screen.getByTestId('think-detail')
     expect(detail.textContent).toMatch(/consumer_saturation/)
     expect(detail.textContent).toMatch(/next: probe get_consumer_lag/)
-    expect(detail.textContent).toMatch(/fresh reading of the alerted subject/)
+    // The reason is on the row itself, so the opened detail does not print it twice.
+    expect(
+      within(think as HTMLElement).getByTestId('ledger-think-reason').textContent,
+    ).toMatch(/fresh reading of the alerted subject/)
+    expect(detail.textContent).not.toMatch(/fresh reading of the alerted subject/)
     // A planner call spends no budget and makes no MCP call; the row says so.
     expect(think?.textContent).toMatch(/the agent thinking, not a call/)
   })
@@ -2099,7 +2106,7 @@ describe('DemoPage — the agent panel after the third take', () => {
     'which is what a killed consumer looks like from the outside; the DLQ is empty and every ' +
     'breaker is closed, so nothing downstream explains it.'
 
-  it('shows the top hypothesis whole and truncates the rest', async () => {
+  it('shows every hypothesis whole, with no "more" button (WO-R3-359)', async () => {
     const run = agentRun({
       hypotheses: [
         {
@@ -2123,12 +2130,11 @@ describe('DemoPage — the agent panel after the third take', () => {
       expect(screen.getAllByTestId('hypothesis-row')).toHaveLength(2)
     })
     const [top, second] = screen.getAllByTestId('hypothesis-row')
-    // The screenshot truncated the top one with "more…", which hid the only
-    // explanation of why the agent believed what it believed.
-    expect(top.textContent).toContain('nothing downstream explains it.')
-    expect(within(top).queryByRole('button', { name: /more/i })).toBeNull()
-    expect(second.textContent).not.toContain('nothing downstream explains it.')
-    expect(within(second).getByRole('button', { name: /more/i })).toBeTruthy()
+    // The third take's screenshot cut the top one with "more…"; since the ninth, none is cut.
+    for (const row of [top, second]) {
+      expect(row.textContent).toContain('nothing downstream explains it.')
+      expect(within(row).queryByRole('button', { name: /more/i })).toBeNull()
+    }
   })
 
   it('draws the remediate threshold on the confidence bar', async () => {

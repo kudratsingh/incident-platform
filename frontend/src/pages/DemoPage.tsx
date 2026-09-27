@@ -168,6 +168,7 @@ import {
   runVerifications,
   stepAnswersForRun,
   summariseStep,
+  thinkHeadline,
   verifyJudgedOn,
 } from '../utils/demoRun'
 import type {
@@ -616,7 +617,7 @@ function StationCell<K extends string>({
         </span>
       )}
       {station.note !== null && (
-        <span className="block text-[11px] mt-0.5 opacity-70 leading-tight">
+        <span className="block text-[11px] mt-0.5 opacity-70 leading-tight [overflow-wrap:anywhere]">
           {station.note}
         </span>
       )}
@@ -1058,7 +1059,7 @@ function MetricChart({
           the threshold and the window; line two is every marker, named, plus the
           samples themselves — identity is never colour alone and no value on this
           chart is reachable only by hovering. */}
-      <p className="text-xs text-gray-500 mt-1 truncate">
+      <p className="text-xs text-gray-500 mt-1">
         threshold {threshold} — {thresholdWhy}
         {' · '}
         <button
@@ -1157,35 +1158,13 @@ function ConfidenceBar({ confidence }: { confidence: number }) {
 }
 
 /**
- * A reasoning excerpt, truncated unless it is the one that matters.
- *
- * The top hypothesis is shown whole: the third take's screenshot truncated it with
- * "more…" — so the one sentence explaining why the agent believed what it believed
- * was the one sentence not on screen. Every other excerpt still truncates, because
- * five of them at full length is the panel.
+ * A reasoning excerpt, always whole: no "more…" and no clamp on any of them (WO-R3-359).
+ * The panel scrolls inside itself instead.
  */
-function Excerpt({
-  text,
-  testId,
-  full = false,
-}: {
-  text: string
-  testId?: string
-  full?: boolean
-}) {
-  const [open, setOpen] = useState(false)
-  const long = !full && text.length > 140
+function Excerpt({ text, testId }: { text: string; testId?: string }) {
   return (
-    <p data-testid={testId} className="text-sm text-gray-400 leading-snug">
-      {open || !long ? text : `${text.slice(0, 140)}…`}
-      {long && (
-        <button
-          onClick={() => setOpen((o) => !o)}
-          className="ml-1 text-xs text-blue-300 hover:text-blue-200"
-        >
-          {open ? 'less' : 'more'}
-        </button>
-      )}
+    <p data-testid={testId} className="text-sm text-gray-400 leading-snug [overflow-wrap:anywhere]">
+      {text}
     </p>
   )
 }
@@ -1212,14 +1191,16 @@ function isTerminalRun(run: AgentRun | null): boolean {
  * bar at zero, which would read as "the agent had no confidence in this" (ADR 0030 in
  * the UI, again).
  */
-function CauseRow({ cause, top }: { cause: RankedCause; top: boolean }) {
+function CauseRow({ cause }: { cause: RankedCause }) {
   return (
     <li
       data-testid="hypothesis-row"
       className="bg-gray-950/60 border border-gray-800 rounded px-3 py-2"
     >
-      <div className="flex items-baseline justify-between gap-2">
-        <span className="text-base text-gray-100">{cause.name}</span>
+      <div className="flex flex-wrap items-baseline justify-between gap-x-2">
+        <span className="text-base text-gray-100 min-w-0 [overflow-wrap:anywhere]">
+          {cause.name}
+        </span>
         <span className="text-xs font-mono text-gray-500">
           {cause.category ?? 'no category reported'}
         </span>
@@ -1233,8 +1214,7 @@ function CauseRow({ cause, top }: { cause: RankedCause; top: boolean }) {
       </div>
       {cause.reasoning_excerpt ? (
         <div className="mt-1">
-          {/* The top one whole; the rest truncated. */}
-          <Excerpt text={cause.reasoning_excerpt} full={top} />
+          <Excerpt text={cause.reasoning_excerpt} />
         </div>
       ) : (
         <p className="text-xs text-gray-600 mt-1">no reasoning reported</p>
@@ -1248,7 +1228,10 @@ function NextActionLine({ snapshot }: { snapshot: RankingSnapshot }) {
   const next = snapshot.nextAction
   if (next === null && snapshot.reason === null) return null
   return (
-    <p data-testid="ranking-next-action" className="text-xs text-gray-400 mt-1">
+    <p
+      data-testid="ranking-next-action"
+      className="text-xs text-gray-400 mt-1 [overflow-wrap:anywhere]"
+    >
       {next !== null && (
         <>
           next:{' '}
@@ -1365,7 +1348,7 @@ function HypothesesPanel({
         </p>
       ) : (
         <div data-testid="hypotheses-now">
-          <p className="text-xs font-mono text-gray-500">
+          <p className="text-xs font-mono text-gray-500 [overflow-wrap:anywhere]">
             {head.at === null ? 'the run’s latest reading' : `ranked ${clockTime(head.at)}`}
             {head.tool !== null && ` · ${head.tool}`}
             {head.seq !== null && ` · step #${String(head.seq)}`}
@@ -1375,7 +1358,6 @@ function HypothesesPanel({
               <CauseRow
                 key={`${cause.category ?? 'none'}-${cause.name}-${String(i)}`}
                 cause={cause}
-                top={i === 0}
               />
             ))}
           </ol>
@@ -1398,14 +1380,21 @@ function HypothesesPanel({
                       {snapshot.tool !== null && ` · ${snapshot.tool}`}
                       {snapshot.seq !== null && ` · step #${String(snapshot.seq)}`}
                     </p>
-                    <ul className="text-xs text-gray-400">
+                    <ul className="text-xs text-gray-400 [overflow-wrap:anywhere]">
                       {snapshot.ranking.map((cause, i) => (
-                        <li key={`${cause.name}-${String(i)}`} className="font-mono">
-                          {cause.confidence === null
-                            ? '—'
-                            : cause.confidence.toFixed(2)}{' '}
-                          {cause.name}
-                          {cause.category === null ? '' : ` · ${cause.category}`}
+                        <li key={`${cause.name}-${String(i)}`}>
+                          <span className="font-mono">
+                            {cause.confidence === null
+                              ? '—'
+                              : cause.confidence.toFixed(2)}{' '}
+                            {cause.name}
+                            {cause.category === null ? '' : ` · ${cause.category}`}
+                          </span>
+                          {cause.reasoning_excerpt !== null && (
+                            <span className="block text-gray-500 leading-snug">
+                              {cause.reasoning_excerpt}
+                            </span>
+                          )}
                         </li>
                       ))}
                     </ul>
@@ -1685,45 +1674,37 @@ const LEDGER_TONE: Record<LedgerKind, string> = {
   phase: 'border-purple-800/60 bg-gray-900',
 }
 
-/** The one line every row shares: when, what kind, which tool, what it answered. */
+/**
+ * The line every row shares: when, what kind, which tool, what it answered.
+ * Inline text that wraps onto more lines, never cut: the owner has to see every character (WO-R3-359).
+ */
 function LedgerLine({
   at,
   badge,
   badgeClassName,
   subject,
   summary,
-  keepSubject = false,
 }: {
   at: string | null
   badge: string
   badgeClassName: string
   subject: string
   summary: string | null
-  /** True where the subject is short by construction and the summary is the sentence. */
-  keepSubject?: boolean
 }) {
   return (
-    <span className="flex items-center gap-1.5 min-w-0">
-      <span className="text-[10px] font-mono text-gray-500 shrink-0">
+    <span className="block leading-snug [overflow-wrap:anywhere]">
+      <span className="text-[10px] font-mono text-gray-500 mr-1.5">
         {/* Every field but `seq` and `kind` can be null: this is the responder's own
             account of its own call and the platform fills nothing in. */}
         {at === null ? 'no time reported' : clockTime(at)}
       </span>
       <span
-        className={`px-1.5 py-0.5 rounded text-[10px] border font-mono shrink-0 ${badgeClassName}`}
+        className={`inline-block px-1.5 py-0.5 rounded text-[10px] leading-none border font-mono mr-1.5 ${badgeClassName}`}
       >
         {badge}
       </span>
-      <span
-        className={`text-[13px] font-mono text-gray-100 ${
-          keepSubject ? 'shrink-0 whitespace-nowrap' : 'truncate'
-        }`}
-      >
-        {subject}
-      </span>
-      {summary !== null && (
-        <span className="text-xs text-gray-400 truncate shrink-[2]">→ {summary}</span>
-      )}
+      <span className="text-[13px] font-mono text-gray-100">{subject}</span>
+      {summary !== null && <span className="text-xs text-gray-400"> → {summary}</span>}
     </span>
   )
 }
@@ -1741,7 +1722,14 @@ const THINK_BADGE = {
 }
 
 /** The ranking a THINK row opens: what was on the table, and what it led to. */
-function ThinkDetail({ report }: { report: ReturnType<typeof plannerReport> }) {
+function ThinkDetail({
+  report,
+  shownReason,
+}: {
+  report: ReturnType<typeof plannerReport>
+  /** The reason already on the row, so the same words are not printed twice. */
+  shownReason: string | null
+}) {
   if (report === null) return null
   return (
     <div data-testid="think-detail" className="mt-1 space-y-1">
@@ -1774,7 +1762,7 @@ function ThinkDetail({ report }: { report: ReturnType<typeof plannerReport> }) {
               report.nextAction.tool === null ? '' : ` ${report.nextAction.tool}`
             }`}
       </p>
-      {report.reason !== null && (
+      {report.reason !== null && report.reason.replace(/\s+/g, ' ') !== shownReason && (
         <p className="text-[11px] text-gray-400 leading-snug">{report.reason}</p>
       )}
     </div>
@@ -1807,6 +1795,7 @@ function StepEntry({
         className: 'bg-gray-700/50 text-gray-300 border-gray-600',
       })
   const isAction = step.kind === 'action'
+  const headline = thinkHeadline(step)
   const [open, setOpen] = useState(false)
   const expanded = open || isAction
   const args = think ? null : compactJson(step.arguments)
@@ -1852,8 +1841,7 @@ function StepEntry({
                 ? (THINK_SUBJECT[planner.tool] ?? planner.tool)
                 : (step.tool ?? 'no tool reported')
             }
-            summary={summariseStep(step)}
-            keepSubject={think}
+            summary={headline === null ? summariseStep(step) : headline.headline}
           />
         </button>
       )}
@@ -1869,19 +1857,28 @@ function StepEntry({
           {judgedOn}
         </p>
       )}
+      {/* The planner's own reason, whole, under the verdict line (WO-R3-359). */}
+      {headline?.reason != null && (
+        <p
+          data-testid="ledger-think-reason"
+          className="text-[11px] text-gray-400 leading-snug mt-0.5 [overflow-wrap:anywhere]"
+        >
+          {headline.reason}
+        </p>
+      )}
 
       {expanded && (
         <div className="mt-1 space-y-1">
-          {think && open && <ThinkDetail report={planner} />}
+          {think && open && <ThinkDetail report={planner} shownReason={headline?.reason ?? null} />}
           {args !== null && (
-            <pre className="text-[11px] font-mono text-gray-400 whitespace-pre-wrap break-all">
+            <pre className="text-[11px] font-mono text-gray-400 whitespace-pre-wrap break-all overflow-x-auto">
               {args}
             </pre>
           )}
           {excerpt != null && excerpt !== '' && (
             <pre
               data-testid="ledger-result"
-              className="text-[11px] font-mono text-gray-300 whitespace-pre-wrap break-all bg-gray-950 border border-gray-800 rounded p-1.5"
+              className="text-[11px] font-mono text-gray-300 whitespace-pre-wrap break-all overflow-x-auto bg-gray-950 border border-gray-800 rounded p-1.5"
             >
               {excerpt}
             </pre>
@@ -1971,7 +1968,7 @@ function RowEntry({ entry }: { entry: LedgerEntry }) {
           <p className="text-[11px] font-mono text-gray-600">{row.action}</p>
           {args !== null && (
             <pre
-              className={`text-[11px] font-mono whitespace-pre-wrap break-all ${
+              className={`text-[11px] font-mono whitespace-pre-wrap break-all overflow-x-auto ${
                 entry.kind === 'lab' ? 'text-amber-200/80' : 'text-gray-400'
               }`}
             >
@@ -2230,7 +2227,7 @@ function ActionLedger({
       )}
 
       <div className="flex items-center justify-between gap-2 mt-2">
-        <p className="text-xs text-gray-600 font-mono truncate">
+        <p className="text-xs text-gray-600 font-mono">
           …/steps + /audit/logs — newest first
         </p>
         {!pinned && (
@@ -2637,7 +2634,7 @@ function BriefingCard({
         <p className="text-xs uppercase tracking-wider text-gray-500">
           What the writer said
         </p>
-        <p className="text-sm text-gray-300 leading-relaxed">
+        <p className="text-sm text-gray-300 leading-relaxed whitespace-pre-line [overflow-wrap:anywhere]">
           {briefing.prose ?? (
             <span className="text-gray-600">
               No prose — this run was not enriched, so the deterministic template above
@@ -3319,9 +3316,14 @@ export default function DemoPage() {
           shorter. Each panel scrolls inside itself instead. 21rem since WO-R3-336:
           the header carries a take selector as well, and the measurement that
           matters is where the ledger's bottom lands — 886 of a 900-pixel viewport
-          on the live state, measured in a real browser. */}
-      <div className="grid grid-cols-1 xl:grid-cols-12 gap-3 mt-2 xl:h-[21rem]">
-        <div className="xl:col-span-4 flex flex-col gap-3 min-h-0 overflow-y-auto">
+          on the live state, measured in a real browser.
+          Widths 30/35/35 since WO-R3-359: the agent and ledger columns wrap every row whole, so
+          they get the room; minmax(0, …) stops a long word from widening a column. */}
+      <div
+        data-testid="demo-panels"
+        className="grid grid-cols-1 xl:grid-cols-[minmax(0,30fr)_minmax(0,35fr)_minmax(0,35fr)] gap-3 mt-2 xl:h-[21rem]"
+      >
+        <div className="flex flex-col gap-3 min-h-0 overflow-y-auto">
           {mode === 'consumer_outage' ? (
             <MetricChart
               testId="metric-chart-lag"
@@ -3420,7 +3422,7 @@ export default function DemoPage() {
           </div>
         </div>
 
-        <div className="xl:col-span-4 min-h-0 flex flex-col">
+        <div className="min-h-0 flex flex-col">
           <AgentPanel
             run={run}
             steps={steps}
@@ -3435,7 +3437,7 @@ export default function DemoPage() {
           />
         </div>
 
-        <div className="xl:col-span-4 min-h-0 flex flex-col">
+        <div className="min-h-0 flex flex-col">
           <ActionLedger
             entries={ledger}
             steps={steps}
