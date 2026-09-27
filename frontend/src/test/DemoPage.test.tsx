@@ -883,9 +883,9 @@ describe('DemoPage — the action ledger', () => {
     renderDemo()
     const counts = await screen.findByTestId('ledger-counts')
     await waitFor(() => {
-      expect(counts.textContent).toMatch(/1 steps reported/)
+      expect(counts.textContent).toMatch(/^1 tool call \(reads \+ actions\)/)
     })
-    expect(counts.textContent).toMatch(/2 calls the platform recorded/)
+    expect(counts.textContent).toMatch(/the platform recorded 2 tool calls/)
     expect(counts.textContent).not.toMatch(/reporter stopped/)
   })
 
@@ -927,9 +927,10 @@ describe('DemoPage — the action ledger', () => {
     renderDemo()
     const counts = await screen.findByTestId('ledger-counts')
     await waitFor(() => {
-      expect(counts.textContent).toMatch(/1 steps reported/)
+      expect(counts.textContent).toMatch(/^1 tool call \(reads \+ actions\)/)
     })
-    expect(counts.textContent).toMatch(/1 planner calls, which make none/)
+    expect(counts.textContent).toMatch(/ · 1 planner\/judge step/)
+    expect(counts.textContent).not.toMatch(/which make none/)
   })
 
   it('falls back to the audit rows when no step was reported, and says so', async () => {
@@ -1984,7 +1985,7 @@ describe('DemoPage — the ledger hides what is not this run’s', () => {
     )
     // One call by this run's own principal, not three.
     expect(screen.getByTestId('ledger-counts').textContent).toMatch(
-      /1 calls the platform recorded/,
+      /the platform recorded 1 tool call$/,
     )
   })
 

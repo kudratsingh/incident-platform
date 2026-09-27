@@ -1,0 +1,320 @@
+{
+  "id": "8ef22e0d-d43f-5258-a57e-bfd36bcf665f",
+  "tenant_id": "d3fa17de-7a17-de7a-17de-7a17de7a17de",
+  "alert_id": null,
+  "service_account_id": "586042d6-f550-4d76-9f4f-a9f291419d1a",
+  "scenario": "remediate_consumer_lag_success",
+  "state": "resolved",
+  "phase_history": [
+    {
+      "at": "2026-09-27T08:51:45.659161+00:00",
+      "state": "triage"
+    },
+    {
+      "at": "2026-09-27T08:51:45.733669+00:00",
+      "state": "investigating"
+    },
+    {
+      "at": "2026-09-27T08:52:02.634541+00:00",
+      "state": "planning"
+    },
+    {
+      "at": "2026-09-27T08:52:11.008861+00:00",
+      "state": "remediating"
+    },
+    {
+      "at": "2026-09-27T08:52:11.065681+00:00",
+      "state": "verifying"
+    },
+    {
+      "at": "2026-09-27T08:52:13.134147+00:00",
+      "state": "resolved"
+    }
+  ],
+  "current_hypothesis": {
+    "name": "worker-dispatcher-lag-climbing-29-and-rising",
+    "category": "consumer_saturation",
+    "confidence": 0.85
+  },
+  "last_step": {
+    "at": "2026-09-27T08:52:11.078901Z",
+    "kind": "read",
+    "tool": "get_consumer_lag"
+  },
+  "hypotheses": [
+    {
+      "name": "worker-dispatcher-lag-climbing-29-and-rising",
+      "category": "consumer_saturation",
+      "confidence": 0.85,
+      "reasoning_excerpt": "The consumer lag for worker-dispatcher is confirmed growing (0→4→10→16→23→29 over ~30 seconds), well above the threshold of 20, indicating the consumer is falling behind on processing."
+    },
+    {
+      "name": "dlq-message-blocking-worker-dispatcher",
+      "category": "poison_message",
+      "confidence": 0.25,
+      "reasoning_excerpt": "A poison message in the queue could cause the consumer to stall and lag to grow; no DLQ evidence yet."
+    },
+    {
+      "name": "recent-deploy-caused-consumer-slowdown",
+      "category": "deploy_regression",
+      "confidence": 0.2,
+      "reasoning_excerpt": "A recent deploy could have introduced a regression causing the consumer to slow down; no deploy evidence yet."
+    },
+    {
+      "name": "downstream-dependency-slowing-worker-dispatcher",
+      "category": "transient_dependency",
+      "confidence": 0.15,
+      "reasoning_excerpt": "A slow downstream dependency could cause message processing to back up; circuit breakers unchecked."
+    },
+    {
+      "name": "db-query-latency-slowing-consumer-processing",
+      "category": "db_query_latency",
+      "confidence": 0.1,
+      "reasoning_excerpt": "Slow database queries could cause the consumer to process messages slower, building up lag."
+    }
+  ],
+  "plan": {
+    "action_tool": "restart_consumer_group",
+    "action_arguments": {
+      "consumer_group": "worker-dispatcher",
+      "idempotency_key": "e0a64477-f983-490a-bc17-89db3c07fcf3-restart-worker-dispatcher"
+    },
+    "rationale_excerpt": null,
+    "target_hypothesis": "worker-dispatcher-lag-climbing-29-and-rising"
+  },
+  "verification": {
+    "of": 6,
+    "attempt": 1,
+    "verdict": "verified",
+    "reasoning_excerpt": "Remediation accepted with group_recognized=true and accepted=true; lag trend in recent_samples shows clear decline from 55 down to 0 over the ~90-second observation window, with sustained lag=0 for the last five measurements, definitively reversing the \"climbing-29-and-rising\" a…"
+  },
+  "verifications": [
+    {
+      "of": 6,
+      "attempt": 1,
+      "verdict": "verified",
+      "reasoning_excerpt": "Remediation accepted with group_recognized=true and accepted=true; lag trend in recent_samples shows clear decline from 55 down to 0 over the ~90-second observation window, with sustained lag=0 for the last five measurements, definitively reversing the \"climbing-29-and-rising\" a…"
+    }
+  ],
+  "steps_dropped": 0,
+  "budget": {
+    "usd_used": 0.169434,
+    "tokens_used": 55390,
+    "wall_seconds": 27.475,
+    "tool_calls_max": 13,
+    "tool_calls_used": 3
+  },
+  "briefing": {
+    "prose": "Findings: A restart_consumer_group action was fired against worker-dispatcher (kill_key_cleared=true, latency_key_cleared=false), but the post-restart lag check at ~08:52:08 showed lag climbing further to 55 — up from 29 at alert time — indicating the restart did not arrest the saturation within this run's observation window.\n\nRecommendation: Check whether the consumer restart has since taken full effect by pulling current lag for worker-dispatcher; if lag is still climbing, investigate why latency_key_cleared remained false after the restart, as the uncleared latency key may be preventing consumers from catching up.",
+    "findings": "A restart_consumer_group action was fired against worker-dispatcher (kill_key_cleared=true, latency_key_cleared=false), but the post-restart lag check at ~08:52:08 showed lag climbing further to 55 — up from 29 at alert time — indicating the restart did not arrest the saturation within this run's observation window.",
+    "incidents": {
+      "primary": {
+        "name": "worker-dispatcher-lag-climbing-29-and-rising",
+        "category": "consumer_saturation",
+        "addressed": true,
+        "confidence": 0.85
+      },
+      "secondary": [],
+      "unresolved_extra": []
+    },
+    "attribution": null,
+    "budget_used": {
+      "usd": "0.169434",
+      "tokens": 55390,
+      "tool_calls": 3,
+      "wall_seconds": 27.474986
+    },
+    "final_state": "resolved",
+    "incident_id": "e0a64477-f983-490a-bc17-89db3c07fcf3",
+    "recorded_at": "2026-09-27T08:52:17.887556+00:00",
+    "alert_summary": "source=kafka:consumer_lag severity=critical fingerprint=consumer_stalled group=worker-dispatcher",
+    "recommendation": "Check whether the consumer restart has since taken full effect by pulling current lag for worker-dispatcher; if lag is still climbing, investigate why latency_key_cleared remained false after the restart, as the uncleared latency key may be preventing consumers from catching up.",
+    "attempted_action": null,
+    "escalation_reason": "",
+    "investigation_trail": [
+      {
+        "tool": "get_consumer_lag",
+        "summary": "{\"consumer_group\":\"worker-dispatcher\",\"lag\":29,\"lag_known\":true,\"source\":\"live\",\"cache_key\":\"kafka:consumer_lag:worker-dispatcher\",\"measured_at\":\"2026-09-27T08:51:47.337691Z\",\"age_seconds\":4,\"recent_samples\":[{\"lag\":29,\"measured_at\":\"2026-09-27T08:51:47.337691Z\"},{\"lag\":23,\"measured_at\":\"2026-09-27T08:51:42.239360Z\"},{\"lag\":16,\"measured_at\":\"2026-09-27T08:51:37.161929Z\"},{\"lag\":10,\"measured_at\":\"2026-09-27T08:51:32.098531Z\"},{\"lag\":4,\"measured_at\":\"2026-09-27T08:51:27.052226Z\"},{\"lag\":0,\"measured_at\":\"2026-09-27T08:51:21.586957Z\"},{\"lag\":0,\"measured_at\":\"2026-09-27T08:51:16.277940Z\"},{\"lag\":0,\"measured_at\":\"2026-09-27T08:51:11.051402Z\"},{\"lag\":0,\"measured_at\":\"2026-09-27T08:51:05.937699Z\"},{\"lag\":0,\"measured_at\":\"2026-09-27T08:51:00.761324Z\"},{\"lag\":0,\"measured_at\":\"2026-09-27T08:50:55.619311Z\"},{\"lag\":0,\"measured_at\":\"2026-09-27T08:50:50.493261Z\"},{\"lag\":0,\"measured_at\":\"2026-09-27T08:50:45.352221Z\"},{\"lag\":0,\"measured_at\":\"2026-09-27T08:50:40.214260Z\"},{\"lag\":0,\"measured_at\":\"2026-09-27T08:50:35.101611Z\"}]}",
+        "arguments": {
+          "consumer_group": "worker-dispatcher"
+        }
+      },
+      {
+        "tool": "restart_consumer_group",
+        "summary": "{\"consumer_group\":\"worker-dispatcher\",\"kill_key_cleared\":true,\"latency_key_cleared\":false,\"group_recognized\":true,\"accepted\":true}",
+        "arguments": {
+          "consumer_group": "worker-dispatcher",
+          "idempotency_key": "b117d4a9906abb1dd1cd7501cff39c75"
+        }
+      },
+      {
+        "tool": "get_consumer_lag",
+        "summary": "{\"consumer_group\":\"worker-dispatcher\",\"lag\":55,\"lag_known\":true,\"source\":\"live\",\"cache_key\":\"kafka:consumer_lag:worker-dispatcher\",\"measured_at\":\"2026-09-27T08:52:08.296763Z\",\"age_seconds\":2,\"recent_samples\":[{\"lag\":55,\"measured_at\":\"2026-09-27T08:52:08.296763Z\"},{\"lag\":49,\"measured_at\":\"2026-09-27T08:52:03.182670Z\"},{\"lag\":42,\"measured_at\":\"2026-09-27T08:51:57.552426Z\"},{\"lag\":36,\"measured_at\":\"2026-09-27T08:51:52.435301Z\"},{\"lag\":29,\"measured_at\":\"2026-09-27T08:51:47.337691Z\"},{\"lag\":23,\"measured_at\":\"2026-09-27T08:51:42.239360Z\"},{\"lag\":16,\"measured_at\":\"2026-09-27T08:51:37.161929Z\"},{\"lag\":10,\"measured_at\":\"2026-09-27T08:51:32.098531Z\"},{\"lag\":4,\"measured_at\":\"2026-09-27T08:51:27.052226Z\"},{\"lag\":0,\"measured_at\":\"2026-09-27T08:51:21.586957Z\"},{\"lag\":0,\"measured_at\":\"2026-09-27T08:51:16.277940Z\"},{\"lag\":0,\"measured_at\":\"2026-09-27T08:51:11.051402Z\"},{\"lag\":0,\"measured_at\":\"2026-09-27T08:51:05.937699Z\"},{\"lag\":0,\"measured_at\":\"2026-09-27T08:51:00.761324Z\"},{\"lag\":0,\"measured_at\":\"2026-09-27T08:50:55.619311Z\"}]}",
+        "arguments": {
+          "of": 6,
+          "attempt": 1,
+          "consumer_group": "worker-dispatcher"
+        }
+      }
+    ]
+  },
+  "started_at": "2026-09-27T08:51:45.724437Z",
+  "updated_at": "2026-09-27T08:52:17.875679Z",
+  "finished_at": "2026-09-27T08:52:13.134147Z",
+  "steps": [
+    {
+      "at": "2026-09-27T08:51:51.557158Z",
+      "seq": 1,
+      "kind": "report",
+      "tool": "investigation_planner",
+      "outcome": "ok",
+      "arguments": {
+        "reason": null,
+        "ranking": [
+          {
+            "name": "worker-dispatcher-lag-23-above-threshold-20",
+            "category": "consumer_saturation",
+            "confidence": 0.8
+          },
+          {
+            "name": "recent-deploy-caused-consumer-slowdown",
+            "category": "deploy_regression",
+            "confidence": 0.2
+          },
+          {
+            "name": "dlq-entries-blocking-worker-dispatcher",
+            "category": "poison_message",
+            "confidence": 0.15
+          }
+        ],
+        "next_action": {
+          "kind": "probe",
+          "tool": "get_consumer_lag"
+        }
+      },
+      "latency_ms": null,
+      "result_excerpt": "top consumer_saturation 0.80 → probe get_consumer_lag"
+    },
+    {
+      "at": "2026-09-27T08:51:51.610183Z",
+      "seq": 2,
+      "kind": "read",
+      "tool": "get_consumer_lag",
+      "outcome": "ok",
+      "arguments": {
+        "consumer_group": "worker-dispatcher"
+      },
+      "latency_ms": 13.0,
+      "result_excerpt": "{\"consumer_group\":\"worker-dispatcher\",\"lag\":29,\"lag_known\":true,\"source\":\"live\",\"cache_key\":\"kafka:consumer_lag:worker-dispatcher\",\"measured_at\":\"2026-09-27T08:51:47.337691Z\",\"age_seconds\":4,\"recent_samples\":[{\"lag\":29,\"measured_at\":\"2026-09-27T08:51:47.337691Z\"},{\"lag\":23,\"measured_at\":\"2026-09-27T08:51:42.239360Z\"},{\"lag\":16,\"measured_at\":\"2026-09-27T08:51:37.161929Z\"},{\"lag\":10,\"measured_at\":\"…"
+    },
+    {
+      "at": "2026-09-27T08:52:02.600967Z",
+      "seq": 3,
+      "kind": "report",
+      "tool": "investigation_planner",
+      "outcome": "ok",
+      "arguments": {
+        "reason": "The worker-dispatcher consumer lag is confirmed growing steadily from 0 to 29 messages over ~30 seconds (most recent reading: lag=29, measured_at=2026-09-27T08:51:47Z), well above the threshold of 20, with lag_known=true and source=live. The trend is clearly upward with no sign …",
+        "ranking": [
+          {
+            "name": "worker-dispatcher-lag-climbing-29-and-rising",
+            "category": "consumer_saturation",
+            "confidence": 0.85
+          },
+          {
+            "name": "dlq-message-blocking-worker-dispatcher",
+            "category": "poison_message",
+            "confidence": 0.25
+          },
+          {
+            "name": "recent-deploy-caused-consumer-slowdown",
+            "category": "deploy_regression",
+            "confidence": 0.2
+          },
+          {
+            "name": "downstream-dependency-slowing-worker-dispatcher",
+            "category": "transient_dependency",
+            "confidence": 0.15
+          },
+          {
+            "name": "db-query-latency-slowing-consumer-processing",
+            "category": "db_query_latency",
+            "confidence": 0.1
+          }
+        ],
+        "next_action": {
+          "kind": "remediate",
+          "tool": null
+        }
+      },
+      "latency_ms": null,
+      "result_excerpt": "top consumer_saturation 0.85 → remediate: The worker-dispatcher consumer lag is confirmed growing steadily from 0 to 29 messages over ~30 seconds (most recent reading: lag=29, measured_at=2026-09-27T08:51:47Z), well above the threshold of 20, with lag_known=true and source=live. The trend is clearly upward with no sign …"
+    },
+    {
+      "at": "2026-09-27T08:52:11.050154Z",
+      "seq": 4,
+      "kind": "action",
+      "tool": "restart_consumer_group",
+      "outcome": "ok",
+      "arguments": {
+        "consumer_group": "worker-dispatcher",
+        "idempotency_key": "b117d4a9906abb1dd1cd7501cff39c75"
+      },
+      "latency_ms": 18.0,
+      "result_excerpt": "{\"consumer_group\":\"worker-dispatcher\",\"kill_key_cleared\":true,\"latency_key_cleared\":false,\"group_recognized\":true,\"accepted\":true}"
+    },
+    {
+      "at": "2026-09-27T08:52:11.089374Z",
+      "seq": 5,
+      "kind": "read",
+      "tool": "get_consumer_lag",
+      "outcome": "ok",
+      "arguments": {
+        "consumer_group": "worker-dispatcher"
+      },
+      "latency_ms": 9.0,
+      "result_excerpt": "{\"consumer_group\":\"worker-dispatcher\",\"lag\":55,\"lag_known\":true,\"source\":\"live\",\"cache_key\":\"kafka:consumer_lag:worker-dispatcher\",\"measured_at\":\"2026-09-27T08:52:08.296763Z\",\"age_seconds\":2,\"recent_samples\":[{\"lag\":55,\"measured_at\":\"2026-09-27T08:52:08.296763Z\"},{\"lag\":49,\"measured_at\":\"2026-09-27T08:52:03.182670Z\"},{\"lag\":42,\"measured_at\":\"2026-09-27T08:51:57.552426Z\"},{\"lag\":36,\"measured_at\":\"…"
+    },
+    {
+      "at": "2026-09-27T08:52:13.122199Z",
+      "seq": 6,
+      "kind": "report",
+      "tool": "verify_judge",
+      "outcome": "ok",
+      "arguments": {
+        "reason": "Remediation accepted with group_recognized=true and accepted=true; lag trend in recent_samples shows clear decline from 55 down to 0 over the ~90-second observation window, with sustained lag=0 for the last five measurements, definitively reversing the \"climbing-29-and-rising\" a…",
+        "ranking": [
+          {
+            "name": "worker-dispatcher-lag-climbing-29-and-rising",
+            "category": "consumer_saturation",
+            "confidence": 0.85
+          },
+          {
+            "name": "dlq-message-blocking-worker-dispatcher",
+            "category": "poison_message",
+            "confidence": 0.25
+          },
+          {
+            "name": "recent-deploy-caused-consumer-slowdown",
+            "category": "deploy_regression",
+            "confidence": 0.2
+          },
+          {
+            "name": "downstream-dependency-slowing-worker-dispatcher",
+            "category": "transient_dependency",
+            "confidence": 0.15
+          },
+          {
+            "name": "db-query-latency-slowing-consumer-processing",
+            "category": "db_query_latency",
+            "confidence": 0.1
+          }
+        ],
+        "next_action": null
+      },
+      "latency_ms": null,
+      "result_excerpt": "top consumer_saturation 0.85 → verify 1/6 verified: Remediation accepted with group_recognized=true and accepted=true; lag trend in recent_samples shows clear decline from 55 down to 0 over the ~90-second observation window, with sustained lag=0 for the last five measurements, definitively reversing the \"climbing-29-and-rising\" a…"
+    }
+  ],
+  "active": false
+}

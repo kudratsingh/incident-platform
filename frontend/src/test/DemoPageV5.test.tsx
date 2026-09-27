@@ -311,7 +311,7 @@ describe('DemoPage — no run selected means no row is the agent’s', () => {
     })
     expect(stationState('agent_acting')).toBe('pending')
     expect(screen.getByTestId('ledger-counts').textContent).toMatch(
-      /0 steps reported · 0 calls/,
+      /^0 tool calls \(reads \+ actions\) · 0 planner\/judge steps$/,
     )
   })
 })
