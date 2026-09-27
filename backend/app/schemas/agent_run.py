@@ -37,7 +37,8 @@ class AgentRunSummaryResponse(BaseModel):
     alert_id: uuid.UUID | None = None
     # The principal that wrote every report in this run.
     service_account_id: uuid.UUID
-    # The responder's own short name for the run. Null when it sent none.
+    # The responder's own short name for the run, null when it sent none. `report_agent_run`
+    # takes it as `run_label` (ADR 0035); every read surface calls it `scenario`.
     scenario: str | None = None
     state: str
     # Append-only, oldest first: `[{"state": ..., "at": ...}]`. One entry per

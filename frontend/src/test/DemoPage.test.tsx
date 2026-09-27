@@ -714,6 +714,18 @@ describe('DemoPage — the agent panel is the middle of the page', () => {
     expect(screen.getByTestId('budget-meter').textContent).toMatch(/not reported/i)
   })
 
+  it('labels the run by its scenario, and says so when there is none', async () => {
+    // The write side calls this field `run_label` (ADR 0035); the read side and the
+    // card call it `scenario`, one word on screen (WO-R3-317).
+    stub({ runs: [agentRun({ scenario: null })] })
+    renderDemo()
+    const panel = await screen.findByTestId('agent-panel')
+    await waitFor(() => {
+      expect(panel.textContent).toContain('no scenario')
+    })
+    expect(panel.textContent).not.toMatch(/no (run )?label/)
+  })
+
   it('says when all it got was a top hypothesis', async () => {
     // What a commander older than WO-R3-329 reports: one hypothesis, no ranking,
     // no reasoning. Not the same finding as a run that ranked nothing.

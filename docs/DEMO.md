@@ -455,7 +455,7 @@ the end.
 
 | Section | Source | When it is absent |
 |---|---|---|
-| state pill, run label, finished-at | `state`, `scenario`, `finished_at` | an unrecognised state renders verbatim |
+| state pill, scenario, finished-at | `state`, `scenario` (written as `run_label`, ADR 0035), `finished_at` | an unrecognised state renders verbatim |
 | **budget** | `budget` — calls used against the cap, tokens, dollars, wall seconds | "not reported"; a bar with no cap is a bar with an invented denominator, so there is none |
 | **what the agent thinks now** | the newest ranking on top — `hypotheses[]` (name, category, confidence bar, reasoning excerpt ≤ 280 chars), stamped with the newest planner call's time and `seq`, with its chosen next action and reason under it. The **top one is shown whole**; the rest truncate. The bar carries a tick at **0.7**, the confidence the loop gates a remediation on. Below it a **confidence sparkline** (one point per planner call, with the 0.7 line and every value printed) and the **earlier rankings**, collapsed, each with its own timestamp | "None reported yet". Where only `current_hypothesis` exists it becomes a one-entry list **and the panel says so**: that is a commander older than WO-R3-329, not a run that ranked nothing. A ranking entry with no confidence gets a sentence, never a bar at zero |
 | **the plan** | `plan` — tool, arguments, the hypothesis it is aimed at, the rationale excerpt | "No action planned yet" while the run is live; on a **terminal** run, "the agent handed off without acting" |

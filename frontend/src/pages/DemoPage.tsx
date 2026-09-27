@@ -357,7 +357,7 @@ function RunSelector({
       >
         {runs.map((r, i) => (
           <option key={r.id} value={r.id}>
-            {shortId(r.id)} · {r.scenario ?? 'no label'} · {r.state}
+            {shortId(r.id)} · {r.scenario ?? 'no scenario'} · {r.state}
             {i === 0 ? ' · newest' : ''}
           </option>
         ))}
@@ -376,7 +376,7 @@ function takeOptionLabel(option: TakeOption): string {
   const outcome =
     run === null
       ? 'no run yet'
-      : `${run.scenario ?? 'no label'} · ${run.state}${
+      : `${run.scenario ?? 'no scenario'} · ${run.state}${
           option.runs.length > 1 ? ` · ${String(option.runs.length)} runs` : ''
         }`
   if (option.current) return `this take · ${span} → live · ${outcome}`
@@ -1504,7 +1504,7 @@ function AgentPanel({
             {agentStateLabel(run)}
           </span>
           <p className="text-xs font-mono text-gray-500">
-            {run.scenario ?? 'no run label'} · {shortId(run.id)}
+            {run.scenario ?? 'no scenario'} · {shortId(run.id)}
             {run.finished_at !== null && ` · finished ${clockTime(run.finished_at)}`}
           </p>
         </div>
