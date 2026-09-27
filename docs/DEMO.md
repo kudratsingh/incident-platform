@@ -8,9 +8,11 @@ resolution without switching tabs. WO-R3-313 built the first version, WO-R3-327
 added the reset boundary, **WO-R3-330 rebuilt it around one run** after the owner's
 first live take, **WO-R3-334 made it read one TAKE** after the third, and
 **WO-R3-336 made it start each take at zero and read the run as it happens** after
-the fourth, and **WO-R3-341 made a finished run stay on screen and stopped the
-stations moving backwards** after the fifth — see "What the takes showed" at the
-end, which is the whole reason the page has the shape it does.
+the fourth, **WO-R3-341 made a finished run stay on screen and stopped the
+stations moving backwards** after the fifth, and **WO-R3-354 put the run's state
+changes into the ledger and made the briefing card say what a resolved run did**
+after the seventh — see "What the takes showed" at the end, which is the whole
+reason the page has the shape it does.
 
 The other half of the demo — the step machine that fires the fault, runs the agent
 and resets the world — lives in the commander repo (`scripts/demo_live.py`,
@@ -508,6 +510,55 @@ sequence number, its outcome and its latency. An **ACTION row is highlighted and
 never collapsed** — the action is the point of the run, so it shows its arguments and
 its result without being asked.
 
+### The run's state changes are rows (WO-R3-354)
+
+The owner, after the seventh take: *"the action ledger is not completely accurate
+throughout the run — it should be easier to note the transitions so we can see which
+state we are at and what should be done."* So every `phase_history` entry is a
+divider, and each step sits under the divider of the state it ran in (by time: a step
+belongs to the newest state change at or before it). Sections are newest first, and so
+are the rows inside a section; the fault, the page and the reset, which happen before
+the run's first state, stay at the bottom.
+
+```
+  ── VERIFYING · 01:52:11 ──
+  reading the alerted subject again to check the action worked; ends when …
+  01:52:13  THINK   verify judge       → top consumer_saturation 0.85 → verify 1/6 verified …
+            judged on lag 55 measured 3 s BEFORE the action
+  01:52:11  READ    get_consumer_lag   → lag 55, known
+  ── REMEDIATING · 01:52:11 ──
+  calling the one action the plan chose; ends when the platform answers the call
+  01:52:11  ACTION  restart_consumer_group → accepted, kill key cleared
+```
+
+Each divider carries one fixed sentence: what the state does and what ends it.
+
+| State | The sentence under its divider | Pinned while live as "now: …" |
+|---|---|---|
+| triage | checking the alert to decide whether it is worth investigating; ends when the agent takes it up or sets it aside as noise | deciding whether this alert is worth investigating |
+| investigating | reading the alerted subject and ranking causes; ends when the planner chooses remediate or stop | reading the alerted subject and ranking causes until the planner chooses remediate or stop |
+| planning | turning the top cause into one action with its arguments and checking that action is allowed; ends when it is sent, needs a person to approve it, or is refused | choosing one action and checking it is allowed before it is sent |
+| awaiting approval | holding the planned action until a person approves it; ends when someone approves it or it is refused | waiting for a person to approve the planned action |
+| remediating | calling the one action the plan chose; ends when the platform answers the call | waiting for the platform to answer the action |
+| verifying | reading the alerted subject again to check the action worked; ends when a reading taken after the action is inside the threshold, or when the checks run out and a person is called | waiting for a reading taken after the action that is inside the threshold |
+| resolved | finished: a check after the action said the fault is gone; nothing more happens in this run | — |
+| escalated | finished: the agent handed the incident to a person, with a briefing saying why; nothing more happens in this run | — |
+| failed | finished: the run stopped on an error, or a reset closed it; nothing more happens in this run | — |
+
+**While the run is live, the newest divider is pinned to the top of the ledger** and
+shows the state's exit condition in the present tense instead of its sentence —
+*"now: VERIFYING — waiting for a reading taken after the action that is inside the
+threshold"* — so which state the run is in and what it is waiting for never scrolls
+away. A finished run pins nothing.
+
+**A verify judge's row shows what it judged** (INC-005): under the row, the newest read
+before it — its value and when it was measured against the action's time, e.g. *"judged
+on lag 55 measured 3 s BEFORE the action"*, in amber when the reading is older than the
+action. The seventh take's judge said `verified` about exactly that reading.
+
+A step reported with outcome `ok` (the commander's word) is not tinted as a failure;
+only an outcome other than `ok` or `success` is.
+
 The summary after the arrow comes from a per-tool table, because "lag 30, known" is a
 sentence and the first sixty characters of a JSON body is not:
 
@@ -615,10 +666,12 @@ about were underneath them. The page therefore asks for
 `action_prefix=event.` only while the toggle is on — so the job stream can never
 crowd out a derivation.
 
-**Both witnesses are counted**, in one line above the rows: *N steps reported · M calls
-the platform recorded*, where N is the run's `read` and `action` steps and M is its own
-principal's `agent.tool_invoked` rows. The planner's reports are counted **beside** them
-(*K planner calls, which make none*), never in them.
+**The counts line says both numbers plainly** (WO-R3-354 item 4): *"N tool calls
+(reads + actions) · M planner/judge steps"*, where N is the run's `read` and `action`
+steps and M its planner, reflection and verify-judge steps (which make no call and
+spend no tool budget). The platform's own count — this run's principal's
+`agent.tool_invoked` rows — is added as *"· the platform recorded K tool calls"* only
+when it differs from N.
 
 **The disagreement warning has to earn itself** (item 4). The fourth take's page said
 *"4 steps reported · 5 calls the platform recorded — the two do not agree"* about a run
@@ -637,9 +690,17 @@ Rendered once `agent_run.briefing` lands, and it **stays** — see the `active=t
 bug below.
 
 - **final state** as a pill (green for `resolved`, red otherwise);
-- **alert summary** and **escalation reason**;
-- **attempted action** — the tool and its arguments, or "None — the agent escalated
-  without acting";
+- **alert summary** and **escalation reason** (the reason is left out on a resolved run
+  that gives none);
+- **the action** — on a **resolved** run the card is titled *Resolution briefing* and
+  names the action taken from the run's own steps: the tool, its arguments without the
+  idempotency key, and the platform's `accepted` answer (*"restart_consumer_group ·
+  consumer_group=worker-dispatcher · accepted"*), falling back to the plan's action
+  before the step is in. The briefing's own `attempted_action` is an escalation field
+  and is null on a resolved run, which is why the seventh take's card said "None — the
+  agent escalated without acting" about a run that restarted the group (WO-R3-354
+  item 2). On an escalated run the card keeps its old sentences: the tool and its
+  arguments, or "None — the agent escalated without acting";
 - **verify verdict** — from the run record's own `verification`, not from the
   briefing, which has never carried one. The first build said so in a sentence; now
   that the record carries the verdicts, the card shows the verdict itself;
@@ -649,7 +710,9 @@ bug below.
   the one-sentence detail. A run that read a recovery it cannot claim says so here
   rather than in prose; a run that never acted reads *"no attribution because no
   action"* rather than "none recorded", which would suggest a gap in the record
-  instead of the consequence of the run's own decision;
+  instead of the consequence of the run's own decision; a **resolved run that acted
+  and carries none** reads *"None — no reading taken after the action showed the fault
+  gone (ADR 0071)"*, which is ADR 0071's reason for refusing one;
 - **causes**, as the three slots of commander ADR 0065 — primary, secondary,
   unresolved extra — each with category, name, confidence and whether any attempt
   aimed at it. `unresolved extra` is printed even when empty: the remainder is the
@@ -716,6 +779,33 @@ platform about itself. The operator sees both.
 ---
 
 ## What the takes showed
+
+### The seventh take (2026-09-27, $0.18) — the ledger and the card disagreed with the run
+
+Run `8ef22e0d`, archive `a6ad732b145f`; its run record is the test fixture
+`frontend/src/test/fixtures/take7-run.json`, and the rehearsal run before it
+(`9c3f9575`, 08:25:24 UTC) is `take7-prior-run.json`. Four things on the screen were
+wrong, and one bug caused two of them:
+
+1. **"ranked 01:25:24" on a 01:51–01:52 run, and "4 steps reported · 3 calls · 4
+   planner calls" over six recorded steps.** The page merges the run's steps from two
+   polls, the run detail and the `/steps` tail, by `seq`. A poll keeps its last answer
+   while the next is in flight, so right after the page switched from the rehearsal run
+   to the take's run both polls still held the **rehearsal's** steps, and they were
+   merged into the new run's list. The take's own steps 1–6 replaced theirs by `seq`;
+   the rehearsal's steps 7 (a `list_dlq_messages` read) and 8 (a `verify_judge` at
+   08:25:24.78 UTC) stayed. The "ranked" header reads the newest planner step, which
+   was that step 8 — 01:25:24 local — and the counts had one read and one judge step
+   too many. Not a wrong field and not a seconds/minutes slip: the wrong run's steps.
+   Fixed by merging only answers whose run id is the selected run's
+   (`stepAnswersForRun`), which also stops the old tail's cursor skipping the new
+   run's first steps.
+2. **The card said "None — the agent escalated without acting"** on a run that
+   restarted the group and resolved: see the briefing section above.
+3. **The transitions were hard to follow**: see "The run's state changes are rows".
+4. **The judge's verdict rested on a reading taken before the action** (INC-005,
+   fixed in the commander by WO-R3-353); the verify row now shows the reading's time
+   against the action's.
 
 ### The fifth take (2026-09-21, $0.23) — the run was right, the screen was not
 
