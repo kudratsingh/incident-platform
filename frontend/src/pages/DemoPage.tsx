@@ -148,22 +148,29 @@ import type {
   TakeOption,
 } from '../utils/demoPhase'
 import {
+  actionTaken,
   budgetMeter,
   buildLedger,
   confidenceTrend,
+  countsSentence,
   dlqDecisionFromSteps,
   hypothesesSource,
   isThinkStep,
   labToolName,
   lastReportAt,
   ledgerCounts,
+  ledgerDisplayOrder,
   mergeSteps,
+  phaseMeaning,
   plannerReport,
   rankingHistory,
   runVerifications,
+  stepAnswersForRun,
   summariseStep,
+  verifyJudgedOn,
 } from '../utils/demoRun'
 import type {
+  ActionTaken,
   ConfidencePoint,
   LedgerEntry,
   LedgerKind,
@@ -174,6 +181,7 @@ import type {
   AgentBriefing,
   AgentBriefingSlot,
   AgentRun,
+  AgentRunPhase,
   AgentRunStepRecord,
   AgentRunVerification,
   Job,
@@ -1669,6 +1677,7 @@ const LEDGER_TONE: Record<LedgerKind, string> = {
   reset: 'border-gray-700 bg-gray-800/30',
   job_event: 'border-gray-800 bg-gray-900/40',
   human: 'border-green-800/50 bg-green-950/20',
+  phase: 'border-purple-800/60 bg-gray-900',
 }
 
 /** The one line every row shares: when, what kind, which tool, what it answered. */
@@ -1774,7 +1783,14 @@ const THINK_SUBJECT: Record<string, string> = {
   verify_judge: 'verify judge',
 }
 
-function StepEntry({ step }: { step: AgentRunStepRecord }) {
+function StepEntry({
+  step,
+  judgedOn = null,
+}: {
+  step: AgentRunStepRecord
+  /** On a verify judge's row: the reading it judged and when that was measured (item 5). */
+  judgedOn?: string | null
+}) {
   const planner = plannerReport(step)
   const think = planner !== null
   // `kind` is an open string on the wire; an unrecognised one is shown verbatim
@@ -1790,12 +1806,14 @@ function StepEntry({ step }: { step: AgentRunStepRecord }) {
   const expanded = open || isAction
   const args = think ? null : compactJson(step.arguments)
   const excerpt = think ? null : step.result_excerpt
-  const failed = step.outcome != null && step.outcome !== 'success'
+  // The commander reports `ok`; the platform's own word is `success`. Either is not a failure.
+  const failed = step.outcome != null && step.outcome !== 'success' && step.outcome !== 'ok'
 
   return (
     <div
       data-testid="ledger-entry"
       data-kind={think ? 'think' : step.kind}
+      data-seq={step.seq}
       className={`rounded border px-2 py-1 ${
         isAction
           ? 'border-blue-500/60 bg-blue-950/30'
@@ -1833,6 +1851,18 @@ function StepEntry({ step }: { step: AgentRunStepRecord }) {
             keepSubject={think}
           />
         </button>
+      )}
+      {/* Its own line so it is never cut: a verdict on a reading older than the action
+          is INC-005's shape, and the row has to show it. */}
+      {judgedOn !== null && (
+        <p
+          data-testid="ledger-judged-on"
+          className={`text-[11px] font-mono mt-0.5 ${
+            judgedOn.includes('BEFORE') ? 'text-amber-300' : 'text-gray-400'
+          }`}
+        >
+          {judgedOn}
+        </p>
       )}
 
       {expanded && (
@@ -1978,8 +2008,46 @@ function ResetDivider({ at }: { at: string }) {
   )
 }
 
+/**
+ * One transition of the run: its state, its time, and what the state does and what ends it.
+ * While the run is live the newest one is pinned to the top with its exit condition in the
+ * present tense, so the current state and what it waits for never scroll away (WO-R3-354).
+ */
+function PhaseDivider({ phase, pinned }: { phase: AgentRunPhase; pinned: boolean }) {
+  const meaning = phaseMeaning(phase.state)
+  const label = phase.state.replace(/_/g, ' ').toUpperCase()
+  return (
+    <div
+      data-testid="ledger-phase-divider"
+      data-state={phase.state}
+      data-pinned={pinned ? 'true' : undefined}
+      role="separator"
+      aria-label={`state ${label}`}
+      className={`py-1 text-center ${
+        pinned ? 'sticky top-0 z-10 bg-gray-900 border-b border-purple-700/60 pb-1.5' : ''
+      }`}
+    >
+      <p className="text-xs uppercase tracking-wider font-mono text-purple-200 whitespace-nowrap">
+        ── {label} · {clockTime(phase.at)} ──
+      </p>
+      {/* Pinned, the present-tense exit condition replaces the sentence, to keep the pin short. */}
+      {pinned && meaning.now !== null ? (
+        <p data-testid="ledger-phase-now" className="text-sm text-purple-100 leading-snug">
+          now: {label} — {meaning.now}
+        </p>
+      ) : (
+        <p data-testid="ledger-phase-meaning" className="text-[11px] text-gray-400 leading-snug">
+          {meaning.does}
+        </p>
+      )}
+    </div>
+  )
+}
+
 function ActionLedger({
   entries,
+  steps,
+  live,
   counts,
   thinkCount,
   boundaryInView,
@@ -1995,6 +2063,10 @@ function ActionLedger({
   onRetry,
 }: {
   entries: LedgerEntry[]
+  /** The run's own steps, for what each verify judge was given. */
+  steps: AgentRunStepRecord[]
+  /** True while the run has not finished — the only time a state is pinned. */
+  live: boolean
   counts: {
     steps: number
     calls: number
@@ -2026,6 +2098,7 @@ function ActionLedger({
   const scroller = useRef<HTMLDivElement | null>(null)
   const [pinned, setPinned] = useState(true)
   const count = entries.length
+  const shown = useMemo(() => ledgerDisplayOrder(entries), [entries])
 
   useEffect(() => {
     const box = scroller.current
@@ -2080,13 +2153,10 @@ function ActionLedger({
         </div>
       </div>
 
-      {/* Read and action steps only, against this run's own `agent.tool_invoked` rows.
-          The planner's own reports are counted beside them rather than in them: they
-          make no MCP call, so counting them would recreate the disagreement the fourth
-          take's page invented. */}
+      {/* Tool calls (reads + actions) and planner/judge steps, each named; the platform's
+          count of this run's own calls is added only where it differs (WO-R3-354 item 4). */}
       <p data-testid="ledger-counts" className="text-xs text-gray-500 mt-0.5">
-        {counts.calls} steps reported · {counts.auditCalls} calls the platform recorded
-        {thinkCount > 0 && ` · ${String(thinkCount)} planner calls, which make none`}
+        {countsSentence(counts, thinkCount)}
         {counts.warn && (
           <span className="text-amber-300">
             {' '}
@@ -2136,11 +2206,17 @@ function ActionLedger({
           data-testid="ledger-scroller"
           className="space-y-1 mt-2 overflow-y-auto pr-1 flex-1 min-h-0"
         >
-          {entries.map((entry) =>
-            entry.kind === 'reset' ? (
+          {shown.map((entry, i) =>
+            entry.kind === 'phase' && entry.phase ? (
+              <PhaseDivider key={entry.id} phase={entry.phase} pinned={live && i === 0} />
+            ) : entry.kind === 'reset' ? (
               <ResetDivider key={entry.id} at={entry.at} />
             ) : entry.kind === 'step' && entry.step ? (
-              <StepEntry key={entry.id} step={entry.step} />
+              <StepEntry
+                key={entry.id}
+                step={entry.step}
+                judgedOn={verifyJudgedOn(entry.step, steps)}
+              />
             ) : (
               <RowEntry key={entry.id} entry={entry} />
             ),
@@ -2269,10 +2345,12 @@ function slotLine(slot: AgentBriefingSlot): string {
 export function briefingMarkdown(
   briefing: AgentBriefing,
   verification: AgentRunVerification | null,
+  action: ActionTaken | null = null,
 ): string {
   const slots = briefing.incidents
+  const resolved = briefing.final_state === 'resolved'
   const lines: string[] = [
-    '# Escalation briefing',
+    resolved ? '# Resolution briefing' : '# Escalation briefing',
     '',
     `- **Final state**: ${briefing.final_state}`,
     `- **Incident**: ${briefing.incident_id}`,
@@ -2281,7 +2359,9 @@ export function briefingMarkdown(
   if (briefing.escalation_reason) {
     lines.push(`- **Escalation reason**: ${briefing.escalation_reason}`)
   }
-  if (briefing.attempted_action) {
+  if (resolved) {
+    lines.push(`- **Action taken**: ${actionSentence(action)}`)
+  } else if (briefing.attempted_action) {
     lines.push(
       `- **Attempted action**: ${briefing.attempted_action.tool} ` +
         `${JSON.stringify(briefing.attempted_action.arguments)}`,
@@ -2300,7 +2380,9 @@ export function briefingMarkdown(
   lines.push(
     `- **Recovery attribution**: ${
       attribution === null
-        ? 'none recorded'
+        ? resolved && action !== null
+          ? `none — ${NO_ATTRIBUTION_REASON} (ADR 0071)`
+          : 'none recorded'
         : `${attribution.verdict} — ${attribution.resource} via ${attribution.probe_tool}; ${attribution.detail}`
     }`,
   )
@@ -2329,6 +2411,21 @@ export function briefingMarkdown(
     briefing.prose ? briefing.prose : '_no prose — this run was not enriched._',
   )
   return lines.join('\n')
+}
+
+/** ADR 0071's reason a resolved run carries no attribution, in its own words. */
+const NO_ATTRIBUTION_REASON = 'no reading taken after the action showed the fault gone'
+
+/** The action a resolved run took, as one line: tool, arguments, and the platform's answer. */
+function actionSentence(action: ActionTaken | null): string {
+  if (action === null) return 'none — the run resolved without acting'
+  const answer =
+    action.accepted === null
+      ? 'acceptance not reported'
+      : action.accepted
+        ? 'accepted'
+        : 'not accepted'
+  return [action.tool, action.argumentsSummary, answer].filter((p) => p !== null).join(' · ')
 }
 
 function SlotRow({ role, slots }: { role: string; slots: AgentBriefingSlot[] }) {
@@ -2365,9 +2462,12 @@ const ATTRIBUTION_STYLE: Record<string, string> = {
 function BriefingCard({
   briefing,
   verification,
+  action,
 }: {
   briefing: AgentBriefing
   verification: AgentRunVerification | null
+  /** From the run record, not the briefing: a resolved run's briefing carries no action. */
+  action: ActionTaken | null
 }) {
   const toast = useToast()
   const slots = briefing.incidents
@@ -2375,7 +2475,7 @@ function BriefingCard({
   const attribution = briefing.attribution ?? null
 
   async function copy() {
-    const ok = await copyToClipboard(briefingMarkdown(briefing, verification))
+    const ok = await copyToClipboard(briefingMarkdown(briefing, verification, action))
     if (ok) toast.info('Copied the briefing as Markdown')
     else toast.error('Could not copy the briefing — select it and copy manually')
   }
@@ -2388,7 +2488,7 @@ function BriefingCard({
     >
       <div className="flex items-center justify-between gap-2 mb-3">
         <h2 id="demo-briefing" className="text-base text-gray-200">
-          Escalation briefing
+          {resolved ? 'Resolution briefing' : 'Escalation briefing'}
         </h2>
         <div className="flex items-center gap-2">
           <span
@@ -2416,28 +2516,39 @@ function BriefingCard({
             <p className="text-xs uppercase tracking-wider text-gray-500">Alert</p>
             <p className="text-gray-200">{briefing.alert_summary}</p>
           </div>
-          <div>
-            <p className="text-xs uppercase tracking-wider text-gray-500">
-              Escalation reason
-            </p>
-            <p className="text-gray-300">
-              {briefing.escalation_reason || <span className="text-gray-600">none given</span>}
-            </p>
-          </div>
+          {!(resolved && !briefing.escalation_reason) && (
+            <div>
+              <p className="text-xs uppercase tracking-wider text-gray-500">
+                Escalation reason
+              </p>
+              <p className="text-gray-300">
+                {briefing.escalation_reason || <span className="text-gray-600">none given</span>}
+              </p>
+            </div>
+          )}
         </div>
 
         <div className="space-y-2">
           <div>
             <p className="text-xs uppercase tracking-wider text-gray-500">
-              Attempted action, and how it was judged
+              {resolved ? 'Action taken' : 'Attempted action'}, and how it was judged
             </p>
-            {briefing.attempted_action ? (
-              <p className="text-sm font-mono text-gray-300 break-all">
+            {resolved ? (
+              // The briefing's `attempted_action` is an escalation field and is null on a
+              // resolved run, so the action comes from the run's own steps (WO-R3-354 item 2).
+              <p
+                data-testid="briefing-action"
+                className={`text-sm break-all ${action === null ? 'text-gray-600' : 'font-mono text-gray-300'}`}
+              >
+                {action === null ? 'None — the run resolved without acting.' : actionSentence(action)}
+              </p>
+            ) : briefing.attempted_action ? (
+              <p data-testid="briefing-action" className="text-sm font-mono text-gray-300 break-all">
                 {briefing.attempted_action.tool}{' '}
                 {JSON.stringify(briefing.attempted_action.arguments)}
               </p>
             ) : (
-              <p className="text-sm text-gray-600">
+              <p data-testid="briefing-action" className="text-sm text-gray-600">
                 None — the agent escalated without acting.
               </p>
             )}
@@ -2471,9 +2582,11 @@ function BriefingCard({
               // "none recorded" about it reads as a gap in the record rather than as
               // the consequence of the run's own decision (WO-R3-334).
               <p data-testid="briefing-attribution" className="text-sm text-gray-600">
-                {briefing.attempted_action
-                  ? 'None recorded — this run’s trajectory carries no attribution read.'
-                  : 'No attribution because no action: there is nothing to credit a recovery to.'}
+                {resolved && action !== null
+                  ? `None — ${NO_ATTRIBUTION_REASON} (ADR 0071).`
+                  : briefing.attempted_action
+                    ? 'None recorded — this run’s trajectory carries no attribution read.'
+                    : 'No attribution because no action: there is nothing to credit a recovery to.'}
               </p>
             ) : (
               <div data-testid="briefing-attribution">
@@ -2767,12 +2880,14 @@ export default function DemoPage() {
 
   useEffect(() => {
     if (runId === null) return
-    const tail = stepPoll.data
-    const incoming = [...(runDetail.data?.steps ?? []), ...(tail?.steps ?? [])]
-    // The platform's cursor, not one computed from what arrived: `next_after_seq`
-    // is the highest `seq` STORED, so a poll that returns nothing still advances.
-    const nextCursor = tail?.next_after_seq ?? null
-    const dropped = tail?.steps_dropped ?? runDetail.data?.steps_dropped ?? 0
+    // Only the answers that are this run's: right after a switch both polls still hold
+    // the previous run's (WO-R3-354 item 3). The cursor is the platform's `next_after_seq`,
+    // the highest `seq` STORED, so a poll that returns nothing still advances.
+    const {
+      steps: incoming,
+      cursor: nextCursor,
+      dropped,
+    } = stepAnswersForRun(runId, runDetail.data, stepPoll.data)
     setStepStore((prev) => {
       const base = prev.runId === runId ? prev.steps : []
       if (incoming.length === 0) {
@@ -3008,10 +3123,11 @@ export default function DemoPage() {
         showJobEvents,
         runPrincipalId,
         showHiddenReads,
+        phaseHistory: run?.phase_history,
         // Newest at the TOP (the owner's rule from the fourth take), which is this
         // helper's default — the page no longer asks it to reverse.
       }),
-    [steps, ledgerRows, showJobEvents, runPrincipalId, showHiddenReads],
+    [steps, ledgerRows, showJobEvents, runPrincipalId, showHiddenReads, run?.phase_history],
   )
   /**
    * The two witnesses' counts, and the rule for when their disagreeing means anything.
@@ -3306,6 +3422,8 @@ export default function DemoPage() {
         <div className="xl:col-span-4 min-h-0 flex flex-col">
           <ActionLedger
             entries={ledger}
+            steps={steps}
+            live={run !== null && !isTerminalRun(run)}
             counts={counts}
             thinkCount={thinkCount}
             boundaryInView={
@@ -3333,7 +3451,11 @@ export default function DemoPage() {
       </div>
 
       {briefing !== null && (
-        <BriefingCard briefing={briefing} verification={latestVerification} />
+        <BriefingCard
+          briefing={briefing}
+          verification={latestVerification}
+          action={actionTaken(run, steps)}
+        />
       )}
 
       {mode === 'dlq_backlog' && (

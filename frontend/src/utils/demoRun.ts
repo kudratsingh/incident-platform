@@ -47,8 +47,11 @@
 import type {
   AgentRun,
   AgentRunBudget,
+  AgentRunPhase,
   AgentRunRankedHypothesis,
+  AgentRunState,
   AgentRunStepRecord,
+  AgentRunStepsResponse,
   AgentRunVerification,
   AuditLog,
   Job,
@@ -196,6 +199,8 @@ export type LedgerKind =
   | 'reset'
   | 'job_event'
   | 'human'
+  /** One `phase_history` entry, drawn as a divider (WO-R3-354). */
+  | 'phase'
 
 /** The two kinds the ledger hides behind the "reads hidden" toggle. */
 export const HIDDEN_LEDGER_KINDS: readonly LedgerKind[] = ['lab_probe', 'other_principal']
@@ -208,6 +213,8 @@ export interface LedgerEntry {
   step?: AgentRunStepRecord
   /** Set on every entry derived from an audit row. */
   row?: AuditLog
+  /** Set on a `phase` entry. */
+  phase?: AgentRunPhase
 }
 
 export interface LedgerInput {
@@ -240,6 +247,8 @@ export interface LedgerInput {
    * Default stays newest-first.
    */
   oldestFirst?: boolean
+  /** The run's `phase_history`; each entry becomes a divider at its own time. */
+  phaseHistory?: AgentRunPhase[]
 }
 
 export interface LedgerExclusions {
@@ -327,10 +336,16 @@ export function buildLedger(input: LedgerInput): LedgerEntry[] {
     entries.push({ id: `row-${row.id}`, at: row.created_at, kind, row })
   }
 
+  for (const [i, phase] of (input.phaseHistory ?? []).entries()) {
+    entries.push({ id: `phase-${String(i)}`, at: utcIso(phase.at), kind: 'phase', phase })
+  }
+
   const newestFirst = entries.sort((a, b) => {
     if (a.at !== b.at) return a.at < b.at ? 1 : -1
-    // Same instant: the step order is the run's own order, and a step is more
-    // specific than the row that recorded it.
+    // Same instant: a transition opens its state, so it counts as the older of the two.
+    if ((a.kind === 'phase') !== (b.kind === 'phase')) return a.kind === 'phase' ? 1 : -1
+    // Then the step order is the run's own order, and a step is more specific than
+    // the row that recorded it.
     return (b.step?.seq ?? 0) - (a.step?.seq ?? 0)
   })
   return input.oldestFirst === true ? newestFirst.reverse() : newestFirst
@@ -373,6 +388,87 @@ function auditLedgerKind(
   }
   if (row.principal_type === 'user') return 'human'
   return null
+}
+
+// ── the run's states, as dividers in the ledger (WO-R3-354) ──────────────────
+// Every `phase_history` entry is a divider row saying what the state does and what ends it.
+
+/** What one state does, and — while a run sits in it — the condition that ends it. */
+export interface PhaseMeaning {
+  /** What the state does and what ends it, for someone who has never seen the agent. */
+  does: string
+  /** The exit condition in the present tense, for the pinned "now:" line; null once finished. */
+  now: string | null
+}
+
+export const PHASE_MEANING: Record<AgentRunState, PhaseMeaning> = {
+  triage: {
+    does: 'checking the alert to decide whether it is worth investigating; ends when the agent takes it up or sets it aside as noise',
+    now: 'deciding whether this alert is worth investigating',
+  },
+  investigating: {
+    does: 'reading the alerted subject and ranking causes; ends when the planner chooses remediate or stop',
+    now: 'reading the alerted subject and ranking causes until the planner chooses remediate or stop',
+  },
+  planning: {
+    does: 'turning the top cause into one action with its arguments and checking that action is allowed; ends when it is sent, needs a person to approve it, or is refused',
+    now: 'choosing one action and checking it is allowed before it is sent',
+  },
+  awaiting_approval: {
+    does: 'holding the planned action until a person approves it; ends when someone approves it or it is refused',
+    now: 'waiting for a person to approve the planned action',
+  },
+  remediating: {
+    does: 'calling the one action the plan chose; ends when the platform answers the call',
+    now: 'waiting for the platform to answer the action',
+  },
+  verifying: {
+    does: 'reading the alerted subject again to check the action worked; ends when a reading taken after the action is inside the threshold, or when the checks run out and a person is called',
+    now: 'waiting for a reading taken after the action that is inside the threshold',
+  },
+  resolved: {
+    does: 'finished: a check after the action said the fault is gone; nothing more happens in this run',
+    now: null,
+  },
+  escalated: {
+    does: 'finished: the agent handed the incident to a person, with a briefing saying why; nothing more happens in this run',
+    now: null,
+  },
+  failed: {
+    does: 'finished: the run stopped on an error, or a reset closed it; nothing more happens in this run',
+    now: null,
+  },
+}
+
+export function phaseMeaning(state: string): PhaseMeaning {
+  const known = (PHASE_MEANING as Record<string, PhaseMeaning | undefined>)[state]
+  return known ?? { does: `"${state}" is not a state this page knows`, now: null }
+}
+
+/** A `+00:00` time as the `Z` form the steps use, so the ledger's string sort holds. */
+function utcIso(at: string): string {
+  if (at.endsWith('Z')) return at
+  if (at.endsWith('+00:00')) return `${at.slice(0, -6)}Z`
+  const parsed = Date.parse(at)
+  return Number.isNaN(parsed) ? at : new Date(parsed).toISOString()
+}
+
+/**
+ * A newest-first ledger regrouped so each divider heads the rows of its own state.
+ *
+ * Sections newest first, rows inside a section newest first; rows older than the first
+ * transition (the fault, the page, the reset) stay at the bottom.
+ */
+export function ledgerDisplayOrder(newestFirst: LedgerEntry[]): LedgerEntry[] {
+  if (!newestFirst.some((e) => e.kind === 'phase')) return newestFirst
+  const sections: { head: LedgerEntry | null; rows: LedgerEntry[] }[] = [{ head: null, rows: [] }]
+  for (const entry of [...newestFirst].reverse()) {
+    if (entry.kind === 'phase') sections.push({ head: entry, rows: [] })
+    else sections[sections.length - 1].rows.push(entry)
+  }
+  return sections
+    .reverse()
+    .flatMap((s) => [...(s.head === null ? [] : [s.head]), ...s.rows.reverse()])
 }
 
 /**
@@ -501,6 +597,20 @@ export function ledgerCounts(input: {
     agreed: calls === auditCalls,
     warn: auditCalls > calls && input.terminal === true && silent,
   }
+}
+
+/**
+ * The counts line: the run's tool calls and its planner/judge steps, each named, plus the
+ * platform's own count of this run's calls only when it differs (WO-R3-354 item 4).
+ */
+export function countsSentence(
+  counts: Pick<LedgerCounts, 'calls' | 'auditCalls'>,
+  thinkCount: number,
+): string {
+  const n = (count: number, noun: string) => `${String(count)} ${noun}${count === 1 ? '' : 's'}`
+  const line = `${n(counts.calls, 'tool call')} (reads + actions) · ${n(thinkCount, 'planner/judge step')}`
+  if (counts.auditCalls === counts.calls) return line
+  return `${line} · the platform recorded ${n(counts.auditCalls, 'tool call')}`
 }
 
 // ── one row, one line ────────────────────────────────────────────────────────
@@ -705,6 +815,34 @@ export function thinkSentence(step: AgentRunStepRecord): string | null {
     : text
 }
 
+/**
+ * What a `verify_judge` step was judging: the newest read before it, its value, and when
+ * that reading was measured against the action's time (WO-R3-354 item 5, INC-005).
+ *
+ * The seventh take's judge said "verified" about lag 55 measured 3 s BEFORE the restart;
+ * putting that on the row makes a verdict on a stale reading visible. Null for any other step.
+ */
+export function verifyJudgedOn(
+  step: AgentRunStepRecord,
+  steps: AgentRunStepRecord[],
+): string | null {
+  if (!isThinkStep(step) || step.tool !== 'verify_judge') return null
+  const before = steps.filter((s) => s.seq < step.seq).sort((a, b) => b.seq - a.seq)
+  const reading = before.find((s) => s.kind === 'read')
+  if (reading === undefined) return null
+  const summary = summariseResult(reading.tool, reading.result_excerpt)
+  const value = (summary ?? reading.tool ?? 'a reading').replace(/, known$/, '')
+  const measured = /"measured_at"\s*:\s*"([^"]+)"/.exec(reading.result_excerpt ?? '')?.[1] ?? null
+  if (measured === null) return `judged on ${value}, which carries no measured time`
+  const action = before.find((s) => s.kind === 'action')
+  const actionAt = action?.at ?? null
+  if (actionAt === null) return `judged on ${value}, with no action to compare its time to`
+  const deltaMs = Date.parse(measured) - Date.parse(actionAt)
+  if (Number.isNaN(deltaMs)) return `judged on ${value}`
+  const seconds = String(Math.round(Math.abs(deltaMs) / 1000))
+  return `judged on ${value} measured ${seconds} s ${deltaMs < 0 ? 'BEFORE' : 'after'} the action`
+}
+
 /** One cause as a ranking carried it. `confidence` is null where none was sent. */
 export interface RankedCause {
   name: string
@@ -889,6 +1027,75 @@ export function confidenceTrend(steps: AgentRunStepRecord[]): ConfidencePoint[] 
       if (top === undefined || top.confidence === null) return []
       return [{ seq: report.seq, at: report.at, confidence: top.confidence, name: top.name }]
     })
+}
+
+// ── the action a run took, for the briefing card (WO-R3-354 item 2) ─────────
+
+/** The one action a run sent, as the briefing card names it. */
+export interface ActionTaken {
+  tool: string
+  /** `key=value` pairs without the idempotency key; null where there are none. */
+  argumentsSummary: string | null
+  /** The platform's `accepted` answer; null before the action step is in or when it is absent. */
+  accepted: boolean | null
+  at: string | null
+}
+
+function argumentsSummary(args: Record<string, unknown> | null | undefined): string | null {
+  const pairs = Object.entries(args ?? {})
+    .filter(([key]) => key !== 'idempotency_key')
+    .map(([key, value]) => `${key}=${typeof value === 'string' ? value : JSON.stringify(value)}`)
+  return pairs.length === 0 ? null : pairs.join(', ')
+}
+
+/**
+ * The newest action step's tool, arguments and `accepted`, or the plan's action while the
+ * step is not in yet; null for a run that neither planned nor acted.
+ */
+export function actionTaken(run: AgentRun | null, steps: AgentRunStepRecord[]): ActionTaken | null {
+  const step = [...steps].filter((s) => s.kind === 'action').sort((a, b) => b.seq - a.seq)[0]
+  const plan = run?.plan ?? null
+  if (step !== undefined) {
+    const excerpt = step.result_excerpt ?? ''
+    const flag = boolField(excerptObject(excerpt), 'accepted')
+    const text = /"accepted"\s*:\s*(true|false)/.exec(excerpt)?.[1]
+    return {
+      tool: step.tool ?? plan?.action_tool ?? 'no tool reported',
+      argumentsSummary: argumentsSummary(step.arguments ?? plan?.action_arguments),
+      accepted: flag ?? (text === undefined ? null : text === 'true'),
+      at: step.at,
+    }
+  }
+  if (plan === null) return null
+  return {
+    tool: plan.action_tool,
+    argumentsSummary: argumentsSummary(plan.action_arguments),
+    accepted: null,
+    at: null,
+  }
+}
+
+// ── which answers belong to the selected run (WO-R3-354 item 3) ────────────
+
+/**
+ * The step lists and cursor the page may merge for `runId`, from the two polls that carry them.
+ *
+ * A poll keeps its last answer while the next is in flight, so right after a run switch both
+ * still hold the PREVIOUS run's steps. Merged by `seq`, the rehearsal's steps 7 and 8 outlived
+ * the switch on the seventh take: "ranked 01:25:24" on a 01:52 run, and a DLQ read in its ledger.
+ */
+export function stepAnswersForRun(
+  runId: string,
+  detail: AgentRun | null,
+  tail: AgentRunStepsResponse | null,
+): { steps: AgentRunStepRecord[]; cursor: number | null; dropped: number } {
+  const ownDetail = detail !== null && detail.id === runId ? detail : null
+  const ownTail = tail !== null && tail.run_id === runId ? tail : null
+  return {
+    steps: [...(ownDetail?.steps ?? []), ...(ownTail?.steps ?? [])],
+    cursor: ownTail?.next_after_seq ?? null,
+    dropped: ownTail?.steps_dropped ?? ownDetail?.steps_dropped ?? 0,
+  }
 }
 
 // ── what the run decided about one dead-letter row ───────────────────────────
