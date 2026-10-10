@@ -9,6 +9,15 @@ requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.111.0",
     "uvicorn[standard]>=0.29.0",
+    # The <2.1 cap is load-bearing (WO-R3-352, 2026-10-10). Typing is not the
+    # blocker: with the mypy plugin removed, mypy --strict is clean on 2.0.54
+    # and on 2.1.4 alike. Tracing is. opentelemetry-instrumentation-sqlalchemy
+    # (0.66b1, the newest release) only instruments sqlalchemy <2.1.0; on 2.1
+    # it logs an error and does nothing, so every process silently loses its
+    # database spans (test_mcp_observability.py fails). Lift the cap — and drop
+    # the sqlalchemy[mypy] extra and the [tool.mypy] plugin with it, since 2.1
+    # removed sqlalchemy.ext.mypy — once the instrumentation supports 2.1
+    # (open-telemetry/opentelemetry-python-contrib #5118 / PR #5120).
     "sqlalchemy[asyncio]>=2.0.0,<2.1",
     "asyncpg>=0.29.0",
     "alembic>=1.13.0",
