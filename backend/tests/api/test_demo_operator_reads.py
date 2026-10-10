@@ -375,7 +375,8 @@ async def test_consumer_lag_reports_every_group_with_the_live_one_named(
     ).json()
 
     assert body["live_group"] == LIVE_REFRESHED_GROUP
-    assert body["total"] == len(body["groups"]) == 8
+    # 8 → 9 with WO-R3-371: `dependency-resolver` is measured beside the dispatcher.
+    assert body["total"] == len(body["groups"]) == 9
     by_name = {g["consumer_group"]: g for g in body["groups"]}
     live = by_name[LIVE_REFRESHED_GROUP]
     assert live["lag"] == 42

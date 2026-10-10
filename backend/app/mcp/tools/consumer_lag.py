@@ -1,9 +1,10 @@
 """
 `get_consumer_lag` — the Redis-cached Kafka consumer lag from `kafka:consumer_lag:`.
-Unknown groups return `lag: null`. Three things the description says out loud, since
-the agent cannot read this file: unknown is not zero (`lag_known`), only
-`worker-dispatcher`'s number moves (`source`), and one call carries the trend via
-`measured_at` + `recent_samples` (R2-17, WO-R3-254). Requires `telemetry:read`.
+Unknown groups return `lag: null`. Four things the description says out loud, since
+the agent cannot read this file: unknown is not zero (`lag_known`), only the two
+measured groups' numbers move (`source`), one call carries the trend via
+`measured_at` + `recent_samples` (R2-17, WO-R3-254), and a flat lag is not a live
+consumer — `last_poll_at` is (WO-R3-371, ADR 0041). Requires `telemetry:read`.
 
 The reading itself moved to `app/core/consumer_lag.py` (WO-R3-312) so the operator
 console reports the same number from the same arithmetic; this module is the agent's
@@ -15,6 +16,7 @@ from datetime import datetime
 from app.core.consumer_lag import (
     LAG_SAMPLES_AGENT_CAP,
     LIVE_REFRESHED_GROUP,
+    LIVE_REFRESHED_GROUPS,
     SEEDED_CONSUMER_GROUPS,
     STATIC_LAG_GROUPS,
     LagSource,
@@ -46,7 +48,7 @@ class GetConsumerLagInput(BaseModel):
         default=LIVE_REFRESHED_GROUP,
         description=(
             "Kafka consumer group to inspect. Continuously refreshed "
-            f"group: {LIVE_REFRESHED_GROUP}. Groups reported from a "
+            "groups: " + ", ".join(LIVE_REFRESHED_GROUPS) + ". Groups reported from a "
             "recorded constant: "
             + ", ".join(STATIC_LAG_GROUPS)
             + ". Any other name is accepted and returns lag: null with "
@@ -124,9 +126,28 @@ class GetConsumerLagOutput(BaseModel):
         "Comparing them is how to tell "
         "a climbing lag from a flat one without waiting. Empty for a "
         "group reporting a recorded constant (nothing measures it), and "
-        "empty for the continuously-refreshed group when no window has "
+        "empty for a continuously-refreshed group when no window has "
         "been recorded yet — an empty list is absence of history, never "
         "evidence the lag is steady.",
+    )
+    last_poll_at: datetime | None = Field(
+        default=None,
+        description="When this group's consumer last asked Kafka for "
+        "messages — ISO-8601, UTC, the worker's clock. A running consumer "
+        "asks every few seconds whether or not there is anything to read, "
+        "so this is the liveness reading: lag alone cannot show a stopped "
+        "consumer behind a quiet topic. `null` for a group reporting a "
+        "recorded constant (nothing polls it) and whenever the platform "
+        "holds no poll time for the group — unknown, never evidence either "
+        "way.",
+    )
+    last_poll_age_seconds: int | None = Field(
+        default=None,
+        description="How long ago `last_poll_at` was, in whole seconds. "
+        "`null` exactly when `last_poll_at` is null. On a consuming group it "
+        "is never more than a few seconds above `age_seconds`; well above "
+        "it — and growing call after call — means the consumer had stopped "
+        "asking for messages before the platform last measured.",
     )
 
 
@@ -135,13 +156,14 @@ class GetConsumerLagOutput(BaseModel):
     description=(
         "Read the last-emitted Kafka consumer lag for one of the "
         "platform's consumer groups. Known consumer groups: "
-        "worker-dispatcher, billing-consumer, orders-consumer, "
-        "notifications-consumer, analytics-consumer, payments-consumer, "
-        "shipping-consumer, healthy-consumer.\n"
+        "worker-dispatcher, dependency-resolver, billing-consumer, "
+        "orders-consumer, notifications-consumer, analytics-consumer, "
+        "payments-consumer, shipping-consumer, healthy-consumer.\n"
         "FRESHNESS: cached in Redis, never a live Kafka query, and the "
         "refresh behaviour differs per group — read `source` on the "
         "response before reasoning about change over time.\n"
-        "  - `worker-dispatcher` (source: live) is re-measured by a "
+        "  - `worker-dispatcher` and `dependency-resolver` (source: live) "
+        "are re-measured by a "
         "background pass whose interval is deployment-configured, and "
         "cached under a TTL of a few passes. THE INTERVAL IS NOT A "
         "NUMBER YOU CAN ASSUME: read `age_seconds` for how old the "
@@ -150,9 +172,15 @@ class GetConsumerLagOutput(BaseModel):
         "single reading is up to one interval stale in either direction "
         "— after a fault begins the cached value catches up within about "
         "one interval, and after a recovery it can keep reading the old "
-        "high value for a fraction of one. This is the only group whose "
-        "lag moves, and so the only one where watching lag grow or drain "
-        "is a valid way to observe a change.\n"
+        "high value for a fraction of one. These are the only two groups "
+        "whose lag moves, and so the only ones where watching lag grow or "
+        "drain is a valid way to observe a change. `worker-dispatcher` "
+        "consumes submitted jobs and runs them. `dependency-resolver` "
+        "consumes job completions and moves a waiting job whose parent "
+        "jobs have all completed on to run; its lag grows only while "
+        "completions are arriving, so on a quiet platform it reads flat "
+        "whether or not anything is consuming — see IS ANYTHING CONSUMING "
+        "below.\n"
         "  - The other seven (source: static) report a recorded "
         "constant that nothing refreshes. Re-reading one after an "
         "action returns the same number — that is the expected "
@@ -178,7 +206,7 @@ class GetConsumerLagOutput(BaseModel):
         "reporting a recorded constant, `measured_at` and `age_seconds` "
         "are null and `recent_samples` is empty: a constant was never "
         "measured at a moment, so it has no time and no history. "
-        "`recent_samples` can also be empty for worker-dispatcher when "
+        "`recent_samples` can also be empty for a live group when "
         "nothing has been recorded yet — an empty list is missing "
         "history, not a flat line.\n"
         "A STALLED CONSUMER STILL REPORTS LAG. A consumer that has "
@@ -186,6 +214,18 @@ class GetConsumerLagOutput(BaseModel):
         "goes on reporting its real and climbing lag rather than going "
         "null — rising lag is the expected signal of a stall, not "
         "absence of data.\n"
+        "IS ANYTHING CONSUMING? Lag says how far behind a group is, not "
+        "whether anything is reading it. On the two live groups "
+        "`last_poll_at` is when the group's consumer last asked Kafka for "
+        "messages, which a running consumer does every few seconds even "
+        "with nothing to read, and `last_poll_age_seconds` is how long ago "
+        "that was. On a consuming group `last_poll_age_seconds` is never "
+        "more than a few seconds above `age_seconds`. Well above it, and "
+        "growing call after call, means the consumer had stopped asking "
+        "before the platform last measured: it is not consuming, whatever "
+        "the lag reads — including a lag of 0. Both are null on the seven "
+        "static groups, and null when the platform holds no poll time, "
+        "which is unknown rather than evidence either way.\n"
         "UNKNOWN IS NOT ZERO. `lag_known: false` with `lag: null` means "
         "the platform could not determine lag (nothing recorded for the "
         "group, unknown group, consumer not started, no partition "
@@ -197,10 +237,10 @@ class GetConsumerLagOutput(BaseModel):
         "`source: static` with `lag_known: false` means a value that "
         "should be recorded for this group is absent — an environment "
         "problem to report, not a fault to diagnose.\n"
-        "Neither a number nor a null proves liveness. Consumer-group "
-        "membership is the authoritative check — a group holds its "
-        "assignment and keeps reporting accurate lag for minutes after "
-        "its consumer stops, without being evicted."
+        "Neither a lag number nor a null proves liveness — a group holds "
+        "its assignment and keeps reporting accurate lag for minutes after "
+        "its consumer stops, without being evicted. `last_poll_at` is the "
+        "liveness reading."
     ),
     input_model=GetConsumerLagInput,
     output_model=GetConsumerLagOutput,
@@ -226,6 +266,8 @@ async def get_consumer_lag(
             LagSample(lag=s.lag, measured_at=s.measured_at)
             for s in reading.recent_samples[:LAG_SAMPLES_AGENT_CAP]
         ],
+        last_poll_at=reading.last_poll_at,
+        last_poll_age_seconds=reading.last_poll_age_seconds,
     )
 
 
@@ -233,6 +275,7 @@ __all__ = [
     "LAG_SAMPLES_AGENT_CAP",
     "STATIC_LAG_GROUPS",
     "LIVE_REFRESHED_GROUP",
+    "LIVE_REFRESHED_GROUPS",
     "SEEDED_CONSUMER_GROUPS",
     "GetConsumerLagInput",
     "GetConsumerLagOutput",

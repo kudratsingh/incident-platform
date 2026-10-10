@@ -7,6 +7,7 @@ relay's advisory-lock gate (ADR 0020), and before the work. Fails open; needs `C
 """
 
 from enum import StrEnum
+from typing import Any
 
 from app.config import get_settings
 from app.core.logging import get_logger
@@ -120,11 +121,32 @@ async def loop_is_paused(loop_name: ControlLoopName) -> bool:
     return paused
 
 
+async def loop_pause_state(redis: Any, loop_name: ControlLoopName) -> tuple[bool, int | None]:
+    """`(paused, seconds until the pause lifts)` for one loop — the READER's half (ADR 0041).
+
+    The same predicate `loop_is_paused` decides on, so the reading cannot claim a pause the loop
+    is not honouring: the key counts only under `CHAOS_ENABLED`, and without it nothing is read.
+    The one deliberate difference is failure. The loop fails open, because a lost check must not
+    stop work; a reader that failed open would report "not paused" about a pause it could not
+    see, so this raises and the caller says unknown. Seconds is None for a key with no expiry.
+    """
+    if not get_settings().chaos_enabled:
+        return False, None
+    ttl = int(await redis.ttl(pause_key_for(loop_name)))
+    # redis-py: -2 = absent, -1 = present with no expiry.
+    if ttl == -2:
+        return False, None
+    if ttl == -1:
+        return True, None
+    return True, ttl
+
+
 __all__ = [
     "LOOP_FUNCTIONS",
     "TICK_INTERVAL_SECONDS",
     "ControlLoopName",
     "loop_is_paused",
+    "loop_pause_state",
     "pause_key_for",
     "tick_interval_seconds",
 ]

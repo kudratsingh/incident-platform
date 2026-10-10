@@ -19,20 +19,23 @@ from app.config import get_settings
 from app.core import metrics
 from app.core.circuit_breaker import record_registered_breakers
 from app.core.consumer_lag import (
-    LAG_SAMPLES_TTL as _LAG_SAMPLES_TTL,
-)
-from app.core.consumer_lag import (
+    DEPENDENCY_RESOLVER_GROUP,
     LIVE_REFRESHED_GROUP,
-    lag_query_timeout_seconds,
+    lag_key,
     lag_value_ttl_seconds,
     metrics_interval_seconds,
     record_lag_sample,
+    record_last_poll,
+)
+from app.core.consumer_lag import (
+    LAG_SAMPLES_TTL as _LAG_SAMPLES_TTL,
 )
 from app.core.consumer_lag import (
     samples_key as _samples_key,
 )
 from app.core.leader_lock import OUTBOX_RELAY_LOCK_KEY, advisory_leader_lock
 from app.core.logging import get_logger, job_id_var, trace_id_var
+from app.core.loop_heartbeat import record_loop_run
 from app.core.outbox_heartbeat import record_relay_tick
 from app.core.tracing import extract_context, get_tracer
 from app.models.enums import TERMINAL_JOB_STATUSES, JobStatus, JobType
@@ -711,47 +714,6 @@ class JobDispatcherConsumer(BaseKafkaConsumer):
                     extra_data={"error": error, "reason": "dispatcher_escape"},
                 )
 
-    async def consumer_lag(self) -> int | None:
-        """Sum of (log_end_offset - committed_offset) across all assigned partitions.
-
-        Returns `None`, never 0, when unknown (not started, restarting, no assignment, query failed
-        or slower than `lag_query_timeout_seconds`): a fabricated 0 reads as healthy. ADR 0040.
-        """
-        consumer = self._consumer
-        if consumer is None or self.restarting:
-            return None
-        timeout = lag_query_timeout_seconds()
-        try:
-            assignment = consumer.assignment()
-            if not assignment:
-                return None
-            # Bounded: a client stopped mid-query hung this pass for its 40-s request timeout.
-            return await asyncio.wait_for(
-                _sum_partition_lag(consumer, assignment), timeout=timeout
-            )
-        except TimeoutError:
-            logger.warning(
-                "consumer_lag query timed out", extra={"timeout_seconds": timeout}
-            )
-            return None
-        except Exception as exc:
-            logger.warning("consumer_lag query failed", extra={"error": str(exc)})
-            return None
-
-
-async def _sum_partition_lag(consumer: Any, assignment: Any) -> int:
-    """Sum of log-end minus committed offset; a partition never committed counts in full."""
-    end_offsets = await consumer.end_offsets(list(assignment))
-    lag = 0
-    for tp in assignment:
-        committed = await consumer.committed(tp)
-        end = end_offsets.get(tp, 0)
-        if committed is None:
-            lag += int(end)
-        else:
-            lag += max(0, int(end) - int(committed))
-    return lag
-
 
 def _job_submitted_payload(job: Job) -> dict[str, Any]:
     """The canonical `job.submitted` outbox payload for a job row.
@@ -872,6 +834,9 @@ async def _promote_delayed_loop(
             # (`workers/control_loop_pause.py`).
             if not await loop_is_paused(ControlLoopName.DELAYED_RETRY_PROMOTE):
                 await _promote_delayed_once(session_factory, redis)
+                # After the work, inside the unpaused branch: a paused loop keeps turning, and
+                # a stamp on every turn would report it running (ADR 0041). Never raises.
+                await record_loop_run(ControlLoopName.DELAYED_RETRY_PROMOTE)
         except asyncio.CancelledError:
             break
         except Exception as exc:
@@ -1011,6 +976,7 @@ async def _resume_unblocked_waiting_loop(
                 cursor = await _resume_unblocked_waiting_once(
                     session_factory, redis, cursor
                 )
+                await record_loop_run(ControlLoopName.RESUME_UNBLOCKED_WAITING)
         except asyncio.CancelledError:
             break
         except Exception as exc:
@@ -1101,6 +1067,7 @@ async def _requeue_stale_pending_loop(
         try:
             if not await loop_is_paused(ControlLoopName.STALE_PENDING_BACKSTOP):
                 await _requeue_stale_pending_once(session_factory, redis)
+                await record_loop_run(ControlLoopName.STALE_PENDING_BACKSTOP)
         except asyncio.CancelledError:
             break
         except Exception as exc:
@@ -1329,6 +1296,7 @@ async def _renew_running_leases_loop(
                     dispatcher,
                     settings.stale_running_threshold_seconds,
                 )
+                await record_loop_run(ControlLoopName.LEASE_RENEWAL)
         except asyncio.CancelledError:
             break
         except Exception as exc:
@@ -1356,6 +1324,7 @@ async def _stale_running_sweep_loop(
                     dispatcher,
                     settings.stale_running_threshold_seconds,
                 )
+                await record_loop_run(ControlLoopName.STALE_RUNNING_SWEEP)
         except asyncio.CancelledError:
             break
         except Exception as exc:
@@ -1476,6 +1445,7 @@ async def _promote_dlq_replay_loop(
         try:
             if not await loop_is_paused(ControlLoopName.DLQ_REPLAY_PROMOTE):
                 await _promote_dlq_replay_once(session_factory, redis)
+                await record_loop_run(ControlLoopName.DLQ_REPLAY_PROMOTE)
         except asyncio.CancelledError:
             break
         except Exception as exc:
@@ -1703,12 +1673,14 @@ async def _digest_loop(session_factory: async_sessionmaker[AsyncSession]) -> Non
             # (`control_loop_pause.tick_interval_seconds`).
             if await loop_is_paused(ControlLoopName.DIGEST):
                 continue
-            if not incident_digest.is_enabled():
-                continue
-            written = await incident_digest.run_digest_for_all_active_tenants(
-                session_factory
-            )
-            logger.info("digest batch finished", extra={"written": written})
+            # A pass with the feature off is still a pass: the loop came round, looked, and had
+            # nothing to do — the relay's idle pass, not a stopped loop (ADR 0041).
+            if incident_digest.is_enabled():
+                written = await incident_digest.run_digest_for_all_active_tenants(
+                    session_factory
+                )
+                logger.info("digest batch finished", extra={"written": written})
+            await record_loop_run(ControlLoopName.DIGEST)
         except asyncio.CancelledError:
             break
         except Exception as exc:
@@ -1746,6 +1718,7 @@ async def _slo_evaluation_loop(
             if await loop_is_paused(ControlLoopName.SLO_EVALUATION):
                 continue
             created = await slo.run_evaluation(session_factory)
+            await record_loop_run(ControlLoopName.SLO_EVALUATION)
             if created:
                 logger.warning(
                     "SLO evaluation raised fast-burn alerts",
@@ -1776,6 +1749,7 @@ async def _idempotency_reaper_loop(
             async with session_factory() as session:
                 async with session.begin():
                     reaped = await IdempotencyRepository(session).delete_expired()
+            await record_loop_run(ControlLoopName.IDEMPOTENCY_REAPER)
             if reaped:
                 logger.info(
                     "idempotency reaper deleted expired records",
@@ -1793,6 +1767,7 @@ async def _metrics_loop(
     redis: Any,
     consumer: JobDispatcherConsumer,
     session_factory: async_sessionmaker[AsyncSession],
+    resolver: BaseKafkaConsumer | None = None,
 ) -> None:
     """Emit queue/in-flight/consumer-lag gauges on the configured metrics interval.
 
@@ -1807,6 +1782,12 @@ async def _metrics_loop(
     Since WO-R3-338 the platform's own alert rules run on this same tick, right after the
     measurement they read (ADR 0039). Same clock on purpose: a rule evaluating between two
     measurements can only re-read the number it already saw.
+
+    Since WO-R3-371 the pass also measures the dependency resolver when `worker_loop` hands it
+    in, and publishes when each measured consumer last polled (ADR 0041). The resolver's reading
+    is written exactly like the dispatcher's — value key, dated sample, same TTLs — minus the
+    CloudWatch gauge (`ConsumerLag` keeps meaning the dispatcher) and minus paging (the rule
+    reads `PAGED_LAG_GROUPS`).
     """
     while True:
         try:
@@ -1814,7 +1795,14 @@ async def _metrics_loop(
             if await loop_is_paused(ControlLoopName.METRICS):
                 continue
             delayed = await queue.delayed_length(redis)
-            lag = await consumer.consumer_lag()
+            # Both offset queries at once: each is bounded at half a pass (ADR 0040), and two in
+            # a row could cost a whole one. `consumer_lag()` never raises.
+            if resolver is not None:
+                lag, resolver_lag = await asyncio.gather(
+                    consumer.consumer_lag(), resolver.consumer_lag()
+                )
+            else:
+                lag, resolver_lag = await consumer.consumer_lag(), None
             await metrics.emit_gauge("QueueDepth", float(delayed))
             await metrics.emit_gauge("InFlightJobs", float(len(consumer.in_flight)))
             # `lag is None` means unknown (not started, no assignment, query
@@ -1835,16 +1823,54 @@ async def _metrics_loop(
                         "consumer lag sample not recorded",
                         extra={"error": str(exc)},
                     )
+            if resolver_lag is not None:
+                await _record_group_lag(redis, DEPENDENCY_RESOLVER_GROUP, resolver_lag)
+            await _publish_last_poll(redis, LIVE_REFRESHED_GROUP, consumer)
+            if resolver is not None:
+                await _publish_last_poll(redis, DEPENDENCY_RESOLVER_GROUP, resolver)
             # Last, and in its own handler: the rules read what this pass just recorded,
             # and a rule that fails must cost neither the gauges nor the next pass.
             try:
                 await alert_rules.evaluate_alert_rules(session_factory, redis)
             except Exception as exc:
                 logger.error("alert rule pass failed", extra={"error": str(exc)})
+            await record_loop_run(ControlLoopName.METRICS)
         except asyncio.CancelledError:
             break
         except Exception as exc:
             logger.error("metrics loop error", extra={"error": str(exc)})
+
+
+async def _record_group_lag(redis: Any, group: str, lag: int) -> None:
+    """A measured group other than the dispatcher: the same value key and window, best effort.
+
+    Best effort where the dispatcher's value write is not, because nothing gates on this
+    group's number — it is a reading for the agent and the console, never an admission check.
+    """
+    try:
+        await redis.set(lag_key(group), lag, ex=lag_value_ttl_seconds())
+        await record_lag_sample(redis, lag, group=group)
+    except Exception as exc:
+        logger.warning(
+            "consumer lag not recorded", extra={"group": group, "error": str(exc)}
+        )
+
+
+async def _publish_last_poll(redis: Any, group: str, consumer: Any) -> None:
+    """Publish when `consumer` last polled — every pass, whether or not its lag was measurable.
+
+    Only a real time is published: a consumer that has never polled leaves the record to expire
+    into "unknown" rather than being dated now (ADR 0041).
+    """
+    polled_at = getattr(consumer, "last_poll_at", None)
+    if not isinstance(polled_at, datetime):
+        return
+    try:
+        await record_last_poll(redis, polled_at, group=group)
+    except Exception as exc:
+        logger.warning(
+            "consumer poll time not recorded", extra={"group": group, "error": str(exc)}
+        )
 
 
 _SUPERVISOR_POLL_SECONDS = 2.0
@@ -1990,7 +2016,9 @@ async def worker_loop(
                 _requeue_stale_pending_loop(session_factory, redis)
             ),
             asyncio.create_task(_outbox_relay_loop(session_factory)),
-            asyncio.create_task(_metrics_loop(redis, dispatcher, session_factory)),
+            asyncio.create_task(
+                _metrics_loop(redis, dispatcher, session_factory, dep_resolver)
+            ),
             asyncio.create_task(_digest_loop(session_factory)),
             asyncio.create_task(_idempotency_reaper_loop(session_factory)),
             asyncio.create_task(

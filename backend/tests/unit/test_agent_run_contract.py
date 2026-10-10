@@ -114,7 +114,8 @@ def test_the_tool_surface_grows_by_exactly_two() -> None:
     assert sorted(t.name for t in list_tools() if t.is_commander) == (
         COMMANDER_TOOLS_AFTER
     )
-    assert len(list_tools()) == 25, sorted(t.name for t in list_tools())
+    # 25 → 26 with WO-R3-371's `get_control_loops`, a read tool (ADR 0041).
+    assert len(list_tools()) == 26, sorted(t.name for t in list_tools())
 
 
 def test_the_read_tier_does_not_grow() -> None:
@@ -125,7 +126,8 @@ def test_the_read_tier_does_not_grow() -> None:
         if t.required_scope in {Scope.TELEMETRY_READ, Scope.INCIDENTS_READ}
     )
 
-    assert len(read) == 16, read
+    # 16 → 17 with WO-R3-371's `get_control_loops`; still none of this packet's two.
+    assert len(read) == 17, read
     for name in COMMANDER_TOOLS_AFTER:
         assert name not in read
 
@@ -163,7 +165,8 @@ def test_nothing_existing_moves() -> None:
         if not t.is_commander
     }
 
-    assert len(unchanged) == 23
+    # 23 → 24 with WO-R3-371's `get_control_loops` (ADR 0041).
+    assert len(unchanged) == 24
     assert "report_agent_run" not in unchanged
     # The read tier's scopes are what a re-pin compares first.
     assert unchanged["get_consumer_lag"] == ("telemetry:read", False, False)

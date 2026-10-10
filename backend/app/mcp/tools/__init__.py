@@ -10,6 +10,7 @@ from app.mcp.tools import (  # noqa: F401
     circuit_breakers,
     commander_runs,
     consumer_lag,
+    control_loops,
     dag_state,
     deploy_history,
     health,
