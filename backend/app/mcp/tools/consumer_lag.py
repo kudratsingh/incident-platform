@@ -4,7 +4,8 @@ Unknown groups return `lag: null`. Four things the description says out loud, si
 the agent cannot read this file: unknown is not zero (`lag_known`), only the two
 measured groups' numbers move (`source`), one call carries the trend via
 `measured_at` + `recent_samples` (R2-17, WO-R3-254), and a flat lag is not a live
-consumer — `last_poll_at` is (WO-R3-371, ADR 0041). Requires `telemetry:read`.
+consumer — `polling` is, the platform's verdict drawn from `last_poll_at` (WO-R3-371,
+then WO-R3-373 when the bare number was misread; ADR 0041). Requires `telemetry:read`.
 
 The reading itself moved to `app/core/consumer_lag.py` (WO-R3-312) so the operator
 console reports the same number from the same arithmetic; this module is the agent's
@@ -17,6 +18,7 @@ from app.core.consumer_lag import (
     LAG_SAMPLES_AGENT_CAP,
     LIVE_REFRESHED_GROUP,
     LIVE_REFRESHED_GROUPS,
+    POLLING_INTERVALS,
     SEEDED_CONSUMER_GROUPS,
     STATIC_LAG_GROUPS,
     LagSource,
@@ -134,20 +136,40 @@ class GetConsumerLagOutput(BaseModel):
         default=None,
         description="When this group's consumer last asked Kafka for "
         "messages — ISO-8601, UTC, the worker's clock. A running consumer "
-        "asks every few seconds whether or not there is anything to read, "
-        "so this is the liveness reading: lag alone cannot show a stopped "
-        "consumer behind a quiet topic. `null` for a group reporting a "
-        "recorded constant (nothing polls it) and whenever the platform "
-        "holds no poll time for the group — unknown, never evidence either "
-        "way.",
+        "asks every couple of seconds whether or not there is anything to "
+        "read; `polling` is the verdict drawn from this time. `null` for a "
+        "group reporting a recorded constant (nothing polls it) and whenever "
+        "the platform holds no poll time for the group — unknown, never "
+        "evidence either way.",
     )
     last_poll_age_seconds: int | None = Field(
         default=None,
-        description="How long ago `last_poll_at` was, in whole seconds. "
-        "`null` exactly when `last_poll_at` is null. On a consuming group it "
-        "is never more than a few seconds above `age_seconds`; well above "
-        "it — and growing call after call — means the consumer had stopped "
-        "asking for messages before the platform last measured.",
+        description="How long ago `last_poll_at` was, in whole seconds — "
+        "the number behind `polling`. `null` exactly when `last_poll_at` is "
+        "null.",
+    )
+    polling: bool | None = Field(
+        default=None,
+        description="Whether this group's consumer is asking Kafka for "
+        "messages — the platform's verdict, so read this rather than "
+        "comparing ages yourself. `true`: when the platform last measured, "
+        "the consumer had polled within the last "
+        f"{POLLING_INTERVALS} poll intervals (`poll_interval_seconds`). "
+        "`false`: it had not — the consumer has stopped (dead, crashed or "
+        "wedged), whatever `lag` reads, a lag of 0 included. `null`: the "
+        "platform holds no poll time for this group (a group reporting a "
+        "recorded constant, an unknown group, or nothing recorded yet) — "
+        "unknown, never evidence either way.",
+    )
+    poll_interval_seconds: float | None = Field(
+        default=None,
+        description="How often a running consumer of this group asks Kafka "
+        "for messages, at the longest — one request is cut off after this "
+        "many seconds and the next follows once its batch is handled, sooner "
+        "when messages are waiting. A fixed property of the platform's "
+        "consumer, the same on every deployment. `polling` turns false once "
+        f"the last poll is more than {POLLING_INTERVALS} of these old. `null` "
+        "for a group reporting a recorded constant and for an unknown group.",
     )
 
 
@@ -160,87 +182,53 @@ class GetConsumerLagOutput(BaseModel):
         "orders-consumer, notifications-consumer, analytics-consumer, "
         "payments-consumer, shipping-consumer, healthy-consumer.\n"
         "FRESHNESS: cached in Redis, never a live Kafka query, and the "
-        "refresh behaviour differs per group — read `source` on the "
-        "response before reasoning about change over time.\n"
+        "refresh behaviour differs per group — read `source` before "
+        "reasoning about change over time.\n"
         "  - `worker-dispatcher` and `dependency-resolver` (source: live) "
-        "are re-measured by a "
-        "background pass whose interval is deployment-configured, and "
-        "cached under a TTL of a few passes. THE INTERVAL IS NOT A "
-        "NUMBER YOU CAN ASSUME: read `age_seconds` for how old the "
-        "reading in front of you is, and the gaps between "
-        "`recent_samples` for how often this deployment measures. Any "
-        "single reading is up to one interval stale in either direction "
-        "— after a fault begins the cached value catches up within about "
-        "one interval, and after a recovery it can keep reading the old "
-        "high value for a fraction of one. These are the only two groups "
-        "whose lag moves, and so the only ones where watching lag grow or "
-        "drain is a valid way to observe a change. `worker-dispatcher` "
-        "consumes submitted jobs and runs them. `dependency-resolver` "
-        "consumes job completions and moves a waiting job whose parent "
-        "jobs have all completed on to run; its lag grows only while "
-        "completions are arriving, so on a quiet platform it reads flat "
-        "whether or not anything is consuming — see IS ANYTHING CONSUMING "
-        "below.\n"
-        "  - The other seven (source: static) report a recorded "
-        "constant that nothing refreshes. Re-reading one after an "
-        "action returns the same number — that is the expected "
-        "behaviour, not evidence the action failed, and lag on these "
-        "groups will never be seen to grow.\n"
-        "ONE CALL SHOWS THE TREND. Every response carries `measured_at` "
-        "(when this number was measured), `age_seconds` (how old it is), "
-        "and `recent_samples` — the measurements recorded over the last "
-        f"15 minutes, newest first, at most {LAG_SAMPLES_AGENT_CAP} of "
-        "them, each with its own time, the current "
-        "one included. Compare those "
-        "samples to decide whether lag is climbing, draining or flat. "
-        "That comparison is the evidence; a second call is not, because "
-        "a new measurement exists only once a pass has taken one. Two "
-        "calls inside one interval therefore return the SAME number with "
-        "the SAME `measured_at`, and that repetition means 'not "
-        "re-measured yet', never 'not moving' — reading sooner cannot "
-        "show change that has not been measured. If you need a genuinely "
-        "newer number than the one in front of you, it exists once "
-        "`age_seconds` exceeds the gap between the newest two samples; "
-        "until then this response already "
-        "contains every reading the platform has. On the seven groups "
-        "reporting a recorded constant, `measured_at` and `age_seconds` "
-        "are null and `recent_samples` is empty: a constant was never "
-        "measured at a moment, so it has no time and no history. "
-        "`recent_samples` can also be empty for a live group when "
-        "nothing has been recorded yet — an empty list is missing "
-        "history, not a flat line.\n"
-        "A STALLED CONSUMER STILL REPORTS LAG. A consumer that has "
-        "stopped processing keeps its Kafka assignment, so this metric "
-        "goes on reporting its real and climbing lag rather than going "
-        "null — rising lag is the expected signal of a stall, not "
-        "absence of data.\n"
-        "IS ANYTHING CONSUMING? Lag says how far behind a group is, not "
-        "whether anything is reading it. On the two live groups "
-        "`last_poll_at` is when the group's consumer last asked Kafka for "
-        "messages, which a running consumer does every few seconds even "
-        "with nothing to read, and `last_poll_age_seconds` is how long ago "
-        "that was. On a consuming group `last_poll_age_seconds` is never "
-        "more than a few seconds above `age_seconds`. Well above it, and "
-        "growing call after call, means the consumer had stopped asking "
-        "before the platform last measured: it is not consuming, whatever "
-        "the lag reads — including a lag of 0. Both are null on the seven "
-        "static groups, and null when the platform holds no poll time, "
-        "which is unknown rather than evidence either way.\n"
-        "UNKNOWN IS NOT ZERO. `lag_known: false` with `lag: null` means "
-        "the platform could not determine lag (nothing recorded for the "
-        "group, unknown group, consumer not started, no partition "
-        "assignment, or the query errored). It is deliberately not "
-        "reported as 0, because "
-        "a fabricated 0 would read as healthy. A measured `lag: 0` with "
-        "`lag_known: true` is the opposite finding — the group is "
-        "caught up. Never treat a null as a zero.\n"
-        "`source: static` with `lag_known: false` means a value that "
-        "should be recorded for this group is absent — an environment "
-        "problem to report, not a fault to diagnose.\n"
-        "Neither a lag number nor a null proves liveness — a group holds "
-        "its assignment and keeps reporting accurate lag for minutes after "
-        "its consumer stops, without being evicted. `last_poll_at` is the "
-        "liveness reading."
+        "are re-measured by a background pass whose interval is "
+        "deployment-configured, and cached under a TTL of a few passes. "
+        "THE INTERVAL IS NOT A NUMBER YOU CAN ASSUME: `age_seconds` says how "
+        "old this reading is, and the gaps between `recent_samples` how often "
+        "this deployment measures. A reading can trail a change by up to one "
+        "interval in either direction. These are the only two groups whose "
+        "lag moves. `worker-dispatcher` consumes submitted jobs and runs "
+        "them. `dependency-resolver` consumes job completions and moves a "
+        "waiting job whose parent jobs have all completed on to run; on a "
+        "quiet platform its lag reads flat whether or not anything is "
+        "consuming.\n"
+        "  - The other seven (source: static) report a recorded constant "
+        "that nothing refreshes. Re-reading one after an action returns the "
+        "same number — expected, not evidence the action failed — and their "
+        "lag will never be seen to grow.\n"
+        "ONE CALL SHOWS THE TREND. `recent_samples` holds the measurements of "
+        f"the last 15 minutes, newest first, at most {LAG_SAMPLES_AGENT_CAP} "
+        "of them, each with its own time, the current one included: compare "
+        "them to decide whether lag is climbing, draining or flat. A second "
+        "call is not more evidence: two calls inside one interval return the "
+        "SAME number and `measured_at`, which means 'not re-measured yet', "
+        "never 'not moving'; a newer number exists once `age_seconds` "
+        "exceeds the gap between the newest two samples. On the static "
+        "groups `measured_at` and `age_seconds` are null and "
+        "`recent_samples` is empty (a constant was never measured at a "
+        "moment); on a live group an empty list is missing history, not a "
+        "flat line.\n"
+        "IS IT CONSUMING? Read `polling`: a dead consumer reads `polling: "
+        "false` while `lag`, `lag_known`, `source` and `age_seconds` can all "
+        "still look healthy (a lag of 0 included), and "
+        "`last_poll_age_seconds` is the number behind that verdict. A stopped "
+        "consumer keeps its Kafka assignment for minutes, so its lag goes on "
+        "reporting — and climbs while work arrives — rather than going null; "
+        "neither a lag nor a null proves a consumer is alive. `polling: null` "
+        "(the static groups, or no poll time recorded) is unknown, never "
+        "evidence either way.\n"
+        "UNKNOWN IS NOT ZERO. `lag_known: false` with `lag: null` means the "
+        "platform could not determine lag (nothing recorded, unknown group, "
+        "consumer not started, no partition assignment, or the query "
+        "errored); it is never reported as 0, because a fabricated 0 would "
+        "read as healthy. A measured `lag: 0` with `lag_known: true` is the "
+        "opposite finding — the group is caught up. `source: static` with "
+        "`lag_known: false` is an environment problem to report, not a fault "
+        "to diagnose."
     ),
     input_model=GetConsumerLagInput,
     output_model=GetConsumerLagOutput,
@@ -268,6 +256,8 @@ async def get_consumer_lag(
         ],
         last_poll_at=reading.last_poll_at,
         last_poll_age_seconds=reading.last_poll_age_seconds,
+        polling=reading.polling,
+        poll_interval_seconds=reading.poll_interval_seconds,
     )
 
 

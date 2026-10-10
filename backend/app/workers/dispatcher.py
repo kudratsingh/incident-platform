@@ -1860,13 +1860,17 @@ async def _publish_last_poll(redis: Any, group: str, consumer: Any) -> None:
     """Publish when `consumer` last polled — every pass, whether or not its lag was measurable.
 
     Only a real time is published: a consumer that has never polled leaves the record to expire
-    into "unknown" rather than being dated now (ADR 0041).
+    into "unknown" rather than being dated now (ADR 0041). The moment this pass read the stamp is
+    recorded beside it, from the same clock, because `get_consumer_lag`'s `polling` verdict is
+    decided from the gap between the two (WO-R3-373) — not from how old the record is when
+    someone reads it.
     """
     polled_at = getattr(consumer, "last_poll_at", None)
     if not isinstance(polled_at, datetime):
         return
+    observed_at = datetime.now(UTC)
     try:
-        await record_last_poll(redis, polled_at, group=group)
+        await record_last_poll(redis, polled_at, group=group, observed_at=observed_at)
     except Exception as exc:
         logger.warning(
             "consumer poll time not recorded", extra={"group": group, "error": str(exc)}

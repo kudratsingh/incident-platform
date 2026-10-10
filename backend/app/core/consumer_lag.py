@@ -26,6 +26,11 @@ Since WO-R3-371 two groups are measured, not one: `dependency-resolver` joined
 `worker-dispatcher` (ADR 0041), and each measured group also carries the time its consumer
 last polled, because a lag can be flat and fresh on a consumer that has stopped reading.
 
+Since WO-R3-373 the platform also says what that time MEANS: `polling`, decided here in
+`polling_verdict` from the poll time and the moment the metrics pass looked at it, against
+the poll loop's own cadence (`POLL_INTERVAL_SECONDS`, which the loop reads from here too).
+A number the reader had to threshold was misread once (INC-008 addendum); a verdict is not.
+
 Nothing here decides what `unknown` means for a caller. It reports what it found —
 including that it found nothing — and the surfaces say so in their own words.
 """
@@ -139,8 +144,37 @@ SEEDED_CONSUMER_GROUPS = LIVE_REFRESHED_GROUPS + STATIC_LAG_GROUPS
 # Lag says how far behind a group is, not whether anything is reading: a dead resolver behind
 # a quiet `job.completed` topic reads the same flat lag as a healthy one. The consumer keeps
 # the time in memory on every poll (no I/O in its poll loop) and the metrics pass publishes
-# it here, every pass, whether or not the lag itself was measurable.
+# it here, every pass, whether or not the lag itself was measurable. Since WO-R3-373 the
+# record also carries when the pass looked (`observed_at`), so the verdict below is decided
+# on the clock that stamped the poll rather than on whichever process reads it later.
 LAST_POLL_SUFFIX = ":last_poll"
+
+# The poll loop's own timing (`BaseKafkaConsumer.run`), here rather than in the worker so the
+# loop and the verdict read ONE set of numbers — core imports no worker; the worker imports
+# these. Every consumer group runs that loop unmodified, the two measured ones included.
+#
+# One fetch waits this long for messages when there are none, so an idle consumer asks again
+# about twice a second.
+POLL_FETCH_WAIT_SECONDS = 0.5
+# …and is cut off at this, however Kafka behaves, so a running consumer never goes longer than
+# this between asks on the fetch alone.
+POLL_FETCH_BOUND_SECONDS = 2.0
+# The pause after a batch whose handler failed, or after a loop error, before the next ask.
+POLL_RETRY_PAUSE_SECONDS = 1.0
+
+# `poll_interval_seconds` on the wire: the cadence a running consumer of a measured group asks
+# Kafka at, at its longest — the fetch bound. A fixed property of the platform's consumer, not
+# of a deployment, so it is the same number on every stack (unlike the metrics pass interval).
+POLL_INTERVAL_SECONDS = POLL_FETCH_BOUND_SECONDS
+
+# N: how many poll intervals may pass since the last poll before `polling` reads false
+# (WO-R3-373, ADR 0041 amendment). Chosen from the loop's own jitter: a running consumer's gap
+# between asks is ~0.5 s idle and at most the fetch bound plus the retry pause (3 s) plus the
+# time to handle one batch of ten. Five intervals is 10 s — more than three times that worst
+# healthy gap, so a running group cannot cross the line on jitter — while a stopped consumer
+# crosses it within 10 s of its last poll, plus at most one pass for the platform to look.
+# The INC-008 reading it exists for was 36 s past its last poll at the look.
+POLLING_INTERVALS = 5
 
 LagSource = Literal["live", "static", "unrecognized"]
 
@@ -211,6 +245,37 @@ def source_for(group: str) -> LagSource:
     return "unrecognized"
 
 
+def poll_interval_seconds(group: str) -> float | None:
+    """The cadence `group`'s consumer polls at, or None where nothing polls.
+
+    Only a measured group has a consumer the platform watches; a recorded constant and an
+    unknown name have none, so they carry no cadence and can carry no verdict.
+    """
+    return POLL_INTERVAL_SECONDS if group in LIVE_REFRESHED_GROUPS else None
+
+
+def polling_verdict(
+    last_poll_at: datetime | None,
+    observed_at: datetime | None,
+    interval_seconds: float | None,
+) -> bool | None:
+    """Was the consumer polling when the platform looked? The one place this is decided.
+
+    True when the consumer's last poll was no more than `POLLING_INTERVALS` intervals before the
+    look, False when it was longer ago, None when any input is unknown — unknown is not evidence.
+
+    Measured at the LOOK, not against the reader's clock. The platform's default pass runs every
+    60 s, so a healthy consumer's poll can be a minute old by the time a reading is taken, and a
+    read-time age would flap it to false between passes; and if the pass itself stops, the
+    record expires into unknown (three passes) rather than making a live consumer look dead.
+    Both times come from the worker's own clock, so no cross-process skew enters the gap.
+    """
+    if last_poll_at is None or observed_at is None or interval_seconds is None:
+        return None
+    gap = max(0.0, (observed_at - last_poll_at).total_seconds())
+    return gap <= POLLING_INTERVALS * interval_seconds
+
+
 @dataclass(frozen=True)
 class LagSampleReading:
     """One past measurement of a group's lag."""
@@ -240,6 +305,11 @@ class LagReading:
     # it) and whenever no readable poll time is on record — unknown, never a guess.
     last_poll_at: datetime | None = None
     last_poll_age_seconds: int | None = None
+    # The verdict drawn from that time (`polling_verdict`) and the cadence it was drawn against
+    # (`poll_interval_seconds`). The cadence is known for every measured group; the verdict only
+    # when the pass recorded both the poll and when it looked (WO-R3-373).
+    polling: bool | None = None
+    poll_interval_seconds: float | None = None
 
 
 def parse_lag(raw: Any) -> int | None:
@@ -339,17 +409,50 @@ async def record_lag_sample(
     await redis.set(key, json.dumps(samples), ex=LAG_SAMPLES_TTL)
 
 
-async def record_last_poll(redis: Any, polled_at: datetime, *, group: str) -> None:
-    """Publish when `group`'s consumer last polled. Written by the metrics pass every pass.
+async def record_last_poll(
+    redis: Any,
+    polled_at: datetime,
+    *,
+    group: str,
+    observed_at: datetime | None = None,
+) -> None:
+    """Publish when `group`'s consumer last polled, and when the pass looked. Every pass.
+
+    One JSON record, `{"last_poll_at", "observed_at"}`, so the two times the verdict is decided
+    from are written together and can never come from different passes. `observed_at` defaults
+    to now; the metrics pass passes the instant it read the consumer's stamp.
 
     Fresh-or-absent, like the value key and for the mirror-image reason: if the pass itself
     stops, an old poll time left readable would make a live consumer look dead, so the record
     lives three passes and then reads as unknown.
     """
-    stamp = (
-        polled_at if polled_at.tzinfo is not None else polled_at.replace(tzinfo=UTC)
-    ).isoformat()
-    await redis.set(last_poll_key(group), stamp, ex=lag_value_ttl_seconds())
+    record = {
+        "last_poll_at": _utc(polled_at).isoformat(),
+        "observed_at": _utc(observed_at or datetime.now(UTC)).isoformat(),
+    }
+    await redis.set(last_poll_key(group), json.dumps(record), ex=lag_value_ttl_seconds())
+
+
+def parse_last_poll(raw: Any) -> tuple[datetime | None, datetime | None]:
+    """Decode a poll record into `(last_poll_at, observed_at)`; unknown halves are None.
+
+    Accepts the bare ISO time v0.6.24 wrote (a worker mid-upgrade can leave one for up to three
+    passes): that record carries the poll time but not when it was observed, so it yields the
+    fact and no verdict — never a guessed look time.
+    """
+    text = _text(raw)
+    if not isinstance(text, str):
+        return None, None
+    try:
+        loaded = json.loads(text)
+    except ValueError:
+        return parse_measured_at(text), None
+    if not isinstance(loaded, dict):
+        return None, None
+    return (
+        parse_measured_at(loaded.get("last_poll_at")),
+        parse_measured_at(loaded.get("observed_at")),
+    )
 
 
 async def read_lag(redis: Any, group: str) -> LagReading:
@@ -363,9 +466,11 @@ async def read_lag(redis: Any, group: str) -> LagReading:
     # for a constant, so nothing reads one either.
     samples: tuple[LagSampleReading, ...] = ()
     last_poll_at: datetime | None = None
+    observed_at: datetime | None = None
     if source == "live":
         samples = parse_samples(await redis.get(samples_key(group)))
-        last_poll_at = parse_measured_at(_text(await redis.get(last_poll_key(group))))
+        last_poll_at, observed_at = parse_last_poll(await redis.get(last_poll_key(group)))
+    interval = poll_interval_seconds(group)
 
     # The newest sample dates the current reading only if it IS that reading. The loop
     # writes the value then the window, so a read between the two sees a number with no
@@ -397,6 +502,8 @@ async def read_lag(redis: Any, group: str) -> LagReading:
             if last_poll_at is not None
             else None
         ),
+        polling=polling_verdict(last_poll_at, observed_at, interval),
+        poll_interval_seconds=interval,
     )
 
 
@@ -405,6 +512,11 @@ def _text(raw: Any) -> Any:
     if isinstance(raw, bytes | bytearray):
         return raw.decode(errors="replace")
     return raw
+
+
+def _utc(at: datetime) -> datetime:
+    """A naive stamp means a writer dropped the offset; the clock is UTC everywhere."""
+    return at if at.tzinfo is not None else at.replace(tzinfo=UTC)
 
 
 __all__ = [
@@ -423,6 +535,11 @@ __all__ = [
     "MIN_LAG_VALUE_TTL_SECONDS",
     "MIN_METRICS_INTERVAL_SECONDS",
     "PAGED_LAG_GROUPS",
+    "POLLING_INTERVALS",
+    "POLL_FETCH_BOUND_SECONDS",
+    "POLL_FETCH_WAIT_SECONDS",
+    "POLL_INTERVAL_SECONDS",
+    "POLL_RETRY_PAUSE_SECONDS",
     "SEEDED_CONSUMER_GROUPS",
     "STATIC_LAG_GROUPS",
     "LagReading",
@@ -435,8 +552,11 @@ __all__ = [
     "last_poll_key",
     "metrics_interval_seconds",
     "parse_lag",
+    "parse_last_poll",
     "parse_measured_at",
     "parse_samples",
+    "poll_interval_seconds",
+    "polling_verdict",
     "read_lag",
     "record_lag_sample",
     "record_last_poll",

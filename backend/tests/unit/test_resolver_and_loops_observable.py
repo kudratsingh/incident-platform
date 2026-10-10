@@ -322,12 +322,18 @@ async def test_an_unreadable_poll_time_is_unknown_not_a_guess() -> None:
 
 
 async def test_the_poll_writer_dates_in_utc_and_lives_three_passes() -> None:
+    """Since WO-R3-373 the record is `{"last_poll_at", "observed_at"}` — the poll time and when
+    the pass looked at it, written together — still in UTC, still three passes."""
     redis = _RedisStub()
     at = datetime(2026, 10, 10, 7, 0, 0, tzinfo=UTC)
+    looked = at + timedelta(seconds=4)
 
-    await record_last_poll(redis, at, group=DEPENDENCY_RESOLVER_GROUP)
+    await record_last_poll(redis, at, group=DEPENDENCY_RESOLVER_GROUP, observed_at=looked)
 
-    assert redis.store[last_poll_key(DEPENDENCY_RESOLVER_GROUP)] == at.isoformat()
+    assert json.loads(redis.store[last_poll_key(DEPENDENCY_RESOLVER_GROUP)]) == {
+        "last_poll_at": at.isoformat(),
+        "observed_at": looked.isoformat(),
+    }
     assert redis.ttls[last_poll_key(DEPENDENCY_RESOLVER_GROUP)] == lag_value_ttl_seconds()
     assert last_poll_key(DEPENDENCY_RESOLVER_GROUP).startswith("kafka:consumer_lag:")
 

@@ -138,6 +138,9 @@ CONSUMER_LAG_OUTPUT_FIELDS = {
     # WO-R3-371 (ADR 0041): when the group's consumer last polled. Additive.
     "last_poll_at",
     "last_poll_age_seconds",
+    # WO-R3-373 (ADR 0041 amendment): the verdict drawn from it, and the cadence. Additive.
+    "polling",
+    "poll_interval_seconds",
 }
 
 

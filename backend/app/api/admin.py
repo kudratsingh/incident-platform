@@ -887,7 +887,8 @@ async def admin_consumer_lag(
     """Every consumer group the platform tracks, in one reading.
 
     The same arithmetic the agent's `get_consumer_lag` uses (`app/core/consumer_lag.py`),
-    so the console and the agent cannot disagree about whether a lag is known. Unlike
+    so the console and the agent cannot disagree about whether a lag is known — or, since
+    WO-R3-373, about whether a measured group's consumer is polling. Unlike
     that tool this takes no group argument: an operator watching a queue drain wants
     every group at once. Not tenant-scoped, and it says so — consumer groups are
     platform-wide.
@@ -908,6 +909,10 @@ async def admin_consumer_lag(
                     ConsumerLagSampleResponse(lag=s.lag, measured_at=s.measured_at)
                     for s in reading.recent_samples
                 ],
+                last_poll_at=reading.last_poll_at,
+                last_poll_age_seconds=reading.last_poll_age_seconds,
+                polling=reading.polling,
+                poll_interval_seconds=reading.poll_interval_seconds,
             )
         )
     return ConsumerLagResponse(

@@ -235,6 +235,81 @@ async def test_the_description_lists_the_resolver_and_says_how_to_read_a_poll(  
     )
 
 
+# 1b. WO-R3-373: the reading says whether the consumer is alive — `polling`, a verdict
+
+
+async def test_over_the_wire_a_killed_resolver_reads_polling_false(  # type: ignore[no-untyped-def]
+    mcp, db_session: AsyncSession, default_tenant
+) -> None:
+    """The INC-008 addendum's reading — lag 0, known, live, fresh — now carries its verdict, so
+    nothing is left for the reader to threshold against a cadence nobody told it."""
+    ac, redis = mcp
+    await _stranded_world(redis)
+    token = await _token(db_session, default_tenant.id, AGENT_SCOPES)
+
+    reading = _content(
+        await _call(ac, token, "get_consumer_lag", {"consumer_group": "dependency-resolver"})
+    )
+
+    assert (reading["lag"], reading["lag_known"], reading["source"]) == (0, True, "live")
+    assert reading["polling"] is False
+    assert reading["poll_interval_seconds"] == 2.0
+    assert reading["last_poll_age_seconds"] >= 140
+    assert "chaos" not in json.dumps(reading).lower()
+
+
+async def test_over_the_wire_a_running_resolver_reads_polling_true(  # type: ignore[no-untyped-def]
+    mcp, db_session: AsyncSession, default_tenant
+) -> None:
+    ac, redis = mcp
+    await _resolver_world(redis, polled_seconds_ago=1)
+    token = await _token(db_session, default_tenant.id, [Scope.TELEMETRY_READ.value])
+
+    reading = _content(
+        await _call(ac, token, "get_consumer_lag", {"consumer_group": "dependency-resolver"})
+    )
+
+    assert reading["polling"] is True
+    assert reading["poll_interval_seconds"] == 2.0
+
+
+async def test_over_the_wire_a_static_group_reads_polling_null(  # type: ignore[no-untyped-def]
+    mcp, db_session: AsyncSession, default_tenant
+) -> None:
+    """Nothing polls a recorded constant: unknown, which is not the same as false."""
+    ac, redis = mcp
+    await redis.set(lag_key("billing-consumer"), 15000)
+    token = await _token(db_session, default_tenant.id, [Scope.TELEMETRY_READ.value])
+
+    reading = _content(
+        await _call(ac, token, "get_consumer_lag", {"consumer_group": "billing-consumer"})
+    )
+
+    assert reading["source"] == "static"
+    assert reading["polling"] is None
+    assert reading["poll_interval_seconds"] is None
+
+
+async def test_tools_list_carries_the_verdict_and_says_it_in_one_sentence(  # type: ignore[no-untyped-def]
+    mcp, db_session: AsyncSession, default_tenant
+) -> None:
+    ac, _ = mcp
+    token = await _token(db_session, default_tenant.id, [Scope.TELEMETRY_READ.value])
+    resp = await ac.post(
+        "/mcp",
+        json={"jsonrpc": "2.0", "id": "1", "method": "tools/list", "params": {}},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    lag = {t["name"]: t for t in resp.json()["result"]["tools"]}["get_consumer_lag"]
+
+    assert {"polling", "poll_interval_seconds"} <= set(lag["outputSchema"]["properties"])
+    assert (
+        "a dead consumer reads `polling: false` while `lag`, `lag_known`, `source` and "
+        "`age_seconds` can all still look healthy (a lag of 0 included), and "
+        "`last_poll_age_seconds` is the number behind that verdict."
+    ) in lag["description"]
+
+
 # 2. `get_control_loops` reads the worker's loops
 
 

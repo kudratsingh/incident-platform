@@ -17,7 +17,13 @@ from typing import Any
 import pytest
 import pytest_asyncio
 from app.core.breaker_state import breaker_key_for
-from app.core.consumer_lag import LIVE_REFRESHED_GROUP, lag_key, samples_key
+from app.core.consumer_lag import (
+    DEPENDENCY_RESOLVER_GROUP,
+    LIVE_REFRESHED_GROUP,
+    lag_key,
+    record_last_poll,
+    samples_key,
+)
 from app.core.security import create_access_token, hash_password
 from app.dependencies import get_db, get_redis
 from app.main import create_app
@@ -453,6 +459,91 @@ async def test_the_console_and_the_agent_read_one_number(
         tool.lag_known,
         tool.source,
     )
+
+
+async def test_consumer_lag_says_whether_each_measured_consumer_is_polling(
+    app_client: AsyncClient,
+    db_session: AsyncSession,
+    default_tenant,
+    redis_stub: _RedisStub,
+) -> None:
+    """WO-R3-373: the operator's reading carries the verdict the agent's does — `polling` and
+    the cadence it was judged against, with the poll time and its age behind them (the REST
+    twin lacked the poll fields since WO-R3-371). Unknown stays null, never false."""
+    support = await _user(db_session, default_tenant.id, UserRole.SUPPORT)
+    now = datetime.now(UTC)
+    await record_last_poll(
+        redis_stub,  # type: ignore[arg-type]
+        now - timedelta(seconds=1),
+        group=LIVE_REFRESHED_GROUP,
+        observed_at=now,
+    )
+    await record_last_poll(
+        redis_stub,  # type: ignore[arg-type]
+        now - timedelta(seconds=40),
+        group=DEPENDENCY_RESOLVER_GROUP,
+        observed_at=now,
+    )
+    redis_stub.store[lag_key("billing-consumer")] = "7"
+
+    body = (
+        await app_client.get("/api/v1/admin/consumer-lag", headers=_headers(support))
+    ).json()
+
+    by_name = {g["consumer_group"]: g for g in body["groups"]}
+    dispatcher = by_name[LIVE_REFRESHED_GROUP]
+    assert dispatcher["polling"] is True
+    assert dispatcher["poll_interval_seconds"] == 2.0
+    assert dispatcher["last_poll_age_seconds"] <= 2
+    resolver = by_name[DEPENDENCY_RESOLVER_GROUP]
+    assert resolver["polling"] is False
+    assert resolver["last_poll_at"] is not None
+    assert resolver["last_poll_age_seconds"] >= 40
+    static = by_name["billing-consumer"]
+    assert (static["polling"], static["poll_interval_seconds"]) == (None, None)
+    assert (static["last_poll_at"], static["last_poll_age_seconds"]) == (None, None)
+
+
+async def test_the_console_and_the_agent_read_one_verdict(
+    app_client: AsyncClient,
+    db_session: AsyncSession,
+    default_tenant,
+    redis_stub: _RedisStub,
+) -> None:
+    """Both surfaces take `polling` from `app/core/consumer_lag.read_lag` — one place."""
+    from app.dependencies import Principal
+    from app.mcp.registry import ToolContext
+    from app.mcp.tools.consumer_lag import GetConsumerLagInput, get_consumer_lag
+
+    support = await _user(db_session, default_tenant.id, UserRole.SUPPORT)
+    now = datetime.now(UTC)
+    await record_last_poll(
+        redis_stub,  # type: ignore[arg-type]
+        now - timedelta(seconds=30),
+        group=DEPENDENCY_RESOLVER_GROUP,
+        observed_at=now,
+    )
+
+    rest = (
+        await app_client.get("/api/v1/admin/consumer-lag", headers=_headers(support))
+    ).json()
+    tool = await get_consumer_lag(
+        GetConsumerLagInput(consumer_group=DEPENDENCY_RESOLVER_GROUP),
+        ToolContext(
+            db=db_session,
+            redis=redis_stub,  # type: ignore[arg-type]
+            principal=Principal(kind="user", tenant_id=default_tenant.id),
+        ),
+    )
+
+    resolver = next(
+        g for g in rest["groups"] if g["consumer_group"] == DEPENDENCY_RESOLVER_GROUP
+    )
+    assert (resolver["polling"], resolver["poll_interval_seconds"]) == (
+        tool.polling,
+        tool.poll_interval_seconds,
+    )
+    assert tool.polling is False
 
 
 # --------------------------------------------------------------------------
