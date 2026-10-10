@@ -160,7 +160,9 @@ Producer-side validation in `publish_raw` catches schema violations *before* the
 
 `kafka:consumer_lag:worker-dispatcher` in Redis is the cached lag value from the dispatcher consumer's `consumer_lag()` method, under a TTL of three metrics passes. The metrics loop emits it once per pass, and the pass interval is `METRICS_LOOP_INTERVAL_SECONDS` — 60s by default, 5s in the demo stack (WO-R3-338, owner decision O-35), with the TTL derived from it rather than fixed; the backpressure check in `POST /jobs` reads it without ever round-tripping to Kafka. Threshold: `Settings.backpressure_lag_threshold` (default 1000); above that, the API returns 503 with `BackpressureError`.
 
-For lag on the other 7 consumer groups, use Redpanda Console or `rpk group describe <group>`.
+Since WO-R3-371 the same pass also measures `dependency-resolver` and writes `kafka:consumer_lag:dependency-resolver` the same way, with the same TTL — for the agent's `get_consumer_lag` and the operator's `GET /admin/consumer-lag`, not for backpressure and not for paging ([ADR 0041](ADR/0041-the-stuck-chains-cause-is-readable.md)). Both measured groups also publish when their consumer last polled (`kafka:consumer_lag:<group>:last_poll`), because the resolver consumes `job.completed` and on a quiet platform its lag is flat whether or not it is running: a killed resolver shows up as a poll time that stops moving, not as lag.
+
+For lag on the other 6 consumer groups, use Redpanda Console or `rpk group describe <group>`.
 
 ### Pause + resume a consumer group
 

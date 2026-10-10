@@ -18,7 +18,7 @@ One line per document, so you can find the right one without opening five.
 
 | Document | What it answers |
 |---|---|
-| [ADR/](ADR/) | Why the platform looks the way it does. [ADR/README.md](ADR/README.md) indexes all 26 with their statuses and which ones later amended which |
+| [ADR/](ADR/) | Why the platform looks the way it does. [ADR/README.md](ADR/README.md) indexes all 41 with their statuses and which ones later amended which |
 
 ## History — read as a record, not as current state
 
