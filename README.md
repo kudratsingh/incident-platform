@@ -153,6 +153,7 @@ All LLM features use `messages.parse()` with Pydantic schemas, `claude-opus-4-7`
 
 - Docker & Docker Compose
 - Python 3.12+
+- [uv](https://docs.astral.sh/uv/) — installs the dependency versions pinned in `uv.lock`
 - Node.js 18+
 
 ### Start infrastructure
@@ -166,9 +167,11 @@ Redpanda is a Kafka-API-compatible broker on `localhost:9092`. Redpanda Console 
 ### Backend
 
 ```bash
-python -m venv .venv
+# Installs exactly the versions in uv.lock — the same set CI tests — into .venv.
+# (`pip install -e ".[dev]"` still works, but it resolves the newest release of
+# everything, which is not what CI ran.)
+uv sync --extra dev
 source .venv/bin/activate
-pip install -e ".[dev]"
 
 # Run migrations (from the repo root — alembic.ini lives here, and the
 # alembic CLI does not search parent directories, so `cd backend` cannot
