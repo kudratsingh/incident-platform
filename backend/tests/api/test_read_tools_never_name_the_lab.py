@@ -302,6 +302,7 @@ _ARGUMENTS: dict[str, dict[str, Any]] = {
     "get_cache_key_info": {"key": "{cache_key}"},
     "get_circuit_breakers": {},
     "get_consumer_lag": {"consumer_group": "worker-dispatcher"},
+    "get_control_loops": {},
     "get_dag_state": {"job_id": str(_DLQ_JOB_ID)},
     "get_deploy_history": {},
     "get_incident": {"id": str(_ALERT_ID)},

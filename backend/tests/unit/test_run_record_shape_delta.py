@@ -135,6 +135,9 @@ CONSUMER_LAG_OUTPUT_FIELDS = {
     "measured_at",
     "age_seconds",
     "recent_samples",
+    # WO-R3-371 (ADR 0041): when the group's consumer last polled. Additive.
+    "last_poll_at",
+    "last_poll_age_seconds",
 }
 
 
@@ -176,14 +179,15 @@ def test_the_surface_does_not_grow() -> None:
         "report_agent_briefing",
         "report_agent_run",
     ]
-    assert len(list_tools()) == 25, sorted(t.name for t in list_tools())
+    # 25 → 26 with WO-R3-371's `get_control_loops` (ADR 0041).
+    assert len(list_tools()) == 26, sorted(t.name for t in list_tools())
 
     read = sorted(
         t.name
         for t in list_tools()
         if t.required_scope in {Scope.TELEMETRY_READ, Scope.INCIDENTS_READ}
     )
-    assert len(read) == 16, read
+    assert len(read) == 17, read
 
 
 def test_the_shape_deltas_are_exactly_these() -> None:

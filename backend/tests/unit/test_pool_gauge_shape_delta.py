@@ -63,6 +63,8 @@ READ_TIER_AFTER = [
     "get_cache_key_info",
     "get_circuit_breakers",
     "get_consumer_lag",
+    # WO-R3-371 (ADR 0041): the worker's background loops, read-scoped.
+    "get_control_loops",
     "get_dag_state",
     "get_deploy_history",
     "get_incident",
@@ -99,7 +101,8 @@ def test_the_surface_does_not_grow() -> None:
     )
 
     assert read == READ_TIER_AFTER
-    assert len(list_tools()) == 25, sorted(t.name for t in list_tools())
+    # 25 → 26 with WO-R3-371's `get_control_loops` (ADR 0041), listed above.
+    assert len(list_tools()) == 26, sorted(t.name for t in list_tools())
 
 
 def test_the_shape_deltas_are_exactly_these() -> None:

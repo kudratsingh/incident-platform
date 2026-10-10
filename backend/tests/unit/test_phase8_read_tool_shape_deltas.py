@@ -23,6 +23,8 @@ READ_TIER_AFTER = [
     "get_cache_key_info",
     "get_circuit_breakers",
     "get_consumer_lag",
+    # WO-R3-371 (ADR 0041): the worker's background loops, read-scoped.
+    "get_control_loops",
     "get_dag_state",
     "get_deploy_history",
     "get_incident",
@@ -128,8 +130,9 @@ def test_the_read_tier_grows_by_exactly_two() -> None:
 
     assert read == READ_TIER_AFTER
     # 23 → 25 with WO-R3-312's two `agent_runs:write` tools, which are not reads and so
-    # leave the list above alone (ADR 0035).
-    assert len(list_tools()) == 25, sorted(t.name for t in list_tools())
+    # leave the list above alone (ADR 0035). 25 → 26 with WO-R3-371's `get_control_loops`,
+    # which is a read and so is in the list (ADR 0041).
+    assert len(list_tools()) == 26, sorted(t.name for t in list_tools())
 
 
 def test_neither_new_tool_takes_an_argument() -> None:

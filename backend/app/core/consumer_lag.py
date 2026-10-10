@@ -22,6 +22,10 @@ many samples fifteen minutes of history holds. One module owns all three, becaus
 that no longer exceeded the interval would blank `check_backpressure`'s reading on a
 healthy stack and nothing would say why.
 
+Since WO-R3-371 two groups are measured, not one: `dependency-resolver` joined
+`worker-dispatcher` (ADR 0041), and each measured group also carries the time its consumer
+last polled, because a lag can be flat and fresh on a consumer that has stopped reading.
+
 Nothing here decides what `unknown` means for a caller. It reports what it found —
 including that it found nothing — and the surfaces say so in their own words.
 """
@@ -45,7 +49,7 @@ CONSUMER_LAG_KEY_PREFIX = "kafka:consumer_lag:"
 
 # The metrics loop's timestamped window, beside the value key because
 # `check_backpressure` fixes that shape. One window per group, keyed by group, though
-# only the continuously-refreshed group has a writer.
+# only the measured groups (`LIVE_REFRESHED_GROUPS`) have a writer.
 LAG_SAMPLES_SUFFIX = ":samples"
 
 # How much history the window holds (WO-R3-328). Fifteen minutes because that is the span
@@ -94,8 +98,23 @@ MIN_LAG_VALUE_TTL_SECONDS = 15
 # Unbounded, a query on a consumer the supervisor was restarting waited out the 40-s client timeout.
 LAG_QUERY_TIMEOUT_CAP_SECONDS = 2.0
 
-# The one group genuinely refreshed: every ~60s, 90s TTL, so its number moves.
+# The dispatcher's group: the one `check_backpressure` gates on, the one the operator's chart
+# draws, and the one the platform pages on. Measured by the metrics pass, so its number moves.
 LIVE_REFRESHED_GROUP = "worker-dispatcher"
+
+# The dependency resolver's group, measured by the same pass since WO-R3-371 (ADR 0041). A
+# stranded chain is a dead resolver OR a stopped coordinator, and until this group had a reading
+# nothing the agent could call told the two apart (INC-008). Must equal
+# `settings.kafka_consumer_group_dependency`, which is the group the consumer actually joins.
+DEPENDENCY_RESOLVER_GROUP = "dependency-resolver"
+
+# Every group whose lag is a measurement rather than a recorded constant: `source: live`.
+LIVE_REFRESHED_GROUPS: tuple[str, ...] = (LIVE_REFRESHED_GROUP, DEPENDENCY_RESOLVER_GROUP)
+
+# The groups the `consumer_stalled` rule pages on (ADR 0039). Measured is not paged: the
+# resolver's normal lag is zero and a burst of completions after a recovery can spike it for
+# a pass, so paging on it is its own decision with its own threshold (ADR 0041).
+PAGED_LAG_GROUPS: tuple[str, ...] = (LIVE_REFRESHED_GROUP,)
 
 # Groups whose lag is a recorded constant, from
 # `seed_eval_fixtures._seed_consumer_lag`. Nothing refreshes them, so the value
@@ -112,8 +131,16 @@ STATIC_LAG_GROUPS = (
 )
 
 # Advertised in the tool's input description so `tools/list` gives a menu, and the set
-# the console's own listing walks. A name outside it returns `lag: null`.
-SEEDED_CONSUMER_GROUPS = (LIVE_REFRESHED_GROUP,) + STATIC_LAG_GROUPS
+# the console's own listing walks. A name outside it returns `lag: null`. (The name predates
+# the resolver joining: it is "every group the platform reports on", measured or recorded.)
+SEEDED_CONSUMER_GROUPS = LIVE_REFRESHED_GROUPS + STATIC_LAG_GROUPS
+
+# When a measured group's consumer last asked Kafka for messages, beside its lag (WO-R3-371).
+# Lag says how far behind a group is, not whether anything is reading: a dead resolver behind
+# a quiet `job.completed` topic reads the same flat lag as a healthy one. The consumer keeps
+# the time in memory on every poll (no I/O in its poll loop) and the metrics pass publishes
+# it here, every pass, whether or not the lag itself was measurable.
+LAST_POLL_SUFFIX = ":last_poll"
 
 LagSource = Literal["live", "static", "unrecognized"]
 
@@ -172,8 +199,12 @@ def samples_key(group: str) -> str:
     return f"{lag_key(group)}{LAG_SAMPLES_SUFFIX}"
 
 
+def last_poll_key(group: str) -> str:
+    return f"{lag_key(group)}{LAST_POLL_SUFFIX}"
+
+
 def source_for(group: str) -> LagSource:
-    if group == LIVE_REFRESHED_GROUP:
+    if group in LIVE_REFRESHED_GROUPS:
         return "live"
     if group in STATIC_LAG_GROUPS:
         return "static"
@@ -204,6 +235,11 @@ class LagReading:
     measured_at: datetime | None
     age_seconds: int | None
     recent_samples: tuple[LagSampleReading, ...]
+    # When the group's consumer last polled, as the metrics pass last published it, and how
+    # long ago that is on the reader's clock. Both null for a recorded constant (nothing polls
+    # it) and whenever no readable poll time is on record — unknown, never a guess.
+    last_poll_at: datetime | None = None
+    last_poll_age_seconds: int | None = None
 
 
 def parse_lag(raw: Any) -> int | None:
@@ -303,6 +339,19 @@ async def record_lag_sample(
     await redis.set(key, json.dumps(samples), ex=LAG_SAMPLES_TTL)
 
 
+async def record_last_poll(redis: Any, polled_at: datetime, *, group: str) -> None:
+    """Publish when `group`'s consumer last polled. Written by the metrics pass every pass.
+
+    Fresh-or-absent, like the value key and for the mirror-image reason: if the pass itself
+    stops, an old poll time left readable would make a live consumer look dead, so the record
+    lives three passes and then reads as unknown.
+    """
+    stamp = (
+        polled_at if polled_at.tzinfo is not None else polled_at.replace(tzinfo=UTC)
+    ).isoformat()
+    await redis.set(last_poll_key(group), stamp, ex=lag_value_ttl_seconds())
+
+
 async def read_lag(redis: Any, group: str) -> LagReading:
     """The current reading for one group. Never raises on missing data; an absent
     value is reported as unknown rather than as zero."""
@@ -310,11 +359,13 @@ async def read_lag(redis: Any, group: str) -> LagReading:
     lag = parse_lag(await redis.get(key))
     source = source_for(group)
 
-    # Only the continuously-refreshed group has a recorded window; nothing writes one
+    # Only a measured group has a recorded window and a poll time; nothing writes either
     # for a constant, so nothing reads one either.
     samples: tuple[LagSampleReading, ...] = ()
+    last_poll_at: datetime | None = None
     if source == "live":
         samples = parse_samples(await redis.get(samples_key(group)))
+        last_poll_at = parse_measured_at(_text(await redis.get(last_poll_key(group))))
 
     # The newest sample dates the current reading only if it IS that reading. The loop
     # writes the value then the window, so a read between the two sees a number with no
@@ -324,8 +375,9 @@ async def read_lag(redis: Any, group: str) -> LagReading:
         if samples and lag is not None and samples[0].lag == lag
         else None
     )
+    now = datetime.now(UTC)
     age_seconds = (
-        max(0, int((datetime.now(UTC) - measured_at).total_seconds()))
+        max(0, int((now - measured_at).total_seconds()))
         if measured_at is not None
         else None
     )
@@ -339,11 +391,26 @@ async def read_lag(redis: Any, group: str) -> LagReading:
         measured_at=measured_at,
         age_seconds=age_seconds,
         recent_samples=samples,
+        last_poll_at=last_poll_at,
+        last_poll_age_seconds=(
+            max(0, int((now - last_poll_at).total_seconds()))
+            if last_poll_at is not None
+            else None
+        ),
     )
+
+
+def _text(raw: Any) -> Any:
+    """A Redis value as text when it is bytes; anything else unchanged for the parser to judge."""
+    if isinstance(raw, bytes | bytearray):
+        return raw.decode(errors="replace")
+    return raw
 
 
 __all__ = [
     "CONSUMER_LAG_KEY_PREFIX",
+    "DEPENDENCY_RESOLVER_GROUP",
+    "LAST_POLL_SUFFIX",
     "LAG_QUERY_TIMEOUT_CAP_SECONDS",
     "LAG_SAMPLES_AGENT_CAP",
     "LAG_SAMPLES_MAX_ENTRIES",
@@ -352,8 +419,10 @@ __all__ = [
     "LAG_SAMPLES_WINDOW_SECONDS",
     "LAG_VALUE_TTL_INTERVALS",
     "LIVE_REFRESHED_GROUP",
+    "LIVE_REFRESHED_GROUPS",
     "MIN_LAG_VALUE_TTL_SECONDS",
     "MIN_METRICS_INTERVAL_SECONDS",
+    "PAGED_LAG_GROUPS",
     "SEEDED_CONSUMER_GROUPS",
     "STATIC_LAG_GROUPS",
     "LagReading",
@@ -363,12 +432,14 @@ __all__ = [
     "lag_query_timeout_seconds",
     "lag_samples_at_interval",
     "lag_value_ttl_seconds",
+    "last_poll_key",
     "metrics_interval_seconds",
     "parse_lag",
     "parse_measured_at",
     "parse_samples",
     "read_lag",
     "record_lag_sample",
+    "record_last_poll",
     "samples_key",
     "source_for",
 ]

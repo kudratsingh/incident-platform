@@ -574,7 +574,8 @@ def test_the_chaos_surface_grows_by_exactly_one_tool(
     assert len(chaos_names) == 15, sorted(chaos_names)
     # 38 → 40 with WO-R3-312's two `[commander: telemetry]` tools, which are
     # neither chaos nor reads: the chaos count above and the read tier both stay put.
-    assert len(names) == 40, sorted(names)
+    # 40 → 41 with WO-R3-371's `get_control_loops`, a read tool: the chaos count holds.
+    assert len(names) == 41, sorted(names)
 
 
 def test_no_new_refusal_code_reaches_the_commanders_chaos_client() -> None:

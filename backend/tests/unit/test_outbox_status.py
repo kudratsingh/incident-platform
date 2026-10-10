@@ -49,6 +49,8 @@ READ_TIER_AFTER = [
     "get_cache_key_info",
     "get_circuit_breakers",
     "get_consumer_lag",
+    # WO-R3-371 (ADR 0041): the worker's background loops, read-scoped.
+    "get_control_loops",
     "get_dag_state",
     "get_deploy_history",
     "get_incident",
@@ -499,7 +501,8 @@ def test_the_read_tier_gained_exactly_this_tool() -> None:
         if t.required_scope in {Scope.TELEMETRY_READ, Scope.INCIDENTS_READ}
     )
     assert read == READ_TIER_AFTER
-    assert len(list_tools()) == 25
+    # 25 → 26 with WO-R3-371's `get_control_loops`, which joins the read tier above.
+    assert len(list_tools()) == 26
     # Which two the growth is, spelled out: a third tool riding in on this count is
     # what the assertion above exists to stop.
     assert sorted(t.name for t in list_tools() if t.is_commander) == [

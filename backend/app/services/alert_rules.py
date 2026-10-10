@@ -21,8 +21,9 @@ the reset would have to sweep, and forgetting to sweep it would silence the next
 **A recorded constant is never a breach.** Seven consumer groups report a lag the seed
 script wrote once (500 … 100,000) and nothing refreshes them; a rule reading those values
 would page six times on a healthy world and never resolve, because nothing can bring a
-constant down. So the lag rule reads the latest MEASURED sample, which only the
-continuously-refreshed group has. Absence is not recovery either: a window that stopped
+constant down. So the lag rule reads the latest MEASURED sample, which only a measured
+group has — and of the two measured groups it pages on the dispatcher's alone (ADR 0041:
+the resolver is read, not paged). Absence is not recovery either: a window that stopped
 being written leaves an open episode open, because `get_consumer_lag`'s own rule is that
 unknown is not zero.
 
@@ -377,14 +378,17 @@ async def _evaluate_consumer_lag(
 
 
 def _measured_groups() -> tuple[str, ...]:
-    """The groups whose lag is a measurement. Today exactly the one with a writer.
+    """The groups this rule pages on: measured groups only, and of those the paged ones.
 
-    Derived from `source_for` rather than naming the group, so a second continuously
-    refreshed group is covered by the rule the day it gets a writer.
+    Until WO-R3-371 this was "every live group", which was the dispatcher alone. The
+    dependency resolver is now measured too, and deliberately NOT paged (ADR 0041): its
+    normal lag is zero, a burst of completions after a recovery can spike it for one pass,
+    and a page on it is a decision with its own threshold, not a side effect of being read.
+    Still filtered through `source_for`, so a recorded constant can never page.
     """
-    from app.core.consumer_lag import SEEDED_CONSUMER_GROUPS
+    from app.core.consumer_lag import PAGED_LAG_GROUPS
 
-    return tuple(g for g in SEEDED_CONSUMER_GROUPS if source_for(g) == "live")
+    return tuple(g for g in PAGED_LAG_GROUPS if source_for(g) == "live")
 
 
 # ---------------------------------------------------------------------------

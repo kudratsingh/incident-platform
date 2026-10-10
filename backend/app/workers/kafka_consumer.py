@@ -11,6 +11,7 @@ import json
 import math
 import time
 from abc import ABC, abstractmethod
+from datetime import UTC, datetime
 from typing import Any
 
 from aiokafka import (  # type: ignore[import-untyped]
@@ -19,6 +20,7 @@ from aiokafka import (  # type: ignore[import-untyped]
     TopicPartition,
 )
 from app.config import get_settings
+from app.core.consumer_lag import lag_query_timeout_seconds
 from app.core.logging import get_logger
 from app.workers.schema_registry import SchemaValidationError
 from app.workers.schema_registry import validate as validate_schema
@@ -147,6 +149,11 @@ class BaseKafkaConsumer(ABC):
         self._consumer: AIOKafkaConsumer | None = None
         self._running = False
         self._chaos_killed = False
+        # When this consumer last asked Kafka for messages (WO-R3-371, ADR 0041). Set on every
+        # poll in `run()`, in memory only — the poll loop does no I/O for it — and published by
+        # the metrics pass. A killed, crashed or wedged consumer stops setting it, which is the
+        # one reading that tells a stopped consumer from an idle one behind a quiet topic.
+        self.last_poll_at: datetime | None = None
 
     async def start(self) -> None:
         settings = get_settings()
@@ -209,6 +216,9 @@ class BaseKafkaConsumer(ABC):
                 if latency_ms > 0:
                     await asyncio.sleep(latency_ms / 1000.0)
 
+            # "Asked for messages now" — after the kill and latency checks, so a consumer the lab
+            # stopped or slowed stops stamping exactly when it stops asking.
+            self.last_poll_at = datetime.now(UTC)
             try:
                 # getmany() batches up to 10 messages per poll for efficiency
                 records: dict[TopicPartition, list[ConsumerRecord]] = await asyncio.wait_for(
@@ -325,6 +335,44 @@ class BaseKafkaConsumer(ABC):
             )
             return False
 
+    async def consumer_lag(self) -> int | None:
+        """Sum of (log_end_offset - committed_offset) across all assigned partitions.
+
+        Returns `None`, never 0, when unknown (not started, restarting, no assignment, query failed
+        or slower than `lag_query_timeout_seconds`): a fabricated 0 reads as healthy. ADR 0040.
+        On the base class since WO-R3-371, so the metrics pass can measure any consumer it is
+        handed with the same arithmetic and the same bounds — today the dispatcher and the
+        dependency resolver (ADR 0041).
+        """
+        consumer = self._consumer
+        if consumer is None or self.restarting:
+            return None
+        timeout = lag_query_timeout_seconds()
+        try:
+            assignment = consumer.assignment()
+            if not assignment:
+                return None
+            # Bounded: a client stopped mid-query hung this pass for its 40-s request timeout.
+            return await asyncio.wait_for(
+                _sum_partition_lag(consumer, assignment), timeout=timeout
+            )
+        except TimeoutError:
+            logger.warning(
+                "consumer_lag query timed out",
+                extra={"group_id": self._group_label(), "timeout_seconds": timeout},
+            )
+            return None
+        except Exception as exc:
+            logger.warning(
+                "consumer_lag query failed",
+                extra={"group_id": self._group_label(), "error": str(exc)},
+            )
+            return None
+
+    def _group_label(self) -> str | None:
+        # A log field must never raise: a consumer built around `__init__` (tests do) has no id.
+        return getattr(self, "group_id", None)
+
     @abstractmethod
     async def handle_message(
         self,
@@ -338,3 +386,17 @@ class BaseKafkaConsumer(ABC):
         """Handle one message. `partition`/`offset` are keyword-only (`**_` to ignore); the event
         log needs them to dedup."""
         ...
+
+
+async def _sum_partition_lag(consumer: Any, assignment: Any) -> int:
+    """Sum of log-end minus committed offset; a partition never committed counts in full."""
+    end_offsets = await consumer.end_offsets(list(assignment))
+    lag = 0
+    for tp in assignment:
+        committed = await consumer.committed(tp)
+        end = end_offsets.get(tp, 0)
+        if committed is None:
+            lag += int(end)
+        else:
+            lag += max(0, int(end) - int(committed))
+    return lag
