@@ -20,7 +20,12 @@ from aiokafka import (  # type: ignore[import-untyped]
     TopicPartition,
 )
 from app.config import get_settings
-from app.core.consumer_lag import lag_query_timeout_seconds
+from app.core.consumer_lag import (
+    POLL_FETCH_BOUND_SECONDS,
+    POLL_FETCH_WAIT_SECONDS,
+    POLL_RETRY_PAUSE_SECONDS,
+    lag_query_timeout_seconds,
+)
 from app.core.logging import get_logger
 from app.workers.schema_registry import SchemaValidationError
 from app.workers.schema_registry import validate as validate_schema
@@ -220,17 +225,22 @@ class BaseKafkaConsumer(ABC):
             # stopped or slowed stops stamping exactly when it stops asking.
             self.last_poll_at = datetime.now(UTC)
             try:
-                # getmany() batches up to 10 messages per poll for efficiency
+                # getmany() batches up to 10 messages per poll for efficiency. The wait and the
+                # bound are the numbers `get_consumer_lag`'s `polling` verdict is built on
+                # (`app/core/consumer_lag.py`, ADR 0041 amendment), read from there so the two
+                # cannot drift.
                 records: dict[TopicPartition, list[ConsumerRecord]] = await asyncio.wait_for(
-                    self._consumer.getmany(timeout_ms=500, max_records=10),
-                    timeout=2.0,
+                    self._consumer.getmany(
+                        timeout_ms=round(POLL_FETCH_WAIT_SECONDS * 1000), max_records=10
+                    ),
+                    timeout=POLL_FETCH_BOUND_SECONDS,
                 )
                 had_failure = await self._process_batch(records)
                 if had_failure:
                     # Pace the hot retry of a persistently failing message
                     # (it is refetched on the very next poll after seek-back);
                     # matches the loop-error backoff below.
-                    await asyncio.sleep(1.0)
+                    await asyncio.sleep(POLL_RETRY_PAUSE_SECONDS)
 
             except TimeoutError:
                 # No messages — just loop again
@@ -243,7 +253,7 @@ class BaseKafkaConsumer(ABC):
                     "kafka consumer loop error",
                     extra={"group_id": self.group_id, "error": str(exc)},
                 )
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(POLL_RETRY_PAUSE_SECONDS)
 
     async def _process_batch(self, records: dict[TopicPartition, list[ConsumerRecord]]) -> bool:
         """Process one getmany() batch; return True when any partition failed.

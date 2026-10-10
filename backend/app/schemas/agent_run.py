@@ -168,6 +168,14 @@ class ConsumerLagGroupResponse(BaseModel):
     # group nothing measures, and empty before the first window is recorded — an
     # empty list is missing history, not a flat line.
     recent_samples: list[ConsumerLagSampleResponse] = Field(default_factory=list)
+    # Is anything consuming (WO-R3-373)? The same verdict the agent's `get_consumer_lag`
+    # reports, from the same function: `polling` true/false on a measured group whose poll
+    # is on record, null where nothing polls or nothing is recorded — unknown, never false.
+    # The poll time and its age are the fact behind it; the interval is the yardstick.
+    last_poll_at: datetime | None = None
+    last_poll_age_seconds: int | None = None
+    polling: bool | None = None
+    poll_interval_seconds: float | None = None
 
 
 class ConsumerLagResponse(BaseModel):
