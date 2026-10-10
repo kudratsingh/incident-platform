@@ -77,7 +77,7 @@ This is the field that moves when the resolver is killed.
 - **Making the killed resolver read `lag_known: false`** — by skipping the measurement while the consumer is not polling. That is what the commander's WO-R3-372 guessed the reading would be ("lag_known false / consumers 0"). It would break the dispatcher's established contract — "a stalled consumer still reports lag" is what the demo and the `consumer_stalled` page stand on — or give the two live groups opposite rules. The poll time says it without moving either.
 - **A consumer count.** Kafka membership is not visible without an admin client ([ADR 0040](0040-the-lag-clock-survives-a-restart.md) rejected a second connection per process for the same reason), and a stopped consumer stays a member for minutes anyway — a count of 1 would have read healthy.
 - **The consumer writing its own poll time to Redis.** It would put a Redis write in every consumer's poll loop in production, and a slow Redis would slow every consumer; publishing from the pass costs one write per group per pass.
-- **A platform-computed `consuming: true/false`.** A verdict needs a threshold (an injected latency of up to 60 s per poll would flip it), and the description can state the comparison instead. Times are facts; the verdict is the reader's.
+- **A platform-computed `consuming: true/false`.** A verdict needs a threshold (an injected latency of up to 60 s per poll would flip it), and the description can state the comparison instead. Times are facts; the verdict is the reader's. — **Reversed by the 2026-10-10 amendment below (WO-R3-373):** the first paid run on this release made the read and misread the comparison.
 - **Paging on the resolver** — §1.
 - **`paused` without the `CHAOS_ENABLED` gate.** The loop ignores the key when the flag is off; a reading that reported it anyway would claim a pause the loop is not honouring.
 
@@ -89,9 +89,62 @@ This is the field that moves when the resolver is killed.
 - **No migration, no new scope, no new refusal code, no new `BlastRadius` member,** and `get_outbox_status` is unchanged.
 - **Not built, recorded:** `saga-coordinator` has no reading. With this order the agent can positively identify a dead resolver, and only by elimination a stopped coordinator; measuring a third group is one more consumer handed to the pass and one more tuple member. `restart_consumer_group`'s description still tells the caller to "confirm via group membership", which now has a better answer in `last_poll_at`; changing it is a contract delta of its own.
 
+## Amendment — 2026-10-10: the platform states the verdict, `polling` (WO-R3-373, INC-008 addendum, owner decision O-51)
+
+§2 and the rejection of a platform-computed verdict stand above as the record of what shipped in v0.6.24 and are not rewritten. What changed on 2026-10-10 is that the comparison §2 left to the reader went wrong the first time a reader made it.
+
+**What happened.** The next paid run of the `resolver_stall` world made the read this ADR exists for and got `lag 0, lag_known true, source live, age_seconds 3, last_poll_age_seconds 39` — a consumer that had stopped asking 36 seconds before the platform looked, i.e. dead. The planner wrote "the dependency-resolver is polling (lag=0, last_poll_age=39s) … somewhat elevated but not conclusive", then anchored on `get_control_loops`' `paused: true` with its 851-second expiry and escalated without restarting anything. The description's rule — "never more than a few seconds above `age_seconds`" — asked the reader to threshold one number against another with no stated cadence. A number the reader must threshold lost to a boolean with a clock. The rejection above traded that risk for the purity of "times are facts"; the trade was wrong for a reading whose whole purpose is one yes-or-no question.
+
+### Decision
+
+**1. Two output fields on `get_consumer_lag`.** `polling` (`bool | null`) and `poll_interval_seconds` (`float | null`), both optional with a null default:
+
+| Group | `poll_interval_seconds` | `polling` |
+|---|---|---|
+| `worker-dispatcher`, `dependency-resolver`, poll on record | `2.0` | `true` / `false` |
+| the same, nothing on record (never polled, or the pass stopped for three passes) | `2.0` | `null` |
+| the seven recorded constants, an unrecognised name | `null` | `null` |
+
+Null is unknown, never false — the rule every field in this reading already keeps.
+
+**2. The cadence is the loop's own, and the loop reads it from the same place.** Both measured groups run `BaseKafkaConsumer.run()` unmodified (pinned: `JobDispatcherConsumer.run is BaseKafkaConsumer.run`, likewise the resolver). Its three timings were literals in the loop; they now live in `app/core/consumer_lag.py` and the loop imports them, so the verdict and the loop cannot drift: `POLL_FETCH_WAIT_SECONDS = 0.5` (one fetch waits this long when nothing is waiting), `POLL_FETCH_BOUND_SECONDS = 2.0` (a fetch is cut off here however Kafka behaves), `POLL_RETRY_PAUSE_SECONDS = 1.0` (after a failed batch or a loop error). `poll_interval_seconds` is the fetch bound — the longest a running consumer goes between asks on the fetch alone. It is a property of the platform's consumer, not of a deployment, so the description and the commander's snapshot are the same bytes on every stack (the constraint [ADR 0039](0039-the-platform-pages-on-its-own-metric.md) put on the pass interval).
+
+**3. N = 5 intervals, so the line is 10 seconds — chosen from the loop's own jitter.**
+
+| A running consumer's gap between asks | Seconds |
+|---|---|
+| idle (nothing to read) | ~0.5 |
+| messages waiting | ~0, plus handling the batch of ten |
+| a fetch Kafka does not answer | 2.0 (the bound) |
+| a failed batch or a loop error | + 1.0 |
+| worst healthy gap | ≈ 3, plus handling one batch |
+
+Ten seconds is more than three times the worst healthy gap, so a running group does not cross the line on jitter — `tests/unit/test_consumer_polling_verdict.py` looks at a running consumer 2,000 times at arbitrary moments, at the loop's own jittered cadence and at its worst case on every gap, and the shipped loop through a failed batch, and never reads false. A stopped consumer crosses it 10 seconds after its last poll, and the reading says so at the next pass — within 15 seconds on the demo stack's 5-second pass, within 70 at the 60-second default. The INC-008 reading was 36 seconds past.
+
+**4. Decided at the look, not at the read — in one function.** The metrics pass now records, beside the poll time, the moment it read it: `kafka:consumer_lag:<group>:last_poll` becomes one JSON record `{"last_poll_at", "observed_at"}` (same key, same three-pass TTL), both stamped by the worker's own clock. `polling_verdict` in `app/core/consumer_lag.py` decides `observed_at − last_poll_at ≤ 5 × poll_interval_seconds`; `read_lag` calls it; the MCP tool and the operator's REST reading both build from `read_lag`. Not against the reader's clock, for three reasons: at the platform's default 60-second pass a healthy consumer's `last_poll_age_seconds` reaches a minute between passes, so a read-time verdict would flap it to false; a stopped pass would make every live consumer read dead — the exact failure §2's fresh-or-absent rule exists to prevent (with the verdict taken at the look, a stopped pass reads the last look's verdict and then, three passes later, unknown); and the gap never crosses a process boundary, so no clock skew enters it. The cost, stated: a verdict is up to one pass old when read, like every other field here ("a reading can trail a change by up to one interval"). `last_poll_age_seconds` stays as the number behind it — on a reading taken right after a pass it is the gap plus `age_seconds`.
+
+**5. The record's old shape reads as a fact without a verdict.** A bare ISO time — what a v0.6.24 worker writes, for at most three passes after an upgrade — still yields `last_poll_at`, with `polling: null`, never a guessed look time.
+
+**6. The description says it in one sentence, and is shorter.** The IS ANYTHING CONSUMING paragraph, the comparison rule and the closing liveness sentence become one IS IT CONSUMING paragraph whose first sentence is: *"Read `polling`: a dead consumer reads `polling: false` while `lag`, `lag_known`, `source` and `age_seconds` can all still look healthy (a lag of 0 included), and `last_poll_age_seconds` is the number behind that verdict."* The rest of the description is tightened without dropping a rule: 4,852 → 3,093 characters.
+
+**7. The REST twin catches up.** `GET /admin/consumer-lag` gains `last_poll_at`, `last_poll_age_seconds`, `polling` and `poll_interval_seconds` per group — the "not yet" in Consequences above, closed.
+
+### Boundaries, recorded rather than discovered
+
+- **An injected per-poll delay above 10 seconds reads `false` between polls** — the case the rejection above named. It is the honest answer (the consumer is not asking), it is a lab-only state, and no scenario uses it as its fault: the commander's `remediate_consumer_lag_success` records why `inject_latency` was abandoned (a delayed consumer still serves the per-principal arrival rate, so no visible lag forms). A future scenario that delays a consumer must expect `polling` to flicker and grade accordingly.
+- **A handler that blocks longer than 10 seconds reads `false` while it blocks** — for instance the resolver waiting on a held database pool, up to the pool's 30-second checkout timeout. Also honest: it is not asking for messages. The held-pool world grades on the pool readings ([ADR 0033](0033-each-process-publishes-its-own-pool-gauge.md)), not on this.
+- **While the supervisor restarts a consumer it is not polling**, so `polling` reads false until the first poll after the restart and true at the next look — which is what a scenario that verifies `restart_consumer_group` by `polling: true` should wait for.
+- **Not paged, not a new rule.** `consumer_stalled` is unchanged. `restart_consumer_group`'s description still says to "confirm via group membership"; `polling` is now the better answer, and changing that text is a contract delta of its own, not taken here.
+
+### Consequences of the amendment
+
+- **Contract delta, one entry:** `get_consumer_lag` — `description` 4,852 → 3,093 characters; `outputSchema` gains `polling` and `poll_interval_seconds` (optional, default null — a commander model with `extra="forbid"`/`"ignore"` needs to know); the `last_poll_at` and `last_poll_age_seconds` field descriptions are rewritten to point at the verdict. `inputSchema`, `required` and `$defs` are byte-identical; the other 40 entries are byte-identical; 41 tools. `tools/list` sha256 (same canonicalisation as above, `CHAOS_ENABLED=true`): `5382e7c6…` → `2237c269…`. Release, re-pin, rebless; the canned readings of `get_consumer_lag` gain the two fields at the re-pin.
+- **One Redis value shape change, no new key:** `kafka:consumer_lag:<group>:last_poll` is a JSON record now (`docs/REDIS.md`). No migration, no new scope, no new refusal code, no new `BlastRadius` member, and the reset is untouched (the key is outside `chaos:*`, as before).
+- Tests: `backend/tests/unit/test_consumer_polling_verdict.py` (the verdict, the cadence, the jitter, a kill, a kill cleared and the supervisor's restart, the nulls, the description), wire cases in `backend/tests/api/test_mcp_resolver_and_control_loops.py` and `backend/tests/api/test_demo_operator_reads.py`.
+
 ## Pointers
 
-- `backend/app/core/consumer_lag.py` (`LIVE_REFRESHED_GROUPS`, `PAGED_LAG_GROUPS`, `record_last_poll`, `read_lag`), `backend/app/core/loop_heartbeat.py`
+- `backend/app/core/consumer_lag.py` (`LIVE_REFRESHED_GROUPS`, `PAGED_LAG_GROUPS`, `record_last_poll`, `read_lag`; since the amendment `POLL_*`, `POLLING_INTERVALS`, `polling_verdict`, `parse_last_poll`), `backend/app/core/loop_heartbeat.py`
 - `backend/app/workers/kafka_consumer.py` (`last_poll_at`, `consumer_lag`), `backend/app/workers/dispatcher.py` (`_metrics_loop`, each loop's `record_loop_run`), `backend/app/workers/control_loop_pause.py` (`loop_pause_state`)
 - `backend/app/mcp/tools/consumer_lag.py`, `backend/app/mcp/tools/control_loops.py`, `backend/app/services/alert_rules.py` (`_measured_groups`)
-- Tests: `backend/tests/unit/test_resolver_and_loops_observable.py`, `backend/tests/api/test_mcp_resolver_and_control_loops.py`, and the read-tier pins updated in `test_outbox_status.py`, `test_phase8_read_tool_shape_deltas.py`, `test_pool_gauge_shape_delta.py`, `test_run_record_shape_delta.py`, `test_agent_run_contract.py`
+- Tests: `backend/tests/unit/test_consumer_polling_verdict.py` (amendment), `backend/tests/unit/test_resolver_and_loops_observable.py`, `backend/tests/api/test_mcp_resolver_and_control_loops.py`, and the read-tier pins updated in `test_outbox_status.py`, `test_phase8_read_tool_shape_deltas.py`, `test_pool_gauge_shape_delta.py`, `test_run_record_shape_delta.py`, `test_agent_run_contract.py`
