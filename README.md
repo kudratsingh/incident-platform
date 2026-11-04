@@ -1,468 +1,88 @@
 # Incident & Workflow Platform
 
-A production-style enterprise operations platform for submitting, orchestrating, and observing background jobs — CSV uploads, report generation, bulk API syncs, document analysis, and multi-step workflows. Multi-tenant, event-sourced, LLM-augmented, and instrumented end-to-end.
+A multi-tenant job and workflow platform built to make distributed-systems behavior inspectable: event-sourced jobs, transactional outbox delivery, dependency DAGs, saga compensation, live progress and audited incident operations.
 
-Built as an intentional showcase of senior-level distributed-systems patterns: transactional outbox, CQRS, event sourcing, sagas, DAG-based dependencies, backpressure, circuit breakers, JWT + row-level security, SLOs with fast-burn alarms, and prompt-cached LLM features that fail open.
+It is also the managed environment for [Incident Commander](https://github.com/kudratsingh/incident-commander). The agent gets the same scoped, rate-limited MCP interface any external machine client would use.
 
----
+## What it does
 
-## What's inside
+- **Submit and track jobs:** asynchronous, thread and process execution, retries, delayed replay, dead-letter handling and SSE progress.
+- **Coordinate workflows:** dependency DAGs, waiting/resume transitions and saga compensation.
+- **Preserve the event chain:** Postgres transactions write an outbox; Kafka consumers build event history and read models.
+- **Isolate tenants:** JWT identity, application filtering, forced PostgreSQL row-level security, quotas and tenant-scoped rate limits.
+- **Operate failures:** consumer and background-loop health, traces, outbox status, DLQ triage, circuit breakers, incidents, SLOs and linked runbooks.
+- **Expose agent tools:** read diagnostics, bounded Tier-1 actions and write-only run telemetry, with service-account scopes, idempotency and audit.
+- **Assist operators with optional LLM features:** DLQ classification, retry advice, natural-language filters and incident digests. They are off by default and degrade to the deterministic path on provider failure.
 
-- **HTTP API** in FastAPI serving `/api/v1/*` behind an ALB.
-- **Worker process** running 8 concurrent Kafka consumer groups + 11 background loops (outbox relay, delayed-retry promote, DLQ-replay promote, resume-waiting sweep, stale-PENDING backstop, stale-RUNNING crash-recovery sweep, lease renewal, SLO evaluation, metrics, LLM digest, idempotency reaper).
-- **MCP tool server** at `backend/app/mcp/`, deployed as a second process from the same image. It is the agent-facing surface: scoped service-account tokens, per-principal rate limits, and an audit row for every tool call. See [ADR 0006](docs/ADR/0006-mcp-server-standalone-process.md) and [ADR 0007](docs/ADR/0007-machine-principal-scope-model.md).
-- **React SPA** admin console with live SSE progress, saga DAG timelines, DLQ triage, natural-language admin search, and incident digest cards.
-- **Multi-tenancy** with application-layer filtering + Postgres row-level security as defense-in-depth.
-- **LLM features** (Claude via Anthropic SDK): DLQ triage, retry-policy advisor, natural-language admin queries, periodic incident summaries — all off-by-default and fail-open.
-- **AWS deployment** via Terraform: VPC + ECS Fargate + RDS + ElastiCache + S3 + ALB + CloudWatch alarms with linked runbooks. No Kafka broker is provisioned and the deploy job is opt-in — see [ADR 0018](docs/ADR/0018-production-kafka-posture.md).
+**The orchestration infrastructure is implemented; job payload processing remains simulated.** CSV/report/document/sync processors use bounded example work and scripted failure paths. That makes failure-injection experiments reproducible; it is not a claim of completed business integrations.
 
-Current test suite: three tiers — unit, API contract, and Testcontainers integration — all running on every PR. `mypy --strict` clean; 70% coverage gate on the unit + API job.
+## Architecture
 
-There is deliberately no headline test count here. The number was refreshed three times (`240+` → `243` → `726`) and was stale again within a release each time, most recently by roughly 2x. `make test` reports the count for your checkout; `.github/workflows/ci.yml` is the authority on what runs.
+```text
+React console → FastAPI → Postgres job state + transactional outbox
+                         → outbox relay → Kafka
+                           → dispatch / audit / event log / read model
+                           → dependencies / sagas / SSE / optional triage
+                         → Redis cache, locks and browser progress
 
----
-
-## Architecture at a glance
-
-```
-                            ┌───────────────┐
-                            │  React SPA    │
-                            └──────┬────────┘
-                                   │
-                            ┌──────▼──────────────┐
-                            │  ALB → FastAPI      │
-                            └──┬─┬─┬─┬────────────┘
-                               │ │ │ │
-                    ┌──────────┘ │ │ └──────────────┐
-                    ▼            ▼ ▼                ▼
-              ┌─────────┐   ┌────────┐         ┌────────┐
-              │Postgres │   │ Redis  │         │ Kafka  │
-              │ (RDS)   │   │(Elasti)│         │        │
-              └────┬────┘   └───┬────┘         └───┬────┘
-                   │            │                  │
-                   ▼            ▼                  ▼
-              ┌───────────────────────────────────────┐
-              │  Worker process (one ECS task)        │
-              │                                        │
-              │  8 Kafka consumer groups:              │
-              │    dispatcher, audit, sse, event-log,  │
-              │    read-model, dep-resolver,           │
-              │    saga-coord, llm-triage              │
-              │                                        │
-              │  11 background loops:                  │
-              │    outbox relay, promote-delayed,      │
-              │    promote-replay, resume-waiting,     │
-              │    stale-pending, stale-running,       │
-              │    lease-renewal, slo-eval,            │
-              │    metrics, digest, idempotency-reaper │
-              └───────────────────────────────────────┘
+External agent → standalone MCP process → scoped service layer
+                                      → idempotent action + audit
 ```
 
-Full architecture with request lifecycles, concurrency model, and failure-mode catalog is in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+API, worker behavior and MCP handlers share domain services, while the MCP server runs as a separate process. Local Compose supplies Postgres, Redis, Redpanda, MinIO, Jaeger and the frontend. Terraform describes the AWS topology; a production Kafka broker is not provisioned. [Full request lifecycles and failure modes](docs/ARCHITECTURE.md).
 
----
+## The agent boundary
 
-## The agent-facing MCP surface
+Tools cover consumer/control-loop health, database/cache health, traces, deploys, DAGs, outbox delivery, SLOs, alerts, incidents and audit events. Tier-1 operations include consumer restart, targeted DLQ replay, DAG pause, cache invalidation and permanent-DLQ classification.
 
-The platform is also the managed system for [Incident Commander](https://github.com/kudratsingh/incident-commander), an autonomous on-call agent that investigates and remediates incidents here. It gets no special access: it is an ordinary external client holding a scoped service-account token, and everything it can do is a tool on this surface.
+Every call is checked against a machine principal's scopes. Mutations use idempotency keys, and audit-write failure prevents the action from committing. Agent run reporting is separate from planner-selected tools; an agent cannot read its own report back as investigation evidence.
 
-- **Where it lives** — `backend/app/mcp/`, deployed as a second process from the same image ([ADR 0006](docs/ADR/0006-mcp-server-standalone-process.md)). Same commit, same schemas, same service layer; its own ECS service, pool and alarm.
-- **What it serves** — 26 tools by default: 17 read tools (consumer lag and consumer liveness, the worker's background loops, outbox delivery, DLQ contents, traces, deploy history, DAG state, Redis/Postgres health, circuit breakers, SLO status, incidents, alerts, audit events, cache key info), 7 Tier-1 action tools (`restart_consumer_group`, `replay_dlq_messages`, `replay_dlq_by_ids`, `replay_dlq_by_category`, `pause_dag`, `invalidate_cache_key`, `mark_dlq_permanent`) and the 2 run-report tools the responder's own loop calls (`report_agent_run`, `report_agent_briefing`, [ADR 0035](docs/ADR/0035-the-agent-reports-its-run-and-cannot-read-it-back.md)). With `CHAOS_ENABLED=true` a further 15 lab hooks register, for a total of 41 — they are never registered in production ([ADR 0008](docs/ADR/0008-chaos-gating.md)). Count them with `list_tools()`: this line has been stale before (it said 23 and 38 until WO-R3-371 recounted it).
-- **Who may call what** — five non-hierarchical scopes on the service account: `telemetry:read`, `incidents:read`, `actions:propose`, `actions:execute`, `chaos:invoke` ([ADR 0007](docs/ADR/0007-machine-principal-scope-model.md)). Each tool declares the one it requires.
-- **Limits** — per-principal rate limiting (`MCP_RATE_LIMIT_PER_PRINCIPAL`, default 120/min) and an `Idempotency-Key` claim on every mutating call ([ADR 0010](docs/ADR/0010-idempotency-record-lifecycle.md)).
-- **Audit** — every call writes an `agent.tool_invoked` row, and a call whose audit write fails does not commit. The lab's own `chaos.*` rows are withheld from any principal that cannot fire chaos, so an agent under evaluation cannot read which hook caused its incident ([ADR 0012](docs/ADR/0012-the-lab-is-invisible-to-the-agent.md)).
+Chaos tools are a separate, environment-gated lab surface. They register in the local development Compose stack, are rejected in production mode, and require a distinct `chaos:invoke` principal. The agent's normal principal cannot invoke them or read the chaos audit stream. See [scope design](docs/ADR/0007-machine-principal-scope-model.md) and [chaos gating](docs/ADR/0008-chaos-gating.md).
 
-`CLAUDE.md` § "Agent-facing surface" has the naming rules, the scope table and the standing constraints on tool descriptions.
+## Run locally
 
----
-
-## Stack
-
-| Layer | Technology |
-|---|---|
-| API | Python 3.12, FastAPI, Uvicorn, Pydantic v2 |
-| Database | PostgreSQL 16 with row-level security, SQLAlchemy 2 async, Alembic migrations |
-| Cache / Locks / Pub-Sub | Redis 7 (ElastiCache in prod) |
-| Event log | Kafka (Redpanda locally; no production broker provisioned — [ADR 0018](docs/ADR/0018-production-kafka-posture.md)), JSON Schema validation on both producer + consumer |
-| Object storage | S3 (MinIO locally) |
-| Frontend | React 18, TypeScript, Vite, Tailwind CSS, React Router |
-| Auth | JWT with tenant_id claim, refresh tokens, 3 role tiers + platform-admin flag |
-| Streaming | Server-Sent Events (Kafka → Redis Pub/Sub → browser) |
-| Observability | OpenTelemetry (auto-instrumented FastAPI + SQLAlchemy + Redis) → OTLP → X-Ray; CloudWatch metrics + alarms + linked runbooks |
-| LLM | Anthropic Python SDK (Claude Opus 4.7 with adaptive thinking + prompt caching) |
-| Infrastructure | Terraform (VPC, ECS Fargate, RDS, ElastiCache, ALB, ACM, IAM, Secrets Manager) |
-| CI/CD | GitHub Actions — ruff + mypy + pytest + tsc + a Docker-gated Testcontainers integration tier; Docker build → ECR → ECS deploy |
-
----
-
-## Feature highlights by phase
-
-Nine of the fourteen planned phases are shipped (1–7, 10 and 12). `CLAUDE.md`'s status table is the authority; this is the short version:
-
-**Phase 1–3 · Foundations** — clean backend, background execution across asyncio / threads / multiprocessing, live SSE progress, React admin console with request-correlation IDs.
-
-**Phase 4 · Production deployment** — Docker, Terraform, ECS Fargate, RDS Postgres, ElastiCache Redis, secrets management, CI/CD. Kafka is the gap: no production broker is provisioned ([ADR 0018](docs/ADR/0018-production-kafka-posture.md)).
-
-**Phase 5 · Hardening** — sliding-window rate limiting, cache layer, load testing via Locust, `mypy --strict`, 70% coverage gate.
-
-**Phase 6 · Observability & Reliability** — OpenTelemetry distributed tracing (browser → API → worker → DB → external API), custom CloudWatch metrics + 10 alarms, SLOs with 14.4× fast-burn alarms, 8 machine-readable runbooks linked from alarm descriptions, circuit breaker for external calls.
-
-**Phase 7 · Kafka + advanced patterns** — transactional outbox (`outbox_events` table), CQRS read model in Redis, event sourcing (`job_events` immutable log), saga pattern with compensation, job dependency DAGs (`WAITING` → `PENDING` on parent completion), JSON Schema registry, backpressure via consumer-group lag, Testcontainers integration test.
-
-**Phase 10 · AI / LLM integration** (fully shipped)
-- **DLQ triage** — Claude classifies dead-lettered jobs (root cause, summary, suggested fix, retryability, confidence). Persisted to `job_triages`; surfaced in the admin DLQ tab.
-- **LLM-guided retry policy** — after the first deterministic retry, Claude decides retry-with-backoff vs dead-letter-now. Falls back to deterministic backoff on any LLM error so the worker never blocks.
-- **Natural-language admin queries** — `POST /admin/query` translates plain English into a Pydantic `JobFilterSpec` (enum/literal fields only → injection-safe by construction) and runs it through the existing list endpoint.
-- **Periodic incident summaries** — background loop aggregates per-tenant failure stats (with digit-normalized error fingerprints) and asks Claude for a one-paragraph digest plus key concerns + recommended actions.
-
-All LLM features use `messages.parse()` with Pydantic schemas, `claude-opus-4-7` with adaptive thinking, prompt caching via `cache_control: ephemeral`, and are off by default. See [ADR 0005](docs/ADR/0005-llm-features-fail-open.md) for the fail-open rationale.
-
-**Phase 12 · Multi-tenancy** (fully shipped)
-- `tenants` table, `tenant_id` on every domain table, JWT carries `tenant_id` claim.
-- Per-tenant rate limits + monthly job quotas configurable per tenant.
-- Composite `{tenant_id}:{user_id}` Kafka partition key preserves per-tenant AND per-user ordering ([ADR 0004](docs/ADR/0004-tenant-id-in-kafka-partition-key.md)).
-- **Postgres row-level security**, with `FORCE ROW LEVEL SECURITY` so the table owner is not exempt, as defense-in-depth against forgotten `WHERE tenant_id = ?` clauses ([ADR 0003](docs/ADR/0003-rls-as-defense-in-depth.md), [ADR 0015](docs/ADR/0015-force-rls-and-nonowner-app-role.md)). Migration `a7e3d9c41f28` enumerates the covered tables and is the authority on the set — it is listed there rather than counted here so the two cannot disagree.
-- `is_platform_admin` role for cross-tenant operators; `?tenant_id=` query-param override on admin endpoints.
-- Self-service tenant creation at `/auth/register`.
-- Admin Tenants tab with drill-down page, inline rate/quota editors, create-tenant modal.
-
-**Phases 8, 9, 11, 13** — platform engineering & scale, security hardening, real-time stream analytics, disaster recovery & chaos — planned, sized in [`docs/ROADMAP.md`](docs/ROADMAP.md). **Phase 14** (real job processors) is deliberately deferred: today's processors simulate work with sleeps, progress updates and scripted failure paths, which is what makes the incident-commander eval scenarios deterministic.
-
----
-
-## Documentation
-
-`CLAUDE.md` is the high-signal index. Everything else lives in `docs/`:
-
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — runtime topology, five annotated request lifecycles, concurrency model, auth & tenant matrix, failure mode catalog, LLM cost model
-- [`docs/DATA_MODEL.md`](docs/DATA_MODEL.md) — every table, column, index, FK, and constraint with a one-line *why*
-- [`docs/KAFKA.md`](docs/KAFKA.md) — topic catalog, schema-evolution rules, 8-consumer-group ops
-- [`docs/REDIS.md`](docs/REDIS.md) — key catalog with TTLs; what degrades when Redis dies
-- [`docs/ROADMAP.md`](docs/ROADMAP.md) — ~80 categorized extension ideas
-- [`docs/ADR/`](docs/ADR/) — 26 architecture decision records: outbox vs. CDC, JSON Schema vs. Protobuf, RLS as defense-in-depth, composite partition keys, LLM fail-open policy, machine-principal scopes, chaos gating, production Kafka posture, and more. [`docs/ADR/README.md`](docs/ADR/README.md) is the index with every status
-- [`docs/postmortems/`](docs/postmortems/) — one file per incident, written at the time or backfilled
-- [`docs/lessons/`](docs/lessons/) — case studies from how this repo was built
-- [`docs/README.md`](docs/README.md) — one line per document, if you do not know which of these you want
-- [`runbooks/`](runbooks/) — machine-readable on-call playbooks; 8 files covering the 10 CloudWatch alarms and both SLOs
-
----
-
-## Local development
-
-### Prerequisites
-
-- Docker & Docker Compose
-- Python 3.12+
-- [uv](https://docs.astral.sh/uv/) — installs the dependency versions pinned in `uv.lock`
-- Node.js 18+
-
-### Start infrastructure
-
-```bash
-docker compose up postgres redis redpanda minio -d
-```
-
-Redpanda is a Kafka-API-compatible broker on `localhost:9092`. Redpanda Console (`docker compose up redpanda-console -d`) gives you a browser UI at `localhost:8080`.
-
-### Backend
-
-```bash
-# Installs exactly the versions in uv.lock — the same set CI tests — into .venv.
-# (`pip install -e ".[dev]"` still works, but it resolves the newest release of
-# everything, which is not what CI ran.)
-uv sync --extra dev
-source .venv/bin/activate
-
-# Run migrations (from the repo root — alembic.ini lives here, and the
-# alembic CLI does not search parent directories, so `cd backend` cannot
-# work). Migrations run as the database OWNER: since ADR 0015 the runtime
-# DATABASE_URL is the non-owner incident_app role, which cannot create
-# tables, so alembic takes ALEMBIC_DATABASE_URL when it is set.
-make migrate-local
-# ...which is exactly:
-#   ALEMBIC_DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/incident_platform \
-#     .venv/bin/python -m alembic upgrade head
-
-# API + worker (same process for local dev via the app.main lifespan)
-uvicorn backend.app.main:app --reload --port 8000
-```
-
-API docs: `http://localhost:8000/api/v1/docs`
-
-### Frontend
-
-```bash
-cd frontend
-npm install
-npm run dev
-```
-
-App: `http://localhost:3000`
-
-#### How list pages report loading, failure and emptiness
-
-Every list view — Jobs, Sagas, and each Admin Console tab — loads through
-`useAsyncData` (`frontend/src/hooks/useAsyncData.ts`), which owns data,
-loading and error together. Pages render exactly one of four states, in this
-order:
-
-| State | What the operator sees |
-|---|---|
-| loading | Row skeletons |
-| error | A red message with the server's own text and a **Retry** button (`components/ErrorState.tsx`) |
-| empty | The page's empty copy — *only ever* after a 2xx response with zero rows |
-| rows | The table |
-
-The ordering is the point: an empty state is a claim about the data ("Dead
-letter queue is empty", "No sagas yet"), and a failed request cannot support
-it. A request that fails while rows are already on screen keeps those rows and
-adds a banner saying they are the last successful result, rather than blanking
-the table.
-
-#### Admin Console list state is per tab
-
-Each Admin tab owns its own rows, total, page number and page size. The pager
-is driven by the active tab's own values and renders only on tabs whose
-endpoint is paginated and reported a total — Runbooks and Digests return
-everything, so they show no pager. Page size differs by tab (Jobs and DLQ 20,
-Users and Tenants 50), and each tab remembers the page its operator was on.
-Actions refresh the tab they were invoked from: resolving an incident from the
-DLQ tab refreshes the DLQ, not Jobs.
-
-A natural-language query on the Jobs tab is its own result set. While one is
-applied, the structured status/trace filters are shown disabled and left
-exactly as they were; clearing the query re-enables them and refetches.
-
-### Environment variables
-
-Backend reads from environment directly. `backend/app/config.py` is the full list — the table below is the subset you are most likely to set. Note that `.env.example` predates several of these and does not list them.
-
-| Variable | Default | Description |
-|---|---|---|
-| `DATABASE_URL` | `postgresql+asyncpg://...` | asyncpg connection string |
-| `REDIS_URL` | `redis://localhost:6379/0` | Redis connection. In production the scheme is `rediss://` (TLS) with the ElastiCache AUTH token embedded, injected from Secrets Manager |
-| `KAFKA_BOOTSTRAP_SERVERS` | `localhost:9092` | Broker bootstrap. Points at local Redpanda; no production broker exists yet, and Terraform omits this variable from the task definition unless `kafka_bootstrap_servers` is set ([ADR 0018](docs/ADR/0018-production-kafka-posture.md)) |
-| `ALEMBIC_DATABASE_URL` | falls back to `DATABASE_URL` | Owner connection for migrations. Since [ADR 0015](docs/ADR/0015-force-rls-and-nonowner-app-role.md) the runtime `DATABASE_URL` is the non-owner `incident_app` role, which cannot create tables |
-| `INCIDENT_APP_DB_PASSWORD` | — | Password synced onto the `incident_app` role at boot by `app.core.db_bootstrap` |
-| `SECRET_KEY` | — | JWT signing key (required) |
-| `ANTHROPIC_API_KEY` | — | Required only if enabling LLM features. Not a `Settings` field — the Anthropic SDK reads it straight from the environment |
-| `LLM_TRIAGE_ENABLED` | `False` | DLQ triage feature flag |
-| `LLM_RETRY_POLICY_ENABLED` | `False` | Retry policy feature flag |
-| `LLM_NL_QUERY_ENABLED` | `False` | Natural-language query feature flag |
-| `LLM_DIGEST_ENABLED` | `False` | Incident digest feature flag |
-| `BACKPRESSURE_LAG_THRESHOLD` | `1000` | Reject new jobs when consumer lag exceeds this |
-| `CHAOS_ENABLED` | `False` | Registers the 10 chaos MCP tools. One of three gates — see [ADR 0008](docs/ADR/0008-chaos-gating.md). Terraform refuses `true` in the production workspace |
-| `MCP_RATE_LIMIT_PER_PRINCIPAL` | `120` | MCP calls per minute per service account, enforced in `standalone.py` |
-| `SLO_EVALUATION_INTERVAL_SECONDS` | `300.0` | How often the SLO loop runs. `0` disables it |
-| `STALE_RUNNING_THRESHOLD_SECONDS` | `900` | How long a `RUNNING` job may go without a heartbeat before the crash-recovery sweep dead-letters it |
-| `ENVIRONMENT` | `development` | `development` / `production` |
-
-### Full stack via Docker Compose
+Docker Engine and Compose v2:
 
 ```bash
 docker compose up --build
 ```
 
-### Convenience Makefile targets
+- [Console](http://localhost:3000)
+- [API documentation](http://localhost:8000/api/v1/docs)
+- [Jaeger traces](http://localhost:16686)
 
-`make help` lists every target. The ones you'll hit most:
+The Compose stack runs its dedicated migration/bootstrap service before the API and MCP processes start. Use a fresh local account through the console. Provider keys are only needed when deliberately enabling the LLM features.
 
-| Target | What it does |
-|---|---|
-| `make up` / `make down` | Bring the stack up (rebuild + detach) / stop it |
-| `make logs` | Tail the backend logs |
-| `make test` | Unit + API tests on the host venv — no stack, no Docker |
-| `make test-integration` | The Docker-gated integration tier (Testcontainers brings up its own Postgres + Redpanda; the compose stack is **not** required) |
-| `make lint` / `make typecheck` | ruff / mypy --strict, same invocations as CI |
-| `make migrate` | Apply pending Alembic migrations (idempotent) |
-| `make seed-incident-commander` | Create or re-seed **both** eval service accounts and print a fresh scoped token for each: `incident-commander` as `PLATFORM_TOKEN` (`telemetry:read` + `incidents:read`) and `incident-commander-chaos` as `PLATFORM_CHAOS_TOKEN` (those two + `chaos:invoke`). Existing scopes are merged, never narrowed — except `chaos:invoke` on the agent account, which is removed and announced, because the agent must not be able to fire the lab or read that it fired (owner decision O-4). Set `SA_REPLACE_SCOPES=1` to narrow the rest deliberately. A fresh agent account gets no `actions:execute`, so add it via `SA_SCOPES` if you want the agent to run Tier-1 remediations |
-| `make seed-eval-fixtures` | Populate the platform with realistic data for the incident-commander agent's live eval suite |
-| `make mcp-probe STEP=<preset>` | Smoke-test one MCP surface via `scripts/mcp_probe.sh`. `STEP` is one of `initialize`, `tools`, `lag`, `dlq`, `audit`, `forbidden` |
+For the agent lab, `make seed-incident-commander` creates scoped service accounts and prints local token configuration; `make seed-eval-fixtures` seeds the diagnostic world. The agent repository's [pinned demo](https://github.com/kudratsingh/incident-commander/tree/main/demo) is the entry point for reproducing its experiments.
 
-### Seeding realistic data for the agent's live eval suite
+### Development checks
 
-The incident-commander agent's live eval scenarios (`use_live_mcp: true` in scenario definitions) probe the platform's MCP surface and grade the responses against expected shapes. On a fresh stack most tools return empty or null — realistic scenarios need seeded data.
+Python **3.12+**, [uv](https://docs.astral.sh/uv/) and Node for frontend development:
 
 ```bash
-make seed-eval-fixtures
-```
-
-That populates, idempotently:
-
-- **Redis consumer lag** for 8 groups (`billing-consumer` at 15k, `payments-consumer` at 30k, `shipping-consumer` at 100k, `healthy-consumer` at 0, etc.) — makes `get_consumer_lag` return realistic values instead of null
-- **`deploy_markers` table** — 6 recent deploys across `prod` and `staging`, one annotated `notes: "correlated with billing failures"` for the deploy-correlation scenario
-- **`alerts` table** — mix of 3 active + 2 resolved alerts across `kafka` / `dlq` / `api` / `db` sources (the alert-storm scenario expects `total >= 3` active)
-- **DLQ jobs + `job_triages`** — three realistic dead-lettered entries (send_email SMTP refused, process_payment Stripe timeout, csv_upload bad row) each with a populated triage block
-- **Failed jobs with trace_ids** — two jobs in the last hour with matching audit rows so `get_trace(trace_id)` returns a real graph
-- **Dependency DAG** — a stable three-node parent → seed → child that `get_dag_state(seed_id)` walks
-
-The script prints a **EVAL FIXTURE PINS** report on completion listing every deterministic UUID. Scenarios that pin specific IDs (e.g. "look up this DAG root") should paste from that report.
-
-Re-runs are safe (every ID is `uuid5`-derived, existing rows are skipped) so `make eval-live` on the agent side can rerun without churn.
-
----
-
-## Testing
-
-```bash
-# Unit + API (no Docker, no services needed)
+uv sync --extra dev
+make lint
+make typecheck
+make lint-imports
 make test
-
-# The Docker-gated integration tier — real Postgres + Redpanda
-make test-integration
-
-# Fast unit tests only (no I/O, mocked deps)
-pytest backend/tests/unit/
-
-# API contract tests (full FastAPI app with dependency overrides)
-pytest backend/tests/api/
-
-# With coverage report
-pytest --cov=backend/app --cov-report=html
 ```
 
-Unit + API tests use SQLite in-memory + mocked Redis so they run without any external services. Bare `pytest` collects only those two directories — `testpaths` in `pyproject.toml` scopes it deliberately, so there is no "run everything" invocation.
+Unit/API tests use isolated test dependencies. `make test-integration` additionally needs Docker and starts its own Postgres/Redpanda containers. Frontend checks live in [frontend/package.json](frontend/package.json). For host-based development, run migrations from the repository root with `make migrate-local`; the runtime database role deliberately lacks migration privileges.
 
-Integration tests spin up real Postgres (RLS enforcement, the eval-reset SQL, the migration advisory lock, outbox relay exclusivity) or Redpanda (Kafka round-trips) via Testcontainers. They need a reachable Docker daemon, and three of the five files are additionally **opt-in** behind `RUN_RLS_TEST`, `RUN_EVAL_RESET_TEST` and `RUN_MIGRATION_LOCK_TEST`. `make test-integration` exports all three; running `pytest backend/tests/integration/` by hand without them collects the files and then silently **skips** most of them, which still exits 0 — use the make target.
+## Current scope
 
-Load tests live in `backend/tests/load/` (Locust).
+Implemented phases cover the core platform, deployment artifacts, hardening, observability, Kafka patterns, optional LLM features and multi-tenancy. Platform-scale work, further security/stream analytics/disaster-recovery milestones and real job processors remain planned. Deployment artifacts are not evidence that a public service is running.
 
----
+Tests cover unit behavior, API contracts and Docker-backed integrations; CI also checks frontend, infrastructure and workflow configuration. Test counts are intentionally left to the current test run.
 
-## Repository layout
+## Explore the implementation
 
-```
-├── CLAUDE.md                       high-signal architecture index (always loaded)
-├── docs/                           deep reference (architecture, data model, ADRs, roadmap)
-├── runbooks/                       machine-readable on-call runbooks
-├── backend/
-│   ├── app/
-│   │   ├── api/                    HTTP routers (auth, jobs, admin, sagas, audit, streaming)
-│   │   ├── core/                   exceptions, logging, middleware, redis, security, tracing, metrics
-│   │   ├── models/                 SQLAlchemy models (tenants, users, jobs, sagas, triages, digests, ...)
-│   │   ├── repositories/           data access layer
-│   │   ├── schemas/                Pydantic DTOs + Kafka JSON Schema files
-│   │   ├── services/               business logic (job, saga, triage, retry_policy, nl_query, digest, ...)
-│   │   ├── workers/                Kafka consumers, worker loop, processors (async / thread / process)
-│   │   ├── utils/                  rate_limit, quota, cache, backpressure, circuit_breaker
-│   │   └── main.py                 app factory + lifespan
-│   ├── alembic/versions/           Alembic revisions (`alembic history` for the current chain)
-│   └── tests/
-│       ├── unit/                   no I/O, mocked deps
-│       ├── api/                    full FastAPI app, dependency overrides
-│       ├── integration/            Testcontainers (Postgres for RLS, Redpanda for Kafka; opt-in)
-│       └── load/                   Locust
-├── frontend/
-│   └── src/
-│       ├── api/                    typed API client (auth, jobs, sagas, admin)
-│       ├── components/             Layout, StatusBadge, ProgressBar, JobForm, Toast, ...
-│       ├── hooks/                  useAuth, useJobStream (SSE)
-│       ├── pages/                  Login, Register, Dashboard, JobDetail, Admin, AdminTenantDetail, Sagas, SagaNew, SagaDetail
-│       └── test/                   vitest suites, run by the `frontend` CI job
-├── infra/                          Terraform for the full AWS stack
-├── .github/workflows/              CI jobs: frontend, lint, test, integration, infra, workflows, deploy
-│                                   plus release.yml (tag → GHCR image)
-├── docker-compose.yml
-└── pyproject.toml
-```
-
----
-
-## API overview
-
-All routes are prefixed with `/api/v1`. Full OpenAPI spec at `/api/v1/docs` when the API is running.
-
-Core surface:
-
-| Method | Route | Description |
-|---|---|---|
-| `POST` | `/auth/register` | Register — founds a new tenant or joins the default one ([ADR 0024](docs/ADR/0024-tenant-enrolment-policy.md)) |
-| `POST` | `/auth/tenant/members` | Admin-only: enrol a user into the caller's own tenant |
-| `POST` | `/auth/login` | Login (returns access + refresh + tenant_id claim) |
-| `POST` | `/auth/refresh` | Refresh access token |
-| `GET` | `/auth/me` | Current user + tenant slug |
-| `POST` | `/jobs` | Create job (rate-limited + quota-checked + backpressure-gated) |
-| `GET` | `/jobs` | List own jobs (paginated + filtered) |
-| `GET` | `/jobs/{id}` | Job detail |
-| `POST` | `/jobs/{id}/stream-token` | Mint a 60s single-purpose token for the SSE stream (authorizes the job) |
-| `GET` | `/jobs/{id}/stream` | SSE live-progress stream (auth via `?token=` stream token, ADR 0014) |
-| `POST` | `/sagas` | Create multi-step workflow with dependencies |
-| `GET` | `/sagas` | List sagas |
-| `GET` | `/sagas/{id}` | Saga detail with step chain |
-| `GET` | `/admin/jobs` | Admin: search all jobs (accepts `?tenant_id=` for platform admins) |
-| `POST` | `/admin/jobs/{id}/replay` | Admin: replay a failed job |
-| `POST` | `/admin/incidents/{id}/resolve` | Admin: mark incident resolved |
-| `POST` | `/admin/query` | LLM-powered natural-language job search |
-| `GET` | `/admin/jobs/{id}/triage` | LLM triage analysis for a dead-lettered job |
-| `GET` | `/admin/jobs/{id}/timeline` | Event-sourced Kafka timeline for a job |
-| `GET` | `/admin/stats` | Job counts by status (from Redis read-model) |
-| `GET` | `/admin/slos` | SLO state, budget remaining, burn rate |
-| `GET` | `/admin/runbooks/{id}` | Machine-readable runbook YAML |
-| `GET` | `/admin/dlq/stats` | DLQ counts with per-job-type breakdown |
-| `GET` | `/admin/digests` | Recent LLM-written incident summaries |
-| `POST` | `/admin/digests/generate` | Generate a digest on demand |
-| `GET` | `/admin/tenants` | Platform-admin only: list all tenants |
-| `POST` | `/admin/tenants` | Platform-admin only: create a tenant |
-| `PATCH` | `/admin/tenants/{id}` | Platform-admin only: update rate limits / quota |
-| `POST` | `/admin/service-accounts` | Platform-admin only: create a machine principal ([ADR 0007](docs/ADR/0007-machine-principal-scope-model.md)) |
-| `POST` | `/admin/service-accounts/{id}/tokens` | Mint a scoped `sa_…` bearer token |
-| `GET` | `/audit/logs` | Audit trail |
-
-`GET /healthz` and `GET /healthz/worker` sit outside `/api/v1` and are excluded from the OpenAPI schema.
-
----
-
-## Code quality
-
-```bash
-# Lint (fast)
-ruff check backend/
-
-# Type check (strict)
-cd backend && mypy -p app
-
-# Frontend types
-cd frontend && npx tsc --noEmit
-```
-
-CI runs all three on every PR alongside the unit + API suite (`test` job) and the Testcontainers integration tier (`integration` job). See `.github/workflows/ci.yml`.
-
----
-
-## Concurrency model
-
-Three Python concurrency primitives used deliberately per workload:
-
-| Model | Use for | Example processor |
-|---|---|---|
-| `asyncio` | High-concurrency I/O (external APIs, DB, Redis, Kafka) | `bulk_api_sync` in `async_tasks.py` |
-| `threading` | Blocking SDKs / synchronous libraries | `csv_upload` in `thread_adapters.py` |
-| `multiprocessing` | CPU-heavy work (PDF, transforms, aggregates) | `doc_analysis` / `report_gen` in `cpu_processors.py` |
-
-The dispatcher's `_PROCESSORS` map routes each `JobType` to the right primitive. Details in [`docs/ARCHITECTURE.md#concurrency-model`](docs/ARCHITECTURE.md#concurrency-model).
-
----
-
-## Deployment
-
-Terraform provisions the AWS stack in `infra/`:
-
-- VPC with public/private subnets
-- ECS Fargate cluster with a service each for API and worker
-- RDS Postgres with automated backups
-- ElastiCache Redis
-- S3 for artifacts
-- ALB with target-group health checks
-- ACM (planned in Phase 8), IAM roles per service, Secrets Manager for DB password + JWT + Anthropic key
-- CloudWatch metrics + 10 alarms (8 baseline + 2 SLO fast-burn) with runbook URLs in their descriptions; `runbooks/` holds the 8 playbooks they point at (two alarms share a playbook with a sibling)
-- SNS topic for alarm delivery
-
-**Not provisioned: Kafka.** There is no broker in `infra/` — no MSK cluster, no self-managed nodes. A deployed stack therefore accepts jobs and never executes them, because every client falls back to `localhost:9092`. This is a recorded decision, not an oversight: see [ADR 0018](docs/ADR/0018-production-kafka-posture.md) for why, and for what to do when a production broker is actually wanted.
-
-CI builds Docker images, pushes to ECR, and updates the ECS services on merge to `master` — but only when the `ENABLE_ECS_DEPLOY` repository variable is set to `'true'`. It is unset, so that job skips.
-
----
-
-## License
-
-No license is granted at this time. The code is published for reading and review only; all rights are reserved. You may not use, copy, modify or redistribute it without written permission from the author.
+| Area | Entry point |
+|---|---|
+| API and domain services | [backend/app](backend/app/) |
+| Event processing and control loops | [workers](backend/app/workers/) |
+| MCP tools and authorization | [mcp](backend/app/mcp/) |
+| Operator console | [frontend](frontend/) |
+| Data and event design | [Data model](docs/DATA_MODEL.md), [Kafka](docs/KAFKA.md), [Redis](docs/REDIS.md) |
+| Operations | [Runbooks](runbooks/), [architecture](docs/ARCHITECTURE.md) |
+| Decisions, limits and next phases | [ADR index](docs/ADR/README.md), [roadmap](docs/ROADMAP.md), [CLAUDE.md](CLAUDE.md) |
