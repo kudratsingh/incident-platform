@@ -1,8 +1,8 @@
-# Incident & Workflow Platform
+# Incident Platform — Event-Driven Workflow & Incident Operations
 
-A multi-tenant job and workflow platform built to make distributed-systems behavior inspectable: event-sourced jobs, transactional outbox delivery, dependency DAGs, saga compensation, live progress and audited incident operations.
+An **event-driven, multi-tenant workflow and incident platform** built around **Kafka event sourcing, CQRS, a transactional outbox, compensating sagas and dependency DAGs**. FastAPI services, PostgreSQL row-level security, Redis read models and a React operations console connect asynchronous job orchestration with live progress, failure recovery and audited incident control.
 
-It is also the managed environment for [Incident Commander](https://github.com/kudratsingh/incident-commander). The agent gets the same scoped, rate-limited MCP interface any external machine client would use.
+**OpenTelemetry tracing, SLO evaluation, circuit breakers, dead-letter triage and scoped MCP remediation tools** make the platform a controlled environment for [autonomous AI SRE agents](https://github.com/kudratsingh/incident-commander). Machine-principal scopes, idempotency keys, fault-injection hooks and independent audit records expose both distributed-system behavior and the consequences of agent actions.
 
 ## What it does
 
